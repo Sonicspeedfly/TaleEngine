@@ -1,0 +1,21 @@
+# Секреты
+.env
+
+# База данных и данные среды выполнения
+data/*.db
+data/*.db-*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Node / frontend
+frontend/node_modules/
+frontend/dist/
+
+# IDE
+.vscode/
+.idea/

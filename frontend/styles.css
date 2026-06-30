@@ -1,0 +1,422 @@
+/* AiChat SSF — тёмная тема в духе SillyTavern. Без сборки: один CSS-файл. */
+:root {
+  --bg: #14161b;
+  --bg2: #1b1e26;
+  --bg3: #232733;
+  --border: #2e3340;
+  --text: #e6e8ee;
+  --muted: #9aa3b2;
+  --accent: #6d8cff;
+  --accent2: #4a64d0;
+  --user: #2a3a6b;
+  --assistant: #262b38;
+  --danger: #b3434a;
+  --ok: #3fae6b;
+}
+* { box-sizing: border-box; }
+html, body, #app { height: 100%; margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 "Segoe UI", system-ui, sans-serif;
+}
+button {
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--bg3);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 13px;
+}
+button:hover { border-color: var(--accent); }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn-primary { background: var(--accent2); border-color: var(--accent2); }
+.btn-primary:hover { background: var(--accent); }
+.btn-danger { background: transparent; color: var(--danger); border-color: transparent; }
+.btn-danger:hover { background: rgba(179, 67, 74, 0.15); border-color: var(--danger); }
+.btn-icon { padding: 3px 7px; background: transparent; border-color: transparent; color: var(--muted); }
+.btn-icon:hover { color: var(--text); background: var(--bg3); }
+input, textarea, select {
+  width: 100%;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 7px 9px;
+  font: inherit;
+}
+textarea { resize: vertical; }
+label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 10px; }
+label span { color: var(--text); }
+.row { display: flex; gap: 8px; align-items: center; }
+.muted { color: var(--muted); }
+.pill { font-size: 11px; padding: 1px 7px; border-radius: 10px; background: var(--bg3); color: var(--muted); }
+
+/* ----- Раскладка (flex): [сайдбар] | чат | [канвас]. Настройки — оверлей. ----- */
+.app-grid { display: flex; height: 100%; overflow: hidden; }
+.chat, .canvas-pane { flex: 1 1 0; min-width: 0; }
+
+/* ----- Левый сайдбар: колонка с аккордеонами; ☰ слайдит её влево (margin-left). ----- */
+.sidebar {
+  width: 260px; flex: none; background: var(--bg2); border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; overflow-y: auto;
+  transition: margin-left 0.26s ease;
+}
+.app-grid.sb-hidden .sidebar { margin-left: -260px; }
+
+/* Аккордеон разделов: шапка с иконкой всегда видна, тело раскрывается плавно. */
+.acc { border-bottom: 1px solid var(--border); }
+.acc-head {
+  display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+  padding: 11px 12px; background: transparent; border: none; border-radius: 0;
+  font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted);
+}
+.acc-head:hover { background: var(--bg3); color: var(--text); }
+.acc-icon { font-size: 15px; }
+.acc-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acc-chevron { transition: transform 0.2s ease; color: var(--muted); }
+.acc-chevron.open { transform: rotate(90deg); }
+.acc-body { max-height: 0; overflow: hidden; transition: max-height 0.25s ease; }
+.acc-body.open { max-height: 60vh; overflow-y: auto; }
+.list-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 12px; cursor: pointer; border-left: 3px solid transparent;
+}
+.list-item:hover { background: var(--bg3); }
+.list-item.active { background: var(--bg3); border-left-color: var(--accent); }
+.list-item .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.avatar { width: 30px; height: 30px; border-radius: 50%; background: var(--bg3); object-fit: cover; flex: none; display: grid; place-items: center; color: var(--muted); }
+
+/* ----- Центр: чат ----- */
+.chat { position: relative; display: flex; flex-direction: column; height: 100%; overflow: hidden; }
+.chat-header { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--border); background: var(--bg2); }
+.chat-header .title { font-weight: 600; }
+
+/* ----- Колокольчик уведомлений (заявки в друзья) ----- */
+.notif-wrap { position: relative; display: inline-flex; }
+.notif-wrap > button { position: relative; }
+.notif-badge {
+  position: absolute; top: -4px; right: -4px; min-width: 16px; height: 16px;
+  padding: 0 4px; border-radius: 8px; background: var(--danger); color: #fff;
+  font-size: 10px; line-height: 16px; text-align: center; font-weight: 700;
+}
+.notif-backdrop { position: fixed; inset: 0; z-index: 70; }
+.notif-dropdown {
+  position: absolute; top: 110%; right: 0; z-index: 71; width: 280px; max-width: 80vw;
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.45); overflow: hidden;
+}
+.notif-head { padding: 8px 12px; font-weight: 600; border-bottom: 1px solid var(--border); background: var(--bg3); }
+.notif-item { padding: 10px 12px; border-bottom: 1px solid var(--border); }
+.notif-item:last-child { border-bottom: none; }
+.messages { flex: 1; overflow-y: auto; padding: 18px; display: flex; flex-direction: column; gap: 14px; }
+.msg { max-width: 760px; }
+.msg.user { align-self: flex-end; }
+.msg.assistant { align-self: flex-start; }
+.bubble { padding: 10px 14px; border-radius: 14px; white-space: normal; }
+.msg.user .bubble { background: var(--user); }
+.msg.assistant .bubble { background: var(--assistant); }
+.bubble p:first-child { margin-top: 0; }
+.bubble p:last-child { margin-bottom: 0; }
+.bubble em { color: #c7b8ff; }
+.bubble code { background: #0d0f14; padding: 1px 5px; border-radius: 5px; font-family: "Cascadia Code", Consolas, "Courier New", monospace; font-size: 13px; }
+.bubble pre { background: #0d0f14; padding: 10px; border-radius: 8px; overflow-x: auto; border: 1px solid var(--border); font-size: 13px; line-height: 1.45; }
+.bubble pre code { background: transparent; padding: 0; }
+/* Разметка в духе Telegram: цитаты, ссылки, списки, заголовки. */
+.bubble strong, .bubble b { font-weight: 700; }
+.bubble a { color: var(--accent); text-decoration: none; }
+.bubble a:hover { text-decoration: underline; }
+.bubble blockquote { margin: 6px 0; padding: 2px 0 2px 10px; border-left: 3px solid var(--accent); color: var(--muted); }
+.bubble ul, .bubble ol { margin: 6px 0; padding-left: 22px; }
+.bubble li { margin: 2px 0; }
+.bubble h1, .bubble h2, .bubble h3 { font-size: 15px; margin: 8px 0 4px; font-weight: 700; }
+.bubble hr { border: none; border-top: 1px solid var(--border); margin: 8px 0; }
+.msg .speaker { font-size: 12px; color: var(--accent); font-weight: 600; margin: 0 4px 2px; }
+.msg.user .speaker { text-align: right; }
+.msg-meta { display: flex; align-items: center; gap: 6px; margin-top: 4px; font-size: 12px; color: var(--muted); }
+.msg.user .msg-meta { justify-content: flex-end; }
+.swipes { display: inline-flex; align-items: center; gap: 4px; }
+.composer { border-top: 1px solid var(--border); padding: 12px; background: var(--bg2); }
+/* Единый инпут по центру: ограничиваем ширину и центрируем содержимое. */
+.composer > * { max-width: 860px; margin-left: auto; margin-right: auto; }
+.composer .row { align-items: flex-end; }
+.composer textarea { min-height: 46px; max-height: 200px; }
+/* Авторесайз: высоту задаёт JS (autoGrow) до max-height, дальше — скролл. */
+.composer-input { resize: none; overflow-y: auto; line-height: 1.45; }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+.chip { font-size: 12px; background: var(--bg3); border: 1px solid var(--border); border-radius: 8px; padding: 3px 8px; }
+.empty { margin: auto; color: var(--muted); text-align: center; }
+.typing { color: var(--muted); }
+
+/* ----- Правый drawer с настройками ----- */
+/* Панель настроек — выезжающий справа оверлей (не занимает постоянное место). */
+.drawer {
+  position: fixed; right: 0; top: 0; bottom: 0; width: 380px; max-width: 92%;
+  z-index: 56; background: var(--bg2); border-left: 1px solid var(--border);
+  display: flex; flex-direction: column; overflow: hidden;
+  box-shadow: -10px 0 30px rgba(0,0,0,0.45); animation: drawer-in 0.18s ease;
+}
+.drawer-backdrop { position: fixed; inset: 0; z-index: 55; background: rgba(0,0,0,0.4); }
+@keyframes drawer-in { from { transform: translateX(24px); opacity: 0.3; } to { transform: translateX(0); opacity: 1; } }
+.tabs { display: flex; flex-wrap: wrap; gap: 4px; padding: 8px; border-bottom: 1px solid var(--border); }
+.tab-btn { background: transparent; border-color: transparent; color: var(--muted); padding: 5px 8px; }
+.tab-btn.active { color: var(--text); background: var(--bg3); }
+.drawer .body { overflow-y: auto; padding: 14px; flex: 1; }
+.drawer h3 { margin: 0 0 12px; font-size: 14px; }
+.range-val { color: var(--text); float: right; }
+.hr { height: 1px; background: var(--border); margin: 14px 0; }
+.status-ok { color: var(--ok); }
+.status-err { color: var(--danger); }
+.card { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 10px; margin-bottom: 10px; }
+.card .row-between { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.tag { font-size: 11px; padding: 1px 6px; border-radius: 6px; background: var(--bg3); color: var(--muted); }
+.check { display: flex; align-items: center; gap: 8px; }
+.check input { width: auto; }
+.danger-text { color: var(--danger); }
+
+/* Баннер ошибки генерации над полем ввода */
+.error-banner {
+  background: rgba(179, 67, 74, 0.18);
+  border: 1px solid var(--danger);
+  color: #ffb4b8;
+  border-radius: 8px;
+  padding: 7px 10px;
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+.error-banner a { color: #ffd; margin-left: 8px; }
+/* Индикатор режима «опиши арт сообщением» */
+.art-indicator {
+  background: rgba(109, 140, 255, 0.16);
+  border: 1px solid var(--accent);
+  color: #cdd7ff;
+  border-radius: 8px;
+  padding: 7px 10px;
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+.art-indicator a { color: #fff; margin-left: 8px; }
+/* Ответ на конкретное сообщение */
+.reply-bar {
+  background: var(--bg3); border-left: 3px solid var(--accent);
+  border-radius: 6px; padding: 6px 10px; margin-bottom: 8px; font-size: 13px; color: var(--muted);
+}
+.reply-bar a { color: var(--text); margin-left: 8px; }
+.reply-quote {
+  font-size: 12px; color: var(--muted); border-left: 2px solid var(--accent);
+  padding: 1px 8px; margin: 0 4px 3px; opacity: 0.85;
+}
+.msg.user .reply-quote { text-align: right; border-left: none; border-right: 2px solid var(--accent); }
+/* Кнопка записи в активном состоянии */
+.rec-active { color: #fff; background: var(--danger); border-color: var(--danger); }
+.bubble img { max-width: 100%; border-radius: 8px; }
+
+/* Меню генерации арта */
+.art-wrap { position: relative; }
+.art-menu {
+  position: absolute; bottom: 110%; left: 0; z-index: 20;
+  background: var(--bg3); border: 1px solid var(--border); border-radius: 8px;
+  display: flex; flex-direction: column; min-width: 160px; overflow: hidden;
+}
+.art-menu button { border: none; border-radius: 0; text-align: left; background: transparent; }
+.art-menu button:hover { background: var(--bg); }
+
+/* Меню [+] второстепенных действий (голос/арт) в инпуте. */
+.plus-wrap { position: relative; }
+.plus-backdrop { position: fixed; inset: 0; z-index: 19; }
+.plus-menu {
+  position: absolute; bottom: 120%; left: 0; z-index: 20; min-width: 220px; overflow: hidden;
+  background: var(--bg3); border: 1px solid var(--border); border-radius: 10px;
+  display: flex; flex-direction: column; box-shadow: 0 8px 24px rgba(0,0,0,0.45);
+}
+.plus-menu button { border: none; border-radius: 0; text-align: left; background: transparent; padding: 9px 12px; }
+.plus-menu button:hover { background: var(--bg); }
+
+/* Подсветка зоны при перетаскивании файла (drag&drop). */
+.drop-overlay {
+  position: absolute; inset: 10px; z-index: 30; pointer-events: none;
+  display: grid; place-items: center; border: 2px dashed var(--accent); border-radius: 14px;
+  background: rgba(109,140,255,0.10); color: var(--accent); font-weight: 600; font-size: 16px;
+}
+
+/* Выбор фона чата */
+.bg-picker { padding: 10px 14px; border-bottom: 1px solid var(--border); background: var(--bg2); }
+.bg-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 6px; }
+.bg-swatch { width: 34px; height: 34px; border-radius: 8px; padding: 0; display: grid; place-items: center; }
+.bg-thumb { width: 46px; height: 30px; object-fit: cover; border-radius: 6px; cursor: pointer; border: 1px solid var(--border); }
+.bg-thumb:hover { border-color: var(--accent); }
+.messages { background-color: var(--bg); } /* фон по умолчанию, перекрывается inline-стилем */
+
+/* Экран ввода кода доступа */
+.gate { position: fixed; inset: 0; display: grid; place-items: center; background: var(--bg); z-index: 100; }
+.gate-box { width: 320px; max-width: 90%; background: var(--bg2); border: 1px solid var(--border); border-radius: 14px; padding: 24px; }
+.gate-box h2 { margin: 0 0 4px; }
+.gate-box input { margin-top: 8px; }
+
+/* Модальное окно (админка) */
+.modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.55); display: grid; place-items: center; z-index: 60; padding: 16px; }
+.modal { width: 480px; max-width: 100%; max-height: 88vh; overflow-y: auto; background: var(--bg2); border: 1px solid var(--border); border-radius: 14px; padding: 18px; }
+.modal h4 { margin: 6px 0; }
+
+/* ☰ виден всегда — слайдит сайдбар (десктоп) / выезжает оверлей (мобила). */
+.hamburger { display: inline-flex; font-size: 18px; }
+.backdrop { display: none; }
+
+/* ----- Адаптивность ----- */
+@media (max-width: 760px) {
+  /* На мобильном сайдбар — выезжающий оверлей по ☰ (а не колонка). */
+  .hide-mobile { display: none; }
+  .sidebar {
+    position: fixed; left: 0; top: 0; bottom: 0; width: 84%; max-width: 320px; z-index: 50; margin-left: 0;
+    transform: translateX(-100%); transition: transform 0.2s ease; box-shadow: 8px 0 28px rgba(0,0,0,0.45);
+  }
+  .sidebar.open { transform: translateX(0); }
+  .backdrop { display: block; position: fixed; inset: 0; z-index: 49; background: rgba(0,0,0,0.5); }
+  .drawer { width: 100%; max-width: 100%; }
+  .msg { max-width: 100%; }
+}
+
+/* ============================================================
+   Полировка интерфейса (round 13): скроллбары, бейджи, теги
+   ============================================================ */
+
+/* ----- Скроллбары в тон тёмной теме (Firefox + WebKit) ----- */
+* { scrollbar-width: thin; scrollbar-color: var(--bg3) transparent; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--bg3); border-radius: 8px;
+  border: 2px solid transparent; background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover { background: var(--border); background-clip: padding-box; }
+::-webkit-scrollbar-corner { background: transparent; }
+
+/* ----- Списки: мягче и отзывчивее ----- */
+.list-item { border-radius: 8px; margin: 1px 6px; transition: background 0.12s ease; }
+.list-item.active { background: var(--bg3); }
+
+/* ----- Бейдж «пришёл ответ в другом чате» на элементе списка ----- */
+.reply-dot {
+  flex: none; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--accent); box-shadow: 0 0 6px var(--accent);
+}
+
+/* ----- Тег области видимости записи памяти Horae ----- */
+.scope-tag {
+  font-size: 10px; padding: 1px 6px; border-radius: 8px; white-space: nowrap;
+  background: var(--bg); border: 1px solid var(--border); color: var(--muted);
+}
+.scope-tag.global { color: #8fb3ff; border-color: #3a4a78; }
+.scope-tag.session { color: #6fd3a0; border-color: #2f6b4b; }
+.scope-tag.character { color: #d8a76f; border-color: #6b522f; }
+
+/* ----- Тост-уведомление (ответ в другом чате и т.п.) ----- */
+.toast-wrap { position: fixed; right: 16px; bottom: 16px; z-index: 90; display: flex; flex-direction: column; gap: 8px; }
+.toast {
+  background: var(--bg2); border: 1px solid var(--border); border-left: 3px solid var(--accent);
+  border-radius: 10px; padding: 10px 14px; max-width: 320px; cursor: pointer;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.45); animation: toast-in 0.2s ease;
+}
+.toast:hover { border-color: var(--accent); }
+@keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+
+/* ----- Мелкая полировка карточек/кнопок ----- */
+.card { transition: border-color 0.12s ease; }
+.btn-icon { border-radius: 8px; transition: background 0.12s ease, color 0.12s ease; }
+.chat-header { gap: 8px; }
+
+/* ============================================================
+   Предпросмотр вложений, лайтбокс и Канвас
+   ============================================================ */
+
+/* ----- Вложения в пузыре сообщения ----- */
+.attachments { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.att-img { max-width: 220px; max-height: 220px; border-radius: 10px; cursor: zoom-in; object-fit: cover; border: 1px solid var(--border); }
+.att-audio { height: 36px; max-width: 260px; }
+.att-doc { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border-radius: 8px;
+  background: var(--bg3); border: 1px solid var(--border); color: var(--text); text-decoration: none; font-size: 13px; }
+.att-doc:hover { border-color: var(--accent); }
+
+/* Плашка документа в чате (ответ-Канвас) — кликом открывает Canvas. */
+.doc-card { display: flex; align-items: center; gap: 12px; cursor: pointer; padding: 12px 14px;
+  border: 1px solid var(--border); border-radius: 12px; background: var(--bg3);
+  min-width: 240px; max-width: 380px; transition: border-color 0.12s, background 0.12s; }
+.doc-card:hover { border-color: var(--accent); background: var(--bg); }
+.doc-card-icon { font-size: 26px; flex: none; }
+.doc-card-body { display: flex; flex-direction: column; min-width: 0; }
+.doc-card-title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.doc-card-hint { font-size: 12px; color: var(--accent); }
+
+/* Пустое состояние (нет друзей и т.п.) и список выбора друзей для инвайта. */
+.empty-state { text-align: center; padding: 22px 12px; }
+.empty-icon { font-size: 46px; margin-bottom: 6px; }
+.empty-state p { margin: 4px 0; }
+.invite-list { display: flex; flex-direction: column; gap: 4px; max-height: 320px; overflow-y: auto; }
+.invite-item { display: flex; align-items: center; gap: 10px; margin: 0; padding: 8px 10px;
+  border-radius: 10px; cursor: pointer; border: 1px solid transparent; }
+.invite-item:hover { background: var(--bg3); }
+.invite-item.active { background: var(--bg3); border-color: var(--accent); }
+.invite-item input { width: auto; margin: 0; }
+.invite-item .grow { flex: 1; min-width: 0; }
+
+/* ----- Чипы предпросмотра в композере ----- */
+.att-chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px; }
+.att-thumb { width: 40px; height: 40px; border-radius: 6px; object-fit: cover; cursor: zoom-in; }
+.att-audio-sm { height: 30px; max-width: 180px; }
+.att-x { margin-left: 2px; }
+
+/* ----- Лайтбокс ----- */
+.lightbox { position: fixed; inset: 0; z-index: 95; background: rgba(0,0,0,0.85); display: grid; place-items: center; cursor: zoom-out; padding: 24px; }
+.lightbox img { max-width: 95vw; max-height: 95vh; border-radius: 8px; box-shadow: 0 10px 40px rgba(0,0,0,0.6); }
+
+/* ----- Канвас (документ/код рядом с чатом, side-by-side через flex) ----- */
+.canvas-pane { display: flex; flex-direction: column; min-width: 0; height: 100%;
+  background: var(--bg2); border-left: 1px solid var(--border); overflow: hidden; }
+.canvas-head { display: flex; align-items: center; gap: 6px; padding: 8px 12px; border-bottom: 1px solid var(--border); background: var(--bg3); }
+.canvas-title { flex: 1; min-width: 0; background: transparent; border: none; font-size: 15px; font-weight: 600; color: var(--text); padding: 4px 6px; }
+.canvas-title:focus { background: var(--bg); border-radius: 6px; outline: 1px solid var(--border); }
+.canvas-kind { width: auto; }
+/* Плавающий тулбар выделения (как в Notion/Medium) — появляется над фрагментом. */
+.canvas-toolbar {
+  position: fixed; z-index: 70; transform: translateX(-50%);
+  display: flex; align-items: center; gap: 2px; padding: 4px;
+  background: var(--bg3); border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: 0 6px 20px rgba(0,0,0,0.5); animation: toast-in 0.12s ease;
+}
+.canvas-toolbar button {
+  background: transparent; border: none; padding: 5px 8px; border-radius: 7px;
+  font-size: 15px; line-height: 1; color: var(--text);
+}
+.canvas-toolbar button:hover:not(:disabled) { background: var(--bg); }
+.canvas-toolbar .ct-sep { width: 1px; align-self: stretch; background: var(--border); margin: 2px 2px; }
+.canvas-body { position: relative; flex: 1; min-height: 0; }
+/* Переключатель Редактор/Просмотр. */
+.canvas-tabs { display: flex; align-items: center; gap: 4px; padding: 6px 10px; border-bottom: 1px solid var(--border); background: var(--bg3); }
+.canvas-tabs button { font-size: 12px; padding: 5px 12px; background: transparent; border: 1px solid transparent; color: var(--muted); cursor: pointer; border-radius: 6px; }
+.canvas-tabs button.active { background: var(--bg); border-color: var(--border); color: var(--text); }
+.canvas-tabs button.canvas-fmt { min-width: 30px; padding: 5px 9px; border-color: var(--border); }
+.canvas-tabs button.canvas-fmt:hover { background: var(--bg); color: var(--text); }
+/* Предпросмотр: веб-код (iframe), документ (рендер), прочий код (как есть). */
+.canvas-preview-frame { width: 100%; height: 100%; border: none; background: #fff; }
+.canvas-preview { width: 100%; height: 100%; overflow-y: auto; padding: 16px 18px; margin: 0; box-sizing: border-box; }
+.canvas-preview.mono { font-family: "Cascadia Code", Consolas, monospace; font-size: 13px; white-space: pre-wrap; background: var(--bg); }
+.canvas-editor { width: 100%; height: 100%; border: none; border-radius: 0; resize: none; padding: 16px 18px;
+  background: var(--bg); color: var(--text); font: inherit; line-height: 1.6; }
+.canvas-editor.mono { font-family: "Cascadia Code", Consolas, monospace; font-size: 13px; line-height: 1.5; }
+.canvas-editor:focus { outline: none; }
+.canvas-overlay { position: absolute; inset: 0; display: grid; place-items: center; background: rgba(20,22,27,0.6);
+  color: var(--accent); font-weight: 600; backdrop-filter: blur(1px); }
+.canvas-selinfo { font-size: 12px; color: var(--accent); padding: 6px 14px 0; }
+.canvas-ai { display: flex; gap: 8px; padding: 10px 12px; border-top: 1px solid var(--border); background: var(--bg2); }
+.canvas-ai input { flex: 1; }
+/* Мобильные вкладки: на экране либо Чат, либо Canvas — без сплющивания. */
+.only-mobile { display: none; }
+@media (max-width: 760px) {
+  .only-mobile { display: inline-flex; }
+  /* Вкладки: на экране либо чат, либо канвас (через display:none неактивной). */
+  .app-grid.with-canvas.pane-chat > .canvas-pane { display: none; }
+  .app-grid.with-canvas.pane-canvas > .chat { display: none; }
+  .canvas-pane { width: 100%; border-left: none; }
+  .att-img { max-width: 70vw; }
+}

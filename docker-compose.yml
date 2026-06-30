@@ -1,0 +1,46 @@
+# Поднять весь стек одной командой:  docker compose up --build
+#
+# Сервисы:
+#   backend       — FastAPI (REST + WebSocket + SSE) И веб-интерфейс, порт 8000;
+#   telegram_bot  — aiogram-бот, тот же образ и та же БД, что у backend.
+#
+# Общая SQLite-база лежит в томе ./data -> веб и Telegram работают с одними
+# персонажами, памятью и историей.
+#
+# ВАЖНО: ваш LiteLLM-прокси запущен на ХОСТЕ (:4000). Из контейнера он доступен по
+# адресу host.docker.internal:4000 (см. extra_hosts и LITELLM_BASE_URL ниже).
+# Адрес также можно поменять прямо в интерфейсе (вкладка «Подключение»).
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      - LITELLM_BASE_URL=http://host.docker.internal:4000
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # доступ к хостовому LiteLLM из контейнера
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data # общий файл SQLite
+      - ./frontend:/app/frontend # правки UI видны без пересборки образа
+    command: uvicorn backend.main:app --host 0.0.0.0 --port 8000
+    restart: unless-stopped
+
+  telegram_bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      - LITELLM_BASE_URL=http://host.docker.internal:4000
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data:/app/data # ТА ЖЕ папка -> общая база с backend
+    command: python -m telegram_bot.bot
+    depends_on:
+      - backend
+    restart: unless-stopped

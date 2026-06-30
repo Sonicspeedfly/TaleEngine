@@ -1,0 +1,18 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "aichat",
+      "runtimeExecutable": "D:/Programs/AiChat SSF/.venv/Scripts/python.exe",
+      "runtimeArgs": ["-m", "uvicorn", "backend.main:app", "--port", "8042"],
+      "port": 8042,
+      "autoPort": false
+    },
+    {
+      "name": "sonic-hd",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--prefix", "sonic-hd-green-hill"],
+      "port": 5173
+    }
+  ]
+}

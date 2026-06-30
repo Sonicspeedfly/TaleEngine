@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(python --version)",
+      "PowerShell(if \\($?\\) { \"OK: all modules compiled without syntax errors\" })",
+      "Bash(python -c ' *)"
+    ]
+  }
+}

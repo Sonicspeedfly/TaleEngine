@@ -1,0 +1,75 @@
+# =============================================================================
+#  Пример config.yaml для LiteLLM-прокси (всё через Vertex AI).
+#  Запуск:  litellm --config config.yaml --port 4000
+#
+#  model_name — это имя, которое вы вписываете в приложении (вкладка «Подключение»
+#  -> «Модель по умолчанию», и «Модель для генерации артов»).
+#
+#  Доступ к Vertex: задайте переменную окружения
+#     GOOGLE_APPLICATION_CREDENTIALS=/путь/к/service-account.json
+#  (или vertex_project + vertex_credentials в litellm_settings ниже).
+# =============================================================================
+
+model_list:
+  # --------- Текстовые модели (чат) ---------
+  - model_name: gemini-3.1-pro-preview
+    litellm_params:
+      model: vertex_ai/gemini-3.1-pro-preview
+      vertex_location: "global"
+  - model_name: gemini-3.5-flash
+    litellm_params:
+      model: vertex_ai/gemini-3.5-flash
+      vertex_location: "global"
+
+  # --------- Nano-banana (Gemini 2.5 Flash Image) ---------
+  # Генерация и РЕДАКТИРОВАНИЕ картинок прямо в чате (мультимодальный вывод).
+  # В приложении впишите это имя в «Модель для генерации артов».
+  - model_name: nano-banana
+    litellm_params:
+      model: vertex_ai/gemini-2.5-flash-image
+      vertex_location: "global"
+  - model_name: nano-banana Pro
+    litellm_params:
+      model: vertex_ai/gemini-3-pro-image
+      vertex_location: "global"
+  - model_name: nano-banana 2
+    litellm_params:
+      model: vertex_ai/gemini-3.1-flash-image
+      vertex_location: "global" 
+
+  # --------- Imagen (классическая генерация картинок) ---------
+  # Идёт через эндпоинт image_generation. Тоже годится для «артов».
+  - model_name: imagen-4
+    litellm_params:
+      model: vertex_ai/imagen-4.0-generate-001
+      vertex_location: "global"
+  - model_name: imagen-3
+    litellm_params:
+      model: vertex_ai/imagen-3.0-generate-002
+      vertex_location: "global"
+
+  # --------- Эмбеддинги (на будущее: семантический поиск памяти Horae) ---------
+  - model_name: text-embedding
+    litellm_params:
+      model: vertex_ai/text-embedding-005
+      vertex_location: "global"
+
+litellm_settings:
+  drop_params: true
+  # !!! ОБЯЗАТЕЛЬНО ДЛЯ КАРТИНОК !!!
+  # Модели генерации картинок (imagen / *-image, в т.ч. nano-banana) ТРЕБУЮТ явного
+  # vertex_project — иначе ошибка "vertex_project and vertex_location are required
+  # for Vertex AI". Текстовые модели берут проект из ключа (ADC), а картиночные — нет.
+  # Впишите сюда ID вашего GCP-проекта (как в service-account.json, поле project_id).
+  # ВНИМАНИЕ: впишите ВРУЧНУЮ, без копипаста — невидимый таб/пробел в значении даёт
+  # ошибку "Invalid non-printable ASCII character in URL, '\t'". Только буквы/цифры/дефис.
+  # И в YAML отступы — только ПРОБЕЛЫ, не табы.
+  vertex_project: "my-gcp-project-id"
+  vertex_location: "global"
+  # ВАЖНО: imagen-модели обычно НЕ работают в "global" — для них ставьте us-central1.
+  # Gemini-image (nano-banana, *-pro-image) с "global" обычно ок.
+
+# (Необязательно) защитить прокси мастер-ключом — тогда впишите его в приложении
+# в поле «API ключ прокси»:
+# general_settings:
+#   master_key: "sk-1234"

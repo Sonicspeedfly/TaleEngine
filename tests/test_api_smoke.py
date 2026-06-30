@@ -1,0 +1,309 @@
+"""
+Интеграционные («дымовые») тесты REST + WebSocket через FastAPI TestClient.
+
+Реальные вызовы к LLM замоканы. Проверяем сквозной путь: создание персонажа,
+сессия с приветствием, настройки подключения, и полный цикл по WebSocket с
+сохранением ответа ассистента (включая свайпы).
+"""
+import json
+from unittest.mock import patch
+
+# Фикстура `client` определена в tests/conftest.py и доступна всем тестам.
+
+
+def _fake_chunk(text: str):
+    class _Delta:
+        content = text
+
+    class _Choice:
+        delta = _Delta()
+
+    class _Chunk:
+        choices = [_Choice()]
+
+    return _Chunk()
+
+
+async def _fake_acompletion(*args, **kwargs):
+    async def gen():
+        for token in ["Прив", "ет", "!"]:
+            yield _fake_chunk(token)
+
+    return gen()
+
+
+async def _fake_aimage(*args, **kwargs):
+    class _Item:
+        url = "http://img/test.png"
+
+    class _Resp:
+        data = [_Item()]
+
+    return _Resp()
+
+
+def test_health_and_static_index(client):
+    assert client.get("/api/health").json()["status"] == "ok"
+    # Веб-интерфейс отдаётся сервером с корня (StaticFiles).
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "TaleEngine" in r.text
+
+
+def test_character_and_session_with_greeting(client):
+    created = client.post(
+        "/api/characters", json={"name": "Smoke", "first_message": "Привет, гость!"}
+    ).json()
+    cid = created["id"]
+    assert any(c["id"] == cid for c in client.get("/api/characters").json())
+
+    client.patch(f"/api/characters/{cid}", json={"description": "обновлено"})
+
+    sid = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]
+    msgs = client.get(f"/api/sessions/{sid}/messages").json()
+    # Первое сообщение персонажа показывается сразу (как в SillyTavern).
+    assert msgs and msgs[0]["role"] == "assistant"
+    assert "Привет, гость!" in msgs[0]["content"]
+
+
+def test_connection_settings_roundtrip(client):
+    conn = client.get("/api/settings/connection").json()
+    assert "base_url" in conn and "use_proxy" in conn
+    updated = client.put(
+        "/api/settings/connection",
+        json={
+            "use_proxy": True,
+            "base_url": "http://localhost:4000",
+            "api_key": "sk-test",
+            "default_model": "gpt-4o",
+        },
+    ).json()
+    assert updated["default_model"] == "gpt-4o"
+    assert updated["base_url"] == "http://localhost:4000"
+
+
+def test_websocket_user_turn_streams_and_persists(client):
+    cid = client.post("/api/characters", json={"name": "WS"}).json()["id"]
+    sid = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]
+
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        with client.websocket_connect(f"/ws/chat/{sid}") as ws:
+            ws.send_json({"type": "user_message", "content": "привет"})
+            collected = ""
+            for _ in range(50):
+                ev = ws.receive_json()
+                if ev["type"] == "token":
+                    collected += ev["content"]
+                if ev["type"] in ("done", "error"):
+                    break
+
+    assert collected == "Привет!"
+    msgs = client.get(f"/api/sessions/{sid}/messages").json()
+    assistant_msgs = [m for m in msgs if m["role"] == "assistant"]
+    assert assistant_msgs and assistant_msgs[-1]["content"] == "Привет!"
+    # Ответ сохранён как первый свайп (для механики альтернативных вариантов).
+    assert assistant_msgs[-1]["swipes"] == ["Привет!"]
+
+
+def test_ui_settings_roundtrip(client):
+    client.put("/api/settings/ui", json={"params": {"temperature": 0.3}})
+    ui = client.get("/api/settings/ui").json()
+    assert ui["params"]["temperature"] == 0.3
+
+
+def test_chat_import_endpoint(client):
+    lines = "\n".join(
+        [
+            json.dumps({"character_name": "ImportChar", "user_name": "U"}),
+            json.dumps({"is_user": False, "mes": "greeting"}),
+            json.dumps({"is_user": True, "mes": "hello"}),
+        ]
+    )
+    r = client.post(
+        "/api/sessions/import", files={"file": ("chat.jsonl", lines, "application/json")}
+    )
+    assert r.status_code == 200
+    data = r.json()
+    assert data["count"] == 2
+    msgs = client.get(f"/api/sessions/{data['session_id']}/messages").json()
+    assert msgs[0]["content"] == "greeting"
+
+
+def test_image_generation_endpoint(client):
+    cid = client.post("/api/characters", json={"name": "Art"}).json()["id"]
+    sid = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]
+    with patch("backend.llm_gateway.litellm.aimage_generation", new=_fake_aimage):
+        r = client.post(f"/api/sessions/{sid}/image", json={"prompt": "a cat"})
+    assert r.status_code == 200
+    msgs = client.get(f"/api/sessions/{sid}/messages").json()
+    assert any("http://img/test.png" in m["content"] for m in msgs)
+
+
+def test_art_from_message(client):
+    cid = client.post(
+        "/api/characters", json={"name": "ArtMsg", "first_message": "тёмный лес ночью"}
+    ).json()["id"]
+    sid = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]
+    mid = client.get(f"/api/sessions/{sid}/messages").json()[0]["id"]
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion), patch(
+        "backend.llm_gateway.litellm.aimage_generation", new=_fake_aimage
+    ):
+        r = client.post(
+            f"/api/sessions/{sid}/image", json={"mode": "scene", "from_message_id": mid}
+        )
+    assert r.status_code == 200
+    out = client.get(f"/api/sessions/{sid}/messages").json()
+    assert any("http://img/test.png" in m["content"] for m in out)
+
+
+def test_art_prompt_with_attachments(client):
+    cid = client.post("/api/characters", json={"name": "ArtAtt"}).json()["id"]
+    sid = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion), patch(
+        "backend.llm_gateway.litellm.aimage_generation", new=_fake_aimage
+    ):
+        r = client.post(
+            f"/api/sessions/{sid}/image",
+            json={
+                "mode": "prompt",
+                "prompt": "девушка в плаще",
+                "attachments": [{"type": "image", "data": "data:image/png;base64,AAAA"}],
+            },
+        )
+    assert r.status_code == 200
+    out = client.get(f"/api/sessions/{sid}/messages").json()
+    assert any("http://img/test.png" in m["content"] for m in out)
+
+
+def test_default_preset(client):
+    client.post("/api/presets", json={"name": "P1", "params": {"temperature": 0.2}})
+    p2 = client.post("/api/presets", json={"name": "P2", "params": {"temperature": 0.8}}).json()
+    client.post(f"/api/presets/{p2['id']}/default")
+    presets = client.get("/api/presets").json()
+    defaults = [p for p in presets if p["is_default"]]
+    assert len(defaults) == 1 and defaults[0]["id"] == p2["id"]
+
+
+def test_session_background_roundtrip(client):
+    cid = client.post("/api/characters", json={"name": "BG"}).json()["id"]
+    sid = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]
+    client.patch(f"/api/sessions/{sid}", json={"background": "linear-gradient(#000,#111)"})
+    sessions = client.get(f"/api/sessions?character_id={cid}").json()
+    assert any(s["id"] == sid and s["background"] == "linear-gradient(#000,#111)" for s in sessions)
+
+
+def test_art_scene_mode_uses_context(client):
+    cid = client.post("/api/characters", json={"name": "Scene"}).json()["id"]
+    sid = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion), patch(
+        "backend.llm_gateway.litellm.aimage_generation", new=_fake_aimage
+    ):
+        r = client.post(f"/api/sessions/{sid}/image", json={"prompt": "", "mode": "scene"})
+    assert r.status_code == 200
+    msgs = client.get(f"/api/sessions/{sid}/messages").json()
+    assert any("http://img/test.png" in m["content"] for m in msgs)
+
+
+def test_debug_log_records_chat(client):
+    cid = client.post("/api/characters", json={"name": "Dbg"}).json()["id"]
+    sid = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]
+    client.delete("/api/debug/log")
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        with client.websocket_connect(f"/ws/chat/{sid}") as ws:
+            ws.send_json({"type": "user_message", "content": "hi"})
+            for _ in range(50):
+                if ws.receive_json()["type"] in ("done", "error"):
+                    break
+    log = client.get("/api/debug/log").json()
+    assert any(e["kind"] == "chat" and e["status"] == "ok" for e in log)
+    assert any("messages" in e for e in log)  # есть сводка по сообщениям
+
+
+def test_group_create_and_list(client):
+    a = client.post("/api/characters", json={"name": "X1"}).json()
+    b = client.post("/api/characters", json={"name": "X2"}).json()
+    g = client.post(
+        "/api/groups", json={"name": "GG", "character_ids": [a["id"], b["id"]]}
+    ).json()
+    groups = client.get("/api/groups").json()
+    grp = [x for x in groups if x["id"] == g["session_id"]][0]
+    assert grp["title"] == "GG"
+    assert len(grp["members"]) == 2
+
+
+def test_group_turn_one_speaker_responds(client):
+    a = client.post("/api/characters", json={"name": "Алиса"}).json()
+    b = client.post("/api/characters", json={"name": "Боб"}).json()
+    g = client.post(
+        "/api/groups",
+        json={"name": "G", "character_ids": [a["id"], b["id"]], "director": False},
+    ).json()
+    sid = g["session_id"]
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        with client.websocket_connect(f"/ws/chat/{sid}") as ws:
+            ws.send_json({"type": "user_message", "content": "привет всем"})
+            speakers = []
+            for _ in range(100):
+                ev = ws.receive_json()
+                if ev["type"] == "speaker":
+                    speakers.append(ev["name"])
+                if ev["type"] in ("done", "error"):
+                    break
+    assert speakers, "хотя бы один персонаж должен ответить"
+    msgs = client.get(f"/api/sessions/{sid}/messages").json()
+    labeled = [m for m in msgs if m["role"] == "assistant" and m["speaker_name"]]
+    assert labeled and labeled[-1]["content"] == "Привет!"
+
+
+def test_group_mention_targets_named_character(client):
+    a = client.post("/api/characters", json={"name": "Алиса"}).json()
+    b = client.post("/api/characters", json={"name": "Боб"}).json()
+    g = client.post(
+        "/api/groups", json={"name": "G", "character_ids": [a["id"], b["id"]]}
+    ).json()
+    sid = g["session_id"]
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        with client.websocket_connect(f"/ws/chat/{sid}") as ws:
+            ws.send_json({"type": "user_message", "content": "Боб, что скажешь?"})
+            speakers = []
+            for _ in range(100):
+                ev = ws.receive_json()
+                if ev["type"] == "speaker":
+                    speakers.append(ev["name"])
+                if ev["type"] in ("done", "error"):
+                    break
+    assert speakers == ["Боб"]  # ответил только упомянутый
+
+
+def test_reply_to_message_saved(client):
+    cid = client.post("/api/characters", json={"name": "Rep", "first_message": "привет"}).json()["id"]
+    sid = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]
+    mid = client.get(f"/api/sessions/{sid}/messages").json()[0]["id"]  # приветствие
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        with client.websocket_connect(f"/ws/chat/{sid}") as ws:
+            ws.send_json({"type": "user_message", "content": "мой ответ", "reply_to_message_id": mid})
+            for _ in range(50):
+                if ws.receive_json()["type"] in ("done", "error"):
+                    break
+    msgs = client.get(f"/api/sessions/{sid}/messages").json()
+    user_msg = [m for m in msgs if m["role"] == "user"][-1]
+    assert user_msg["reply_to_id"] == mid
+
+
+def test_continue_appends_to_last_assistant(client):
+    cid = client.post("/api/characters", json={"name": "Cont"}).json()["id"]
+    sid = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        with client.websocket_connect(f"/ws/chat/{sid}") as ws:
+            ws.send_json({"type": "user_message", "content": "hi"})
+            for _ in range(50):
+                if ws.receive_json()["type"] in ("done", "error"):
+                    break
+            ws.send_json({"type": "continue"})
+            for _ in range(50):
+                if ws.receive_json()["type"] in ("done", "error"):
+                    break
+    msgs = client.get(f"/api/sessions/{sid}/messages").json()
+    asst = [m for m in msgs if m["role"] == "assistant"][-1]
+    # Исходный ответ "Привет!" + дописанное продолжение "Привет!".
+    assert asst["content"] == "Привет!Привет!"
