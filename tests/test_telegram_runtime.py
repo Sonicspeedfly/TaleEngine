@@ -5,6 +5,8 @@
 """
 import asyncio
 
+from sqlalchemy import select
+
 from backend import models
 from backend import telegram_runtime as tr
 from backend.database import AsyncSessionLocal, init_db
@@ -117,3 +119,131 @@ async def _runtime_scenario():
 
 def test_runtime_chat_selection_and_history():
     asyncio.run(_runtime_scenario())
+
+
+async def _mk_session(character_id, user_key, owner_id=None, is_group=False, title="чат"):
+    async with AsyncSessionLocal() as db:
+        s = models.ChatSession(
+            character_id=character_id, user_key=user_key, owner_id=owner_id,
+            is_group=is_group, title=title,
+        )
+        db.add(s)
+        await db.commit()
+        await db.refresh(s)
+        return s.id
+
+
+async def _linked_account_scenario():
+    await init_db()
+    async with AsyncSessionLocal() as db:
+        ch = models.Character(name="АккПерс")
+        db.add(ch)
+        await db.commit()
+        await db.refresh(ch)
+    tg = 55502
+    owner = 42
+    tr._active_sessions.pop(tg, None)
+
+    # Чат, созданный в ВЕБЕ этим аккаунтом (user_key web:*, owner_id=42).
+    web_sid = await _mk_session(ch.id, "web:abc-123", owner_id=owner, title="Веб-чат")
+    await _add_msg(web_sid, "user", "это мой веб-чат")
+    # Чат, созданный в TELEGRAM этим же аккаунтом.
+    tg_sid = await tr._create_session(tg, ch.id, owner_id=owner)
+    await _add_msg(tg_sid, "assistant", "телеграм-чат жив")
+    # Групповой чат аккаунта — теперь ТОЖЕ доступен из Telegram.
+    grp_sid = await _mk_session(ch.id, "web:grp", owner_id=owner, is_group=True, title="Отряд")
+    # Чужой чат (другой владелец) — не наш.
+    other_sid = await _mk_session(ch.id, "web:other", owner_id=99, title="Чужой")
+
+    # Список чатов привязанного аккаунта: и веб, и телеграм, и группа; без чужого.
+    msg = _FakeMsg(tg)
+    await tr._show_chats(msg, owner_id=owner)
+    listing = msg.sent[0]
+    assert "это мой веб-чат" in listing          # веб-чат виден в Telegram
+    assert "телеграм-чат жив" in listing          # и телеграм-чат
+    assert "👥" in listing and "Отряд" in listing  # групповой — показан с меткой
+    assert "Чужой" not in listing                 # чужой аккаунт — не наш
+    # Владение: можем ПРОДОЛЖИТЬ веб-чат из Telegram, но не чужой.
+    assert await tr._set_active_session(tg, web_sid, owner) is True
+    assert await tr._get_or_create_session(tg, owner) == web_sid
+    assert await tr._set_active_session(tg, other_sid, owner) is False
+
+    # Без привязки (общий режим, owner_id=None) веб-чаты аккаунта НЕ видны —
+    # только начатые в Telegram.
+    assert tr._owns_session(await _get(web_sid), tg, None) is False
+    assert tr._owns_session(await _get(tg_sid), tg, None) is True
+
+
+async def _get(sid):
+    async with AsyncSessionLocal() as db:
+        return await db.get(models.ChatSession, sid)
+
+
+def test_runtime_linked_account_sees_web_chats():
+    asyncio.run(_linked_account_scenario())
+
+
+# ---- Групповые чаты в боте: сводка (info) + ход по упоминанию/кругу ----
+def _fake_chunk(text):
+    class _D:  # delta
+        def __init__(self, c): self.content = c
+    class _C:  # choice
+        def __init__(self, c): self.delta = _D(c)
+    class _Ch:  # chunk
+        def __init__(self, c): self.choices = [_C(c)]
+    return _Ch(text)
+
+
+async def _fake_acompletion(*args, **kwargs):
+    async def gen():
+        for t in ["Привет", ", это ответ"]:
+            yield _fake_chunk(t)
+    return gen()
+
+
+async def _group_scenario():
+    from unittest.mock import patch
+
+    await init_db()
+    async with AsyncSessionLocal() as db:
+        alice = models.Character(name="Алиса")
+        bob = models.Character(name="Боб")
+        db.add_all([alice, bob])
+        await db.commit()
+        await db.refresh(alice)
+        await db.refresh(bob)
+        gsid = (await _mk_session(alice.id, "tg:55503", is_group=True, title="Отряд"))
+        db.add_all([
+            models.GroupMember(session_id=gsid, character_id=alice.id),
+            models.GroupMember(session_id=gsid, character_id=bob.id),
+        ])
+        await db.commit()
+
+    # Сводка по группе: участники, режиссёр, тип.
+    info = await tr._chat_info_text(gsid)
+    assert "Групповой" in info and "Алиса" in info and "Боб" in info and "Режиссёр" in info
+
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        # Упомянут Боб — отвечает именно он (одной репликой, с подписью).
+        res = await tr._generate_group_reply(gsid, "привет, Боб, как дела?", [])
+        assert res == [("Боб", "Привет, это ответ")]
+        # Без упоминания, режиссёр выключен — отвечает следующий по кругу.
+        res2 = await tr._generate_group_reply(gsid, "просто реплика без имён", [])
+        assert len(res2) == 1 and res2[0][0] in ("Алиса", "Боб")
+
+    # Реплики сохранены с указанием говорящего (speaker_name).
+    async with AsyncSessionLocal() as db:
+        saved = (await db.execute(
+            select(models.Message).where(
+                models.Message.session_id == gsid, models.Message.role == "assistant"
+            )
+        )).scalars().all()
+    assert any(m.speaker_name == "Боб" for m in saved)
+
+    # История группы показывает КАЖДОГО говорящего, а не только «ведущего».
+    hist = await tr._history_text(gsid)
+    assert "Боб" in hist
+
+
+def test_runtime_group_chat_info_and_turn():
+    asyncio.run(_group_scenario())
