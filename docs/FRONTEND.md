@@ -56,6 +56,24 @@ Node.js, npm и шаг компиляции не нужны.
 - **Инициализация:** `initApp` (после прохождения гейта: грузит данные, ставит опрос
   заявок в друзья), `mounted` (проверка авторизации).
 
+### Диалоги и уведомления (без браузерных alert/prompt/confirm)
+
+Все браузерные `alert()`/`prompt()`/`confirm()` заменены на внутренние UI — это часть
+приложения, а не системные окна браузера:
+- `showToast(text, onClick)` — всплывающее уведомление (успех/ошибка), авто-скрытие ~8с
+  (`.toast-wrap`). Замена информационных `alert()`.
+- `askConfirm(message, { title, okText, cancelText, danger })` → `Promise<bool>` —
+  модалка подтверждения (замена `confirm()`; по умолчанию `danger:true` — красная кнопка).
+- `askPrompt(title, { message, value, placeholder, okText })` → `Promise<string|null>` —
+  модалка ввода (замена `prompt()`; Enter — подтвердить, Esc/клик-вне/Отмена — `null`;
+  поле авто-фокусится и выделяется).
+
+Реализация — одно реактивное поле `dialog` + `_dialogResolve` (не в data, чтобы Vue не
+оборачивал функцию в Proxy); один шаблон `.dialog-modal`. Вызовы `await this.askConfirm(…)`
+внутри `async`-методов (`deleteSession`, `deleteCharacter`, `deleteMessage`, `removeFriend`,
+`deleteUser`), `await this.askPrompt(…)` — `createCharacter`, `renameSession`, `savePreset`,
+`translateCode`.
+
 ### Хелперы
 - `api(path, opts)` — обёртка над `fetch` с авто-заголовками авторизации; вытаскивает
   реальный `detail` ошибки сервера (а не «HTTP 500»).

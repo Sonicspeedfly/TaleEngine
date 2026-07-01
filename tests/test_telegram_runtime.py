@@ -247,3 +247,53 @@ async def _group_scenario():
 
 def test_runtime_group_chat_info_and_turn():
     asyncio.run(_group_scenario())
+
+
+async def _char_scope_scenario():
+    await init_db()
+    async with AsyncSessionLocal() as db:
+        arthur = models.Character(name="Артур")
+        boris = models.Character(name="Борис")
+        db.add_all([arthur, boris])
+        await db.commit()
+        await db.refresh(arthur)
+        await db.refresh(boris)
+    tg = 55504
+    tr._active_sessions.pop(tg, None)
+
+    a1 = await tr._create_session(tg, arthur.id)
+    await _add_msg(a1, "user", "разговор с Артуром")
+    a2 = await tr._create_session(tg, arthur.id)
+    b1 = await tr._create_session(tg, boris.id)  # чат другого персонажа
+    await _add_msg(b1, "user", "разговор с Борисом")
+    # Групповой чат с участием Артура.
+    g = await _mk_session(arthur.id, f"tg:{tg}", is_group=True, title="Компания")
+    async with AsyncSessionLocal() as db:
+        db.add(models.GroupMember(session_id=g, character_id=arthur.id))
+        await db.commit()
+
+    # Делаем активным чат Артура → список должен быть про Артура.
+    await tr._set_active_session(tg, a1)
+    msg = _FakeMsg(tg)
+    await tr._show_chats(msg)
+    listing = msg.sent[0]
+    assert "Артур" in listing                       # персонаж — в заголовке списка
+    assert "Борис" not in listing                    # чат другого персонажа НЕ показан
+    assert "👥" in listing and "Компания" in listing  # групповой с участием Артура — показан
+    # В списке — НАЗВАНИЯ чатов, а не имя персонажа в каждой строке.
+    assert "🎭 Telegram chat" in listing or "разговор с Артуром" in listing
+
+    # Автозаголовок: первая реплика становится названием чата-заглушки.
+    await tr._maybe_autotitle(a2, "Совсем новая тема беседы")
+    async with AsyncSessionLocal() as db:
+        s = await db.get(models.ChatSession, a2)
+    assert s.title == "Совсем новая тема беседы"
+    # Повторная реплика уже НЕ меняет заголовок.
+    await tr._maybe_autotitle(a2, "другое сообщение")
+    async with AsyncSessionLocal() as db:
+        s2 = await db.get(models.ChatSession, a2)
+    assert s2.title == "Совсем новая тема беседы"
+
+
+def test_runtime_chat_list_scoped_by_character():
+    asyncio.run(_char_scope_scenario())

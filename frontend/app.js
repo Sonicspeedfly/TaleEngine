@@ -171,6 +171,7 @@ createApp({
       notifOpen: false,     // выпадашка уведомлений
       pendingChats: [],     // id чатов, куда пришёл ответ, пока вы были в другом чате
       toasts: [],           // всплывающие уведомления (тосты) в правом нижнем углу
+      dialog: null,         // модальный диалог (подтверждение/ввод) вместо браузерных alert/prompt/confirm
 
       // --- Отладочный лог LLM ---
       debugOpen: false,
@@ -322,7 +323,7 @@ createApp({
       this.characters = await this.api("/characters");
     },
     async createCharacter() {
-      const name = prompt("Имя нового персонажа:");
+      const name = await this.askPrompt("Имя нового персонажа", { placeholder: "Например: Алиса" });
       if (!name) return;
       await this.api("/characters", {
         method: "POST",
@@ -337,7 +338,7 @@ createApp({
       form.append("file", file);
       const res = await fetch("/api/characters/import", { method: "POST", body: form, headers: this.authHeaders() });
       e.target.value = "";
-      if (!res.ok) { alert("Не удалось импортировать персонажа (код " + res.status + ")"); return; }
+      if (!res.ok) { this.showToast("Не удалось импортировать персонажа (код " + res.status + ")"); return; }
       await this.loadCharacters();
     },
     async selectCharacter(c) {
@@ -361,7 +362,7 @@ createApp({
       await this.loadCharacters();
     },
     async deleteCharacter(c) {
-      if (!confirm("Удалить персонажа " + c.name + "?")) return;
+      if (!(await this.askConfirm("Удалить персонажа «" + c.name + "»?", { okText: "Удалить" }))) return;
       await this.api("/characters/" + c.id, { method: "DELETE" });
       if (this.selectedCharacterId === c.id) { this.selectedCharacterId = null; this.sessionId = null; this.messages = []; }
       await this.loadCharacters();
@@ -480,7 +481,7 @@ createApp({
         this.canvasView = (this.canvasIsWeb || this.canvas.kind === "document") ? "preview" : "edit";
         this.canvasOpen = true;
         this.mobilePane = "canvas";
-      } catch (e) { alert("Не удалось открыть канвас: " + e.message); }
+      } catch (e) { this.showToast("Не удалось открыть канвас: " + e.message); }
     },
     async saveCanvas() {
       if (!this.canvas || !this.canvas.id) return;
@@ -544,12 +545,12 @@ createApp({
         this.canvas.can_undo = updated.can_undo;
         if (!fromButton) this.canvasInstruction = "";
         this.clearSel();
-      } catch (e) { alert("ИИ не смог доработать канвас: " + e.message); }
+      } catch (e) { this.showToast("ИИ не смог доработать канвас: " + e.message); }
       finally { this.canvasBusy = false; }
     },
     quickAction(instruction) { return this.reviseCanvas(instruction); },
-    translateCode() {
-      const lang = prompt("На какой язык программирования перевести код? (например: Python, Go, Rust)");
+    async translateCode() {
+      const lang = await this.askPrompt("На какой язык перевести код?", { placeholder: "Например: Python, Go, Rust" });
       if (lang && lang.trim()) {
         this.reviseCanvas("Переведи этот код на " + lang.trim() + ". Сохрани логику и поведение. Верни только код.");
       }
@@ -567,7 +568,7 @@ createApp({
       if (!this.canvas) return;
       await this.saveCanvas();
       const res = await fetch("/api/canvas/" + this.canvas.id + "/export?fmt=" + fmt, { headers: this.authHeaders() });
-      if (!res.ok) { alert("Экспорт не удался (код " + res.status + ")"); return; }
+      if (!res.ok) { this.showToast("Экспорт не удался (код " + res.status + ")"); return; }
       const blob = await res.blob();
       const name = (this.canvas.title || "document").replace(/[^\wа-яёА-ЯЁ\-. ]+/gi, "_").trim() || "document";
       this.downloadBlob(blob, name + "." + fmt);
@@ -660,6 +661,48 @@ createApp({
       this.toasts.push({ id, text, onClick });
       setTimeout(() => this.dismissToast(id), 8000);
     },
+    // Внутренние диалоги вместо браузерных confirm()/prompt() — часть приложения.
+    // Возвращают Promise: askConfirm → true/false, askPrompt → строка или null.
+    askConfirm(message, opts = {}) {
+      return new Promise((resolve) => {
+        this.dialog = {
+          mode: "confirm", message,
+          title: opts.title || "Подтвердите действие",
+          okText: opts.okText || "OK", cancelText: opts.cancelText || "Отмена",
+          danger: opts.danger !== false, value: "", placeholder: "",
+        };
+        this._dialogResolve = resolve;
+      });
+    },
+    askPrompt(message, opts = {}) {
+      return new Promise((resolve) => {
+        this.dialog = {
+          mode: "prompt", message: opts.message || "",
+          title: message || "Введите значение",
+          okText: opts.okText || "OK", cancelText: opts.cancelText || "Отмена",
+          danger: false, value: opts.value || "", placeholder: opts.placeholder || "",
+        };
+        this._dialogResolve = resolve;
+        this.$nextTick(() => {
+          const el = this.$refs.dialogInput;
+          if (el) { el.focus(); el.select(); }
+        });
+      });
+    },
+    dialogOk() {
+      const d = this.dialog;
+      if (!d) return;
+      this.dialog = null;
+      const r = this._dialogResolve; this._dialogResolve = null;
+      if (r) r(d.mode === "prompt" ? d.value : true);
+    },
+    dialogCancel() {
+      const d = this.dialog;
+      if (!d) return;
+      this.dialog = null;
+      const r = this._dialogResolve; this._dialogResolve = null;
+      if (r) r(d.mode === "prompt" ? null : false);
+    },
     dismissToast(id) {
       const i = this.toasts.findIndex((t) => t.id === id);
       if (i >= 0) this.toasts.splice(i, 1);
@@ -669,14 +712,14 @@ createApp({
       this.dismissToast(t.id);
     },
     async deleteSession(s) {
-      if (!confirm("Удалить этот чат?")) return;
+      if (!(await this.askConfirm("Удалить этот чат?", { okText: "Удалить" }))) return;
       await this.api("/sessions/" + s.id, { method: "DELETE" });
       if (this.sessionId === s.id) { this.sessionId = null; this.messages = []; }
       await this.loadSessions();
       await this.loadGroups();
     },
     async renameSession(s) {
-      const title = prompt("Новое название чата:", s.title);
+      const title = await this.askPrompt("Новое название чата", { value: s.title, placeholder: "Название чата" });
       if (!title) return;
       await this.api("/sessions/" + s.id, { method: "PATCH", body: JSON.stringify({ title }) });
       await this.loadSessions();
@@ -711,7 +754,7 @@ createApp({
       else this.groupInviteSelected.push(username);
     },
     async createGroup() {
-      if (this.groupSelectedIds.length < 1) { alert("Выберите хотя бы одного персонажа"); return; }
+      if (this.groupSelectedIds.length < 1) { this.showToast("Выберите хотя бы одного персонажа"); return; }
       const r = await this.api("/groups", {
         method: "POST",
         body: JSON.stringify({
@@ -921,7 +964,7 @@ createApp({
       this.loadMessages();
     },
     async deleteMessage(msg) {
-      if (!confirm("Удалить сообщение?")) return;
+      if (!(await this.askConfirm("Удалить сообщение?", { okText: "Удалить" }))) return;
       await this.api("/messages/" + msg.id, { method: "DELETE" });
       this.loadMessages();
     },
@@ -985,7 +1028,7 @@ createApp({
         this.mediaRecorder.start();
         this.recording = true;
       } catch (e) {
-        alert("Не удалось получить доступ к микрофону: " + e.message);
+        this.showToast("Не удалось получить доступ к микрофону: " + e.message);
       }
     },
 
@@ -1106,7 +1149,7 @@ createApp({
       if (!res.ok) {
         let detail = "код " + res.status;
         try { const j = await res.json(); if (j && j.detail) detail = j.detail; } catch (e) {}
-        alert("Не удалось импортировать чат: " + detail);
+        this.showToast("Не удалось импортировать чат: " + detail);
         return;
       }
       const data = await res.json();
@@ -1129,7 +1172,7 @@ createApp({
       } else {
         msg += "\nДанных Horae в файле не найдено — снимок состояния не сохранён.";
       }
-      alert(msg);
+      this.showToast(msg);
     },
 
     // ---------- Сохранение настроек интерфейса в системе (БД) ----------
@@ -1148,7 +1191,7 @@ createApp({
     // ---------- Пресеты параметров ----------
     async loadPresets() { this.presets = await this.api("/presets"); },
     async savePreset() {
-      const name = this.presetName.trim() || prompt("Название пресета:");
+      const name = this.presetName.trim() || (await this.askPrompt("Название пресета", { placeholder: "Например: Творческий" }));
       if (!name) return;
       await this.api("/presets", { method: "POST", body: JSON.stringify({ name, params: this.params }) });
       this.presetName = "";
@@ -1300,7 +1343,7 @@ createApp({
       if (!this.newFriendName.trim()) return;
       try {
         await this.api("/friends/add", { method: "POST", body: JSON.stringify({ username: this.newFriendName }) });
-      } catch (e) { alert("Пользователь не найден"); return; }
+      } catch (e) { this.showToast("Пользователь не найден"); return; }
       this.newFriendName = "";
       await this.loadFriends();
     },
@@ -1314,7 +1357,10 @@ createApp({
     },
     async removeFriend(f) {
       // /decline удаляет дружбу в любую сторону — используем его и для «удалить из друзей».
-      if (!confirm("Удалить " + f.username + " из друзей? Он также потеряет доступ к чатам, которыми вы делились.")) return;
+      if (!(await this.askConfirm(
+        "Удалить «" + f.username + "» из друзей? Он также потеряет доступ к чатам, которыми вы делились.",
+        { okText: "Удалить" }
+      ))) return;
       await this.api("/friends/" + f.friendship_id + "/decline", { method: "POST" });
       await this.loadFriends();
     },
@@ -1346,7 +1392,7 @@ createApp({
         } catch (e) { /* пропускаем тех, кого не вышло */ }
       }
       this.inviteOpen = false;
-      if (ok) alert("Приглашено: " + ok);
+      if (ok) this.showToast("Приглашено: " + ok);
     },
     // ---------- Отладочный лог LLM ----------
     async openDebug() {
@@ -1409,10 +1455,10 @@ createApp({
       await this.loadAdmin();
     },
     async deleteUser(u) {
-      if (!confirm("Удалить пользователя " + u.username + "?")) return;
+      if (!(await this.askConfirm("Удалить пользователя «" + u.username + "»?", { okText: "Удалить" }))) return;
       try {
         await this.api("/admin/users/" + u.id, { method: "DELETE" });
-      } catch (e) { alert(e.message); }
+      } catch (e) { this.showToast(e.message); }
       await this.loadAdmin();
     },
     async saveSecurity() {
@@ -1433,11 +1479,14 @@ createApp({
       // HTTP Basic Auth вступает в силу на уровне браузера — нужна перезагрузка,
       // чтобы появилось системное окно входа и браузер запомнил учётку.
       if (baOn) {
-        alert("HTTP Basic Auth включён. Сейчас страница перезагрузится — браузер спросит логин и пароль.");
+        await this.askConfirm(
+          "HTTP Basic Auth включён. Страница перезагрузится — браузер спросит логин и пароль.",
+          { okText: "Перезагрузить", cancelText: "Позже", danger: false }
+        );
         location.reload();
         return;
       }
-      alert("Сохранено");
+      this.showToast("Сохранено");
     },
     async saveTelegram() {
       await this.api("/admin/telegram", {
@@ -1450,12 +1499,12 @@ createApp({
           default_character_id: this.adminTg.default_character_id,
         }),
       });
-      alert("Сохранено");
+      this.showToast("Сохранено");
     },
     async startBot() {
       try {
         this.adminTg.bot_state = await this.api("/admin/telegram/start", { method: "POST" });
-      } catch (e) { alert("Не удалось запустить бота — проверьте токен."); }
+      } catch (e) { this.showToast("Не удалось запустить бота — проверьте токен."); }
     },
     async stopBot() {
       this.adminTg.bot_state = await this.api("/admin/telegram/stop", { method: "POST" });
@@ -2314,6 +2363,21 @@ createApp({
   <!-- ===== Всплывающие уведомления (тосты) ===== -->
   <div class="toast-wrap">
     <div v-for="t in toasts" :key="t.id" class="toast" @click="toastClick(t)">{{ t.text }}</div>
+  </div>
+
+  <!-- ===== Диалог (подтверждение/ввод) вместо браузерных confirm/prompt ===== -->
+  <div v-if="dialog" class="modal-backdrop" @click.self="dialogCancel" @keydown.esc="dialogCancel">
+    <div class="modal dialog-modal">
+      <h3>{{ dialog.title }}</h3>
+      <p v-if="dialog.message" class="dialog-msg">{{ dialog.message }}</p>
+      <input v-if="dialog.mode==='prompt'" ref="dialogInput" v-model="dialog.value"
+             :placeholder="dialog.placeholder" class="dialog-input"
+             @keyup.enter="dialogOk" @keyup.esc="dialogCancel" />
+      <div class="dialog-actions">
+        <button class="btn-ghost" @click="dialogCancel">{{ dialog.cancelText }}</button>
+        <button :class="dialog.danger ? 'btn-danger' : 'btn-primary'" @click="dialogOk">{{ dialog.okText }}</button>
+      </div>
+    </div>
   </div>
 
   <!-- ===== Лайтбокс: полноэкранный предпросмотр картинки ===== -->

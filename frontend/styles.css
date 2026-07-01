@@ -259,6 +259,17 @@ label span { color: var(--text); }
 .modal { width: 480px; max-width: 100%; max-height: 88vh; overflow-y: auto; background: var(--bg2); border: 1px solid var(--border); border-radius: 14px; padding: 18px; }
 .modal h4 { margin: 6px 0; }
 
+/* Диалог подтверждения/ввода (замена браузерных confirm/prompt). */
+.dialog-modal { width: 420px; z-index: 70; }
+.dialog-modal h3 { margin: 0 0 10px; font-size: 16px; }
+.dialog-msg { margin: 0 0 14px; color: var(--text); line-height: 1.5; white-space: pre-wrap; }
+.dialog-input { width: 100%; box-sizing: border-box; margin-bottom: 14px; padding: 9px 11px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px; color: var(--text); font-size: 14px; }
+.dialog-input:focus { outline: none; border-color: var(--accent); }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.btn-ghost { background: transparent; color: var(--muted); }
+.btn-ghost:hover { color: var(--text); background: var(--bg3); }
+
 /* ☰ виден всегда — слайдит сайдбар (десктоп) / выезжает оверлей (мобила). */
 .hamburger { display: inline-flex; font-size: 18px; }
 .backdrop { display: none; }

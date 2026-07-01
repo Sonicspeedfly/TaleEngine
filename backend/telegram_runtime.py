@@ -35,7 +35,7 @@ from aiogram.types import CallbackQuery, KeyboardButton
 from aiogram.types import Message as TgMessage
 from aiogram.types import ReplyKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 
 from backend import accounts, admin_service, group_chat, models
 from backend.config import settings
@@ -145,6 +145,34 @@ def _owns_session(sess, tg_user_id: int, owner_id) -> bool:
     if owner_id is not None:
         return sess.owner_id == owner_id
     return sess.user_key == f"tg:{tg_user_id}"
+
+
+async def _current_character_id(tg_user_id: int, owner_id) -> int | None:
+    """Текущий («выбранный») персонаж = персонаж активного чата (иначе — последнего)."""
+    active_id = _active_sessions.get(tg_user_id)
+    if active_id is not None:
+        async with AsyncSessionLocal() as db:
+            sess = await db.get(models.ChatSession, active_id)
+        if _owns_session(sess, tg_user_id, owner_id):
+            return sess.character_id
+    sess = await _latest_session(tg_user_id, owner_id)
+    return sess.character_id if sess else None
+
+
+# Названия-заглушки, которые не жаль перезаписать автозаголовком по 1-й реплике.
+_PLACEHOLDER_TITLES = {"", "Telegram chat", "Новый чат"}
+
+
+async def _maybe_autotitle(session_id: int, text: str) -> None:
+    """Если у чата ещё заглушечное название — сделать его из первой реплики пользователя."""
+    text = (text or "").strip()
+    if not text:
+        return
+    async with AsyncSessionLocal() as db:
+        sess = await db.get(models.ChatSession, session_id)
+        if sess and (sess.title or "").strip() in _PLACEHOLDER_TITLES:
+            sess.title = _preview(text, 40)
+            await db.commit()
 
 
 async def _latest_session(tg_user_id: int, owner_id=None):
@@ -321,6 +349,7 @@ async def _generate_group_reply(
 async def _respond(message: TgMessage, session_id: int, text: str,
                    attachments: list[AttachmentIn]) -> None:
     """Сгенерировать и отправить ответ: групповой чат — по персонажам, иначе — обычно."""
+    await _maybe_autotitle(session_id, text)  # первую реплику делаем названием чата
     async with AsyncSessionLocal() as db:
         sess = await db.get(models.ChatSession, session_id)
     if sess and sess.is_group:
@@ -484,25 +513,38 @@ async def _chat_info_text(session_id: int) -> str:
 
 async def _show_chats(message: TgMessage, owner_id=None):
     """
-    Список чатов пользователя: персонаж, число сообщений, последняя реплика.
-    При привязанном аккаунте — ВСЕ чаты (в т.ч. созданные в вебе), см.
-    _own_sessions_filter: Telegram как альтернативный доступ к своим диалогам.
+    Список чатов ВЫБРАННОГО персонажа: его одиночные чаты + групповые с его участием.
+    В списке — НАЗВАНИЕ чата (а не имя персонажа): персонаж и так один на весь список.
+    Область — свои чаты (`_own_sessions_filter`: при аккаунте видны и веб-чаты).
     """
+    tg_id = message.from_user.id
+    cur_char = await _current_character_id(tg_id, owner_id)
+    if cur_char is None:
+        await message.answer("У вас пока нет чатов. Выберите персонажа (🎭), чтобы начать.")
+        return
     async with AsyncSessionLocal() as db:
+        char = await db.get(models.Character, cur_char)
+        char_name = char.name if char else "Персонаж"
+        # Групповые сессии, где этот персонаж — участник.
+        grp_subq = select(models.GroupMember.session_id).where(
+            models.GroupMember.character_id == cur_char
+        )
         sessions = (await db.execute(
             select(models.ChatSession)
-            .where(_own_sessions_filter(message.from_user.id, owner_id))
+            .where(
+                _own_sessions_filter(tg_id, owner_id),
+                or_(models.ChatSession.character_id == cur_char,
+                    models.ChatSession.id.in_(grp_subq)),
+            )
             .order_by(models.ChatSession.id.desc())
         )).scalars().all()
         sessions = sessions[:20]
         if not sessions:
-            await message.answer("У вас пока нет чатов. Выберите персонажа (🎭), чтобы начать.")
+            await message.answer(
+                f"У «{char_name}» пока нет чатов — напишите сообщение, и начнётся новый."
+            )
             return
         sess_ids = [s.id for s in sessions]
-        char_ids = {s.character_id for s in sessions}
-        chars = {c.id: c.name for c in (await db.execute(
-            select(models.Character).where(models.Character.id.in_(char_ids))
-        )).scalars().all()}
         counts = dict((await db.execute(
             select(models.Message.session_id, func.count())
             .where(models.Message.session_id.in_(sess_ids), models.Message.role != "system")
@@ -519,33 +561,19 @@ async def _show_chats(message: TgMessage, owner_id=None):
                 select(models.Message).where(models.Message.id.in_(list(last_ids.values())))
             )).scalars().all():
                 last_msg[m.session_id] = m
-        # Участники групповых чатов — для подписи «👥 Имя, Имя…».
-        group_ids = [s.id for s in sessions if s.is_group]
-        members_by_sess: dict[int, list[str]] = {}
-        if group_ids:
-            for sid, cname in (await db.execute(
-                select(models.GroupMember.session_id, models.Character.name)
-                .join(models.Character, models.Character.id == models.GroupMember.character_id)
-                .where(models.GroupMember.session_id.in_(group_ids))
-            )).all():
-                members_by_sess.setdefault(sid, []).append(cname)
 
-    active_id = _active_sessions.get(message.from_user.id)
+    active_id = _active_sessions.get(tg_id)
     kb = InlineKeyboardBuilder()
-    lines = ["💬 Ваши чаты — нажмите, чтобы продолжить:", ""]
+    lines = [f"💬 Чаты с «{char_name}» — нажмите, чтобы продолжить:", ""]
     for s in sessions:
         cnt = counts.get(s.id, 0)
         mark = "✅ " if s.id == active_id else ""
-        if s.is_group:
-            names = ", ".join(members_by_sess.get(s.id, [])) or (s.title or "группа")
-            icon, label = "👥", f"{s.title or 'Группа'}: {names}"
-        else:
-            icon, label = "🎭", chars.get(s.character_id, "Персонаж")
-        # Подпись кнопки покороче (лимит Telegram) — детали идут текстом ниже.
-        btn = f"{mark}{icon} {label}"
+        icon = "👥" if s.is_group else "🎭"
+        title = (s.title or "").strip() or ("Групповой чат" if s.is_group else "Без названия")
+        btn = f"{mark}{icon} {title}"
         kb.button(text=(btn[:58] + "…") if len(btn) > 59 else btn, callback_data=f"chat:{s.id}")
         snippet = _preview(last_msg[s.id].content, 60) if s.id in last_msg else "пусто"
-        lines.append(f"{mark}{icon} {label} · {cnt} сообщ. — {snippet}")
+        lines.append(f"{mark}{icon} {title} · {cnt} сообщ. — {snippet}")
     kb.adjust(1)
     await message.answer("\n".join(lines), reply_markup=kb.as_markup())
 
