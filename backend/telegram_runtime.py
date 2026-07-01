@@ -4,10 +4,16 @@ Telegram-бот внутри веб-сервера (управляется из 
 Возможности прямо в Telegram:
   * /start            — начать (если есть доступ);
   * /request          — запросить доступ (заявка попадёт в админку);
-  * /characters       — выбрать персонажа кнопками;
+  * /characters       — выбрать персонажа кнопками (начинает НОВЫЙ чат);
+  * /chats            — список всех своих чатов, продолжить любой (с историей);
+  * /history          — показать историю текущего чата;
   * /new              — начать новый чат с текущим персонажем;
   * /model            — выбрать модель (нейросеть) из прокси кнопками;
   * текст и голосовые  — обычное общение (аудио уходит модели нативно).
+
+Большие сообщения: длинный вход пользователя (Telegram-клиент режет >4096 на
+несколько сообщений) собираем обратно в ОДИН ход; длинный ответ нейросети режем
+на части ≤4096 (см. telegram_format), чтобы Telegram не вернул ошибку.
 
 Доступ: open_to_all=True — для всех; иначе только белый список (по Telegram-ID).
 Бот, память Horae и LiteLLM — те же, что у веба (общая БД и логика).
@@ -23,7 +29,7 @@ from aiogram.types import CallbackQuery, KeyboardButton
 from aiogram.types import Message as TgMessage
 from aiogram.types import ReplyKeyboardMarkup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from backend import accounts, admin_service, models
 from backend.config import settings
@@ -43,6 +49,15 @@ _last_error: str = ""
 # Буфер альбомов (несколько файлов одним сообщением) по media_group_id.
 _media_buffers: dict[str, dict] = {}
 _MEDIA_DEBOUNCE = 1.3  # сколько ждать остальные файлы альбома, прежде чем отвечать
+# Буфер длинного текста: Telegram-клиент режет сообщение >4096 на куски и шлёт их
+# отдельными апдейтами — копим и склеиваем обратно в ОДИН ход (см. _handle_text).
+_text_buffers: dict[int, dict] = {}
+_TEXT_DEBOUNCE = 1.5
+_SPLIT_HINT = 4000  # кусок такой длины почти наверняка «обрезан» клиентом — ждём продолжение
+# Активный чат пользователя Telegram: tg_user_id -> session_id. Позволяет
+# продолжить ВЫБРАННЫЙ (в т.ч. старый) чат, а не всегда самый свежий. В памяти —
+# при рестарте бота откатывается на последнюю сессию (см. _get_or_create_session).
+_active_sessions: dict[int, int] = {}
 
 
 def is_running() -> bool:
@@ -138,13 +153,36 @@ async def _create_session(tg_user_id: int, character_id: int, owner_id=None) -> 
         db.add(sess)
         await db.commit()
         await db.refresh(sess)
-        return sess.id
+    _active_sessions[tg_user_id] = sess.id  # созданный чат сразу становится активным
+    return sess.id
+
+
+async def _set_active_session(tg_user_id: int, session_id: int) -> bool:
+    """Сделать выбранный чат активным (если он существует и принадлежит юзеру)."""
+    async with AsyncSessionLocal() as db:
+        sess = await db.get(models.ChatSession, session_id)
+    if not sess or sess.user_key != f"tg:{tg_user_id}":
+        return False
+    _active_sessions[tg_user_id] = session_id
+    return True
 
 
 async def _get_or_create_session(tg_user_id: int, owner_id=None) -> int | None:
-    """Активная (последняя) сессия пользователя; создаём с дефолтным персонажем."""
+    """
+    Активный чат пользователя (выбранный через /chats — иначе последний); при
+    отсутствии — создаём с дефолтным персонажем. Устаревший активный id (чат
+    удалён) сбрасываем и откатываемся на последнюю сессию.
+    """
+    active_id = _active_sessions.get(tg_user_id)
+    if active_id is not None:
+        async with AsyncSessionLocal() as db:
+            sess = await db.get(models.ChatSession, active_id)
+        if sess and sess.user_key == f"tg:{tg_user_id}":
+            return active_id
+        _active_sessions.pop(tg_user_id, None)  # активный чат исчез
     sess = await _latest_session(tg_user_id)
     if sess:
+        _active_sessions[tg_user_id] = sess.id
         return sess.id
     char_id = admin_service.telegram_cache().get("default_character_id")
     async with AsyncSessionLocal() as db:
@@ -194,7 +232,9 @@ async def _generate_reply(session_id: int, text: str, attachments: list[Attachme
 
 # Постоянные кнопки ПОД полем ввода (reply-клавиатура) — основные действия.
 BTN_CHARS = "🎭 Персонажи"
+BTN_CHATS = "💬 Мои чаты"
 BTN_NEW = "🆕 Новый чат"
+BTN_HISTORY = "🕘 История"
 BTN_MODEL = "🧠 Модель"
 BTN_HELP = "❓ Помощь"
 
@@ -202,7 +242,8 @@ BTN_HELP = "❓ Помощь"
 def _main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=BTN_CHARS), KeyboardButton(text=BTN_NEW)],
+            [KeyboardButton(text=BTN_CHARS), KeyboardButton(text=BTN_CHATS)],
+            [KeyboardButton(text=BTN_NEW), KeyboardButton(text=BTN_HISTORY)],
             [KeyboardButton(text=BTN_MODEL), KeyboardButton(text=BTN_HELP)],
         ],
         resize_keyboard=True,
@@ -247,6 +288,102 @@ async def _new_chat(message: TgMessage, owner_id=None):
         return
     await _create_session(message.from_user.id, sess.character_id, owner_id=owner_id)
     await message.answer("Начат новый чат с текущим персонажем.")
+
+
+def _smart_join(raw_texts: list[str]) -> str:
+    """
+    Склеить куски пользовательского текста в один. Если предыдущий кусок был
+    «полным» (>= _SPLIT_HINT — клиент Telegram режет длинные сообщения по ~4096),
+    это обрезанное сообщение — клеим ВСТЫК; иначе (отдельные реплики/подписи
+    альбома) — через пустую строку.
+    """
+    text = ""
+    for i, chunk in enumerate(raw_texts):
+        if i == 0:
+            text = chunk
+        elif len(raw_texts[i - 1]) >= _SPLIT_HINT:
+            text += chunk
+        else:
+            text += "\n\n" + chunk
+    return text.strip()
+
+
+def _preview(text: str, limit: int = 160) -> str:
+    """Однострочный сниппет сообщения для списков/истории."""
+    s = " ".join((text or "").split())
+    return (s[:limit] + "…") if len(s) > limit else s
+
+
+async def _history_text(session_id: int, limit: int = 8) -> str:
+    """Последние сообщения чата человекочитаемо (кто что сказал) — для понимания контекста."""
+    async with AsyncSessionLocal() as db:
+        sess = await db.get(models.ChatSession, session_id)
+        char = await db.get(models.Character, sess.character_id) if sess else None
+        char_name = char.name if char else "Персонаж"
+        rows = (await db.execute(
+            select(models.Message)
+            .where(models.Message.session_id == session_id, models.Message.role != "system")
+            .order_by(models.Message.id.desc())
+            .limit(limit)
+        )).scalars().all()
+    msgs = list(reversed(rows))
+    if not msgs:
+        return f"🆕 Чат с «{char_name}» пока пуст — напишите первое сообщение."
+    lines = [f"🗒 История чата с «{char_name}» (последние {len(msgs)}):", ""]
+    for m in msgs:
+        who = "🧑 Вы" if m.role == "user" else f"🎭 {char_name}"
+        body = _preview(m.content) or ("📎 вложение" if m.attachments else "…")
+        lines.append(f"{who}: {body}")
+    return "\n".join(lines)
+
+
+async def _show_chats(message: TgMessage, owner_id=None):
+    """Список всех чатов пользователя: персонаж, число сообщений, последняя реплика."""
+    user_key = f"tg:{message.from_user.id}"
+    async with AsyncSessionLocal() as db:
+        sessions = (await db.execute(
+            select(models.ChatSession)
+            .where(models.ChatSession.user_key == user_key)
+            .order_by(models.ChatSession.id.desc())
+        )).scalars().all()
+        sessions = sessions[:20]
+        if not sessions:
+            await message.answer("У вас пока нет чатов. Выберите персонажа (🎭), чтобы начать.")
+            return
+        sess_ids = [s.id for s in sessions]
+        char_ids = {s.character_id for s in sessions}
+        chars = {c.id: c.name for c in (await db.execute(
+            select(models.Character).where(models.Character.id.in_(char_ids))
+        )).scalars().all()}
+        counts = dict((await db.execute(
+            select(models.Message.session_id, func.count())
+            .where(models.Message.session_id.in_(sess_ids), models.Message.role != "system")
+            .group_by(models.Message.session_id)
+        )).all())
+        last_ids = dict((await db.execute(
+            select(models.Message.session_id, func.max(models.Message.id))
+            .where(models.Message.session_id.in_(sess_ids), models.Message.role != "system")
+            .group_by(models.Message.session_id)
+        )).all())
+        last_msg = {}
+        if last_ids:
+            for m in (await db.execute(
+                select(models.Message).where(models.Message.id.in_(list(last_ids.values())))
+            )).scalars().all():
+                last_msg[m.session_id] = m
+
+    active_id = _active_sessions.get(message.from_user.id)
+    kb = InlineKeyboardBuilder()
+    lines = ["💬 Ваши чаты — нажмите, чтобы продолжить:", ""]
+    for s in sessions:
+        name = chars.get(s.character_id, "Персонаж")
+        cnt = counts.get(s.id, 0)
+        mark = "✅ " if s.id == active_id else ""
+        kb.button(text=f"{mark}{name} · {cnt} сообщ.", callback_data=f"chat:{s.id}")
+        snippet = _preview(last_msg[s.id].content, 60) if s.id in last_msg else "пусто"
+        lines.append(f"{mark}🎭 {name} · {cnt} сообщ. — {snippet}")
+    kb.adjust(1)
+    await message.answer("\n".join(lines), reply_markup=kb.as_markup())
 
 
 async def _show_models(message: TgMessage):
@@ -306,12 +443,12 @@ async def _process_messages(messages: list[TgMessage]) -> None:
         await first.answer("В системе нет персонажей — создайте их в веб-интерфейсе.")
         return
 
-    text_parts: list[str] = []
+    raw_texts: list[str] = []
     attachments: list[AttachmentIn] = []
     for m in messages:
-        caption = (m.caption or m.text or "").strip()
-        if caption:
-            text_parts.append(caption)
+        raw = m.caption or m.text or ""
+        if raw:
+            raw_texts.append(raw)
         try:
             att = await _attachment_from_message(m)
         except Exception:  # noqa: BLE001
@@ -320,7 +457,7 @@ async def _process_messages(messages: list[TgMessage]) -> None:
         if att:
             attachments.append(att)
 
-    text = "\n\n".join(text_parts)
+    text = _smart_join(raw_texts)
     if not text and not attachments:
         return
     await _bot.send_chat_action(first.chat.id, "typing")
@@ -356,6 +493,40 @@ async def _handle_media(message: TgMessage) -> None:
     buf["task"] = asyncio.create_task(_flush_group(gid))
 
 
+async def _flush_text(chat_id: int) -> None:
+    """Через паузу обработать накопленные куски длинного текста как ОДИН ход."""
+    try:
+        await asyncio.sleep(_TEXT_DEBOUNCE)
+    except asyncio.CancelledError:
+        return  # пришёл ещё кусок — таймер перезапустят
+    buf = _text_buffers.pop(chat_id, None)
+    if not buf or not buf["messages"]:
+        return
+    try:
+        await _process_messages(buf["messages"])
+    except Exception:  # noqa: BLE001
+        logger.exception("Ошибка обработки длинного текста Telegram")
+
+
+async def _handle_text(message: TgMessage) -> None:
+    """
+    Короткое одиночное сообщение — отвечаем сразу. Но если сообщение близко к
+    лимиту 4096 (клиент Telegram его обрезал и дошлёт продолжение) или уже идёт
+    накопление — копим куски и склеиваем в один ход (см. _process_messages).
+    """
+    chat_id = message.chat.id
+    buffering = chat_id in _text_buffers
+    looks_split = len(message.text or "") >= _SPLIT_HINT
+    if not buffering and not looks_split:
+        await _process_messages([message])
+        return
+    buf = _text_buffers.setdefault(chat_id, {"messages": [], "task": None})
+    buf["messages"].append(message)
+    if buf["task"]:
+        buf["task"].cancel()
+    buf["task"] = asyncio.create_task(_flush_text(chat_id))
+
+
 def _register(dp: Dispatcher) -> None:
     @dp.message(CommandStart())
     async def on_start(message: TgMessage):
@@ -364,7 +535,8 @@ def _register(dp: Dispatcher) -> None:
             return
         await _get_or_create_session(message.from_user.id, owner_id=owner_id)
         await message.answer(
-            "Привет! Пользуйся кнопками снизу или командами /characters /new /model.",
+            "Привет! Пользуйся кнопками снизу или командами: /characters /chats "
+            "/history /new /model.",
             reply_markup=_main_keyboard(),
         )
 
@@ -472,7 +644,34 @@ def _register(dp: Dispatcher) -> None:
             await cb.answer("Персонаж не найден", show_alert=True)
             return
         await _create_session(cb.from_user.id, cid, owner_id=owner_id)
-        await cb.message.answer(f"Теперь общаемся с персонажем: {char.name}")
+        await cb.message.answer(
+            f"🎭 Начат новый чат с персонажем: {char.name}.\n"
+            "Ваши прежние чаты доступны в 💬 «Мои чаты»."
+        )
+        await cb.answer()
+
+    @dp.message(Command("chats"))
+    @dp.message(F.text == BTN_CHATS)
+    async def on_chats(message: TgMessage):
+        ok, owner_id = await _gate(message)
+        if ok:
+            await _show_chats(message, owner_id)
+
+    @dp.callback_query(F.data.startswith("chat:"))
+    async def on_chat_pick(cb: CallbackQuery):
+        if not admin_service.is_whitelisted(cb.from_user.id):
+            await cb.answer("Нет доступа", show_alert=True)
+            return
+        try:
+            sid = int(cb.data.split(":")[1])
+        except (ValueError, IndexError):
+            await cb.answer()
+            return
+        if not await _set_active_session(cb.from_user.id, sid):
+            await cb.answer("Чат не найден", show_alert=True)
+            return
+        await cb.message.answer(await _history_text(sid))
+        await cb.message.answer("✅ Продолжаем этот чат — пишите сообщение.")
         await cb.answer()
 
     @dp.message(Command("new"))
@@ -481,6 +680,18 @@ def _register(dp: Dispatcher) -> None:
         ok, owner_id = await _gate(message)
         if ok:
             await _new_chat(message, owner_id)
+
+    @dp.message(Command("history"))
+    @dp.message(F.text == BTN_HISTORY)
+    async def on_history(message: TgMessage):
+        ok, owner_id = await _gate(message)
+        if not ok:
+            return
+        session_id = await _get_or_create_session(message.from_user.id, owner_id=owner_id)
+        if session_id is None:
+            await message.answer("Пока нет активного чата — выберите персонажа (🎭).")
+            return
+        await message.answer(await _history_text(session_id))
 
     @dp.message(Command("model"))
     @dp.message(F.text == BTN_MODEL)
@@ -492,8 +703,13 @@ def _register(dp: Dispatcher) -> None:
     @dp.message(F.text == BTN_HELP)
     async def on_help(message: TgMessage):
         await message.answer(
-            "🎭 Персонажи — выбрать персонажа\n🆕 Новый чат — начать заново\n"
-            "🧠 Модель — сменить нейросеть\nКоманды: /characters /new /model /request"
+            "🎭 Персонажи — выбрать персонажа (новый чат)\n"
+            "💬 Мои чаты — список всех чатов, продолжить любой\n"
+            "🆕 Новый чат — начать заново с текущим персонажем\n"
+            "🕘 История — показать историю текущего чата\n"
+            "🧠 Модель — сменить нейросеть\n"
+            "Команды: /characters /chats /history /new /model /request\n\n"
+            "Можно слать длинные тексты, голосовые и файлы — я всё пойму."
         )
 
     @dp.callback_query(F.data.startswith("model:"))
@@ -534,16 +750,10 @@ def _register(dp: Dispatcher) -> None:
 
     @dp.message(F.text)
     async def on_text(message: TgMessage):
-        ok, owner_id = await _gate(message)
-        if not ok:
-            return
-        session_id = await _get_or_create_session(message.from_user.id, owner_id=owner_id)
-        if session_id is None:
-            await message.answer("В системе нет персонажей — создайте их в веб-интерфейсе.")
-            return
-        await _bot.send_chat_action(message.chat.id, "typing")
-        reply = await _generate_reply(session_id, message.text, [])
-        await send_long(message, reply)
+        # Обычный текст. Большие сообщения, порезанные Telegram-клиентом на куски,
+        # собираем обратно в один ход (см. _handle_text). Доступ проверяется на
+        # обработке (в _process_messages), как и для медиа-альбомов.
+        await _handle_text(message)
 
 
 async def start() -> None:
