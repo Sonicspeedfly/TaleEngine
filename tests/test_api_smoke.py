@@ -294,6 +294,55 @@ async def _fail_acompletion(*args, **kwargs):
     raise RuntimeError("LLM недоступен")
 
 
+def _empty_chunk(finish_reason=None):
+    """Чанк без контента (как при блокировке фильтрами у Gemini)."""
+    class _Delta:
+        content = None
+
+    class _Choice:
+        delta = _Delta()
+
+    _Choice.finish_reason = finish_reason
+
+    class _Chunk:
+        choices = [_Choice()]
+
+    return _Chunk()
+
+
+async def _empty_acompletion(*args, **kwargs):
+    async def gen():
+        yield _empty_chunk()
+        yield _empty_chunk(finish_reason="content_filter")
+
+    return gen()
+
+
+def test_empty_llm_response_is_explicit_error(client):
+    """
+    Модель «успешно» вернула ноль токенов (фильтры/лимит размышлений): раньше это
+    было ТИХОЕ ничего (нет ни ответа, ни ошибки). Теперь — явная ошибка в
+    отладочном логе, ответ в чат не пишется, реплика юзера остаётся для retry.
+    """
+    cid = client.post("/api/characters", json={"name": "Пустой"}).json()["id"]
+    sid = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]
+    client.delete("/api/debug/log")
+    with patch("backend.llm_gateway.litellm.acompletion", new=_empty_acompletion):
+        with client.websocket_connect(f"/ws/chat/{sid}") as ws:
+            ws.send_json({"type": "user_message", "content": "привет"})
+            for _ in range(50):
+                if ws.receive_json()["type"] in ("done", "error"):
+                    break
+    # Ответа нет, но причина зафиксирована явно (не молчим).
+    msgs = client.get(f"/api/sessions/{sid}/messages").json()
+    assert [m["role"] for m in msgs] == ["user"]
+    log = client.get("/api/debug/log").json()
+    entry = log[0]
+    assert entry["status"] == "error"
+    assert "ПУСТОЙ ответ" in entry["error"]
+    assert "content_filter" in entry["error"]  # finish_reason попал в объяснение
+
+
 def test_retry_after_failed_turn_no_user_duplicate(client):
     """
     Retry после сбоя: реплика юзера уже в БД (ответ не родился) → «retry» отвечает

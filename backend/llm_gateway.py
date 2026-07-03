@@ -161,14 +161,44 @@ async def stream_completion(
     try:
         response = await litellm.acompletion(**call_kwargs)
         text = ""
+        finish_reason = None
+        thought_len = 0
         async for chunk in response:
-            delta = chunk.choices[0].delta.content
+            if not getattr(chunk, "choices", None):
+                continue  # служебный чанк без choices (например, usage)
+            choice = chunk.choices[0]
+            fr = getattr(choice, "finish_reason", None)
+            if fr:
+                finish_reason = fr
+            # «Думающие» модели (Gemini 3.x и т.п.) стримят рассуждения отдельным
+            # полем — в ответ они не идут, но их объём полезен для диагностики.
+            rc = getattr(choice.delta, "reasoning_content", None)
+            if rc:
+                thought_len += len(rc)
+            delta = choice.delta.content
             if delta:
                 text += delta
                 yield delta
+        if finish_reason:
+            entry["finish_reason"] = finish_reason
+        if not text:
+            # Стрим завершился «успешно», но контента НЕТ (фильтры провайдера,
+            # обрезка по токенам во время размышлений и т.п.). Молчать нельзя —
+            # иначе пользователь видит «ничего» без объяснений. Бросаем ошибку:
+            # она уйдёт клиенту событием error и попадёт в отладочный лог.
+            extra = f", размышления: {thought_len} симв." if thought_len else ""
+            msg = (
+                f"Модель вернула ПУСТОЙ ответ (finish_reason={finish_reason or 'нет'}{extra}). "
+                "Чаще всего это фильтры контента провайдера (даже при Zero-Censorship) "
+                "или исчерпание max_tokens на размышления. Попробуйте переформулировать, "
+                "сменить модель или повторить генерацию."
+            )
+            debug_log.finish(entry, "error", error=msg)
+            raise RuntimeError(msg)
         debug_log.finish(entry, "ok", preview=text[:400])
     except Exception as exc:  # noqa: BLE001
-        debug_log.finish(entry, "error", error=str(exc))
+        if entry.get("status") != "error":  # не перетираем детальную запись о пустом ответе
+            debug_log.finish(entry, "error", error=str(exc))
         raise
 
 
