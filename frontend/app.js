@@ -230,6 +230,12 @@ createApp({
       if (!this.canvas || this.canvasSel.end <= this.canvasSel.start) return "";
       return (this.canvas.content || "").slice(this.canvasSel.start, this.canvasSel.end);
     },
+    // Последний ход остался без ответа (ошибка/обрыв/ручная остановка) — можно повторить.
+    canRetry() {
+      if (this.streaming || !this.messages.length) return false;
+      const last = this.messages[this.messages.length - 1];
+      return last.role === "user" && last.id !== "tmp";
+    },
     // Веб-приложение (HTML/CSS/JS/React) — для него доступен live-предпросмотр в iframe.
     canvasIsWeb() {
       if (!this.canvas || this.canvas.kind !== "code") return false;
@@ -794,22 +800,33 @@ createApp({
         this._intentionalClose = true;
         try { this.ws.close(); } catch (e) {}
       }
+      if (this._wsReconnectTimer) { clearTimeout(this._wsReconnectTimer); this._wsReconnectTimer = null; }
+      const sid = this.sessionId; // для реконнекта: переподключаемся только к ЭТОМУ чату
       const proto = location.protocol === "https:" ? "wss" : "ws";
       const qs = [];
       if (this.accessCode) qs.push("code=" + encodeURIComponent(this.accessCode));
       if (this.userToken) qs.push("token=" + encodeURIComponent(this.userToken));
       const q = qs.length ? "?" + qs.join("&") : "";
       this.ws = new WebSocket(proto + "://" + location.host + "/ws/chat/" + this.sessionId + q);
-      this.ws.onopen = () => (this.connected = true);
+      this.ws.onopen = () => { this.connected = true; this._wsRetry = 0; };
       this.ws.onclose = () => {
         this.connected = false;
         if (this._intentionalClose) { this._intentionalClose = false; return; }
         // Непреднамеренный обрыв: дослушиваем активную генерацию через SSE.
         if (this.streaming && this.currentJobId) this.resumeSSE(this.currentJobId);
+        // Автопереподключение с бэкоффом: сеть моргнула или сервер перезапустился.
+        // Без этого после обрыва connected=false навсегда и отправка блокируется.
+        const delay = Math.min(15000, 1500 * Math.pow(2, this._wsRetry || 0));
+        this._wsRetry = (this._wsRetry || 0) + 1;
+        this._wsReconnectTimer = setTimeout(() => {
+          this._wsReconnectTimer = null;
+          if (this.sessionId === sid) this.connectWs();
+        }, delay);
       };
       this.ws.onmessage = (e) => this.onWsEvent(JSON.parse(e.data));
     },
     onWsEvent(ev) {
+      this._lastEvtAt = Date.now(); // метка для сторожа зависшего стриминга
       if (ev.type === "job") this.currentJobId = ev.job_id;
       else if (ev.type === "speaker") {
         // Групповой чат: начинается реплика нового персонажа.
@@ -852,11 +869,24 @@ createApp({
       } catch (e) {}
     },
     resumeSSE(jobId) {
-      const es = new EventSource("/sse/job/" + jobId);
+      if (this._sse) { try { this._sse.close(); } catch (e) {} this._sse = null; }
+      // SSE отдаёт НАКОПЛЕННЫЙ буфер целиком — сбрасываем live-текст,
+      // иначе уже полученные по WS токены задвоятся на экране.
+      this.currentReply = "";
+      this.liveBubbles = [];
+      const es = (this._sse = new EventSource("/sse/job/" + jobId));
       es.onmessage = (e) => {
         const ev = JSON.parse(e.data);
         this.onWsEvent(ev);
-        if (ev.type === "done" || ev.type === "error") es.close();
+        if (ev.type === "done" || ev.type === "error") { es.close(); this._sse = null; }
+      };
+      es.onerror = () => {
+        // Задача уже завершена и очищена (404) или SSE недоступен: ответ, если он
+        // родился, давно сохранён в БД — перечитываем её и разблокируем интерфейс,
+        // вместо того чтобы вечно крутить «печатает…».
+        try { es.close(); } catch (e) {}
+        this._sse = null;
+        if (this.streaming) this.finishStream();
       };
     },
     // Авторесайз поля ввода под содержимое (до max-height из CSS, дальше — скролл).
@@ -921,6 +951,7 @@ createApp({
       this.currentReply = "";
       this.liveBubbles = [];
       this.streaming = true;
+      this._lastEvtAt = Date.now();
       this.ws.send(JSON.stringify({
         type: "user_message", content,
         attachments: this.pendingAttachments, params: this.params,
@@ -938,10 +969,33 @@ createApp({
       this.currentReply = "";
       this.liveBubbles = [];
       this.streaming = true;
+      this._lastEvtAt = Date.now();
       this.ws.send(JSON.stringify({ type: "regenerate", params: this.params }));
     },
+    // Повторить последний ход: если ответ так и не родился (ошибка/обрыв/остановка) —
+    // сервер сгенерирует его заново БЕЗ дублирования реплики пользователя;
+    // если ответ есть — добавит новый свайп (как обычная перегенерация).
+    retryGeneration() {
+      if (!this.connected || this.streaming) return;
+      this.chatError = "";
+      this.currentReply = "";
+      this.liveBubbles = [];
+      this.streaming = true;
+      this._lastEvtAt = Date.now();
+      this.ws.send(JSON.stringify({ type: "retry", params: this.params }));
+      this.scrollDown();
+    },
     stop() {
-      if (this.ws && this.streaming) this.ws.send(JSON.stringify({ type: "stop" }));
+      if (!this.streaming) return;
+      if (this.ws && this.connected) {
+        this.ws.send(JSON.stringify({ type: "stop" }));
+        // Если done потерялся (сокет умер молча) — разблокируемся сами.
+        setTimeout(() => { if (this.streaming) this.finishStream(); }, 4000);
+      } else {
+        // Соединения нет: просто снимаем блокировку и перечитываем БД
+        // (частичный ответ, если был, сервер уже сохранил).
+        this.finishStream();
+      }
     },
 
     // ---------- Действия над сообщениями ----------
@@ -957,7 +1011,29 @@ createApp({
       await this.api("/messages/" + msg.id, { method: "PATCH", body: JSON.stringify({ active_swipe: next }) });
       this.loadMessages();
     },
-    startEdit(msg) { this.editingId = msg.id; this.editingText = msg.content; },
+    startEdit(msg) {
+      this.editingId = msg.id;
+      this.editingText = msg.content;
+      // Авто-фокус + высота под содержимое: правка начинается сразу, без лишних кликов.
+      this.$nextTick(() => {
+        let el = this.$refs.editArea;
+        if (Array.isArray(el)) el = el[0];
+        if (el) {
+          el.focus();
+          el.style.height = "auto";
+          el.style.height = Math.min(el.scrollHeight + 2, 340) + "px";
+        }
+      });
+    },
+    autoGrowEdit(e) {
+      const el = e.target;
+      el.style.height = "auto";
+      el.style.height = Math.min(el.scrollHeight + 2, 340) + "px";
+    },
+    onEditKeydown(e) {
+      if (e.key === "Escape") { e.preventDefault(); this.editingId = null; return; }
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); this.saveEdit(); }
+    },
     async saveEdit() {
       await this.api("/messages/" + this.editingId, { method: "PATCH", body: JSON.stringify({ content: this.editingText }) });
       this.editingId = null;
@@ -991,6 +1067,22 @@ createApp({
     onAttach(e) {
       this.addFiles(e.target.files);   // несколько файлов сразу
       e.target.value = "";
+    },
+    // Вставка из буфера обмена (Ctrl+V): скриншоты и скопированные картинки/файлы
+    // прикрепляются как вложения; обычный текст вставляется как всегда.
+    onPaste(e) {
+      const items = (e.clipboardData && e.clipboardData.items) || [];
+      const files = [];
+      for (const it of items) {
+        if (it.kind === "file") {
+          const f = it.getAsFile();
+          if (f) files.push(f);
+        }
+      }
+      if (files.length) {
+        e.preventDefault(); // не вставляем «мусорный» текст рядом с картинкой
+        this.addFiles(files);
+      }
     },
     // Drag&drop файла в окно чата — прикрепляем к текущему сообщению (как стейт).
     onDrop(e) {
@@ -1115,6 +1207,7 @@ createApp({
       this.currentReply = "";
       this.liveBubbles = [];
       this.streaming = true;
+      this._lastEvtAt = Date.now();
       this.ws.send(JSON.stringify({ type: "continue", params: this.params }));
     },
 
@@ -1533,6 +1626,35 @@ createApp({
       if (this.authStatus.accounts_enabled && this.userToken) {
         this._friendsTimer = setInterval(() => this.loadFriends(), 20000);
       }
+      // Сторож зависшего стриминга. Полуоткрытый TCP (удалённый сервер, NAT) не даёт
+      // onclose: сокет «жив», но события не приходят — «печатает…» висит вечно, хотя
+      // ответ давно сохранён на сервере. Если 45с тишины — дослушиваем задачу через
+      // SSE (он отдаёт весь накопленный буфер), а без job_id просто перечитываем БД.
+      clearInterval(this._streamWatchdog);
+      this._streamWatchdog = setInterval(() => {
+        if (!this.streaming) return;
+        if (Date.now() - (this._lastEvtAt || 0) < 45000) return;
+        this._lastEvtAt = Date.now();
+        if (this.currentJobId) this.resumeSSE(this.currentJobId);
+        else this.finishStream();
+      }, 15000);
+      // Esc закрывает верхний оверлей — как ожидают от десктопного приложения.
+      if (!this._escBound) {
+        this._escBound = true;
+        window.addEventListener("keydown", (e) => {
+          if (e.key !== "Escape" || e.defaultPrevented) return;
+          if (this.dialog) { this.dialogCancel(); return; }
+          if (this.lightbox) { this.lightbox = null; return; }
+          if (this.plusMenu) { this.plusMenu = false; return; }
+          if (this.notifOpen) { this.notifOpen = false; return; }
+          if (this.inviteOpen) { this.inviteOpen = false; return; }
+          if (this.groupModal) { this.groupModal = false; return; }
+          if (this.profileOpen) { this.profileOpen = false; return; }
+          if (this.debugOpen) { this.debugOpen = false; return; }
+          if (this.adminOpen) { this.adminOpen = false; return; }
+          if (this.drawerTab) { this.drawerTab = null; }
+        });
+      }
     },
   },
 
@@ -1699,7 +1821,8 @@ createApp({
         <button v-if="canvasOpen" class="btn-icon only-mobile" @click="mobilePane='canvas'" title="Открыть Canvas">📋</button>
         <span class="title">{{ sharedView ? ('🔗 ' + sharedView.title) : (currentIsGroup ? currentGroup.title : (selectedCharacter ? selectedCharacter.name : 'TaleEngine')) }}</span>
         <span v-if="currentIsGroup" class="pill" title="Участники группы">👥 {{ currentGroup.members.map(m => m.name).join(', ') }}</span>
-        <span :class="['pill', connected ? 'status-ok' : 'status-err']">{{ connected ? 'online' : 'offline' }}</span>
+        <span :class="['pill', connected ? 'status-ok' : 'status-err']"
+              :title="connected ? 'Соединение с сервером активно' : 'Переподключение…'">{{ connected ? 'online' : '⟳ реконнект' }}</span>
         <span class="pill hide-mobile">{{ params.model || connection.default_model }}</span>
         <span v-if="connection.use_proxy" class="pill hide-mobile" title="Запросы идут в LiteLLM-прокси">proxy {{ connection.base_url }}</span>
         <div style="flex:1"></div>
@@ -1754,10 +1877,13 @@ createApp({
           <div v-if="m.speaker_name" class="speaker">{{ m.speaker_name }}</div>
           <div v-if="m.reply_to_id" class="reply-quote">↪ {{ quoteOf(m.reply_to_id) }}</div>
           <div class="bubble">
-            <!-- режим редактирования -->
-            <div v-if="editingId === m.id">
-              <textarea v-model="editingText" rows="4"></textarea>
-              <div class="row" style="margin-top:6px; justify-content:flex-end">
+            <!-- режим редактирования: авто-фокус, авто-высота, Ctrl+Enter / Esc -->
+            <div v-if="editingId === m.id" class="edit-box">
+              <textarea ref="editArea" v-model="editingText" class="edit-area"
+                        @input="autoGrowEdit" @keydown="onEditKeydown"></textarea>
+              <div class="row edit-actions">
+                <span class="muted edit-hint">Ctrl+Enter — сохранить · Esc — отмена</span>
+                <div style="flex:1"></div>
                 <button @click="editingId = null">Отмена</button>
                 <button class="btn-primary" @click="saveEdit">Сохранить</button>
               </div>
@@ -1773,8 +1899,8 @@ createApp({
                 </span>
               </div>
             </div>
-            <!-- обычный режим: markdown -->
-            <div v-else v-html="renderMd(m.content)"></div>
+            <!-- обычный режим: markdown; двойной клик — быстрое редактирование -->
+            <div v-else v-html="renderMd(m.content)" @dblclick="startEdit(m)"></div>
             <!-- предпросмотр вложений сообщения -->
             <div v-if="m.attachments && m.attachments.length" class="attachments">
               <template v-for="(a, ai) in m.attachments" :key="ai">
@@ -1826,7 +1952,13 @@ createApp({
         <!-- Баннер ошибки генерации: НЕ прячем, чтобы было видно причину -->
         <div v-if="chatError" class="error-banner">
           Ошибка генерации: {{ chatError }}
+          <a v-if="!streaming" href="#" @click.prevent="retryGeneration">↻ повторить</a>
           <a href="#" @click.prevent="chatError=''">скрыть</a>
+        </div>
+        <!-- Ответ не пришёл (ошибка/обрыв/остановка) — предлагаем повторить ход -->
+        <div v-else-if="canRetry" class="art-indicator retry-bar">
+          ⚠ Ответ на последнее сообщение не получен.
+          <a href="#" @click.prevent="retryGeneration">↻ Повторить генерацию</a>
         </div>
         <!-- Индикатор «отвечаю на сообщение» -->
         <div v-if="replyToMsg" class="reply-bar">
@@ -1880,7 +2012,7 @@ createApp({
                   :title="recording ? 'Остановить запись' : 'Записать голос'">{{ recording ? '⏺ стоп' : '🎤' }}</button>
           <textarea ref="composer" v-model="input" rows="1" class="composer-input"
                     :placeholder="composerPlaceholder"
-                    @input="autoGrow" @keydown="onComposerKeydown"></textarea>
+                    @input="autoGrow" @keydown="onComposerKeydown" @paste="onPaste"></textarea>
           <button v-if="streaming" class="btn-danger" @click="stop">■ Стоп</button>
           <button v-else-if="canvasCmdMode" class="btn-primary" @click="applyCanvasCmd" :disabled="canvasBusy">✨ Применить</button>
           <button v-else-if="canvasGenMode" class="btn-primary" @click="send" :disabled="!connected || canvasGenerating">{{ canvasGenerating ? '⏳…' : '📄 Создать' }}</button>
@@ -2017,22 +2149,34 @@ createApp({
         <div v-if="drawerTab==='character'">
           <h3>Редактор персонажа</h3>
           <div v-if="charEdit">
-            <label>Имя<input v-model="charEdit.name" /></label>
+            <p class="muted" style="margin:0 0 8px">Изменения сохраняются автоматически при выходе из поля.</p>
+            <label>Имя<input v-model="charEdit.name" placeholder="Имя персонажа" @change="saveCharacter" /></label>
             <label>Аватар</label>
             <div class="row" style="margin-bottom:10px">
               <img v-if="charEdit.avatar_path" :src="charEdit.avatar_path" class="avatar" style="width:48px;height:48px" />
               <label class="btn" style="margin:0; cursor:pointer">Загрузить файл
                 <input type="file" accept="image/*" style="display:none" @change="onAvatarFile" />
               </label>
-              <button v-if="charEdit.avatar_path" class="btn-danger" @click="charEdit.avatar_path=''">убрать</button>
+              <button v-if="charEdit.avatar_path" class="btn-danger" @click="charEdit.avatar_path=''; saveCharacter()">убрать</button>
             </div>
-            <label>Описание<textarea rows="3" v-model="charEdit.description"></textarea></label>
-            <label>Характер (personality)<textarea rows="2" v-model="charEdit.personality"></textarea></label>
-            <label>Сценарий<textarea rows="2" v-model="charEdit.scenario"></textarea></label>
-            <label>Первое сообщение<textarea rows="3" v-model="charEdit.first_message"></textarea></label>
-            <label>Системный промпт<textarea rows="3" v-model="charEdit.system_prompt"></textarea></label>
-            <label>Модель персонажа (необязательно)<input v-model="charEdit.model" /></label>
-            <button class="btn-primary" @click="saveCharacter">Сохранить персонажа</button>
+            <label>Описание
+              <textarea rows="4" v-model="charEdit.description" @change="saveCharacter"
+                        placeholder="Кто это: внешность, происхождение, ключевые факты биографии"></textarea></label>
+            <label>Характер (personality)
+              <textarea rows="3" v-model="charEdit.personality" @change="saveCharacter"
+                        placeholder="Черты характера, манера речи, привычки, страхи и желания"></textarea></label>
+            <label>Сценарий
+              <textarea rows="3" v-model="charEdit.scenario" @change="saveCharacter"
+                        placeholder="Сеттинг и текущая ситуация: где происходит действие, что вокруг"></textarea></label>
+            <label>Первое сообщение
+              <textarea rows="4" v-model="charEdit.first_message" @change="saveCharacter"
+                        placeholder="Реплика, с которой персонаж начинает каждый новый чат"></textarea></label>
+            <label>Системный промпт
+              <textarea rows="4" v-model="charEdit.system_prompt" @change="saveCharacter"
+                        placeholder="Прямые инструкции модели: стиль ответов, ограничения, формат"></textarea></label>
+            <label>Модель персонажа (необязательно)
+              <input v-model="charEdit.model" placeholder="пусто — модель из настроек генерации" @change="saveCharacter" /></label>
+            <button class="btn-primary" @click="saveCharacter">💾 Сохранить сейчас</button>
           </div>
           <p v-else class="muted">Выберите персонажа слева.</p>
         </div>

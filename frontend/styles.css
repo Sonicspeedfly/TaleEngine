@@ -46,7 +46,11 @@ input, textarea, select {
   padding: 7px 9px;
   font: inherit;
 }
-textarea { resize: vertical; }
+textarea { resize: vertical; line-height: 1.5; }
+/* Единый заметный фокус на всех полях — видно, где печатаешь. */
+input:focus, textarea:focus, select:focus { outline: none; border-color: var(--accent); }
+/* В панели настроек текстовым полям — больше воздуха (карточка персонажа и т.п.). */
+.drawer textarea { min-height: 64px; }
 label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 10px; }
 label span { color: var(--text); }
 .row { display: flex; gap: 8px; align-items: center; }
@@ -132,6 +136,14 @@ label span { color: var(--text); }
 .bubble li { margin: 2px 0; }
 .bubble h1, .bubble h2, .bubble h3 { font-size: 15px; margin: 8px 0 4px; font-weight: 700; }
 .bubble hr { border: none; border-top: 1px solid var(--border); margin: 8px 0; }
+/* Редактирование сообщения прямо в пузыре: авто-высота, заметная рамка. */
+.edit-box { width: 100%; min-width: 280px; }
+.edit-area { width: 100%; box-sizing: border-box; min-height: 84px; max-height: 340px; resize: vertical;
+  background: var(--bg); color: var(--text); border: 1px solid var(--accent); border-radius: 8px;
+  padding: 8px 10px; font: inherit; line-height: 1.5; }
+.edit-area:focus { outline: none; }
+.edit-actions { margin-top: 6px; align-items: center; }
+.edit-hint { font-size: 11px; }
 .msg .speaker { font-size: 12px; color: var(--accent); font-weight: 600; margin: 0 4px 2px; }
 .msg.user .speaker { text-align: right; }
 .msg-meta { display: flex; align-items: center; gap: 6px; margin-top: 4px; font-size: 12px; color: var(--muted); }
@@ -197,6 +209,8 @@ label span { color: var(--text); }
   font-size: 13px;
 }
 .art-indicator a { color: #fff; margin-left: 8px; }
+/* «Ответ не получен — повторить»: жёлтое предупреждение, а не синий инфо-тон. */
+.art-indicator.retry-bar { background: rgba(222, 179, 91, 0.14); border-color: #b9944a; color: #ecd9ae; }
 /* Ответ на конкретное сообщение */
 .reply-bar {
   background: var(--bg3); border-left: 3px solid var(--accent);

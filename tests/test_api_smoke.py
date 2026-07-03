@@ -290,6 +290,53 @@ def test_reply_to_message_saved(client):
     assert user_msg["reply_to_id"] == mid
 
 
+async def _fail_acompletion(*args, **kwargs):
+    raise RuntimeError("LLM недоступен")
+
+
+def test_retry_after_failed_turn_no_user_duplicate(client):
+    """
+    Retry после сбоя: реплика юзера уже в БД (ответ не родился) → «retry» отвечает
+    на неё заново, НЕ дублируя её; если ответ есть → новый свайп (regenerate).
+    """
+    cid = client.post("/api/characters", json={"name": "Ретрай"}).json()["id"]
+    sid = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]
+
+    # 1. Ход, в котором LLM падает: сообщение юзера сохранено, ответа нет.
+    # (Событие error может уйти в эфир ДО подписки клиента — мгновенный фейл;
+    # поэтому проверяем не событие, а итоговое состояние чата.)
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fail_acompletion):
+        with client.websocket_connect(f"/ws/chat/{sid}") as ws:
+            ws.send_json({"type": "user_message", "content": "ответь мне"})
+            for _ in range(50):
+                if ws.receive_json()["type"] in ("done", "error"):
+                    break
+    msgs = client.get(f"/api/sessions/{sid}/messages").json()
+    assert [m["role"] for m in msgs] == ["user"]  # ответ так и не родился
+
+    # 2. Retry: LLM ожил — ответ появляется, реплика юзера НЕ задвоилась.
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        with client.websocket_connect(f"/ws/chat/{sid}") as ws:
+            ws.send_json({"type": "retry"})
+            for _ in range(50):
+                if ws.receive_json()["type"] in ("done", "error"):
+                    break
+    msgs = client.get(f"/api/sessions/{sid}/messages").json()
+    assert [m["role"] for m in msgs] == ["user", "assistant"]
+    assert msgs[-1]["content"] == "Привет!"
+
+    # 3. Retry при уже имеющемся ответе = новый свайп (не новое сообщение).
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        with client.websocket_connect(f"/ws/chat/{sid}") as ws:
+            ws.send_json({"type": "retry"})
+            for _ in range(50):
+                if ws.receive_json()["type"] in ("done", "error"):
+                    break
+    msgs = client.get(f"/api/sessions/{sid}/messages").json()
+    assert [m["role"] for m in msgs] == ["user", "assistant"]  # сообщений не прибавилось
+    assert len(msgs[-1]["swipes"]) == 2  # добавился свайп
+
+
 def test_continue_appends_to_last_assistant(client):
     cid = client.post("/api/characters", json={"name": "Cont"}).json()["id"]
     sid = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]

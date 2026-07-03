@@ -1687,24 +1687,26 @@ async def make_image(
 
 
 # ==================== КОНВЕЙЕР ГЕНЕРАЦИИ ====================
-async def _start_group_turn(session_id, content, attachments, params, db, reply_to_message_id=None) -> str:
+async def _start_group_turn(session_id, content, attachments, params, db, reply_to_message_id=None, save_user=True) -> str:
     """
     Ход в групповом чате: сохраняем реплику пользователя и запускаем сценарий, где
     последовательно отвечают выбранные персонажи (по упоминанию / режиссёр / по кругу).
+    save_user=False — повтор хода (retry): реплика уже в БД, второй раз не сохраняем.
     """
     sess = await db.get(models.ChatSession, session_id)
     members = await group_chat.load_members(db, session_id)
     connection = await get_connection(db)
     director = sess.director
 
-    db.add(
-        models.Message(
-            session_id=session_id, role="user", content=content,
-            attachments=[a.model_dump() for a in attachments],
-            reply_to_id=reply_to_message_id,
+    if save_user:
+        db.add(
+            models.Message(
+                session_id=session_id, role="user", content=content,
+                attachments=[a.model_dump() for a in attachments],
+                reply_to_id=reply_to_message_id,
+            )
         )
-    )
-    await db.commit()
+        await db.commit()
 
     model_used = _effective_model(params, connection)
 
@@ -1926,6 +1928,55 @@ async def _start_continue(session_id, params, db) -> str:
     return job_id
 
 
+async def _start_retry(session_id, params, db) -> str:
+    """
+    Повторная генерация после сбоя/обрыва/ручной остановки. Если диалог кончается
+    репликой ПОЛЬЗОВАТЕЛЯ (ответ так и не родился) — отвечаем на неё заново, НЕ
+    сохраняя её второй раз; иначе — новый свайп последнего ответа (= regenerate).
+    """
+    sess = await db.get(models.ChatSession, session_id)
+    if not sess:
+        raise HTTPException(404, "Сессия не найдена")
+    msgs = (
+        await db.execute(
+            select(models.Message)
+            .where(models.Message.session_id == session_id)
+            .order_by(models.Message.id)
+        )
+    ).scalars().all()
+    last = msgs[-1] if msgs else None
+    if not last or last.role != "user":
+        return await _start_regenerate(session_id, params, db)
+
+    if sess.is_group:
+        # Реплика уже в БД (runner группы читает историю из неё) — не дублируем.
+        return await _start_group_turn(session_id, last.content, [], params, db, save_user=False)
+
+    character = await db.get(models.Character, sess.character_id)
+    connection = await get_connection(db)
+    atts = [AttachmentIn(**a) for a in (last.attachments or []) if isinstance(a, dict)]
+    user_content = build_user_content(last.content, atts)
+    # Контекст: история ДО последней реплики + сама реплика как текущее сообщение —
+    # ровно то же, что видел бы _start_user_turn, но без повторного сохранения.
+    history = [
+        {"role": m.role, "content": m.content} for m in msgs if m.id < last.id
+    ]
+    messages = await build_context_from_db(
+        db, sess, character, last.content, user_content, settings.CONTEXT_TOKEN_BUDGET,
+        history=history, send_avatars=bool(params and params.send_avatars),
+    )
+    job_id = uuid.uuid4().hex
+    await generation_manager.start(
+        job_id,
+        session_id,
+        messages,
+        params,
+        on_complete=_make_persist_new(_effective_model(params, connection)),
+        connection=connection,
+    )
+    return job_id
+
+
 # ==================== WEBSOCKET (основной стриминг) ====================
 @app.websocket("/ws/chat/{session_id}")
 async def ws_chat(websocket: WebSocket, session_id: int):
@@ -1933,6 +1984,7 @@ async def ws_chat(websocket: WebSocket, session_id: int):
     Входящие сообщения от клиента:
       {"type":"user_message","content":"...","attachments":[...],"params":{...}}
       {"type":"regenerate","params":{...}}      — новый вариант последнего ответа
+      {"type":"retry","params":{...}}            — повторить ход после сбоя/остановки
       {"type":"stop"}                            — остановить текущую генерацию
 
     Исходящие: {"type":"job","job_id":...}, {"type":"token",...}, {"type":"done"|"error"}.
@@ -2001,6 +2053,10 @@ async def ws_chat(websocket: WebSocket, session_id: int):
                 elif mtype == "continue":
                     msg = WSContinue(**raw)
                     current_job_id = await _start_continue(session_id, msg.params, db)
+                elif mtype == "retry":
+                    # Повтор хода: ответ на «повисшую» реплику юзера или новый свайп.
+                    rparams = GenerationParams(**(raw.get("params") or {}))
+                    current_job_id = await _start_retry(session_id, rparams, db)
                 else:
                     msg = WSUserMessage(**raw)
                     current_job_id = await _start_user_turn(
