@@ -24,15 +24,52 @@ from backend.models import Character, GroupMember, Message
 
 
 async def load_members(db, session_id: int) -> list:
-    """Список персонажей группового чата."""
+    """
+    Список персонажей группового чата — БЕЗ дублей и в стабильном порядке добавления
+    (по GroupMember.id). Дедуп на чтении лечит уже испорченные данные (повторные
+    строки group_members), чтобы участники не двоились в шапке и в очереди ответов.
+    """
     rows = (
         await db.execute(
             select(Character)
             .join(GroupMember, GroupMember.character_id == Character.id)
             .where(GroupMember.session_id == session_id)
+            .order_by(GroupMember.id)
         )
     ).scalars().all()
-    return rows
+    seen: set[int] = set()
+    members: list = []
+    for c in rows:
+        if c.id not in seen:
+            seen.add(c.id)
+            members.append(c)
+    return members
+
+
+async def dedupe_members(db, session_id: int) -> int:
+    """
+    Самолечение данных: удалить повторяющиеся строки group_members (оставить по одной
+    на персонажа, самую раннюю). Возвращает число удалённых. Вызывается при показе
+    списка групп, поэтому испорченные группы чинятся при первом открытии приложения.
+    """
+    rows = (
+        await db.execute(
+            select(GroupMember)
+            .where(GroupMember.session_id == session_id)
+            .order_by(GroupMember.id)
+        )
+    ).scalars().all()
+    seen: set[int] = set()
+    removed = 0
+    for gm in rows:
+        if gm.character_id in seen:
+            await db.delete(gm)
+            removed += 1
+        else:
+            seen.add(gm.character_id)
+    if removed:
+        await db.commit()
+    return removed
 
 
 def mentioned_responders(user_text: str, members: list) -> list:
@@ -52,23 +89,64 @@ def round_robin_next(members: list, last_speaker_name: str | None) -> list:
     return [members[0]]
 
 
-async def director_pick(members: list, transcript: str, connection: dict) -> list:
-    """ИИ-режиссёр решает, кто ответит следующим (1-2 персонажа или никто)."""
-    names = [m.name for m in members]
-    system = (
-        "Ты — режиссёр ролевой сцены. По диалогу реши, КТО из персонажей логично "
-        "ответит следующим (можно 1-2). Верни ТОЛЬКО имена через запятую строго из "
-        "списка: " + ", ".join(names) + ". Если сейчас никто не должен отвечать, верни 'никто'."
-    )
-    out = (await complete(
-        [{"role": "system", "content": system}, {"role": "user", "content": transcript}],
-        None,
-        connection,
-    )).strip().lower()
-    if "никто" in out or "none" in out:
+def _match_names(members: list, text: str) -> list:
+    """Найти персонажей, чьи имена встретились в тексте (ответе режиссёра).
+
+    Длинные имена проверяем раньше, чтобы «Bot редактор» не перекрывался «Bot»;
+    результат упорядочиваем по позиции имени в тексте (кого режиссёр назвал первым).
+    """
+    low = (text or "").lower()
+    picked: list = []
+    for m in sorted(members, key=lambda x: -len(x.name or "")):
+        name = (m.name or "").lower()
+        if name and name in low and m not in picked:
+            picked.append(m)
+    picked.sort(key=lambda m: low.find((m.name or "").lower()))
+    return picked
+
+
+async def director_pick(
+    members: list, transcript: str, connection: dict, params=None, last_user: str = ""
+) -> list:
+    """
+    ИИ-режиссёр решает, кто ответит следующим (1-2 персонажа). Возвращает [] если
+    выбрать не удалось (модель промолчала/ошиблась/заблокирована) — тогда вызывающий
+    делает round-robin, чтобы КТО-ТО всегда ответил (без этого чат «зависал»).
+
+    Важно: раньше был `complete(..., None, ...)` без params — служебный вызов шёл
+    БЕЗ снятия фильтров, и на «остром» контексте Gemini возвращал пустоту, а режиссёр
+    молча выбирал первого. Теперь передаём params (фильтры сняты) + низкую температуру.
+    """
+    if not members:
         return []
-    picked = [m for m in members if m.name.lower() in out]
-    return picked[:2] or [members[0]]
+    numbered = "\n".join(f"{i + 1}. {m.name}" for i, m in enumerate(members))
+    system = (
+        "Ты — РЕЖИССЁР групповой ролевой сцены. Реши, кто из персонажей заговорит "
+        "СЛЕДУЮЩИМ, чтобы сцена шла живо и естественно.\n"
+        "Персонажи:\n" + numbered + "\n\n"
+        "Правила:\n"
+        "— Отвечает тот, к кому обратились/кого назвали, или кому логичнее реагировать "
+        "на последнюю реплику.\n"
+        "— Обычно ОДИН персонаж; двоих (через запятую) — только если реплика явно к обоим.\n"
+        "— Не выбирай того, кто только что говорил, если в этом нет смысла.\n"
+        "— Ответь ТОЛЬКО именем персонажа из списка. Без пояснений, кавычек и лишних слов."
+    )
+    user = transcript
+    if last_user:
+        user += f"\n\n[Последняя реплика пользователя]: {last_user}\nКто ответит следующим?"
+    # Низкая температура и умеренный лимит — решение должно быть коротким и стабильным.
+    dparams = params.model_copy(update={"temperature": 0.2, "max_tokens": 256}) if params else None
+    try:
+        out = await complete(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            dparams,
+            connection,
+        )
+    except Exception:  # noqa: BLE001 — пустой/ошибочный ответ режиссёра не должен ронять ход
+        return []
+    if "никто" in out.lower() or "none" in out.lower():
+        return []
+    return _match_names(members, out)[:2]
 
 
 async def build_group_messages(

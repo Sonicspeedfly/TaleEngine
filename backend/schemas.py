@@ -25,8 +25,10 @@ class GenerationParams(BaseModel):
     repetition_penalty: Optional[float] = Field(default=None, ge=0)
     frequency_penalty: Optional[float] = None
     presence_penalty: Optional[float] = None
-    # Главный тумблер "Zero-Censorship": снимает фильтры безопасности провайдера.
-    disable_safety: bool = False
+    # Главный тумблер "Zero-Censorship": снимает настраиваемые фильтры провайдера.
+    # По умолчанию ВКЛючён (True) — проекту нужна полная свобода; при желании
+    # пользователь может вернуть фильтры, сняв галку в настройках генерации.
+    disable_safety: bool = True
     # Показывать нейросети аватары (внешность персонажа и ролевика) как картинки.
     send_avatars: bool = False
     # Доступ в интернет: подключает инструмент веб-поиска (Google Search grounding

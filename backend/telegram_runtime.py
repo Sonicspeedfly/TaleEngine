@@ -320,12 +320,14 @@ async def _generate_group_reply(
          else f"Пользователь: {m.content}")
         for m in msgs if m.role != "system"
     )
-    chosen = group_chat.mentioned_responders(text, members)
-    if not chosen:
-        chosen = (await group_chat.director_pick(members, transcript, connection)
-                  if director else group_chat.round_robin_next(members, last_speaker))
-
     params = _bot_params()
+    chosen = group_chat.mentioned_responders(text, members)
+    if not chosen and director:
+        chosen = await group_chat.director_pick(
+            members, transcript, connection, params=params, last_user=text
+        )
+    if not chosen:  # режиссёр выключен/промолчал — по кругу, чтобы кто-то ответил
+        chosen = group_chat.round_robin_next(members, last_speaker)
     model_used = params.model or None
     results: list[tuple[str, str]] = []
     for character in chosen:

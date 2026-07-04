@@ -73,7 +73,7 @@ createApp({
         top_k: 40,
         max_tokens: 1024,
         repetition_penalty: 1.1,
-        disable_safety: false,
+        disable_safety: true,
         send_avatars: false,
         web_access: false,
       },
@@ -2103,7 +2103,7 @@ createApp({
             <input type="number" v-model.number="params.max_tokens" /></label>
           <label>Repetition penalty <span class="range-val">{{ params.repetition_penalty }}</span>
             <input type="range" min="0.8" max="2" step="0.05" v-model.number="params.repetition_penalty" /></label>
-          <label class="check danger-text"><input type="checkbox" v-model="params.disable_safety" /> Zero-Censorship (снять фильтры)</label>
+          <label class="check danger-text"><input type="checkbox" v-model="params.disable_safety" /> Zero-Censorship — снять фильтры (вкл. по умолчанию; порог OFF)</label>
           <label class="check"><input type="checkbox" v-model="params.send_avatars" /> Показывать нейросети аватары (внешность персонажа и ролевика)</label>
           <label class="check"><input type="checkbox" v-model="params.web_access" /> 🌐 Доступ в интернет (веб-поиск на каждый запрос)</label>
 

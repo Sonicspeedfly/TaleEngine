@@ -50,7 +50,8 @@ async def test_stream_concatenates_tokens():
 
 
 @pytest.mark.asyncio
-async def test_disable_safety_adds_block_none():
+async def test_safety_off_uses_threshold_off():
+    """Zero-Censorship: порог OFF (самый пермиссивный) на все категории."""
     with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
         params = GenerationParams(disable_safety=True)
         _ = [
@@ -61,16 +62,32 @@ async def test_disable_safety_adds_block_none():
         ]
     captured = _fake_acompletion.captured
     assert "safety_settings" in captured
-    assert all(s["threshold"] == "BLOCK_NONE" for s in captured["safety_settings"])
+    assert all(s["threshold"] == "OFF" for s in captured["safety_settings"])
 
 
 @pytest.mark.asyncio
-async def test_no_safety_when_flag_off():
+async def test_safety_off_by_default_and_for_service_calls():
+    """
+    Полная свобода по умолчанию: disable_safety=True в схеме → фильтры сняты даже
+    без явного флага. Служебные вызовы (params=None, напр. режиссёр) — тоже без фильтров.
+    """
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        _ = [t async for t in stream_completion([{"role": "user", "content": "hi"}], GenerationParams())]
+    assert "safety_settings" in _fake_acompletion.captured  # дефолт = свобода
+
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        _ = [t async for t in stream_completion([{"role": "user", "content": "hi"}], None)]
+    assert "safety_settings" in _fake_acompletion.captured  # служебный вызов тоже
+
+
+@pytest.mark.asyncio
+async def test_safety_kept_when_user_opts_in():
+    """Если пользователь ЯВНО вернул фильтры (disable_safety=False) — их не снимаем."""
     with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
         _ = [
             t
             async for t in stream_completion(
-                [{"role": "user", "content": "hi"}], GenerationParams()
+                [{"role": "user", "content": "hi"}], GenerationParams(disable_safety=False)
             )
         ]
     assert "safety_settings" not in _fake_acompletion.captured

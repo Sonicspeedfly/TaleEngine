@@ -23,13 +23,17 @@ from backend.schemas import AttachmentIn, GenerationParams
 litellm.drop_params = True
 
 
-# Полное снятие фильтров для Gemini / Vertex AI (режим Zero-Censorship).
+# Полное снятие настраиваемых фильтров для Gemini / Vertex AI.
+# Порог "OFF" (а не "BLOCK_NONE") — САМЫЙ пермиссивный: полностью выключает фильтр,
+# тогда как BLOCK_NONE лишь «не блокировать, но оценивать». Для Gemini 2.5/3 "OFF"
+# и так дефолт. Ставим явно на ВСЕ настраиваемые категории (в т.ч. CIVIC_INTEGRITY).
+# Останутся только неотключаемые фильтры Google (например CSAM) — их обойти нельзя.
 GEMINI_SAFETY_OFF = [
-    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "BLOCK_NONE"},
+    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"},
+    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"},
+    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF"},
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF"},
+    {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "OFF"},
 ]
 
 
@@ -145,8 +149,12 @@ async def stream_completion(
     if params and params.web_access:
         call_kwargs["tools"] = [{"googleSearch": {}}]
 
-    # Zero-Censorship: снимаем фильтры там, где это применимо (для остальных — drop).
-    if params and params.disable_safety:
+    # Полная свобода по умолчанию: снимаем настраиваемые фильтры, если пользователь
+    # их не включил явно (disable_safety=True — дефолт) ИЛИ это служебный вызов
+    # без params (режиссёр, заголовок канваса и т.п.) — их тоже нельзя блокировать.
+    # Для не-Gemini провайдеров LiteLLM отбросит safety_settings (drop_params).
+    safety_off = params is None or params.disable_safety
+    if safety_off:
         call_kwargs["safety_settings"] = GEMINI_SAFETY_OFF
 
     # Запись в отладочный лог: что именно уходит в прокси.
@@ -155,7 +163,7 @@ async def stream_completion(
         {
             "messages": debug_log.summarize_messages(messages),
             "params": {k: call_kwargs.get(k) for k in ("temperature", "top_p", "max_tokens")},
-            "safety_off": bool(params and params.disable_safety),
+            "safety_off": safety_off,
         },
     )
     try:

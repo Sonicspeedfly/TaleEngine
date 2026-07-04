@@ -55,6 +55,42 @@ async def init_db() -> None:
         # Лёгкая dev-миграция: дозаливаем недостающие колонки в уже существующую БД,
         # чтобы при обновлении схемы не приходилось удалять файл aichat.db вручную.
         await conn.run_sync(_sqlite_add_missing_columns)
+        # Разовая чистка «сирот» от старого некаскадного удаления чатов (см. ниже).
+        await conn.run_sync(_cleanup_orphans)
+
+
+def _cleanup_orphans(sync_conn) -> None:
+    """
+    Одноразовая (идемпотентная) чистка данных, осиротевших из-за старого бага: до
+    каскадного удаления чата удалялись только сообщения, а group_members / canvases /
+    session_shares / session-horae оставались в БД. В SQLite id удалённого чата
+    ПЕРЕИСПОЛЬЗУЕТСЯ, и новый групповой чат наследовал чужих участников (группа
+    «пухла» с каждым пересозданием). Здесь: (1) удаляем строки, ссылающиеся на
+    несуществующие чаты; (2) схлопываем дубли участников (оставляем самую раннюю).
+    Выполняется при старте — когда пользователь обновит и перезапустит сервер.
+    """
+    from sqlalchemy import inspect, text
+
+    tables = set(inspect(sync_conn).get_table_names())
+    if "chat_sessions" not in tables:
+        return
+    # 1. Осиротевшие дочерние строки (чат, на который они ссылаются, уже удалён).
+    for tbl in ("messages", "group_members", "canvases", "session_shares"):
+        if tbl in tables:
+            sync_conn.execute(text(
+                f"DELETE FROM {tbl} WHERE session_id NOT IN (SELECT id FROM chat_sessions)"
+            ))
+    if "horae_entries" in tables:  # глобальные (session_id IS NULL) не трогаем
+        sync_conn.execute(text(
+            "DELETE FROM horae_entries WHERE session_id IS NOT NULL "
+            "AND session_id NOT IN (SELECT id FROM chat_sessions)"
+        ))
+    # 2. Дубли участников группы: оставляем по одной строке на (чат, персонаж).
+    if "group_members" in tables:
+        sync_conn.execute(text(
+            "DELETE FROM group_members WHERE id NOT IN "
+            "(SELECT MIN(id) FROM group_members GROUP BY session_id, character_id)"
+        ))
 
 
 def _sqlite_add_missing_columns(sync_conn) -> None:

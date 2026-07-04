@@ -34,6 +34,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import delete as sql_delete
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -528,16 +529,25 @@ async def update_session(
 
 
 @app.delete("/api/sessions/{session_id}")
-async def delete_session(session_id: int, db: AsyncSession = Depends(get_session)):
-    # Сначала удаляем сообщения сессии, затем саму сессию.
-    msgs = (
-        await db.execute(
-            select(models.Message).where(models.Message.session_id == session_id)
-        )
-    ).scalars().all()
-    for m in msgs:
-        await db.delete(m)
+async def delete_session(
+    session_id: int, user=Depends(current_user), db: AsyncSession = Depends(get_session)
+):
+    """
+    Удаляет чат СО ВСЕМИ привязанными к нему строками. Раньше чистились только
+    сообщения — а group_members/canvases/shares/session-horae оставались «сиротами».
+    В SQLite id удалённой строки ПЕРЕИСПОЛЬЗУЕТСЯ, и новый чат наследовал чужих
+    осиротевших участников (группа «пухла» с каждым пересозданием). Каскад это чинит.
+    """
     sess = await db.get(models.ChatSession, session_id)
+    if not await _can_access_session(db, sess, user):
+        raise HTTPException(403, "Нет доступа к этому чату")
+    # Все дочерние таблицы, ссылающиеся на session_id (глобальные Horae с session_id
+    # IS NULL не затрагиваются — они не привязаны к этому чату).
+    for model in (
+        models.Message, models.GroupMember, models.SessionShare,
+        models.Canvas, models.HoraeEntry,
+    ):
+        await db.execute(sql_delete(model).where(model.session_id == session_id))
     if sess:
         await db.delete(sess)
     await db.commit()
@@ -613,10 +623,12 @@ async def create_group(
     payload: GroupCreate, user=Depends(current_user), db: AsyncSession = Depends(get_session)
 ):
     """Создаёт групповой чат из нескольких персонажей с общей «сценой»."""
-    if len(payload.character_ids) < 1:
+    # Убираем дубли, сохраняя порядок — один персонаж = один участник.
+    char_ids = list(dict.fromkeys(payload.character_ids))
+    if len(char_ids) < 1:
         raise HTTPException(400, "Нужен хотя бы один персонаж")
     sess = models.ChatSession(
-        character_id=payload.character_ids[0],  # «ведущий» — первый
+        character_id=char_ids[0],  # «ведущий» — первый
         user_key="web:anon",
         title=payload.name or "Групповой чат",
         is_group=True,
@@ -628,10 +640,10 @@ async def create_group(
     db.add(sess)
     await db.commit()
     await db.refresh(sess)
-    for cid in payload.character_ids:
+    for cid in char_ids:
         db.add(models.GroupMember(session_id=sess.id, character_id=cid))
     # Приветствия участников (first_message) как первые реплики.
-    for cid in payload.character_ids:
+    for cid in char_ids:
         ch = await db.get(models.Character, cid)
         if ch and ch.first_message:
             db.add(
@@ -991,8 +1003,9 @@ async def _import_native_chat(db, data: dict, owner_id, user) -> dict:
     await db.commit()
     await db.refresh(sess)
 
-    # Участники группы (создаём недостающих персонажей).
+    # Участники группы (создаём недостающих персонажей). Дедупим — один раз каждого.
     if sess.is_group:
+        added_ids: set[int] = set()
         for cd in data.get("group_members") or []:
             cname = (cd.get("name") or "").strip()
             if not cname:
@@ -1007,7 +1020,9 @@ async def _import_native_chat(db, data: dict, owner_id, user) -> dict:
                 db.add(member)
                 await db.commit()
                 await db.refresh(member)
-            db.add(models.GroupMember(session_id=sess.id, character_id=member.id))
+            if member.id not in added_ids:
+                added_ids.add(member.id)
+                db.add(models.GroupMember(session_id=sess.id, character_id=member.id))
 
     # Сообщения: создаём, запоминаем idx→id, затем проставляем ответы-на-сообщение.
     idx_to_id: dict = {}
@@ -1730,11 +1745,14 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
         )
 
         chosen = group_chat.mentioned_responders(content, rmembers)
+        if not chosen and director:
+            chosen = await group_chat.director_pick(
+                rmembers, transcript, connection, params=params, last_user=content
+            )
         if not chosen:
-            if director:
-                chosen = await group_chat.director_pick(rmembers, transcript, connection)
-            else:
-                chosen = group_chat.round_robin_next(rmembers, last_speaker)
+            # Никто не упомянут и режиссёр выключен/промолчал — отвечает следующий
+            # по кругу. Так на реплику пользователя ВСЕГДА кто-то реагирует.
+            chosen = group_chat.round_robin_next(rmembers, last_speaker)
 
         for character in chosen:
             job.broadcast({"type": "speaker", "name": character.name, "character_id": character.id})
