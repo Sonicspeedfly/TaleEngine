@@ -53,7 +53,7 @@ from backend.chat_import import parse_sillytavern_chat
 from backend.config import settings
 from backend.database import AsyncSessionLocal, get_session, init_db
 from backend.generation import generation_manager
-from backend.horae_memory import build_context_from_db
+from backend.horae_memory import build_context_from_db, messages_to_history
 from backend.llm_gateway import (
     build_user_content,
     complete,
@@ -555,16 +555,29 @@ async def delete_session(
 
 
 @app.get("/api/sessions/{session_id}/messages")
-async def get_messages(session_id: int, user=Depends(current_user), db: AsyncSession = Depends(get_session)):
+async def get_messages(
+    session_id: int, before: int | None = None, limit: int | None = None,
+    user=Depends(current_user), db: AsyncSession = Depends(get_session),
+):
+    """
+    Сообщения чата. Пагинация для ленивой подгрузки:
+      * `limit=N` (без before) — ПОСЛЕДНИЕ N сообщений;
+      * `before=<id>&limit=N` — N сообщений СТАРШЕ указанного id (скролл вверх);
+      * без параметров — вся история (совместимость).
+    В любом случае возвращаются в хронологическом порядке (по возрастанию id).
+    """
     sess = await db.get(models.ChatSession, session_id)
     if not await _can_access_session(db, sess, user):
         raise HTTPException(403, "Нет доступа к этому чату")
-    q = (
-        select(models.Message)
-        .where(models.Message.session_id == session_id)
-        .order_by(models.Message.id)
-    )
-    rows = (await db.execute(q)).scalars().all()
+    q = select(models.Message).where(models.Message.session_id == session_id)
+    if before is not None:
+        q = q.where(models.Message.id < before)
+    if limit is not None:
+        # Берём последние N (по убыванию) и разворачиваем в хронологический порядок.
+        q = q.order_by(models.Message.id.desc()).limit(max(1, min(limit, 500)))
+        rows = list(reversed((await db.execute(q)).scalars().all()))
+    else:
+        rows = (await db.execute(q.order_by(models.Message.id))).scalars().all()
     # Заголовки/типы канвасов для «плашек документов» (одним запросом).
     canvas_ids = [m.canvas_id for m in rows if m.canvas_id]
     canvas_meta: dict = {}
@@ -1863,9 +1876,8 @@ async def _start_regenerate(session_id, params, db) -> str:
     )
     user_text = last_user.content if last_user else ""
     boundary_id = last_user.id if last_user else target.id
-    history = [
-        {"role": m.role, "content": m.content} for m in msgs if m.id < boundary_id
-    ]
+    # messages_to_history сохраняет вложения истории (модель «видит» прежние файлы).
+    history = messages_to_history([m for m in msgs if m.id < boundary_id])
     user_content = build_user_content(
         user_text,
         [],  # вложения прошлой реплики при перегенерации не пересобираем
@@ -1918,9 +1930,8 @@ async def _start_continue(session_id, params, db) -> str:
     )
     user_text = last_user.content if last_user else ""
     boundary_id = last_user.id if last_user else target.id
-    history = [
-        {"role": m.role, "content": m.content} for m in msgs if m.id < boundary_id
-    ]
+    # messages_to_history сохраняет вложения истории (модель «видит» прежние файлы).
+    history = messages_to_history([m for m in msgs if m.id < boundary_id])
     user_content = build_user_content(user_text, [])
     messages = await build_context_from_db(
         db, sess, character, user_text, user_content, settings.CONTEXT_TOKEN_BUDGET,
@@ -1976,9 +1987,7 @@ async def _start_retry(session_id, params, db) -> str:
     user_content = build_user_content(last.content, atts)
     # Контекст: история ДО последней реплики + сама реплика как текущее сообщение —
     # ровно то же, что видел бы _start_user_turn, но без повторного сохранения.
-    history = [
-        {"role": m.role, "content": m.content} for m in msgs if m.id < last.id
-    ]
+    history = messages_to_history([m for m in msgs if m.id < last.id])
     messages = await build_context_from_db(
         db, sess, character, last.content, user_content, settings.CONTEXT_TOKEN_BUDGET,
         history=history, send_avatars=bool(params and params.send_avatars),

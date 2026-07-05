@@ -5,7 +5,19 @@
 сделано чистой функцией. Покрываем главное по ТЗ: подмешивание памяти в системный
 промпт, срабатывание по ключевым словам и обрезку истории под бюджет токенов.
 """
-from backend.horae_memory import HoraeRecord, assemble_context, estimate_tokens
+from types import SimpleNamespace
+
+from backend.horae_memory import (
+    HoraeRecord,
+    assemble_context,
+    estimate_content_tokens,
+    estimate_tokens,
+    messages_to_history,
+)
+
+
+def _msg(mid, role, content, attachments=None):
+    return SimpleNamespace(id=mid, role=role, content=content, attachments=attachments or [])
 
 
 def _char() -> dict:
@@ -169,6 +181,66 @@ def test_persona_injected_into_system_prompt():
     )
     assert "Кай" in messages[0]["content"]
     assert "Молодой картограф." in messages[0]["content"]
+
+
+def test_history_keeps_attachments_so_model_sees_earlier_files():
+    """
+    Баг: вложения из истории терялись — модель «видела» файл только на своём ходу.
+    Теперь прошлое сообщение с картинкой попадает в историю мультимодальным блоком.
+    """
+    img = {"type": "image", "data": "data:image/png;base64,AAAABBBB", "mime": "image/png", "name": "p.png"}
+    msgs = [
+        _msg(1, "user", "посмотри на это фото", [img]),
+        _msg(2, "assistant", "вижу картинку"),
+    ]
+    hist = messages_to_history(msgs)
+    # Реплика пользователя стала мультимодальной: текст + картинка.
+    first = hist[0]["content"]
+    assert isinstance(first, list)
+    assert any(b.get("type") == "image_url" for b in first)
+    assert any(b.get("type") == "text" and "фото" in b["text"] for b in first)
+    # Ответ ассистента — обычный текст.
+    assert hist[1] == {"role": "assistant", "content": "вижу картинку"}
+
+
+def test_history_attachment_over_limit_becomes_note():
+    """Слишком объёмное вложение из истории заменяется пометкой, а не тянется целиком."""
+    from backend.horae_memory import _MAX_HISTORY_ATT_BYTES
+    huge = {"type": "audio", "data": "Q" * (_MAX_HISTORY_ATT_BYTES + 10), "mime": "audio/mp3", "name": "v.mp3"}
+    msgs = [_msg(1, "user", "послушай", [huge])]
+    hist = messages_to_history(msgs)
+    assert isinstance(hist[0]["content"], str)      # не мультимодальный список
+    assert "[аудио]" in hist[0]["content"]           # но пометка о факте вложения есть
+    assert "послушай" in hist[0]["content"]
+
+
+def test_estimate_content_tokens_ignores_base64_size():
+    """Оценка токенов не должна считать base64 как текст (иначе история выбрасывается)."""
+    big_b64 = "A" * 5_000_000
+    multimodal = [
+        {"type": "text", "text": "hi"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + big_b64}},
+    ]
+    # Мультимодальный блок стоит десятки токенов, а не миллион (как длина base64).
+    assert estimate_content_tokens(multimodal) < 1000
+    assert estimate_content_tokens("просто текст") == estimate_tokens("просто текст")
+
+
+def test_multimodal_history_survives_budget_trim():
+    """Картинка из недавней истории не должна выбрасываться бюджетом из-за размера base64."""
+    img_hist = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "фото"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 2_000_000}},
+        ],
+    }]
+    messages = assemble_context(
+        character=_char(), horae_records=[], history=img_hist,
+        user_message="и что?", token_budget=2000,
+    )
+    # Картинка сохранилась в контексте (в истории есть image_url блок).
+    assert _image_blocks(messages)
 
 
 def test_author_note_injected_before_user_message():

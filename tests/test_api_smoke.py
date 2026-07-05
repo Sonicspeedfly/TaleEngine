@@ -331,6 +331,34 @@ def test_cancel_job_endpoint(client):
     assert client.post("/api/jobs/nonexistent/cancel").status_code == 200
 
 
+def test_messages_pagination(client):
+    """Ленивая подгрузка: limit=последние N; before=<id> — порция старше него."""
+    cid = client.post("/api/characters", json={"name": "Пейдж"}).json()["id"]
+    sid = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]
+    # Наполняем чат сообщениями напрямую через PATCH? Нет — шлём по HTTP /send с мок-LLM.
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        for i in range(12):
+            r = client.post(f"/api/sessions/{sid}/send", json={"content": f"msg{i}"})
+            jid = r.json()["job_id"]
+            with client.stream("GET", f"/sse/job/{jid}") as resp:
+                for line in resp.iter_lines():
+                    if line and ('"done"' in line or '"error"' in line):
+                        break
+    all_msgs = client.get(f"/api/sessions/{sid}/messages").json()
+    assert len(all_msgs) == 24  # 12 user + 12 assistant
+
+    # limit=5 → последние 5 (в хронологическом порядке).
+    last5 = client.get(f"/api/sessions/{sid}/messages?limit=5").json()
+    assert len(last5) == 5
+    assert [m["id"] for m in last5] == [m["id"] for m in all_msgs[-5:]]
+
+    # before=<id первого из last5> & limit=5 → 5 сообщений СТАРШЕ него.
+    older = client.get(f"/api/sessions/{sid}/messages?before={last5[0]['id']}&limit=5").json()
+    assert len(older) == 5
+    assert [m["id"] for m in older] == [m["id"] for m in all_msgs[-10:-5]]
+    assert older[-1]["id"] < last5[0]["id"]  # порядок соблюдён
+
+
 async def _fail_acompletion(*args, **kwargs):
     raise RuntimeError("LLM недоступен")
 

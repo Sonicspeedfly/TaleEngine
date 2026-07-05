@@ -59,6 +59,88 @@ def estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+def estimate_content_tokens(content) -> int:
+    """
+    Оценка токенов для контента, который может быть мультимодальным (список блоков).
+    Для картинок/аудио НЕ считаем длину base64 как текст (это дало бы гигантскую
+    оценку и выбросило всю историю) — берём грубую фиксированную стоимость блока.
+    """
+    if isinstance(content, list):
+        total = 0
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            t = b.get("type")
+            if t == "text":
+                total += estimate_tokens(b.get("text", ""))
+            elif t == "input_audio":
+                total += 1500   # аудио заметно дороже картинки
+            else:                # image_url / document / прочее
+                total += 400
+        return total
+    return estimate_tokens(str(content or ""))
+
+
+# Сколько байт base64-вложений из ИСТОРИИ разрешаем включить в один запрос. Сверх
+# этого — вложение заменяется текстовой пометкой, иначе запрос раздуется и упрётся
+# в лимит провайдера (у Gemini inline-данные ограничены ~20 МБ на запрос).
+_MAX_HISTORY_ATT_BYTES = 12 * 1024 * 1024
+
+
+def _att_label(a: dict) -> str:
+    t = a.get("type")
+    if t == "image":
+        return "изображение"
+    if t == "audio":
+        return "аудио"
+    if t == "document":
+        return "документ: " + (a.get("name") or "файл")
+    return "вложение"
+
+
+def messages_to_history(msgs) -> list[dict]:
+    """
+    Превращает ORM-сообщения в историю для контекста, СОХРАНЯЯ вложения (картинки,
+    аудио, документы) — чтобы модель «видела» присланный ранее файл и на последующих
+    ходах (раньше вложения из истории терялись, и файл был виден только на своём ходу).
+
+    Вложения включаем от свежих к старым, пока суммарный объём не превысит лимит; что
+    не влезло — заменяем текстовой пометкой «[изображение]/[аудио]/…», чтобы модель хотя
+    бы знала о факте вложения. Мультимодальный контент собираем только для реплик
+    пользователя (у ассистента вложений в норме нет, а image в assistant часть
+    провайдеров не принимает).
+    """
+    from backend.llm_gateway import build_user_content
+    from backend.schemas import AttachmentIn
+
+    keep: dict = {}
+    used = 0
+    for m in reversed(msgs):
+        atts = [a for a in (m.attachments or []) if isinstance(a, dict) and a.get("data")]
+        size = sum(len(a.get("data") or "") for a in atts)
+        if atts and used + size <= _MAX_HISTORY_ATT_BYTES:
+            keep[m.id] = True
+            used += size
+        else:
+            keep[m.id] = False
+
+    out: list[dict] = []
+    for m in msgs:
+        atts = [a for a in (m.attachments or []) if isinstance(a, dict) and a.get("data")]
+        if atts and keep.get(m.id) and m.role == "user":
+            try:
+                content = build_user_content(m.content or "", [AttachmentIn(**a) for a in atts])
+            except Exception:  # noqa: BLE001 — битое вложение не должно рушить контекст
+                content = m.content or ""
+        elif atts:
+            note = " ".join(f"[{_att_label(a)}]" for a in atts)
+            content = f"{m.content} {note}".strip() if m.content else note
+        else:
+            content = m.content or ""
+        out.append({"role": m.role, "content": content})
+    return out
+
+
 @dataclass
 class HoraeRecord:
     """
@@ -203,7 +285,7 @@ def assemble_context(
     # 4. Добавляем историю с конца (свежие сообщения важнее), пока хватает бюджета.
     trimmed_history: list[dict] = []
     for msg in reversed(history):
-        cost = estimate_tokens(str(msg.get("content", "")))
+        cost = estimate_content_tokens(msg.get("content"))  # учитывает мультимодальные блоки
         if used + cost > token_budget:
             break
         trimmed_history.insert(0, {"role": msg["role"], "content": msg["content"]})
@@ -323,7 +405,8 @@ async def build_context_from_db(
             .order_by(Message.id)
         )
         msgs = (await session_db.execute(hq)).scalars().all()
-        history = [{"role": m.role, "content": m.content} for m in msgs]
+        # СОХРАНЯЕМ вложения истории — иначе модель не «видит» присланный ранее файл.
+        history = messages_to_history(msgs)
 
     char_dict = {
         "name": character.name,

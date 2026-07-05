@@ -22,6 +22,8 @@ createApp({
       sessions: [],
       sessionId: null,
       messages: [],
+      loadingOlder: false,      // идёт подгрузка старых сообщений (скролл вверх)
+      noMoreMessages: false,    // старых сообщений больше нет (дошли до начала чата)
 
       // --- Ввод и стриминг ---
       input: "",
@@ -605,7 +607,7 @@ createApp({
       this.sessionPersonaId = s.persona_id || null;
       this.sessionBg = s.background || "";
       this.closeSidebarOnMobile(); // на мобильном прячем сайдбар после выбора
-      await this.loadMessages();
+      await this.loadMessages(true);   // свежее открытие — грузим последнюю порцию
       this.connectWs();
     },
     // Открыть чат, которым со мной поделился друг (только из раздела «Доступные мне»).
@@ -619,7 +621,7 @@ createApp({
       this.sessionBg = s.background || "";
       this.closeSidebarOnMobile();
       this.notifOpen = false;
-      await this.loadMessages();
+      await this.loadMessages(true);   // свежее открытие — грузим последнюю порцию
       this.connectWs();
     },
     // Перевести идущую генерацию текущего чата в фон: она досчитается на сервере,
@@ -791,10 +793,44 @@ createApp({
       await this.api("/sessions/" + this.sessionId, { method: "PATCH", body: JSON.stringify({ director: val }) });
       await this.loadGroups();
     },
-    async loadMessages() {
+    // Загрузка окна сообщений (не всей истории). fresh=true — свежее открытие чата
+    // (последние 40 + скролл вниз); иначе обновление текущего окна (после хода/правки).
+    async loadMessages(fresh = false) {
       if (!this.sessionId) return;
-      this.messages = await this.api("/sessions/" + this.sessionId + "/messages");
+      if (fresh) { this.messages = []; this.noMoreMessages = false; }
+      // Окно = столько же, сколько уже показано (сохраняем прокрутку вверх), но не всё:
+      // на открытии — 40, максимум 400 (тяжёлые вложения не тянем разом).
+      const limit = Math.min(400, Math.max(40, this.messages.length + 2));
+      const rows = await this.api("/sessions/" + this.sessionId + "/messages?limit=" + limit);
+      this.messages = rows;
+      this.noMoreMessages = rows.length < limit; // получили меньше лимита → старых нет
       this.scrollDown();
+    },
+    // Подгрузка порции более старых сообщений при скролле вверх (сохраняем позицию).
+    async loadOlder() {
+      if (!this.sessionId || this.loadingOlder || this.noMoreMessages || !this.messages.length) return;
+      const oldest = this.messages[0];
+      if (!oldest || oldest.id === "tmp") return;
+      this.loadingOlder = true;
+      const el = this.$refs.messages;
+      const prevH = el ? el.scrollHeight : 0;
+      try {
+        const older = await this.api(
+          "/sessions/" + this.sessionId + "/messages?before=" + oldest.id + "&limit=40"
+        );
+        if (older.length < 40) this.noMoreMessages = true;
+        if (older.length) {
+          this.messages = older.concat(this.messages);
+          // Держим кадр на месте: добавили сверху -> компенсируем прирост высоты.
+          this.$nextTick(() => { if (el) el.scrollTop += el.scrollHeight - prevH; });
+        }
+      } catch (e) { /* тихо: подгрузка не критична */ }
+      finally { this.loadingOlder = false; }
+    },
+    onMessagesScroll(e) {
+      if (e.target.scrollTop < 120 && !this.loadingOlder && !this.noMoreMessages) {
+        this.loadOlder();
+      }
     },
 
     // ---------- WebSocket стриминг ----------
@@ -1165,10 +1201,66 @@ createApp({
       if (files && files.length) this.addFiles(files);
     },
 
-    // ---------- Запись голоса прямо в браузере (без транскрибации) ----------
+    // ---------- Запись голоса: конвертация в MP3 (webm нейросеть не понимает) ----------
+    // MediaRecorder в Chrome/Edge пишет audio/webm (Opus), а Gemini принимает
+    // wav/mp3/ogg/flac/aac. Поэтому запись перекодируем: декодируем в PCM
+    // (decodeAudioData умеет webm/ogg) и кодируем в MP3 через lamejs (моно, 128 кбит/с).
+    async _decodeToPcm(blob) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      const ctx = new AC();
+      try {
+        return await ctx.decodeAudioData(await blob.arrayBuffer());
+      } finally {
+        if (ctx.close) try { ctx.close(); } catch (e) {}
+      }
+    },
+    _bufferToInt16Mono(buf) {
+      const n = buf.length;
+      const c0 = buf.getChannelData(0);
+      const c1 = buf.numberOfChannels > 1 ? buf.getChannelData(1) : null;
+      const out = new Int16Array(n);
+      for (let i = 0; i < n; i++) {
+        let s = c1 ? (c0[i] + c1[i]) * 0.5 : c0[i];
+        s = Math.max(-1, Math.min(1, s));
+        out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      }
+      return out;
+    },
+    _encodeMp3(int16, sampleRate) {
+      const enc = new lamejs.Mp3Encoder(1, sampleRate, 128);
+      const parts = [];
+      for (let i = 0; i < int16.length; i += 1152) {
+        const b = enc.encodeBuffer(int16.subarray(i, i + 1152));
+        if (b.length) parts.push(new Uint8Array(b)); // lamejs отдаёт Int8Array
+      }
+      const end = enc.flush();
+      if (end.length) parts.push(new Uint8Array(end));
+      return new Blob(parts, { type: "audio/mp3" });
+    },
+    _encodeWav(buf) {
+      // Запасной вариант, если lamejs недоступен: PCM16 моно WAV (тоже понятен модели).
+      const int16 = this._bufferToInt16Mono(buf);
+      const sr = buf.sampleRate;
+      const dv = new DataView(new ArrayBuffer(44 + int16.length * 2));
+      const wr = (o, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i)); };
+      wr(0, "RIFF"); dv.setUint32(4, 36 + int16.length * 2, true); wr(8, "WAVE");
+      wr(12, "fmt "); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+      dv.setUint32(24, sr, true); dv.setUint32(28, sr * 2, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+      wr(36, "data"); dv.setUint32(40, int16.length * 2, true);
+      for (let i = 0; i < int16.length; i++) dv.setInt16(44 + i * 2, int16[i], true);
+      return new Blob([dv], { type: "audio/wav" });
+    },
+    async _voiceToCompatible(blob) {
+      // webm/ogg -> mp3 (lamejs) -> wav (fallback) -> исходник (крайний случай).
+      const buf = await this._decodeToPcm(blob);
+      if (window.lamejs && lamejs.Mp3Encoder) {
+        return { blob: this._encodeMp3(this._bufferToInt16Mono(buf), buf.sampleRate), ext: "mp3", mime: "audio/mp3" };
+      }
+      return { blob: this._encodeWav(buf), ext: "wav", mime: "audio/wav" };
+    },
     async toggleRecord() {
       if (this.recording) {
-        // Остановка: onstop соберёт чанки и добавит аудио во вложения.
+        // Остановка: onstop соберёт чанки, перекодирует и добавит аудио во вложения.
         this.mediaRecorder && this.mediaRecorder.stop();
         return;
       }
@@ -1179,22 +1271,31 @@ createApp({
         this.mediaRecorder.ondataavailable = (ev) => {
           if (ev.data.size > 0) this.recChunks.push(ev.data);
         };
-        this.mediaRecorder.onstop = () => {
-          const blob = new Blob(this.recChunks, { type: this.mediaRecorder.mimeType || "audio/webm" });
+        this.mediaRecorder.onstop = async () => {
+          stream.getTracks().forEach((t) => t.stop()); // отпускаем микрофон
+          this.recording = false;
+          const src = new Blob(this.recChunks, { type: this.mediaRecorder.mimeType || "audio/webm" });
+          // Плашка со спиннером сразу — конвертация в MP3 занимает мгновение.
           const raw = {
             id: (this._attSeq = (this._attSeq || 0) + 1),
-            type: "audio", mime: blob.type, name: "Голосовое сообщение",
-            size: blob.size, data: null, loading: true, error: false,
+            type: "audio", mime: "audio/mp3", name: "Голосовое сообщение.mp3",
+            size: 0, data: null, loading: true, error: false,
           };
           this.pendingAttachments.push(raw);
           const att = this.pendingAttachments[this.pendingAttachments.length - 1];
-          const reader = new FileReader();
-          // Аудио уходит модели как есть — Gemini понимает его нативно.
-          reader.onload = () => { att.data = reader.result; att.loading = false; };
-          reader.onerror = () => { att.error = true; att.loading = false; };
-          reader.readAsDataURL(blob);
-          stream.getTracks().forEach((t) => t.stop()); // отпускаем микрофон
-          this.recording = false;
+          try {
+            const { blob, ext, mime } = await this._voiceToCompatible(src);
+            att.mime = mime;
+            att.name = "Голосовое сообщение." + ext;
+            att.size = blob.size;
+            const reader = new FileReader();
+            reader.onload = () => { att.data = reader.result; att.loading = false; };
+            reader.onerror = () => { att.error = true; att.loading = false; };
+            reader.readAsDataURL(blob);
+          } catch (e) {
+            att.error = true; att.loading = false;
+            this.showToast("Не удалось обработать запись: " + e.message);
+          }
         };
         this.mediaRecorder.start();
         this.recording = true;
@@ -1955,8 +2056,11 @@ createApp({
         </div>
       </div>
 
-      <div class="messages" ref="messages" :style="chatBgStyle">
+      <div class="messages" ref="messages" :style="chatBgStyle" @scroll="onMessagesScroll">
         <div v-if="!sessionId" class="empty">Выберите или создайте персонажа и чат слева.</div>
+        <!-- Индикатор подгрузки истории при скролле вверх -->
+        <div v-if="sessionId && loadingOlder" class="load-older">⏳ Загружаю ранние сообщения…</div>
+        <div v-else-if="sessionId && messages.length >= 40 && noMoreMessages" class="load-older muted">— начало чата —</div>
 
         <div v-for="m in messages" :key="m.id" :class="['msg', m.role]">
           <div v-if="m.speaker_name" class="speaker">{{ m.speaker_name }}</div>

@@ -36,11 +36,20 @@ Node.js, npm и шаг компиляции не нужны.
 - **Чаты:** `loadSessions`, `newChat`, `openSession`, `openSharedSession`,
   `renameSession`, `deleteSession`, `exportSession` (нативный экспорт), `importChat`
   (автоопределение нативный/SillyTavern), `downloadJson`.
+- **Ленивая подгрузка сообщений:** `loadMessages(fresh)` грузит не всю историю, а окно
+  (`?limit=`): на открытии чата — последние 40; `loadOlder` при скролле вверх
+  (`onMessagesScroll`, порог 120px) подгружает `?before=<id>&limit=40` и **сохраняет
+  позицию прокрутки** (компенсирует прирост высоты). `noMoreMessages` — дошли до начала;
+  вверху — индикатор `.load-older`.
 - **WebSocket/генерация:** `connectWs`, `onWsEvent`, `send`, `regenerate`, `stop`,
   `continueReply`, `finishStream`, `resumeSSE`; кросс-чат: `_handoffStreaming`,
   `_trackBackgroundJob`, `showToast`.
 - **Вложения:** `onAttach`/`onPaste`/`onDrop`→`addFiles` (📎, Ctrl+V, drag&drop),
-  `toggleRecord` (запись голоса). **Загрузка с обратной связью:** плашка вложения
+  `toggleRecord` (запись голоса). **Голос → MP3:** MediaRecorder пишет webm/Opus (Chrome),
+  а Gemini его НЕ принимает (только wav/mp3/ogg/flac/aac). Поэтому запись перекодируется:
+  `_voiceToCompatible` — `decodeAudioData` (умеет webm/ogg) → PCM → `_encodeMp3` (lamejs с
+  CDN, моно 128 кбит/с, `audio/mp3`); если lamejs недоступен — `_encodeWav` (тоже понятен
+  модели). **Загрузка с обратной связью:** плашка вложения
   появляется СРАЗУ со спиннером (`loading:true`), а `data` дочитывается `FileReader`
   асинхронно (мутируем реактивную ссылку из массива, чтобы Vue перерисовал состояние).
   Готово → миниатюра/иконка; ошибка → ⚠ + красная рамка + тост. Computed

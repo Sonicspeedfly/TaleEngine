@@ -39,7 +39,7 @@ HTTP Basic Auth поверх всего нужен ещё заголовок `Au
 | GET | `/api/sessions/shared` | Чаты, которыми со мной поделились |
 | PATCH | `/api/sessions/{id}` | Переименование/мета (scenario, author_note, фон, …) |
 | DELETE | `/api/sessions/{id}` | Удалить чат |
-| GET | `/api/sessions/{id}/messages` | Сообщения чата (с проверкой доступа) |
+| GET | `/api/sessions/{id}/messages` | Сообщения чата. Пагинация: `?limit=N` — последние N; `?before=<id>&limit=N` — порция старше id (ленивая подгрузка при скролле вверх); без параметров — вся история |
 | PATCH | `/api/messages/{id}` | Редактировать сообщение/свайп |
 | DELETE | `/api/messages/{id}` | Удалить сообщение |
 | GET | `/api/sessions/{id}/export` | **Нативный экспорт чата AiChat** |

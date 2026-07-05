@@ -159,6 +159,9 @@ label span { color: var(--text); }
 .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
 .chip { font-size: 12px; background: var(--bg3); border: 1px solid var(--border); border-radius: 8px; padding: 3px 8px; }
 .empty { margin: auto; color: var(--muted); text-align: center; }
+/* Индикатор ленивой подгрузки истории (вверху ленты сообщений). */
+.load-older { text-align: center; font-size: 12px; color: var(--accent); padding: 2px 0; flex: none; }
+.load-older.muted { color: var(--muted); }
 .typing { color: var(--muted); }
 
 /* ----- Правый drawer с настройками ----- */
