@@ -24,7 +24,10 @@ Word отдаётся как извлечённый текст.
 - **Linux:** `./start.sh` (слушает `0.0.0.0:8000`; `HOST`/`PORT` переопределяемы).
 - **Docker:** `docker compose up --build`. Из контейнера хостовый LiteLLM виден как
   `host.docker.internal:4000`.
-- **Вручную:** `.venv\Scripts\python -m uvicorn backend.main:app --port 8042`.
+- **Вручную:** `.venv\Scripts\python run.py --host 0.0.0.0 --port 8042` — запуск через
+  `run.py`, а НЕ голый `uvicorn backend.main:app`. `run.py` ставит `ws_max_size=None`
+  (снимает лимит 16 МБ на размер WebSocket-кадра), иначе большие вложения (аудио 14 МБ →
+  base64 ≈ 19 МБ) по WS обрываются с close 1009. `HOST`/`PORT` — из аргументов или env.
 
 Настройки подключения к LiteLLM задаются в UI (⚙ → «Подключение») и хранятся в БД.
 

@@ -40,5 +40,7 @@ if grep -Eq '^TELEGRAM_BOT_TOKEN=.' .env; then
 fi
 
 # 5) Сервер (в основном процессе). exec -> сигналы (Ctrl+C) доходят до uvicorn.
+#    Запускаем через run.py (а не голый uvicorn): он ставит ws_max_size=None —
+#    без лимита на размер WebSocket-кадра, иначе большие вложения (аудио) обрываются.
 echo "[run] Сервер: http://${HOST}:${PORT}"
-exec .venv/bin/python -m uvicorn backend.main:app --host "${HOST}" --port "${PORT}"
+exec .venv/bin/python run.py --host "${HOST}" --port "${PORT}"

@@ -4,7 +4,7 @@
     {
       "name": "aichat",
       "runtimeExecutable": "D:/Programs/AiChat SSF/.venv/Scripts/python.exe",
-      "runtimeArgs": ["-m", "uvicorn", "backend.main:app", "--port", "8042"],
+      "runtimeArgs": ["run.py", "--port", "8042"],
       "port": 8042,
       "autoPort": false
     },

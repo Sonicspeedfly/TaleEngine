@@ -962,22 +962,38 @@ createApp({
       }
       this.chatError = "";
       const attachments = this._cleanAtts(this.pendingAttachments);
+      const replyTo = this.replyToId;
       // Оптимистично показываем своё сообщение сразу (с вложениями — их видно в пузыре).
       this.messages.push({ id: "tmp", role: "user", content, attachments, swipes: [content], active_swipe: 0 });
       this.currentReply = "";
       this.liveBubbles = [];
       this.streaming = true;
       this._lastEvtAt = Date.now();
-      this.ws.send(JSON.stringify({
-        type: "user_message", content,
-        attachments, params: this.params,
-        reply_to_message_id: this.replyToId,
-      }));
       this.input = "";
       this.pendingAttachments = [];
       this.replyToId = null;
       this.resetComposerHeight();
       this.scrollDown();
+      if (attachments.length) {
+        // Вложения (особенно аудио/видео) не влезают в WebSocket-кадр (~16 МБ) —
+        // отправляем ход по HTTP, а ответ слушаем по SSE (тот же поток событий).
+        this.api("/sessions/" + this.sessionId + "/send", {
+          method: "POST",
+          body: JSON.stringify({ content, attachments, params: this.params, reply_to_message_id: replyTo }),
+        }).then((r) => {
+          this.currentJobId = r.job_id;
+          this.resumeSSE(r.job_id);
+        }).catch((e) => {
+          this.chatError = "Не удалось отправить вложение: " + e.message;
+          this.finishStream();
+        });
+      } else {
+        this.ws.send(JSON.stringify({
+          type: "user_message", content,
+          attachments, params: this.params,
+          reply_to_message_id: replyTo,
+        }));
+      }
     },
     regenerate() {
       if (!this.connected || this.streaming) return;
@@ -1003,6 +1019,11 @@ createApp({
     },
     stop() {
       if (!this.streaming) return;
+      // Отмена по id задачи (HTTP) работает и для WS-, и для HTTP-хода (SSE);
+      // сервер отменит генерацию и пришлёт done. WS-стоп — как запасной путь.
+      if (this.currentJobId) {
+        this.api("/jobs/" + this.currentJobId + "/cancel", { method: "POST" }).catch(() => {});
+      }
       if (this.ws && this.connected) {
         this.ws.send(JSON.stringify({ type: "stop" }));
         // Если done потерялся (сокет умер молча) — разблокируемся сами.

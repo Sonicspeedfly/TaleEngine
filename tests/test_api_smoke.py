@@ -290,6 +290,47 @@ def test_reply_to_message_saved(client):
     assert user_msg["reply_to_id"] == mid
 
 
+def test_http_send_with_attachment_streams_via_sse(client):
+    """
+    Большое вложение не влезает в WebSocket-кадр (~16 МБ) → ход уходит по HTTP
+    (`/send`), ответ слушается по SSE. Проверяем: job создаётся, сообщение с
+    вложением сохраняется, ответ ассистента появляется.
+    """
+    cid = client.post("/api/characters", json={"name": "Аудио"}).json()["id"]
+    sid = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]
+    # Крупноватое «аудио» (имитация): data-URI с большим base64.
+    big_audio = "data:audio/webm;base64," + ("A" * 100000)
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        r = client.post(
+            f"/api/sessions/{sid}/send",
+            json={"content": "послушай", "attachments": [
+                {"type": "audio", "data": big_audio, "mime": "audio/webm", "name": "Голос"}
+            ]},
+        )
+        assert r.status_code == 200
+        job_id = r.json()["job_id"]
+        assert job_id
+        # Дослушиваем задачу по SSE до конца.
+        with client.stream("GET", f"/sse/job/{job_id}") as resp:
+            assert resp.status_code == 200
+            done = False
+            for line in resp.iter_lines():
+                if line and '"done"' in line or (line and '"error"' in line):
+                    done = True
+                    break
+            assert done
+    msgs = client.get(f"/api/sessions/{sid}/messages").json()
+    user_msg = [m for m in msgs if m["role"] == "user"][-1]
+    assert user_msg["content"] == "послушай"
+    assert user_msg["attachments"] and user_msg["attachments"][0]["type"] == "audio"
+    assert any(m["role"] == "assistant" for m in msgs)  # ответ пришёл
+
+
+def test_cancel_job_endpoint(client):
+    """POST /api/jobs/{id}/cancel не падает (job уже мог завершиться/не существовать)."""
+    assert client.post("/api/jobs/nonexistent/cancel").status_code == 200
+
+
 async def _fail_acompletion(*args, **kwargs):
     raise RuntimeError("LLM недоступен")
 

@@ -67,7 +67,9 @@ echo [run] Network URL: http://%LANIP%:%PORT%   (open on other LAN devices)
 REM 5) Start the server in its own window, bound to 0.0.0.0 so it is reachable
 REM    over the local network. "cmd /k" keeps the window OPEN on error.
 REM    NOTE: Windows Firewall may pop up the first time - click "Allow access".
-start "AiChat backend" cmd /k ".venv\Scripts\python.exe -m uvicorn backend.main:app --host 0.0.0.0 --port %PORT%"
+REM    Launch via run.py (NOT plain uvicorn): it sets ws_max_size=None so there is
+REM    NO WebSocket message size limit (big audio/photo attachments go through).
+start "AiChat backend" cmd /k ".venv\Scripts\python.exe run.py --host 0.0.0.0 --port %PORT%"
 
 REM 6) The Telegram bot is now started from the in-app Admin panel
 REM    (set the token there and press Start). No separate process here, so two

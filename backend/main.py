@@ -2111,6 +2111,34 @@ async def sse_job(job_id: str):
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
+@app.post("/api/sessions/{session_id}/send")
+async def http_send(
+    session_id: int, msg: WSUserMessage,
+    user=Depends(current_user), db: AsyncSession = Depends(get_session),
+):
+    """
+    Отправить ход по HTTP (а не по WebSocket) и слушать ответ через SSE
+    (`/sse/job/{job_id}`). Нужен для сообщений с БОЛЬШИМИ вложениями: в WebSocket
+    один кадр ограничен (uvicorn ws_max_size ≈ 16 МБ), а 14-МБ аудио в base64 —
+    это ~19 МБ, и такое сообщение молча обрывалось. У HTTP-тела такого лимита нет.
+    """
+    sess = await db.get(models.ChatSession, session_id)
+    if not await _can_access_session(db, sess, user):
+        raise HTTPException(403, "Нет доступа к этому чату")
+    job_id = await _start_user_turn(
+        session_id, msg.content, msg.attachments, msg.params, db,
+        reply_to_message_id=msg.reply_to_message_id,
+    )
+    return {"job_id": job_id}
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str):
+    """Остановить генерацию по id задачи (работает и для WS-, и для HTTP-хода)."""
+    generation_manager.cancel(job_id)
+    return {"ok": True}
+
+
 # ============================ АУТЕНТИФИКАЦИЯ / ДОСТУП ============================
 @app.get("/api/auth/status")
 async def auth_status(db: AsyncSession = Depends(get_session)):
