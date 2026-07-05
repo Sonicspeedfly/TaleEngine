@@ -24,6 +24,8 @@ createApp({
       messages: [],
       loadingOlder: false,      // идёт подгрузка старых сообщений (скролл вверх)
       noMoreMessages: false,    // старых сообщений больше нет (дошли до начала чата)
+      messagePreload: 40,       // сколько сообщений грузить на открытии/за одну подгрузку (настройка админа)
+      headerMenu: false,        // мобильное меню шапки (⋯)
 
       // --- Ввод и стриминг ---
       input: "",
@@ -236,6 +238,10 @@ createApp({
     // Хоть одно вложение ещё читается (спиннер) — отправку задерживаем до готовности.
     attachmentsLoading() {
       return this.pendingAttachments.some((a) => a.loading);
+    },
+    // Размер порции сообщений (предзагрузка) — из настройки, в разумных пределах.
+    msgPageSize() {
+      return Math.min(400, Math.max(10, Math.round(Number(this.messagePreload) || 40)));
     },
     // Последний ход остался без ответа (ошибка/обрыв/ручная остановка) — можно повторить.
     canRetry() {
@@ -799,8 +805,8 @@ createApp({
       if (!this.sessionId) return;
       if (fresh) { this.messages = []; this.noMoreMessages = false; }
       // Окно = столько же, сколько уже показано (сохраняем прокрутку вверх), но не всё:
-      // на открытии — 40, максимум 400 (тяжёлые вложения не тянем разом).
-      const limit = Math.min(400, Math.max(40, this.messages.length + 2));
+      // на открытии — msgPageSize (настройка), максимум 400 (тяжёлые вложения не тянем разом).
+      const limit = Math.min(400, Math.max(this.msgPageSize, this.messages.length + 2));
       const rows = await this.api("/sessions/" + this.sessionId + "/messages?limit=" + limit);
       this.messages = rows;
       this.noMoreMessages = rows.length < limit; // получили меньше лимита → старых нет
@@ -814,11 +820,12 @@ createApp({
       this.loadingOlder = true;
       const el = this.$refs.messages;
       const prevH = el ? el.scrollHeight : 0;
+      const page = this.msgPageSize;
       try {
         const older = await this.api(
-          "/sessions/" + this.sessionId + "/messages?before=" + oldest.id + "&limit=40"
+          "/sessions/" + this.sessionId + "/messages?before=" + oldest.id + "&limit=" + page
         );
-        if (older.length < 40) this.noMoreMessages = true;
+        if (older.length < page) this.noMoreMessages = true;
         if (older.length) {
           this.messages = older.concat(this.messages);
           // Держим кадр на месте: добавили сверху -> компенсируем прирост высоты.
@@ -1116,6 +1123,21 @@ createApp({
       if (!(await this.askConfirm("Удалить сообщение?", { okText: "Удалить" }))) return;
       await this.api("/messages/" + msg.id, { method: "DELETE" });
       this.loadMessages();
+    },
+    // Скопировать текст сообщения в буфер обмена одной кнопкой.
+    async copyMessage(m) {
+      const text = m.content || "";
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch (e) {
+        // Резерв для http/старых браузеров, где clipboard API недоступен.
+        const ta = document.createElement("textarea");
+        ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+        document.body.appendChild(ta); ta.select();
+        try { document.execCommand("copy"); } catch (e2) {}
+        document.body.removeChild(ta);
+      }
+      this.showToast("Скопировано");
     },
 
     // ---------- Вложения (мультимодальность) ----------
@@ -1455,15 +1477,19 @@ createApp({
     },
 
     // ---------- Сохранение настроек интерфейса в системе (БД) ----------
-    async loadUiPrefs() {
+    async loadUiPrefs(applyParams = true) {
       const ui = await this.api("/settings/ui");
-      if (ui && ui.params) this.params = { ...this.params, ...ui.params };
+      if (applyParams && ui && ui.params) this.params = { ...this.params, ...ui.params };
+      if (ui && Number(ui.message_preload) > 0) this.messagePreload = Number(ui.message_preload);
     },
     saveUiPrefs() {
       // Дебаунс, чтобы не дёргать сервер на каждое движение ползунка.
       clearTimeout(this._uiSaveTimer);
       this._uiSaveTimer = setTimeout(() => {
-        this.api("/settings/ui", { method: "PUT", body: JSON.stringify({ params: this.params }) }).catch(() => {});
+        this.api("/settings/ui", {
+          method: "PUT",
+          body: JSON.stringify({ params: this.params, message_preload: this.msgPageSize }),
+        }).catch(() => {});
       }, 600);
     },
 
@@ -1802,7 +1828,8 @@ createApp({
       await this.loadConnection();
       await this.loadPresets();
       const def = this.presets.find((p) => p.is_default);
-      if (def) this.applyPreset(def);
+      // Дефолт-пресет задаёт params; message_preload подтягиваем в любом случае.
+      if (def) { this.applyPreset(def); await this.loadUiPrefs(false); }
       else await this.loadUiPrefs();
       await Promise.all([this.loadCharacters(), this.loadPersonas(), this.loadHorae(), this.loadGroups(), this.loadFriends()]);
       if (this.characters.length) this.selectCharacter(this.characters[0]);
@@ -1831,6 +1858,7 @@ createApp({
           if (e.key !== "Escape" || e.defaultPrevented) return;
           if (this.dialog) { this.dialogCancel(); return; }
           if (this.lightbox) { this.lightbox = null; return; }
+          if (this.headerMenu) { this.headerMenu = false; return; }
           if (this.plusMenu) { this.plusMenu = false; return; }
           if (this.notifOpen) { this.notifOpen = false; return; }
           if (this.inviteOpen) { this.inviteOpen = false; return; }
@@ -2006,13 +2034,13 @@ createApp({
         <button class="btn-icon hamburger" @click="sidebarOpen=!sidebarOpen" title="Меню">☰</button>
         <button v-if="canvasOpen" class="btn-icon only-mobile" @click="mobilePane='canvas'" title="Открыть Canvas">📋</button>
         <span class="title">{{ sharedView ? ('🔗 ' + sharedView.title) : (currentIsGroup ? currentGroup.title : (selectedCharacter ? selectedCharacter.name : 'TaleEngine')) }}</span>
-        <span v-if="currentIsGroup" class="pill" title="Участники группы">👥 {{ currentGroup.members.map(m => m.name).join(', ') }}</span>
+        <span v-if="currentIsGroup" class="pill hide-mobile" title="Участники группы">👥 {{ currentGroup.members.map(m => m.name).join(', ') }}</span>
         <span :class="['pill', connected ? 'status-ok' : 'status-err']"
               :title="connected ? 'Соединение с сервером активно' : 'Переподключение…'">{{ connected ? 'online' : '⟳ реконнект' }}</span>
         <span class="pill hide-mobile">{{ params.model || connection.default_model }}</span>
         <span v-if="connection.use_proxy" class="pill hide-mobile" title="Запросы идут в LiteLLM-прокси">proxy {{ connection.base_url }}</span>
         <div style="flex:1"></div>
-        <button v-if="currentIsGroup" class="btn-icon" :class="currentGroup.director ? 'rec-active' : ''"
+        <button v-if="currentIsGroup" class="btn-icon hide-mobile" :class="currentGroup.director ? 'rec-active' : ''"
                 @click="toggleDirector" title="ИИ-режиссёр: решает, кто ответит">🎬</button>
         <!-- Колокольчик уведомлений: входящие заявки в друзья -->
         <div v-if="currentUserObj" class="notif-wrap">
@@ -2032,13 +2060,27 @@ createApp({
             </div>
           </div>
         </div>
-        <button class="btn-icon" @click="soundOn=!soundOn" :title="soundOn ? 'Звук вкл' : 'Звук выкл'">{{ soundOn ? '🔊' : '🔇' }}</button>
-        <button v-if="currentUserObj" class="btn-icon" @click="openProfile" title="Профиль / привязка Telegram">👤<span class="hide-mobile"> {{ currentUserObj.username }}</span></button>
-        <button v-if="sessionId && authStatus.accounts_enabled && !sharedView" class="btn-icon" @click="openInvite({ id: sessionId })" title="Пригласить друга в этот чат">👥</button>
-        <button v-if="sessionId" class="btn-icon" @click="bgPicker=!bgPicker" title="Фон чата">🖼</button>
-        <button class="btn-icon" @click="openDebug" title="Отладка LLM (что уходит в прокси)">🐞</button>
-        <button v-if="isAdmin" class="btn-icon" @click="openAdmin" title="Администрирование">🛡</button>
+        <button class="btn-icon hide-mobile" @click="soundOn=!soundOn" :title="soundOn ? 'Звук вкл' : 'Звук выкл'">{{ soundOn ? '🔊' : '🔇' }}</button>
+        <button v-if="currentUserObj" class="btn-icon hide-mobile" @click="openProfile" title="Профиль / привязка Telegram">👤<span class="hide-mobile"> {{ currentUserObj.username }}</span></button>
+        <button v-if="sessionId && authStatus.accounts_enabled && !sharedView" class="btn-icon hide-mobile" @click="openInvite({ id: sessionId })" title="Пригласить друга в этот чат">👥</button>
+        <button v-if="sessionId" class="btn-icon hide-mobile" @click="bgPicker=!bgPicker" title="Фон чата">🖼</button>
+        <button class="btn-icon hide-mobile" @click="openDebug" title="Отладка LLM (что уходит в прокси)">🐞</button>
+        <button v-if="isAdmin" class="btn-icon hide-mobile" @click="openAdmin" title="Администрирование">🛡</button>
         <button class="btn-icon" @click="drawerTab = drawerTab ? null : 'generation'" title="Настройки">⚙</button>
+        <!-- На мобильном вторичные действия шапки прячем в это меню (⋯) -->
+        <div class="header-menu-wrap only-mobile">
+          <button class="btn-icon" @click="headerMenu=!headerMenu" title="Ещё">⋯</button>
+          <div v-if="headerMenu" class="plus-backdrop" @click="headerMenu=false"></div>
+          <div v-if="headerMenu" class="plus-menu header-menu">
+            <button v-if="currentIsGroup" @click="toggleDirector(); headerMenu=false">🎬 ИИ-режиссёр: {{ currentGroup.director ? 'вкл' : 'выкл' }}</button>
+            <button @click="soundOn=!soundOn; headerMenu=false">{{ soundOn ? '🔊 Звук вкл' : '🔇 Звук выкл' }}</button>
+            <button v-if="currentUserObj" @click="openProfile(); headerMenu=false">👤 Профиль {{ currentUserObj.username }}</button>
+            <button v-if="sessionId && authStatus.accounts_enabled && !sharedView" @click="openInvite({ id: sessionId }); headerMenu=false">👥 Пригласить в чат</button>
+            <button v-if="sessionId" @click="bgPicker=!bgPicker; headerMenu=false">🖼 Фон чата</button>
+            <button @click="openDebug(); headerMenu=false">🐞 Отладка LLM</button>
+            <button v-if="isAdmin" @click="openAdmin(); headerMenu=false">🛡 Администрирование</button>
+          </div>
+        </div>
       </div>
 
       <!-- Выбор фона чата -->
@@ -2060,7 +2102,7 @@ createApp({
         <div v-if="!sessionId" class="empty">Выберите или создайте персонажа и чат слева.</div>
         <!-- Индикатор подгрузки истории при скролле вверх -->
         <div v-if="sessionId && loadingOlder" class="load-older">⏳ Загружаю ранние сообщения…</div>
-        <div v-else-if="sessionId && messages.length >= 40 && noMoreMessages" class="load-older muted">— начало чата —</div>
+        <div v-else-if="sessionId && messages.length >= msgPageSize && noMoreMessages" class="load-older muted">— начало чата —</div>
 
         <div v-for="m in messages" :key="m.id" :class="['msg', m.role]">
           <div v-if="m.speaker_name" class="speaker">{{ m.speaker_name }}</div>
@@ -2108,6 +2150,7 @@ createApp({
               <button class="btn-icon" @click="swipe(m, 1)" :title="m.id === lastAssistantId ? 'Ещё вариант' : ''">▶</button>
             </span>
             <span v-if="m.model_used" class="tag">{{ m.model_used }}</span>
+            <button v-if="!m.canvas_id" class="btn-icon" @click="copyMessage(m)" title="Скопировать текст">📋</button>
             <template v-if="!m.canvas_id">
               <button class="btn-icon" @click="replyTo(m)" title="Ответить на это сообщение">↩</button>
               <button class="btn-icon" @click="startEdit(m)" title="Редактировать">✎</button>
@@ -2307,6 +2350,15 @@ createApp({
           <label class="check danger-text"><input type="checkbox" v-model="params.disable_safety" /> Zero-Censorship — снять фильтры (вкл. по умолчанию; порог OFF)</label>
           <label class="check"><input type="checkbox" v-model="params.send_avatars" /> Показывать нейросети аватары (внешность персонажа и ролевика)</label>
           <label class="check"><input type="checkbox" v-model="params.web_access" /> 🌐 Доступ в интернет (веб-поиск на каждый запрос)</label>
+
+          <template v-if="isAdmin">
+            <div class="hr"></div>
+            <h3>Загрузка чата</h3>
+            <label>Сколько сообщений подгружать (на открытии и за раз при скролле вверх)
+              <input type="number" min="10" max="400" step="10" v-model.number="messagePreload" @change="saveUiPrefs" />
+            </label>
+            <p class="muted" style="margin:2px 0">Меньше — быстрее открываются длинные чаты; больше — сразу видно больше истории. Настройка общая (задаёт админ).</p>
+          </template>
 
           <div class="hr"></div>
           <h3>Пресеты</h3>

@@ -249,6 +249,9 @@ label span { color: var(--text); }
 }
 .plus-menu button { border: none; border-radius: 0; text-align: left; background: transparent; padding: 9px 12px; }
 .plus-menu button:hover { background: var(--bg); }
+/* Меню шапки (⋯ на мобильном) — выпадает ВНИЗ из кнопки, к правому краю. */
+.header-menu-wrap { position: relative; }
+.plus-menu.header-menu { bottom: auto; top: 118%; left: auto; right: 0; z-index: 30; }
 
 /* Подсветка зоны при перетаскивании файла (drag&drop). */
 .drop-overlay {
@@ -303,6 +306,14 @@ label span { color: var(--text); }
   .backdrop { display: block; position: fixed; inset: 0; z-index: 49; background: rgba(0,0,0,0.5); }
   .drawer { width: 100%; max-width: 100%; }
   .msg { max-width: 100%; }
+  /* Заголовок не должен распирать шапку — обрезаем многоточием. */
+  .chat-header .title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  /* Композер: поле ввода на всю ширину и повыше, кнопки — строкой ниже. */
+  .composer { padding: 8px; }
+  .composer .row { flex-wrap: wrap; gap: 6px; }
+  .composer textarea { min-height: 84px; }
+  .composer-input { order: -1; flex: 1 1 100%; }
+  .composer .row > .btn-primary, .composer .row > .btn-danger { margin-left: auto; }
 }
 
 /* ============================================================

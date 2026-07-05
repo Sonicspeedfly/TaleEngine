@@ -37,10 +37,22 @@ Node.js, npm и шаг компиляции не нужны.
   `renameSession`, `deleteSession`, `exportSession` (нативный экспорт), `importChat`
   (автоопределение нативный/SillyTavern), `downloadJson`.
 - **Ленивая подгрузка сообщений:** `loadMessages(fresh)` грузит не всю историю, а окно
-  (`?limit=`): на открытии чата — последние 40; `loadOlder` при скролле вверх
-  (`onMessagesScroll`, порог 120px) подгружает `?before=<id>&limit=40` и **сохраняет
-  позицию прокрутки** (компенсирует прирост высоты). `noMoreMessages` — дошли до начала;
-  вверху — индикатор `.load-older`.
+  (`?limit=`): на открытии чата — `msgPageSize` сообщений; `loadOlder` при скролле вверх
+  (`onMessagesScroll`, порог 120px) подгружает `?before=<id>&limit=msgPageSize` и
+  **сохраняет позицию прокрутки** (компенсирует прирост высоты). `noMoreMessages` — дошли
+  до начала; вверху — индикатор `.load-older`.
+- **Размер предзагрузки — настройка админа.** `messagePreload` (computed `msgPageSize`
+  клампит 10..400) хранится в общих `/settings/ui` (`message_preload`); число-инпут в
+  дровере «Генерация» под `v-if="isAdmin"`.
+- **Копирование сообщения:** `copyMessage(m)` (кнопка 📋 в `.msg-meta`) — `navigator.
+  clipboard` с fallback на `textarea+execCommand` (для http/старых браузеров) + тост.
+- **Мобильная шапка:** вторичные кнопки (🎬🔊👤👥🖼🐞🛡) — `hide-mobile`, вместо них
+  кнопка ⋯ (`only-mobile`) открывает выпадашку `.header-menu` с теми же действиями
+  (в Esc-цепочке `headerMenu`). Заголовок обрезается многоточием, длинный список
+  участников группы скрыт на мобиле.
+- **Мобильный композер:** на ≤760px `.composer .row` переносит строку, `.composer-input`
+  (`order:-1; flex:1 1 100%; min-height 84px`) занимает всю ширину, кнопки уходят строкой
+  ниже, «Отправить» прижат вправо.
 - **WebSocket/генерация:** `connectWs`, `onWsEvent`, `send`, `regenerate`, `stop`,
   `continueReply`, `finishStream`, `resumeSSE`; кросс-чат: `_handoffStreaming`,
   `_trackBackgroundJob`, `showToast`.
