@@ -39,7 +39,8 @@ HTTP Basic Auth поверх всего нужен ещё заголовок `Au
 | GET | `/api/sessions/shared` | Чаты, которыми со мной поделились |
 | PATCH | `/api/sessions/{id}` | Переименование/мета (scenario, author_note, фон, …) |
 | DELETE | `/api/sessions/{id}` | Удалить чат |
-| GET | `/api/sessions/{id}/messages` | Сообщения чата. Пагинация: `?limit=N` — последние N; `?before=<id>&limit=N` — порция старше id (ленивая подгрузка при скролле вверх); без параметров — вся история |
+| GET | `/api/sessions/{id}/messages` | Сообщения чата. Пагинация: `?limit=N` — последние N; `?before=<id>&limit=N` — порция старше id (ленивая подгрузка при скролле вверх); без параметров — вся история. Вложения — только МЕТА (type/mime/name/size), БЕЗ base64 (иначе чат с фото/аудио весит десятки МБ) |
+| GET | `/api/messages/{id}/att/{idx}` | Байты одного вложения сообщения (лениво грузят `<img>`/`<audio>`, кэшируется). Авторизация — заголовком или `?token=`/`?access_code=` (теги не шлют заголовки) |
 | PATCH | `/api/messages/{id}` | Редактировать сообщение/свайп |
 | DELETE | `/api/messages/{id}` | Удалить сообщение |
 | GET | `/api/sessions/{id}/export` | **Нативный экспорт чата AiChat** |

@@ -137,7 +137,9 @@ class AccessMiddleware(BaseHTTPMiddleware):
         is_admin_path = path.startswith("/api/admin/")
 
         if sec.get("accounts_enabled"):
-            token = request.headers.get("X-User-Token", "")
+            # Токен из заголовка ИЛИ из query (?token=) — второе нужно для <img>/<audio>,
+            # которые не умеют слать заголовки (лениво подгружаемые вложения).
+            token = request.headers.get("X-User-Token", "") or request.query_params.get("token", "")
             async with AsyncSessionLocal() as db:
                 user = await accounts.user_from_token(db, token)
             if user is None:
@@ -158,7 +160,9 @@ class AccessMiddleware(BaseHTTPMiddleware):
             if code:
                 ap = sec.get("admin_password") or ""
                 adm = request.headers.get("X-Admin-Password", "")
-                if request.headers.get("X-Access-Code", "") != code and not (ap and adm == ap):
+                # Код из заголовка ИЛИ из query (?access_code=) — для <img>/<audio>.
+                given = request.headers.get("X-Access-Code", "") or request.query_params.get("access_code", "")
+                if given != code and not (ap and adm == ap):
                     return JSONResponse({"detail": "Требуется код доступа"}, status_code=401)
         return await call_next(request)
 
@@ -554,6 +558,48 @@ async def delete_session(
     return {"ok": True}
 
 
+def _att_meta(a: dict) -> dict:
+    """Мета вложения для списка сообщений (без тяжёлого base64 `data`)."""
+    data = a.get("data") or ""
+    size = int(len(data) * 0.75) if data else int(a.get("size") or 0)  # ~сырой размер
+    return {"type": a.get("type"), "mime": a.get("mime"), "name": a.get("name"), "size": size}
+
+
+@app.get("/api/messages/{message_id}/att/{idx}")
+async def get_attachment(
+    message_id: int, idx: int,
+    token: str = "", x_user_token: str | None = Header(default=None),
+    db: AsyncSession = Depends(get_session),
+):
+    """
+    Отдаёт байты одного вложения сообщения (лениво подгружается тегами <img>/<audio>).
+    Так список сообщений остаётся лёгким, а картинки/аудио грузятся по мере показа и
+    кэшируются браузером. Авторизация — по токену (заголовок или ?token=, т.к. <img>
+    не шлёт заголовки); доступ к чату проверяется как обычно.
+    """
+    msg = await db.get(models.Message, message_id)
+    if not msg:
+        raise HTTPException(404, "Сообщение не найдено")
+    sess = await db.get(models.ChatSession, msg.session_id)
+    user = None
+    if admin_service.security_cache().get("accounts_enabled"):
+        user = await accounts.user_from_token(db, x_user_token or token)
+    if not await _can_access_session(db, sess, user):
+        raise HTTPException(403, "Нет доступа к этому чату")
+    atts = msg.attachments or []
+    if not (0 <= idx < len(atts)) or not isinstance(atts[idx], dict):
+        raise HTTPException(404, "Вложение не найдено")
+    data = atts[idx].get("data") or ""
+    mime = atts[idx].get("mime") or "application/octet-stream"
+    b64 = data.split(",", 1)[1] if data.startswith("data:") and "," in data else data
+    try:
+        raw = base64.b64decode(b64)
+    except Exception:  # noqa: BLE001
+        raise HTTPException(422, "Не удалось декодировать вложение")
+    # Вложения неизменяемы — можно смело кэшировать в браузере.
+    return Response(content=raw, media_type=mime, headers={"Cache-Control": "private, max-age=604800"})
+
+
 @app.get("/api/sessions/{session_id}/messages")
 async def get_messages(
     session_id: int, before: int | None = None, limit: int | None = None,
@@ -591,7 +637,9 @@ async def get_messages(
             "id": m.id,
             "role": m.role,
             "content": m.content,
-            "attachments": m.attachments,
+            # Только МЕТА вложений (без base64 data) — иначе чат с фото/аудио весит
+            # десятки МБ и грузится медленно. Сами данные отдаёт /messages/{id}/att/{i}.
+            "attachments": [_att_meta(a) for a in (m.attachments or []) if isinstance(a, dict)],
             "swipes": m.swipes or [m.content],
             "active_swipe": m.active_swipe,
             "model_used": m.model_used,

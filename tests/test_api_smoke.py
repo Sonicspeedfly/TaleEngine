@@ -331,6 +331,48 @@ def test_cancel_job_endpoint(client):
     assert client.post("/api/jobs/nonexistent/cancel").status_code == 200
 
 
+def test_attachment_served_separately_not_in_list(client):
+    """
+    Оптимизация загрузки: base64-данные вложений НЕ в списке сообщений (иначе чат
+    весит десятки МБ), а отдаются отдельным кэшируемым эндпоинтом по мере показа.
+    """
+    import base64
+
+    cid = client.post("/api/characters", json={"name": "Влож"}).json()["id"]
+    sid = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]
+    raw = b"\x89PNG\r\n\x1a\n" + b"fake-image-bytes" * 50
+    data_uri = "data:image/png;base64," + base64.b64encode(raw).decode()
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        r = client.post(
+            f"/api/sessions/{sid}/send",
+            json={"content": "смотри фото", "attachments": [
+                {"type": "image", "data": data_uri, "mime": "image/png", "name": "p.png"}
+            ]},
+        )
+        jid = r.json()["job_id"]
+        with client.stream("GET", f"/sse/job/{jid}") as resp:
+            for line in resp.iter_lines():
+                if line and ('"done"' in line or '"error"' in line):
+                    break
+    msgs = client.get(f"/api/sessions/{sid}/messages").json()
+    umsg = [m for m in msgs if m["role"] == "user"][-1]
+    att = umsg["attachments"][0]
+    # Мета есть, тяжёлого base64 `data` — НЕТ.
+    assert att["type"] == "image" and att["mime"] == "image/png" and att["name"] == "p.png"
+    assert "data" not in att and att["size"] > 0
+
+    # Байты отдаёт отдельный эндпоинт с правильным content-type и кэшем.
+    resp = client.get(f"/api/messages/{umsg['id']}/att/0")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("image/png")
+    assert "max-age" in resp.headers.get("cache-control", "")
+    assert resp.content == raw
+
+    # Несуществующий индекс/сообщение — 404.
+    assert client.get(f"/api/messages/{umsg['id']}/att/9").status_code == 404
+    assert client.get("/api/messages/999999/att/0").status_code == 404
+
+
 def test_messages_pagination(client):
     """Ленивая подгрузка: limit=последние N; before=<id> — порция старше него."""
     cid = client.post("/api/characters", json={"name": "Пейдж"}).json()["id"]

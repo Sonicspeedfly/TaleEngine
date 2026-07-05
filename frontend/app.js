@@ -803,14 +803,18 @@ createApp({
     // (последние 40 + скролл вниз); иначе обновление текущего окна (после хода/правки).
     async loadMessages(fresh = false) {
       if (!this.sessionId) return;
+      // Если пользователь прокрутил вверх и читает историю — НЕ дёргаем его вниз
+      // при обновлении (после хода/правки). Прыгаем вниз только у нижней кромки/на открытии.
+      const el = this.$refs.messages;
+      const wasNearBottom = fresh || !el || (el.scrollHeight - el.scrollTop - el.clientHeight < 160);
       if (fresh) { this.messages = []; this.noMoreMessages = false; }
       // Окно = столько же, сколько уже показано (сохраняем прокрутку вверх), но не всё:
-      // на открытии — msgPageSize (настройка), максимум 400 (тяжёлые вложения не тянем разом).
+      // на открытии — msgPageSize (настройка), максимум 400.
       const limit = Math.min(400, Math.max(this.msgPageSize, this.messages.length + 2));
       const rows = await this.api("/sessions/" + this.sessionId + "/messages?limit=" + limit);
       this.messages = rows;
       this.noMoreMessages = rows.length < limit; // получили меньше лимита → старых нет
-      this.scrollDown();
+      if (wasNearBottom) this.scrollDown();
     },
     // Подгрузка порции более старых сообщений при скролле вверх (сохраняем позицию).
     async loadOlder() {
@@ -1172,6 +1176,17 @@ createApp({
         };
         reader.readAsDataURL(file);
       }
+    },
+    // Авторизация в query — для <img>/<audio>, которые не умеют слать заголовки.
+    _authQuery() {
+      if (this.userToken) return "token=" + encodeURIComponent(this.userToken);
+      if (this.accessCode) return "access_code=" + encodeURIComponent(this.accessCode);
+      return "";
+    },
+    // URL вложения сохранённого сообщения (данные грузятся лениво, не в списке чата).
+    attUrl(m, i) {
+      const q = this._authQuery();
+      return "/api/messages/" + m.id + "/att/" + i + (q ? "?" + q : "");
     },
     fmtSize(bytes) {
       if (!bytes) return "";
@@ -2135,9 +2150,11 @@ createApp({
             <!-- предпросмотр вложений сообщения -->
             <div v-if="m.attachments && m.attachments.length" class="attachments">
               <template v-for="(a, ai) in m.attachments" :key="ai">
-                <img v-if="a.type==='image'" :src="a.data" class="att-img" @click="lightbox=a.data" title="Открыть" />
-                <audio v-else-if="a.type==='audio'" :src="a.data" controls class="att-audio"></audio>
-                <a v-else class="att-doc" :href="a.data" :download="a.name || 'файл'" title="Скачать">📄 {{ a.name || 'документ' }}</a>
+                <!-- a.data есть только у своего свежеотправленного (оптимистичного) сообщения;
+                     у загруженных из БД — тянем лениво по attUrl (кэшируется браузером). -->
+                <img v-if="a.type==='image'" :src="a.data || attUrl(m, ai)" loading="lazy" class="att-img" @click="lightbox = a.data || attUrl(m, ai)" title="Открыть" />
+                <audio v-else-if="a.type==='audio'" :src="a.data || attUrl(m, ai)" controls preload="none" class="att-audio"></audio>
+                <a v-else class="att-doc" :href="a.data || attUrl(m, ai)" :download="a.name || 'файл'" title="Скачать">📄 {{ a.name || 'документ' }}</a>
               </template>
             </div>
           </div>
