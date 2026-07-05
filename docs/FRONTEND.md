@@ -39,8 +39,16 @@ Node.js, npm и шаг компиляции не нужны.
 - **WebSocket/генерация:** `connectWs`, `onWsEvent`, `send`, `regenerate`, `stop`,
   `continueReply`, `finishStream`, `resumeSSE`; кросс-чат: `_handoffStreaming`,
   `_trackBackgroundJob`, `showToast`.
-- **Вложения:** `onAttach` (множественный выбор, авто-тип), `attachLabel`, `toggleRecord`
-  (запись голоса).
+- **Вложения:** `onAttach`/`onPaste`/`onDrop`→`addFiles` (📎, Ctrl+V, drag&drop),
+  `toggleRecord` (запись голоса). **Загрузка с обратной связью:** плашка вложения
+  появляется СРАЗУ со спиннером (`loading:true`), а `data` дочитывается `FileReader`
+  асинхронно (мутируем реактивную ссылку из массива, чтобы Vue перерисовал состояние).
+  Готово → миниатюра/иконка; ошибка → ⚠ + красная рамка + тост. Computed
+  `attachmentsLoading` + `_awaitAttachments()`: `send`/`sendArt` — async и **ждут
+  дочитывания всех файлов** перед отправкой (иначе сообщение уходило без ещё не
+  загруженного вложения — гонка с FileReader). `_dropBadAttachments` убирает битые,
+  `_cleanAtts` шлёт на бэкенд только поля `AttachmentIn`. Пока грузятся — жёлтая плашка
+  `.files-bar` и кнопка «⏳ файлы…».
 - **Память Horae:** `loadHorae`, `saveHorae`, `editHorae`, `deleteHorae`.
 - **Персоны/Author's Note:** `loadPersonas`, `createPersona`, `applySessionMeta`.
 - **Аккаунты/друзья:** `submitAuth`, `logout`, `loadFriends`, `addFriend`,

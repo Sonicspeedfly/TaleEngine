@@ -31,6 +31,7 @@ createApp({
       // Какая панель видна на мобильном, когда открыт Канвас: 'chat' | 'canvas'.
       mobilePane: "chat",
       pendingAttachments: [],
+      waitingFiles: false,      // отправка ждёт дочитывания вложений
       plusMenu: false,          // выпадашка [+]: голос/арт (второстепенные действия)
       dragOver: false,          // подсветка зоны при перетаскивании файла
       lightbox: null,           // data:URI картинки для полноэкранного предпросмотра
@@ -229,6 +230,10 @@ createApp({
     canvasSelText() {
       if (!this.canvas || this.canvasSel.end <= this.canvasSel.start) return "";
       return (this.canvas.content || "").slice(this.canvasSel.start, this.canvasSel.end);
+    },
+    // Хоть одно вложение ещё читается (спиннер) — отправку задерживаем до готовности.
+    attachmentsLoading() {
+      return this.pendingAttachments.some((a) => a.loading);
     },
     // Последний ход остался без ответа (ошибка/обрыв/ручная остановка) — можно повторить.
     canRetry() {
@@ -919,13 +924,23 @@ createApp({
       this.canvasCmdMode = false;
       await this.reviseCanvas(cmd);
     },
-    send() {
+    async send() {
       const content = this.input.trim();
       if ((!content && this.pendingAttachments.length === 0) || !this.connected || this.streaming) return;
+      // Дожидаемся дочитывания ВСЕХ файлов сообщения, прежде чем отправлять — иначе
+      // сообщение могло уйти без ещё не загруженного вложения (гонка с FileReader).
+      if (this.attachmentsLoading) {
+        this.waitingFiles = true;
+        await this._awaitAttachments();
+        this.waitingFiles = false;
+        if (!this.connected || this.streaming) return; // состояние изменилось, пока ждали
+      }
+      this._dropBadAttachments(); // выкидываем не прочитавшиеся вложения
+      if (!content && this.pendingAttachments.length === 0) return; // всё отвалилось
       // ===== Умная маршрутизация интентов для Canvas =====
       // Явный триггер «📄 Документ»: новый файл, ИЛИ правка открытого (если не «с нуля»).
       if (this.canvasGenMode) {
-        const atts = this.pendingAttachments;
+        const atts = this._cleanAtts(this.pendingAttachments);
         this.input = ""; this.pendingAttachments = []; this.canvasGenMode = false; this.resetComposerHeight();
         if (this.canvasOpen && this.canvas && !this._isNewCanvasIntent(content)) this.editOpenCanvas(content);
         else this.canvasGenerate(content, atts);
@@ -934,7 +949,7 @@ createApp({
       // Канвас ОТКРЫТ и запрос контекстный: «новый …» → новый файл; правка → мутируем открытый.
       if (this.canvasOpen && this.canvas && content) {
         if (this._isNewCanvasIntent(content)) {
-          const atts = this.pendingAttachments;
+          const atts = this._cleanAtts(this.pendingAttachments);
           this.input = ""; this.pendingAttachments = []; this.resetComposerHeight();
           this.canvasGenerate(content, atts);
           return;
@@ -946,15 +961,16 @@ createApp({
         }
       }
       this.chatError = "";
-      // Оптимистично показываем своё сообщение сразу.
-      this.messages.push({ id: "tmp", role: "user", content, swipes: [content], active_swipe: 0 });
+      const attachments = this._cleanAtts(this.pendingAttachments);
+      // Оптимистично показываем своё сообщение сразу (с вложениями — их видно в пузыре).
+      this.messages.push({ id: "tmp", role: "user", content, attachments, swipes: [content], active_swipe: 0 });
       this.currentReply = "";
       this.liveBubbles = [];
       this.streaming = true;
       this._lastEvtAt = Date.now();
       this.ws.send(JSON.stringify({
         type: "user_message", content,
-        attachments: this.pendingAttachments, params: this.params,
+        attachments, params: this.params,
         reply_to_message_id: this.replyToId,
       }));
       this.input = "";
@@ -1051,18 +1067,54 @@ createApp({
       if (a.type === "audio") return "🎤 аудио";
       return "🖼 фото";
     },
-    // Добавить файлы во вложения текущего сообщения (общий код для 📎 и drag&drop).
+    // Добавить файлы во вложения текущего сообщения (общий код для 📎, вставки и DnD).
+    // Плашка появляется СРАЗУ со спиннером, а data дочитывается асинхронно — так видно,
+    // что файл грузится, а send() дожидается готовности всех вложений (см. attachmentsLoading).
     addFiles(files) {
       for (const file of [...files]) {
+        const mime = file.type || "application/octet-stream";
+        let type = "image";
+        if (mime.startsWith("audio")) type = "audio";
+        else if (!mime.startsWith("image")) type = "document"; // pdf/docx/txt/...
+        const raw = {
+          id: (this._attSeq = (this._attSeq || 0) + 1),
+          type, mime, name: file.name || "файл", size: file.size || 0,
+          data: null, loading: true, error: false,
+        };
+        this.pendingAttachments.push(raw);
+        // Берём РЕАКТИВНУЮ ссылку из массива (Vue оборачивает элемент) — иначе
+        // мутация полей не вызовет перерисовку спиннера/превью.
+        const att = this.pendingAttachments[this.pendingAttachments.length - 1];
         const reader = new FileReader();
-        reader.onload = () => {
-          let type = "image";
-          if (file.type.startsWith("audio")) type = "audio";
-          else if (!file.type.startsWith("image")) type = "document"; // pdf/docx/txt/...
-          this.pendingAttachments.push({ type, data: reader.result, mime: file.type, name: file.name });
+        reader.onload = () => { att.data = reader.result; att.loading = false; };
+        reader.onerror = () => {
+          att.error = true; att.loading = false;
+          this.showToast("Не удалось прочитать файл: " + att.name);
         };
         reader.readAsDataURL(file);
       }
+    },
+    fmtSize(bytes) {
+      if (!bytes) return "";
+      if (bytes < 1024) return bytes + " Б";
+      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + " КБ";
+      return (bytes / 1024 / 1024).toFixed(1) + " МБ";
+    },
+    removeAttachment(i) { this.pendingAttachments.splice(i, 1); },
+    // Промис, который завершается, когда ВСЕ вложения дочитаны (data готова или ошибка).
+    _awaitAttachments() {
+      return new Promise((resolve) => {
+        const check = () => (this.attachmentsLoading ? setTimeout(check, 60) : resolve());
+        check();
+      });
+    },
+    // Убрать неудавшиеся/пустые вложения перед отправкой.
+    _dropBadAttachments() {
+      this.pendingAttachments = this.pendingAttachments.filter((a) => a.data && !a.error);
+    },
+    // Чистый payload для бэкенда: только поля AttachmentIn (без служебных id/size/loading).
+    _cleanAtts(list) {
+      return list.map((a) => ({ type: a.type, data: a.data, mime: a.mime, name: a.name }));
     },
     onAttach(e) {
       this.addFiles(e.target.files);   // несколько файлов сразу
@@ -1108,11 +1160,17 @@ createApp({
         };
         this.mediaRecorder.onstop = () => {
           const blob = new Blob(this.recChunks, { type: this.mediaRecorder.mimeType || "audio/webm" });
-          const reader = new FileReader();
-          reader.onload = () => {
-            // Аудио уходит модели как есть — Gemini понимает его нативно.
-            this.pendingAttachments.push({ type: "audio", data: reader.result, mime: blob.type });
+          const raw = {
+            id: (this._attSeq = (this._attSeq || 0) + 1),
+            type: "audio", mime: blob.type, name: "Голосовое сообщение",
+            size: blob.size, data: null, loading: true, error: false,
           };
+          this.pendingAttachments.push(raw);
+          const att = this.pendingAttachments[this.pendingAttachments.length - 1];
+          const reader = new FileReader();
+          // Аудио уходит модели как есть — Gemini понимает его нативно.
+          reader.onload = () => { att.data = reader.result; att.loading = false; };
+          reader.onerror = () => { att.error = true; att.loading = false; };
           reader.readAsDataURL(blob);
           stream.getTracks().forEach((t) => t.stop()); // отпускаем микрофон
           this.recording = false;
@@ -1160,8 +1218,14 @@ createApp({
     async sendArt() {
       const desc = this.input.trim();
       if (!desc && this.pendingAttachments.length === 0) return;
+      if (this.attachmentsLoading) {  // ждём дочитывания прикреплённых фото-референсов
+        this.waitingFiles = true;
+        await this._awaitAttachments();
+        this.waitingFiles = false;
+      }
+      this._dropBadAttachments();
       this.chatError = "";
-      const attachments = this.pendingAttachments;
+      const attachments = this._cleanAtts(this.pendingAttachments);
       this.input = "";
       this.pendingAttachments = [];
       this.artMode = false;
@@ -1985,12 +2049,24 @@ createApp({
           📝 Открыт «{{ canvas.title || 'без названия' }}»: правки («исправь…», «сделай длиннее») меняют его; «напиши новый…» создаст отдельный.
         </div>
         <div class="chips" v-if="pendingAttachments.length">
-          <span class="chip att-chip" v-for="(a, i) in pendingAttachments" :key="i">
-            <img v-if="a.type==='image'" :src="a.data" class="att-thumb" @click="lightbox=a.data" />
-            <audio v-else-if="a.type==='audio'" :src="a.data" controls class="att-audio-sm"></audio>
-            <span v-else>{{ attachLabel(a) }}</span>
-            <a href="#" class="att-x" @click.prevent="pendingAttachments.splice(i, 1)">✕</a>
+          <span class="chip att-chip" :class="{ 'att-loading': a.loading, 'att-error': a.error }"
+                v-for="(a, i) in pendingAttachments" :key="a.id">
+            <span v-if="a.loading" class="att-state">⏳</span>
+            <span v-else-if="a.error" class="att-state">⚠</span>
+            <template v-else>
+              <img v-if="a.type==='image'" :src="a.data" class="att-thumb" @click="lightbox=a.data" title="Открыть" />
+              <audio v-else-if="a.type==='audio'" :src="a.data" controls class="att-audio-sm"></audio>
+              <span v-else class="att-state">📄</span>
+            </template>
+            <span class="att-name" v-if="a.loading || a.error || a.type!=='image'">
+              {{ a.error ? 'ошибка' : (a.type==='audio' ? '🎤 голос' : a.name) }}<i v-if="a.size"> · {{ fmtSize(a.size) }}</i>
+            </span>
+            <a href="#" class="att-x" @click.prevent="removeAttachment(i)" title="Убрать">✕</a>
           </span>
+        </div>
+        <!-- Пока файлы читаются — предупреждаем, что отправка подождёт их -->
+        <div v-if="attachmentsLoading || waitingFiles" class="art-indicator files-bar">
+          ⏳ Загрузка вложений… {{ waitingFiles ? 'отправлю, как только дочитаются.' : 'дождитесь готовности перед отправкой.' }}
         </div>
         <div class="row">
           <!-- [+] второстепенные действия: документ, арт -->
@@ -2017,7 +2093,7 @@ createApp({
           <button v-else-if="canvasCmdMode" class="btn-primary" @click="applyCanvasCmd" :disabled="canvasBusy">✨ Применить</button>
           <button v-else-if="canvasGenMode" class="btn-primary" @click="send" :disabled="!connected || canvasGenerating">{{ canvasGenerating ? '⏳…' : '📄 Создать' }}</button>
           <button v-else-if="artMode" class="btn-primary" @click="sendArt" :disabled="!connected">🎨 Сгенерировать</button>
-          <button v-else class="btn-primary" @click="send" :disabled="!connected">Отправить</button>
+          <button v-else class="btn-primary" @click="send" :disabled="!connected || waitingFiles">{{ waitingFiles ? '⏳ файлы…' : 'Отправить' }}</button>
         </div>
       </div>
     </div>

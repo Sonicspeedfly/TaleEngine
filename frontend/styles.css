@@ -386,10 +386,24 @@ label span { color: var(--text); }
 .invite-item .grow { flex: 1; min-width: 0; }
 
 /* ----- Чипы предпросмотра в композере ----- */
-.att-chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px; }
+.att-chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px; border: 1px solid var(--border);
+  border-radius: 8px; background: var(--bg3); font-size: 12px; }
 .att-thumb { width: 40px; height: 40px; border-radius: 6px; object-fit: cover; cursor: zoom-in; }
 .att-audio-sm { height: 30px; max-width: 180px; }
-.att-x { margin-left: 2px; }
+.att-x { margin-left: 2px; color: var(--muted); }
+.att-x:hover { color: var(--danger); }
+.att-name { color: var(--muted); max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.att-name i { opacity: 0.7; font-style: normal; }
+.att-state { width: 40px; height: 40px; display: grid; place-items: center; font-size: 18px;
+  border-radius: 6px; background: var(--bg); }
+/* Плашка вложения во время чтения — мигающий спиннер; при ошибке — красная рамка. */
+.att-chip.att-loading { border-color: var(--accent); }
+.att-chip.att-loading .att-state { animation: att-pulse 1s ease-in-out infinite; }
+.att-chip.att-error { border-color: var(--danger); }
+.att-chip.att-error .att-state, .att-chip.att-error .att-name { color: var(--danger); }
+@keyframes att-pulse { 0%,100% { opacity: 0.4; } 50% { opacity: 1; } }
+/* Статус-строка «идёт загрузка вложений» над композером. */
+.art-indicator.files-bar { background: rgba(222, 179, 91, 0.14); border-color: #b9944a; color: #ecd9ae; }
 
 /* ----- Лайтбокс ----- */
 .lightbox { position: fixed; inset: 0; z-index: 95; background: rgba(0,0,0,0.85); display: grid; place-items: center; cursor: zoom-out; padding: 24px; }
