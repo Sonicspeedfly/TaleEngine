@@ -1273,19 +1273,19 @@ createApp({
     // Плашка появляется СРАЗУ со спиннером, а data дочитывается асинхронно — так видно,
     // что файл грузится, а send() дожидается готовности всех вложений (см. attachmentsLoading).
     addFiles(files) {
-      // Больше ~20 МБ inline не принимает сам Gemini (лимит запроса) — честно
-      // отказываем сразу, вместо загадочной ошибки после отправки.
-      const MAX_ATTACH = 20 * 1024 * 1024;
+      // Размер НЕ ограничиваем: сколько реально пройдёт — зависит от провайдера
+      // и прокси (напрямую в Gemini inline ~20 МБ, через Vertex/Files API — больше).
+      // Для очень крупных файлов лишь предупреждаем, чтобы отказ не был загадкой.
+      const WARN_ATTACH = 20 * 1024 * 1024;
       for (const file of [...files]) {
         const mime = file.type || "application/octet-stream";
         let type = "image";
         if (mime.startsWith("audio")) type = "audio";
         else if (mime.startsWith("video")) type = "video";
         else if (!mime.startsWith("image")) type = "document"; // pdf/docx/txt/...
-        if (file.size > MAX_ATTACH) {
-          this.showToast("«" + (file.name || "файл") + "» слишком большой: " + this.fmtSize(file.size)
-            + " (лимит нейросети ~20 МБ). Сожмите или обрежьте файл.");
-          continue;
+        if (file.size > WARN_ATTACH) {
+          this.showToast("«" + (file.name || "файл") + "» — " + this.fmtSize(file.size)
+            + ". Отправлю как есть; если провайдер не примет такой объём — ответ придёт с ошибкой, тогда сожмите файл.");
         }
         const raw = {
           id: (this._attSeq = (this._attSeq || 0) + 1),
