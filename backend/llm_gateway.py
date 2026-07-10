@@ -87,6 +87,42 @@ def build_user_content(text: str, attachments: list[AttachmentIn]):
     return blocks
 
 
+# С какого объёма payload считаем запрос «большим» (base64-видео/аудио и т.п.).
+_LARGE_PAYLOAD_BYTES = 8 * 1024 * 1024
+
+
+def _payload_bytes(messages: list[dict]) -> int:
+    """Приблизительный объём запроса в байтах (текст + inline base64-данные)."""
+    total = 0
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, str):
+            total += len(c)
+        elif isinstance(c, list):
+            for b in c:
+                if not isinstance(b, dict):
+                    continue
+                t = b.get("type")
+                if t == "text":
+                    total += len(b.get("text") or "")
+                elif t == "image_url":
+                    total += len(((b.get("image_url") or {}).get("url")) or "")
+                elif t == "input_audio":
+                    total += len(((b.get("input_audio") or {}).get("data")) or "")
+    return total
+
+
+def _request_timeout(messages: list[dict]) -> int:
+    """
+    Таймаут под размер запроса: большие мультимодальные payload'ы (видео, аудио)
+    добираются до Vertex и обрабатываются моделью значительно дольше 120 секунд —
+    иначе крупный файл стабильно падал бы по таймауту, хотя провайдер его принимает.
+    """
+    if _payload_bytes(messages) > _LARGE_PAYLOAD_BYTES:
+        return max(settings.REQUEST_TIMEOUT, settings.LARGE_REQUEST_TIMEOUT)
+    return settings.REQUEST_TIMEOUT
+
+
 def _merge_params(params: Optional[GenerationParams]) -> dict:
     """Сливает дефолты из .env с тем, что пришло из UI (UI имеет приоритет)."""
     merged = {
@@ -167,7 +203,8 @@ async def stream_completion(
     call_kwargs: dict = {
         "messages": messages,
         "stream": True,
-        "timeout": settings.REQUEST_TIMEOUT,
+        # Большой мультимодальный запрос (видео/аудио) получает увеличенный таймаут.
+        "timeout": _request_timeout(messages),
         **_merge_params(params),
     }
     _apply_connection(call_kwargs, params, connection)
@@ -331,7 +368,8 @@ async def generate_image_chat(
 
     kwargs: dict = {
         "messages": [{"role": "user", "content": content}],
-        "timeout": settings.REQUEST_TIMEOUT,
+        # Референсы — data:URI картинок; при большом объёме даём больше времени.
+        "timeout": _request_timeout([{"role": "user", "content": content}]),
         **_route_kwargs(connection, model_name),
     }
     entry = debug_log.log_request(

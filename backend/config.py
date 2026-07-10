@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     # ----- LLM / LiteLLM -----
     DEFAULT_MODEL: str = "gpt-4o"
     REQUEST_TIMEOUT: int = 120  # секунды на запрос к провайдеру
+    # Таймаут для БОЛЬШИХ мультимодальных запросов (видео/аудио inline):
+    # загрузка в прокси/Vertex и обработка медиа до первого токена занимают
+    # заметно дольше обычного текстового запроса.
+    LARGE_REQUEST_TIMEOUT: int = 600
 
     # ----- LiteLLM Proxy -----
     # Если у вас уже запущен LiteLLM-прокси (litellm --port 4000), все запросы

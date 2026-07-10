@@ -380,6 +380,13 @@ label span { color: var(--text); }
 .att-img { max-width: 220px; max-height: 220px; border-radius: 10px; cursor: zoom-in; object-fit: cover; border: 1px solid var(--border); }
 .att-audio { height: 36px; max-width: 260px; }
 .att-video { max-width: 320px; max-height: 240px; border-radius: 10px; border: 1px solid var(--border); background: #000; }
+
+/* Полоса прогресса отправки файлов на сервер (над композером). */
+.upload-bar i { font-style: normal; opacity: 0.8; }
+.upload-track { display: block; height: 6px; margin-top: 6px; border-radius: 4px;
+  background: var(--bg3); overflow: hidden; }
+.upload-fill { display: block; height: 100%; border-radius: 4px; background: var(--accent);
+  transition: width 0.15s linear; }
 .att-doc { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border-radius: 8px;
   background: var(--bg3); border: 1px solid var(--border); color: var(--text); text-decoration: none; font-size: 13px; }
 .att-doc:hover { border-color: var(--accent); }

@@ -167,6 +167,29 @@ def test_build_user_content_with_image_returns_blocks():
     assert content[1]["type"] == "image_url"
 
 
+@pytest.mark.asyncio
+async def test_large_multimodal_payload_gets_bigger_timeout():
+    """Большое inline-видео не должно падать по обычному 120-с таймауту."""
+    from backend.config import settings
+
+    big = AttachmentIn(type="video", data="data:video/mp4;base64," + "A" * 10_000_000, mime="video/mp4")
+    content = build_user_content("смотри", [big])
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        _ = [t async for t in stream_completion([{"role": "user", "content": content}])]
+    assert _fake_acompletion.captured["timeout"] == max(
+        settings.REQUEST_TIMEOUT, settings.LARGE_REQUEST_TIMEOUT
+    )
+
+
+@pytest.mark.asyncio
+async def test_small_payload_keeps_default_timeout():
+    from backend.config import settings
+
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        _ = [t async for t in stream_completion([{"role": "user", "content": "привет"}])]
+    assert _fake_acompletion.captured["timeout"] == settings.REQUEST_TIMEOUT
+
+
 def test_build_user_content_with_video_data_uri():
     # Видео уходит тем же путём, что и PDF: data:URI внутри image_url ->
     # LiteLLM превращает его в inline_data для Gemini (видео нативно).

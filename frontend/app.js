@@ -36,6 +36,9 @@ createApp({
       mobilePane: "chat",
       pendingAttachments: [],
       waitingFiles: false,      // отправка ждёт дочитывания вложений
+      // Прогресс загрузки сообщения с файлами на сервер: null или
+      // { percent (0..100 | null), loaded, total } — полоса над композером.
+      uploadProgress: null,
       plusMenu: false,          // выпадашка [+]: голос/арт (второстепенные действия)
       dragOver: false,          // подсветка зоны при перетаскивании файла
       lightbox: null,           // data:URI картинки для полноэкранного предпросмотра
@@ -407,6 +410,41 @@ createApp({
           + (this.sessionTimezone ? " (" + this.sessionTimezone + ")" : "");
       } catch (e) { return d.toLocaleString("ru-RU"); }
     },
+    // POST с прогрессом загрузки (XMLHttpRequest — fetch не умеет upload.onprogress).
+    // Используется для отправки сообщений с файлами: видно, сколько уже ушло на
+    // сервер, а сторож стриминга не считает долгую загрузку «зависанием».
+    _postWithProgress(path, bodyObj) {
+      return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", "/api" + path);
+        xhr.setRequestHeader("Content-Type", "application/json");
+        const h = this.authHeaders();
+        for (const k in h) xhr.setRequestHeader(k, h[k]);
+        xhr.upload.onprogress = (e) => {
+          this._lastEvtAt = Date.now(); // загрузка идёт — это не зависший стриминг
+          this.uploadProgress = e.lengthComputable
+            ? { percent: Math.min(100, Math.round((e.loaded / e.total) * 100)), loaded: e.loaded, total: e.total }
+            : { percent: null, loaded: e.loaded || 0, total: 0 };
+        };
+        // Тело догрузилось на сервер — полосу прячем (дальше отвечает нейросеть).
+        xhr.upload.onload = () => { this.uploadProgress = null; };
+        xhr.onload = () => {
+          this.uploadProgress = null;
+          if (xhr.status >= 200 && xhr.status < 300) {
+            try { resolve(JSON.parse(xhr.responseText || "null")); }
+            catch (e) { resolve(null); }
+          } else {
+            if (xhr.status === 401) this.needAccess = true;
+            let detail = "HTTP " + xhr.status;
+            try { const j = JSON.parse(xhr.responseText); if (j && j.detail) detail = j.detail; } catch (e) {}
+            reject(new Error(detail));
+          }
+        };
+        xhr.onerror = () => { this.uploadProgress = null; reject(new Error("сеть: не удалось загрузить файл на сервер")); };
+        xhr.onabort = () => { this.uploadProgress = null; reject(new Error("загрузка отменена")); };
+        xhr.send(JSON.stringify(bodyObj));
+      });
+    },
     // Заголовки авторизации БЕЗ Content-Type — для загрузки файлов (multipart).
     authHeaders() {
       const h = {};
@@ -506,10 +544,8 @@ createApp({
       this.canvasGenerating = true;
       this.scrollDown();
       try {
-        const r = await this.api("/sessions/" + this.sessionId + "/canvas_generate", {
-          method: "POST",
-          body: JSON.stringify({ prompt, attachments, params: this.params }),
-        });
+        const r = await this._postWithProgress("/sessions/" + this.sessionId + "/canvas_generate",
+          { prompt, attachments, params: this.params });
         await this.loadMessages();
         await this.openCanvas(r.canvas_id);   // сразу открываем сгенерированное
       } catch (e) {
@@ -1135,10 +1171,9 @@ createApp({
       this.scrollDown();
       if (attachments.length) {
         // Вложения (особенно аудио/видео) не влезают в WebSocket-кадр (~16 МБ) —
-        // отправляем ход по HTTP, а ответ слушаем по SSE (тот же поток событий).
-        this.api("/sessions/" + this.sessionId + "/send", {
-          method: "POST",
-          body: JSON.stringify({ content, attachments, params: this.params, reply_to_message_id: replyTo }),
+        // отправляем ход по HTTP с ПРОГРЕССОМ загрузки, ответ слушаем по SSE.
+        this._postWithProgress("/sessions/" + this.sessionId + "/send", {
+          content, attachments, params: this.params, reply_to_message_id: replyTo,
         }).then((r) => {
           this.currentJobId = r.job_id;
           this.resumeSSE(r.job_id);
@@ -1518,10 +1553,9 @@ createApp({
       this.artMode = false;
       this.resetComposerHeight();
       try {
-        await this.api("/sessions/" + this.sessionId + "/image", {
-          method: "POST",
-          body: JSON.stringify({ prompt: desc, mode: "prompt", attachments }),
-        });
+        // Фото-референсы могут быть тяжёлыми — грузим с прогрессом.
+        await this._postWithProgress("/sessions/" + this.sessionId + "/image",
+          { prompt: desc, mode: "prompt", attachments });
         await this.loadMessages();
       } catch (e) {
         this.chatError = "Арт не удался: " + e.message;
@@ -2396,6 +2430,13 @@ createApp({
         <!-- Пока файлы читаются — предупреждаем, что отправка подождёт их -->
         <div v-if="attachmentsLoading || waitingFiles" class="art-indicator files-bar">
           ⏳ Загрузка вложений… {{ waitingFiles ? 'отправлю, как только дочитаются.' : 'дождитесь готовности перед отправкой.' }}
+        </div>
+        <!-- Прогресс отправки файлов на сервер (XHR upload.onprogress) -->
+        <div v-if="uploadProgress" class="art-indicator files-bar upload-bar">
+          ⬆ Отправка на сервер…
+          {{ uploadProgress.percent != null ? uploadProgress.percent + '%' : '…' }}
+          <i v-if="uploadProgress.total"> ({{ fmtSize(uploadProgress.loaded) }} из {{ fmtSize(uploadProgress.total) }})</i>
+          <span class="upload-track"><span class="upload-fill" :style="{ width: (uploadProgress.percent || 0) + '%' }"></span></span>
         </div>
         <div class="row">
           <!-- [+] второстепенные действия: документ, арт -->
