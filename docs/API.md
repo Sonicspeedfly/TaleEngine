@@ -37,9 +37,9 @@ HTTP Basic Auth поверх всего нужен ещё заголовок `Au
 | GET | `/api/sessions?character_id=` | Чаты персонажа |
 | POST | `/api/sessions?character_id=` | Новый чат |
 | GET | `/api/sessions/shared` | Чаты, которыми со мной поделились |
-| PATCH | `/api/sessions/{id}` | Переименование/мета (scenario, author_note, фон, …) |
+| PATCH | `/api/sessions/{id}` | Переименование/мета (scenario, author_note, фон, `timezone` — часовой пояс чата, …) |
 | DELETE | `/api/sessions/{id}` | Удалить чат |
-| GET | `/api/sessions/{id}/messages` | Сообщения чата. Пагинация: `?limit=N` — последние N; `?before=<id>&limit=N` — порция старше id (ленивая подгрузка при скролле вверх); без параметров — вся история. Вложения — только МЕТА (type/mime/name/size), БЕЗ base64 (иначе чат с фото/аудио весит десятки МБ) |
+| GET | `/api/sessions/{id}/messages` | Сообщения чата. Пагинация: `?limit=N` — последние N; `?before=<id>&limit=N` — порция старше id (ленивая подгрузка при скролле вверх); без параметров — вся история. Вложения — только МЕТА (type/mime/name/size), БЕЗ base64 (иначе чат с фото/аудио весит десятки МБ). Каждое сообщение содержит `created_at` (ISO, UTC) — время отправки (user) / готовности ответа (assistant) |
 | GET | `/api/messages/{id}/att/{idx}` | Байты одного вложения сообщения (лениво грузят `<img>`/`<audio>`, кэшируется). Авторизация — заголовком или `?token=`/`?access_code=` (теги не шлют заголовки) |
 | PATCH | `/api/messages/{id}` | Редактировать сообщение/свайп |
 | DELETE | `/api/messages/{id}` | Удалить сообщение |
@@ -88,7 +88,7 @@ HTTP Basic Auth поверх всего нужен ещё заголовок `Au
 | GET/POST | `/api/personas` · DELETE `/api/personas/{id}` | Персоны пользователя |
 | GET/POST | `/api/presets` · DELETE `/api/presets/{id}` | Пресеты параметров |
 | POST | `/api/presets/{id}/default` | Сделать пресет дефолтным |
-| GET/PUT | `/api/settings/connection` | Подключение к LiteLLM (ключ маскируется не-админам) |
+| GET/PUT | `/api/settings/connection` | Подключение к LiteLLM (ключ маскируется не-админам). Поля `fallback_model`/`auto_fallback` — запасная модель на случай сбоя основной |
 | GET | `/api/models` | Прокси `/v1/models` LiteLLM |
 | GET/PUT | `/api/settings/ui` | Серверные UI-предпочтения (параметры по умолчанию) |
 
@@ -133,6 +133,9 @@ HTTP Basic Auth поверх всего нужен ещё заголовок `Au
 Сервер → клиент:
 - `{"type":"job", job_id}` — id задачи (для SSE-дослушивания)
 - `{"type":"speaker", name}` / `{"type":"token", content}` / `{"type":"speaker_done"}`
+- `{"type":"fallback", model, reason}` — основная модель не ответила, ход повторяется
+  ЗАПАСНОЙ моделью (настройка «Подключение»); клиент сбрасывает live-текст —
+  дальше токены придут с чистого листа
 - `{"type":"done"}` — генерация завершена (клиент перечитывает историю)
 - `{"type":"error", content}` — ошибка (показывается баннером, не «проглатывается»)
 

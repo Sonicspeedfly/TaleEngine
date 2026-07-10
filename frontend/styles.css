@@ -56,6 +56,12 @@ label span { color: var(--text); }
 .row { display: flex; gap: 8px; align-items: center; }
 .muted { color: var(--muted); }
 .pill { font-size: 11px; padding: 1px 7px; border-radius: 10px; background: var(--bg3); color: var(--muted); }
+/* Плашка «имя чата · #номер» в шапке: длинное имя обрезаем, номер остаётся виден. */
+.chat-id-pill { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Формулы KaTeX: блочные — со своим горизонтальным скроллом, не распирают пузырь. */
+.bubble .katex-display { overflow-x: auto; overflow-y: hidden; padding: 2px 0; margin: 8px 0; }
+.bubble .katex { font-size: 1.05em; }
 
 /* ----- Раскладка (flex): [сайдбар] | чат | [канвас]. Настройки — оверлей. ----- */
 .app-grid { display: flex; height: 100%; overflow: hidden; }
@@ -373,6 +379,7 @@ label span { color: var(--text); }
 .attachments { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
 .att-img { max-width: 220px; max-height: 220px; border-radius: 10px; cursor: zoom-in; object-fit: cover; border: 1px solid var(--border); }
 .att-audio { height: 36px; max-width: 260px; }
+.att-video { max-width: 320px; max-height: 240px; border-radius: 10px; border: 1px solid var(--border); background: #000; }
 .att-doc { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border-radius: 8px;
   background: var(--bg3); border: 1px solid var(--border); color: var(--text); text-decoration: none; font-size: 13px; }
 .att-doc:hover { border-color: var(--accent); }
@@ -472,4 +479,6 @@ label span { color: var(--text); }
   .app-grid.with-canvas.pane-canvas > .chat { display: none; }
   .canvas-pane { width: 100%; border-left: none; }
   .att-img { max-width: 70vw; }
+  .att-video { max-width: 78vw; }
+  .chat-id-pill { max-width: 34vw; }
 }

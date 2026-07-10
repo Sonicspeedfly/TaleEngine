@@ -60,3 +60,17 @@ def test_plain_text_document():
     block = prepare_document(data, "text/plain", "note.txt")
     assert block["type"] == "text"
     assert "привет мир" in block["text"]
+
+
+def test_binary_file_not_dumped_as_text():
+    """
+    Регресс бага «отправка видео ломает чат»: бинарник (видео/архив) раньше
+    декодировался latin-1 и в контекст уходили мегабайты мусора. Теперь — короткая
+    пометка о неподдерживаемом формате.
+    """
+    fake_binary = bytes(range(256)) * 64  # 16 КБ псевдо-видео с NUL-байтами
+    data = base64.b64encode(fake_binary).decode()
+    block = prepare_document(data, "application/octet-stream", "clip.bin")
+    assert block["type"] == "text"
+    assert "не поддерживается" in block["text"]
+    assert len(block["text"]) < 300  # мусор в текст не попал

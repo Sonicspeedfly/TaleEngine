@@ -257,10 +257,11 @@ def _effective_model(params, connection: dict) -> str:
 
 
 # ---- Колбэки сохранения ответа ассистента (после завершения генерации) ----
+# model_override приходит от менеджера генерации, если ответ дала ЗАПАСНАЯ модель.
 def _make_persist_new(model_used: str):
     """Создаёт НОВОЕ сообщение ассистента (первый свайп = сам ответ)."""
 
-    async def cb(session_id: int, content: str) -> None:
+    async def cb(session_id: int, content: str, model_override: str | None = None) -> None:
         async with AsyncSessionLocal() as db:
             db.add(
                 models.Message(
@@ -269,7 +270,7 @@ def _make_persist_new(model_used: str):
                     content=content,
                     swipes=[content],
                     active_swipe=0,
-                    model_used=model_used,
+                    model_used=model_override or model_used,
                 )
             )
             await db.commit()
@@ -280,7 +281,7 @@ def _make_persist_new(model_used: str):
 def _make_persist_swipe(message_id: int, model_used: str):
     """Добавляет новый вариант (свайп) к существующему ответу ассистента."""
 
-    async def cb(session_id: int, content: str) -> None:
+    async def cb(session_id: int, content: str, model_override: str | None = None) -> None:
         async with AsyncSessionLocal() as db:
             msg = await db.get(models.Message, message_id)
             if not msg:
@@ -290,7 +291,7 @@ def _make_persist_swipe(message_id: int, model_used: str):
             msg.swipes = swipes
             msg.active_swipe = len(swipes) - 1
             msg.content = content
-            msg.model_used = model_used
+            msg.model_used = model_override or model_used
             await db.commit()
 
     return cb
@@ -299,7 +300,7 @@ def _make_persist_swipe(message_id: int, model_used: str):
 def _make_persist_continue(message_id: int, model_used: str):
     """Дописывает сгенерированный текст В КОНЕЦ существующего ответа (функция «Продолжить»)."""
 
-    async def cb(session_id: int, content: str) -> None:
+    async def cb(session_id: int, content: str, model_override: str | None = None) -> None:
         async with AsyncSessionLocal() as db:
             msg = await db.get(models.Message, message_id)
             if not msg:
@@ -312,7 +313,7 @@ def _make_persist_continue(message_id: int, model_used: str):
             else:
                 swipes = [new_full]
             msg.swipes = swipes
-            msg.model_used = model_used
+            msg.model_used = model_override or model_used
             await db.commit()
 
     return cb
@@ -485,6 +486,7 @@ async def list_sessions(
             "background": s.background,
             "is_group": s.is_group,
             "director": s.director,
+            "timezone": s.timezone or "",
         }
         for s in rows
     ]
@@ -563,6 +565,14 @@ def _att_meta(a: dict) -> dict:
     data = a.get("data") or ""
     size = int(len(data) * 0.75) if data else int(a.get("size") or 0)  # ~сырой размер
     return {"type": a.get("type"), "mime": a.get("mime"), "name": a.get("name"), "size": size}
+
+
+def _iso_utc(dt) -> str | None:
+    """created_at -> ISO-строка. SQLite func.now() пишет UTC без tzinfo — помечаем 'Z',
+    чтобы браузер корректно перевёл в часовой пояс пользователя/чата."""
+    if not dt:
+        return None
+    return dt.isoformat() + ("" if dt.tzinfo else "Z")
 
 
 @app.get("/api/messages/{message_id}/att/{idx}")
@@ -648,6 +658,8 @@ async def get_messages(
             "canvas_id": m.canvas_id,
             "canvas_title": canvas_meta.get(m.canvas_id, {}).get("title") if m.canvas_id else None,
             "canvas_kind": canvas_meta.get(m.canvas_id, {}).get("kind") if m.canvas_id else None,
+            # Время сообщения: у user — момент отправки, у assistant — момент ответа.
+            "created_at": _iso_utc(m.created_at),
         }
         for m in rows
     ]
@@ -673,6 +685,7 @@ async def list_groups(user=Depends(current_user), db: AsyncSession = Depends(get
                 "title": s.title,
                 "director": s.director,
                 "scenario": s.scenario,
+                "timezone": s.timezone or "",
                 "members": [{"id": c.id, "name": c.name} for c in members],
             }
         )

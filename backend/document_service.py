@@ -149,6 +149,28 @@ def _decode_text(src_bytes: bytes) -> str:
     return ""
 
 
+def _looks_binary(raw: bytes) -> bool:
+    """
+    Бинарный ли это файл (видео/архив/exe и т.п.), а не текст. Важно: latin-1
+    «успешно» декодирует ЛЮБЫЕ байты, поэтому без этой проверки бинарник
+    превращался в мегабайты мусора и ломал запрос к нейросети.
+    """
+    head = raw[:4096]
+    if not head:
+        return False
+    if b"\x00" in head:
+        return True
+    try:
+        head.decode("utf-8")
+        return False
+    except UnicodeDecodeError:
+        pass
+    # Не UTF-8: оцениваем долю непечатаемых символов в cp1251-прочтении.
+    text = head.decode("cp1251", errors="replace")
+    weird = sum(1 for ch in text if not (ch.isprintable() or ch in "\r\n\t"))
+    return weird > len(text) * 0.15
+
+
 def _pdf_block(pdf_bytes: bytes) -> dict:
     data_uri = "data:application/pdf;base64," + base64.b64encode(pdf_bytes).decode()
     return {"type": "image_url", "image_url": {"url": data_uri}}
@@ -179,6 +201,14 @@ def prepare_document(data: str, mime: str | None, name: str | None) -> dict:
         if text:
             return {"type": "text", "text": f"[Документ «{label}» — содержимое ниже]\n\n{text}"}
         return {"type": "text", "text": f"[Прикреплён документ «{label}», распознать не удалось.]"}
+
+    # Бинарный файл неизвестного формата (видео/архив/…): мусор в контекст не льём.
+    if _looks_binary(raw):
+        return {
+            "type": "text",
+            "text": f"[Прикреплён файл «{label}» ({mime or 'неизвестный тип'}) — "
+                    "формат не поддерживается для чтения, содержимое не передано.]",
+        }
 
     # Текстовые форматы.
     text = _decode_text(raw)

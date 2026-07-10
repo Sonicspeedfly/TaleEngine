@@ -18,6 +18,9 @@ aiosqlite>=0.19              # асинхронный драйвер SQLite
 pydantic>=2.6
 pydantic-settings>=2.2
 
+# --- Часовые пояса (zoneinfo на Windows требует базу tzdata) ---
+tzdata>=2024.1
+
 # --- Telegram-бот (общий образ с backend) ---
 aiogram>=3.4
 

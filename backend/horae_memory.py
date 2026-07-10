@@ -95,6 +95,8 @@ def _att_label(a: dict) -> str:
         return "изображение"
     if t == "audio":
         return "аудио"
+    if t == "video":
+        return "видео: " + (a.get("name") or "файл")
     if t == "document":
         return "документ: " + (a.get("name") or "файл")
     return "вложение"
@@ -248,6 +250,7 @@ def assemble_context(
     character_avatar=None,
     persona_avatar=None,
     send_avatars: bool = False,
+    user_time: str = "",
 ) -> list[dict]:
     """
     ЧИСТАЯ функция сборки контекста. Возвращает messages для LiteLLM:
@@ -301,6 +304,13 @@ def assemble_context(
     if send_avatars:
         messages.extend(_avatar_messages(character, character_avatar, persona_avatar))
     messages.extend(trimmed_history)
+    # Текущее время пользователя (часовой пояс — настройка чата): модель понимает,
+    # утро сейчас у собеседника или глубокая ночь, и может на это опираться.
+    if user_time:
+        messages.append({
+            "role": "system",
+            "content": f"[Время пользователя] Сейчас у пользователя {user_time}.",
+        })
     # Author's Note: вставляем системным сообщением прямо перед репликой пользователя,
     # чтобы у заметки была максимальная «свежесть» и влияние на ответ.
     if author_note and author_note.strip():
@@ -315,6 +325,38 @@ def assemble_context(
         }
     )
     return messages
+
+
+# Русские названия дней недели для блока «время пользователя».
+_RU_WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+
+
+def session_user_time(session) -> str:
+    """
+    Текущее время пользователя по часовому поясу чата (session.timezone).
+    Поддерживаются IANA-имена (Europe/Moscow) и смещения ("+03:00", "UTC+3").
+    Пустая настройка или неизвестный пояс -> "" (блок времени не добавляется).
+    """
+    import re as _re
+    from datetime import datetime, timedelta, timezone as _tz
+
+    tz_name = (getattr(session, "timezone", "") or "").strip()
+    if not tz_name:
+        return ""
+    tzinfo = None
+    m = _re.fullmatch(r"(?:UTC|GMT)?\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?", tz_name)
+    if m:
+        sign = -1 if m.group(1) == "-" else 1
+        tzinfo = _tz(sign * timedelta(hours=int(m.group(2)), minutes=int(m.group(3) or 0)))
+    else:
+        try:
+            from zoneinfo import ZoneInfo
+
+            tzinfo = ZoneInfo(tz_name)
+        except Exception:  # noqa: BLE001 — опечатка в имени пояса не должна ронять ход
+            return ""
+    now = datetime.now(tzinfo)
+    return f"{now.strftime('%H:%M')}, {_RU_WEEKDAYS[now.weekday()]} {now.strftime('%d.%m.%Y')} ({tz_name})"
 
 
 # ----------------------------------------------------------------------------
@@ -430,4 +472,5 @@ async def build_context_from_db(
         character_avatar=character.avatar_path,
         persona_avatar=(persona or {}).get("avatar"),
         send_avatars=send_avatars,
+        user_time=session_user_time(session),
     )

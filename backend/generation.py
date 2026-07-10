@@ -16,7 +16,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional
 
-from backend.llm_gateway import stream_completion
+from backend.llm_gateway import effective_model, stream_completion
 from backend.schemas import GenerationParams
 
 logger = logging.getLogger("aichat.generation")
@@ -30,6 +30,8 @@ class GenerationJob:
     buffer: str = ""        # весь накопленный текст — кэш для реконнекта
     done: bool = False
     error: Optional[str] = None
+    # Если ответ дала ЗАПАСНАЯ модель (fallback) — её имя, для записи в model_used.
+    model_used: Optional[str] = None
     # Ссылка на фоновую задачу — нужна, чтобы её можно было остановить (кнопка Stop).
     task: Optional["asyncio.Task"] = None
     # Очереди подписчиков: у каждого подключённого клиента — своя очередь событий.
@@ -56,8 +58,10 @@ class GenerationJob:
             q.put_nowait(event)
 
 
-# Колбэк, который сохраняет финальный ответ в БД: (session_id, text) -> awaitable.
-OnComplete = Callable[[int, str], Awaitable[None]]
+# Колбэк, который сохраняет финальный ответ в БД:
+# (session_id, text, model_used_override) -> awaitable. Третий аргумент задан,
+# только если ответ дала запасная модель (иначе None — пишется основная).
+OnComplete = Callable[..., Awaitable[None]]
 
 
 class GenerationManager:
@@ -130,21 +134,53 @@ class GenerationManager:
         except Exception as exc:  # noqa: BLE001 — сеть/провайдер упали, но сервер живёт
             # Печатаем полный traceback в консоль сервера — видно реальную причину.
             logger.exception("Ошибка генерации (job %s): %s", job.job_id, exc)
-            job.error = str(exc)
-            job.broadcast({"type": "error", "content": job.error})
+            # Запасная модель: если настроена и включён авто-режим — повторяем ход ею,
+            # вместо того чтобы сразу показывать ошибку.
+            fb = ((connection or {}).get("fallback_model") or "").strip()
+            auto = (connection or {}).get("auto_fallback", True)
+            if fb and auto and fb != effective_model(params, connection):
+                await self._run_fallback(job, messages, params, connection, fb, exc)
+            else:
+                job.error = str(exc)
+                job.broadcast({"type": "error", "content": job.error})
         finally:
             # Сохраняем накопленный ответ в БД ДО события 'done' — чтобы к моменту,
             # когда клиент увидит «готово», сообщение уже точно было записано.
             # Это работает и при обрыве связи, и при нажатии Stop (есть частичный текст).
             if on_complete and job.buffer:
                 try:
-                    await on_complete(job.session_id, job.buffer)
+                    await on_complete(job.session_id, job.buffer, job.model_used)
                 except Exception:  # noqa: BLE001 — сохранение не должно ронять воркер
                     pass
             job.done = True
             job.broadcast({"type": "done", "content": ""})
             # Подчищаем job через некоторое время, чтобы реконнект успел забрать кэш.
             asyncio.create_task(self._cleanup_later(job.job_id))
+
+    async def _run_fallback(self, job, messages, params, connection, fb_model, primary_exc) -> None:
+        """
+        Повтор генерации ЗАПАСНОЙ моделью после сбоя основной. Частичный текст
+        основной модели сбрасывается (событие 'fallback' велит клиенту очистить
+        live-текст), ответ пишется с чистого листа.
+        """
+        job.buffer = ""
+        job.broadcast({"type": "fallback", "model": fb_model, "reason": str(primary_exc)})
+        # С этого момента любой сохранённый текст — от запасной модели.
+        job.model_used = fb_model
+        fparams = (
+            params.model_copy(update={"model": fb_model})
+            if params else GenerationParams(model=fb_model)
+        )
+        try:
+            async for token in stream_completion(messages, fparams, connection):
+                job.buffer += token
+                job.broadcast({"type": "token", "content": token})
+        except asyncio.CancelledError:
+            pass  # Stop во время запасной генерации — частичный текст сохранится
+        except Exception as exc2:  # noqa: BLE001
+            logger.exception("Запасная модель тоже не ответила (job %s)", job.job_id)
+            job.error = f"Основная модель: {primary_exc}\nЗапасная ({fb_model}): {exc2}"
+            job.broadcast({"type": "error", "content": job.error})
 
     async def _cleanup_later(self, job_id: str, delay: int = 300) -> None:
         await asyncio.sleep(delay)

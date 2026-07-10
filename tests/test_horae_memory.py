@@ -254,3 +254,46 @@ def test_author_note_injected_before_user_message():
     assert "Author's Note" in note["content"]
     assert "Держи мрачный тон." in note["content"]
     assert messages[-1]["content"] == "что дальше?"
+
+
+def test_user_time_block_injected_before_user_message():
+    """Блок «[Время пользователя]» добавляется системным сообщением у конца контекста."""
+    messages = assemble_context(
+        character=_char(), horae_records=[], history=[],
+        user_message="Доброе утро!", user_time="09:15, четверг 10.07.2026 (Europe/Moscow)",
+    )
+    time_msgs = [m for m in messages if m["role"] == "system" and "Время пользователя" in m["content"]]
+    assert len(time_msgs) == 1
+    assert "09:15" in time_msgs[0]["content"]
+    # Без user_time блока нет.
+    messages2 = assemble_context(character=_char(), horae_records=[], history=[], user_message="привет")
+    assert not any("Время пользователя" in m["content"] for m in messages2 if m["role"] == "system")
+
+
+def test_session_user_time_offset_iana_and_bad():
+    """session_user_time: смещения '+03:00', IANA-имена, пусто/опечатка -> ''. """
+    from backend.horae_memory import session_user_time
+
+    out = session_user_time(SimpleNamespace(timezone="+03:00"))
+    assert "(+03:00)" in out and ":" in out
+    assert session_user_time(SimpleNamespace(timezone="")) == ""
+    assert session_user_time(SimpleNamespace(timezone="Nope/Nowhere")) == ""
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo("Europe/Moscow")
+        has_tzdb = True
+    except Exception:
+        has_tzdb = False
+    if has_tzdb:
+        assert "Europe/Moscow" in session_user_time(SimpleNamespace(timezone="Europe/Moscow"))
+
+
+def test_video_attachment_label_in_history_note():
+    """Видео, не влезшее в лимит вложений истории, помечается как [видео: имя]."""
+    big = "data:video/mp4;base64," + "A" * 6_000_000  # больше _MAX_HISTORY_ATT_BYTES
+    msgs = [
+        _msg(1, "user", "смотри", [{"type": "video", "data": big, "mime": "video/mp4", "name": "clip.mp4"}]),
+        _msg(2, "assistant", "вижу"),
+    ]
+    history = messages_to_history(msgs)
+    assert "[видео: clip.mp4]" in history[0]["content"]

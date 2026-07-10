@@ -167,6 +167,31 @@ def test_build_user_content_with_image_returns_blocks():
     assert content[1]["type"] == "image_url"
 
 
+def test_build_user_content_with_video_data_uri():
+    # Видео уходит тем же путём, что и PDF: data:URI внутри image_url ->
+    # LiteLLM превращает его в inline_data для Gemini (видео нативно).
+    att = AttachmentIn(type="video", data="data:video/mp4;base64,AAAA", mime="video/mp4", name="clip.mp4")
+    content = build_user_content("смотри", [att])
+    assert content[1]["type"] == "image_url"
+    assert content[1]["image_url"]["url"].startswith("data:video/mp4;base64,")
+
+
+def test_build_user_content_video_bare_base64_gets_data_uri():
+    # Голый base64 (например из Telegram) оборачивается в data:URI по mime.
+    att = AttachmentIn(type="video", data="AAAA", mime="video/webm")
+    content = build_user_content("", [att])
+    assert content[0]["image_url"]["url"] == "data:video/webm;base64,AAAA"
+
+
+def test_legacy_video_saved_as_document_is_rerouted():
+    # Регресс: раньше видео сохранялось с type="document" (и декодировалось как
+    # текст-мусор). Такие старые записи в истории перенаправляются по mime.
+    att = AttachmentIn(type="document", data="data:video/mp4;base64,AAAA", mime="video/mp4", name="старое.mp4")
+    content = build_user_content("", [att])
+    assert content[0]["type"] == "image_url"
+    assert content[0]["image_url"]["url"].startswith("data:video/mp4;base64,")
+
+
 def test_build_user_content_with_audio_strips_data_uri():
     # Аудио для Gemini: base64 без префикса data URI + формат файла.
     att = AttachmentIn(

@@ -616,8 +616,27 @@ async def _attachment_from_message(message: TgMessage) -> AttachmentIn | None:
             return AttachmentIn(type="image", data=data_uri, mime=mime, name=name)
         if (mime or "").startswith("audio/"):
             return AttachmentIn(type="audio", data=b64, mime=mime, name=name)
+        if (mime or "").startswith("video/"):
+            return AttachmentIn(type="video", data=data_uri, mime=mime, name=name)
         # Документ Word/PDF/текст (или что-то ещё — document_service разберётся).
         return AttachmentIn(type="document", data=data_uri, mime=mime, name=name)
+    if message.video:
+        f = await _bot.get_file(message.video.file_id)
+        buf = await _bot.download_file(f.file_path)
+        b64 = base64.b64encode(buf.read()).decode()
+        mime = message.video.mime_type or "video/mp4"
+        return AttachmentIn(
+            type="video", data=f"data:{mime};base64,{b64}", mime=mime,
+            name=message.video.file_name or "видео",
+        )
+    if message.video_note:
+        f = await _bot.get_file(message.video_note.file_id)
+        buf = await _bot.download_file(f.file_path)
+        b64 = base64.b64encode(buf.read()).decode()
+        return AttachmentIn(
+            type="video", data=f"data:video/mp4;base64,{b64}", mime="video/mp4",
+            name="видеосообщение",
+        )
     if message.audio:
         f = await _bot.get_file(message.audio.file_id)
         buf = await _bot.download_file(f.file_path)
@@ -951,8 +970,10 @@ def _register(dp: Dispatcher) -> None:
     @dp.message(F.photo)
     @dp.message(F.document)
     @dp.message(F.audio)
+    @dp.message(F.video)
+    @dp.message(F.video_note)
     async def on_media(message: TgMessage):
-        # Файлы (фото/документ/аудио). Альбом из нескольких файлов с подписью
+        # Файлы (фото/документ/аудио/видео). Альбом из нескольких файлов с подписью
         # собираем в ОДИН ход к нейросети (см. _handle_media).
         await _handle_media(message)
 

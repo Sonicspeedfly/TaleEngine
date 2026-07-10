@@ -26,6 +26,9 @@ def default_connection() -> dict:
         "default_model": settings.DEFAULT_MODEL,
         "image_model": settings.LITELLM_IMAGE_MODEL or "",
         "image_via_chat": False,
+        # Запасная модель на случай сбоя основной (+ авто-повтор ею).
+        "fallback_model": "",
+        "auto_fallback": True,
     }
 
 
@@ -43,7 +46,10 @@ async def set_connection(db, data: dict) -> dict:
     row = await db.get(AppSetting, CONNECTION_KEY)
     # Берём только известные поля; строки чистим от пробелов/табов/переводов строк
     # (частая беда при копипасте — невидимый \t ломает URL у провайдера).
-    allowed = {"use_proxy", "base_url", "api_key", "default_model", "image_model", "image_via_chat"}
+    allowed = {
+        "use_proxy", "base_url", "api_key", "default_model", "image_model",
+        "image_via_chat", "fallback_model", "auto_fallback",
+    }
     clean = {}
     for k, v in data.items():
         if k not in allowed:

@@ -86,7 +86,7 @@ createApp({
       presetName: "",
 
       // --- Подключение к LiteLLM (вкладка Connection) ---
-      connection: { use_proxy: true, base_url: "http://localhost:4000", api_key: "", default_model: "gpt-4o", image_model: "", image_via_chat: false },
+      connection: { use_proxy: true, base_url: "http://localhost:4000", api_key: "", default_model: "gpt-4o", image_model: "", image_via_chat: false, fallback_model: "", auto_fallback: true },
       models: [],
       connStatus: "",
       connOk: null,
@@ -104,6 +104,9 @@ createApp({
       personaNew: { name: "", description: "", avatar_path: null },
       authorNote: "",
       sessionPersonaId: null,
+      // Часовой пояс ТЕКУЩЕГО чата (IANA-имя): нейросеть видит время пользователя,
+      // а метки времени сообщений показываются в этом поясе.
+      sessionTimezone: "",
 
       // --- Адаптив / мобильный режим ---
       // Сайдбар: на десктопе показан по умолчанию, на мобильном скрыт; ☰ слайдит.
@@ -191,6 +194,30 @@ createApp({
   computed: {
     selectedCharacter() {
       return this.characters.find((c) => c.id === this.selectedCharacterId) || null;
+    },
+    // Открытая сейчас сессия из списка чатов (для заголовка «имя чата · #номер»).
+    currentSession() {
+      return this.sessions.find((s) => s.id === this.sessionId) || null;
+    },
+    // Полное имя открытого чата (обычный / группа / расшаренный).
+    currentSessionTitle() {
+      if (this.sharedView) return this.sharedView.title || "";
+      if (this.currentIsGroup) return this.currentGroup.title || "";
+      return this.currentSession ? (this.currentSession.title || "") : "";
+    },
+    // Запасная модель из настроек подключения (для баннера ошибки и ретрая).
+    fallbackModel() {
+      return ((this.connection && this.connection.fallback_model) || "").trim();
+    },
+    // Список часовых поясов для настройки чата (браузер знает полный список IANA).
+    tzOptions() {
+      try {
+        if (Intl.supportedValuesOf) return Intl.supportedValuesOf("timeZone");
+      } catch (e) {}
+      return ["UTC", "Europe/Moscow", "Europe/Kaliningrad", "Europe/Samara",
+              "Asia/Yekaterinburg", "Asia/Omsk", "Asia/Krasnoyarsk", "Asia/Irkutsk",
+              "Asia/Yakutsk", "Asia/Vladivostok", "Asia/Magadan", "Asia/Kamchatka",
+              "Europe/Kyiv", "Europe/Minsk", "Asia/Almaty", "Asia/Tashkent"];
     },
     lastAssistantId() {
       const a = [...this.messages].reverse().find((m) => m.role === "assistant");
@@ -318,8 +345,67 @@ createApp({
     },
 
     renderMd(text) {
+      // LaTeX: формулы вырезаются ДО markdown-it (иначе он «съедает» \( \[ и **),
+      // рендерятся KaTeX'ом и подставляются обратно уже готовым HTML.
+      const math = [];
+      const protectedText = this._extractMath(text || "", math);
+      let html = md.render(protectedText);
+      if (math.length) {
+        html = html.replace(/%%MATH-(\d+)%%/g, (_, i) => math[+i] || "");
+      }
       // ADD_DATA_URI_TAGS: разрешаем <img src="data:..."> (сгенерированные арты).
-      return DOMPurify.sanitize(md.render(text || ""), { ADD_DATA_URI_TAGS: ["img"] });
+      return DOMPurify.sanitize(html, { ADD_DATA_URI_TAGS: ["img"] });
+    },
+    // Вырезает LaTeX-фрагменты ($$..$$, \[..\], \(..\), $..$) вне код-блоков,
+    // складывает готовый HTML KaTeX в out и возвращает текст с плейсхолдерами
+    // %%MATH-n%% (markdown-it отдаёт их как обычный текст, потом подставляем HTML).
+    _extractMath(text, out) {
+      if (!window.katex) return text;
+      const token = (tex, display) => {
+        try {
+          out.push(katex.renderToString(tex, { displayMode: display, throwOnError: false, output: "html" }));
+          return "%%MATH-" + (out.length - 1) + "%%";
+        } catch (e) { return tex; }
+      };
+      // Код (``` и `…`) не трогаем: внутри него $ и \( — обычные символы.
+      const parts = text.split(/(```[\s\S]*?(?:```|$)|`[^`\n]*`)/);
+      return parts.map((seg, idx) => {
+        if (idx % 2 === 1) return seg;
+        return seg
+          .replace(/\$\$([\s\S]+?)\$\$/g, (m, tex) => token(tex, true))
+          .replace(/\\\[([\s\S]+?)\\\]/g, (m, tex) => token(tex, true))
+          .replace(/\\\((.+?)\\\)/g, (m, tex) => token(tex, false))
+          // Одинарные $…$: без пробела после открывающего и перед закрывающим,
+          // в одну строку — чтобы не срабатывать на цены («$5 и $10»).
+          .replace(/\$(\S(?:[^$\n]*\S)?)\$/g, (m, tex) => token(tex, false));
+      }).join("");
+    },
+
+    // ---------- Метки времени сообщений ----------
+    // Короткая метка: сегодня — «14:32», иначе «07.10 14:32» (в часовом поясе чата).
+    fmtWhen(iso) {
+      if (!iso) return "";
+      const d = new Date(iso);
+      if (isNaN(d)) return "";
+      const tz = this.sessionTimezone || undefined;
+      try {
+        const time = d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit", timeZone: tz });
+        const today = new Date().toLocaleDateString("ru-RU", { timeZone: tz });
+        const day = d.toLocaleDateString("ru-RU", { timeZone: tz });
+        return day === today ? time : day.slice(0, 5) + " " + time;
+      } catch (e) { // неизвестный пояс — показываем локальное время браузера
+        return d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
+      }
+    },
+    // Полная метка для title-подсказки.
+    fmtWhenFull(iso) {
+      if (!iso) return "";
+      const d = new Date(iso);
+      if (isNaN(d)) return "";
+      try {
+        return d.toLocaleString("ru-RU", { timeZone: this.sessionTimezone || undefined })
+          + (this.sessionTimezone ? " (" + this.sessionTimezone + ")" : "");
+      } catch (e) { return d.toLocaleString("ru-RU"); }
     },
     // Заголовки авторизации БЕЗ Content-Type — для загрузки файлов (multipart).
     authHeaders() {
@@ -612,9 +698,28 @@ createApp({
       this.authorNote = s.author_note || "";
       this.sessionPersonaId = s.persona_id || null;
       this.sessionBg = s.background || "";
+      // Часовой пояс чата: из сессии; для групп (открываются как {id}) — из списка групп.
+      this.sessionTimezone = s.timezone || "";
+      if (!this.sessionTimezone) {
+        const g = this.groups.find((x) => x.id === s.id);
+        this.sessionTimezone = (g && g.timezone) || "";
+      }
+      // Пояс ещё не задан — определяем по браузеру и сохраняем за этим чатом.
+      // Пользователь может сменить его во вкладке «Персона» (настройка на чат).
+      if (!this.sessionTimezone) this._autoTimezone();
       this.closeSidebarOnMobile(); // на мобильном прячем сайдбар после выбора
       await this.loadMessages(true);   // свежее открытие — грузим последнюю порцию
       this.connectWs();
+    },
+    // Определить часовой пояс по браузеру и тихо сохранить его за текущим чатом.
+    _autoTimezone() {
+      let tz = "";
+      try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || ""; } catch (e) {}
+      if (!tz || !this.sessionId) return;
+      this.sessionTimezone = tz;
+      this.api("/sessions/" + this.sessionId, {
+        method: "PATCH", body: JSON.stringify({ timezone: tz }),
+      }).catch(() => {});
     },
     // Открыть чат, которым со мной поделился друг (только из раздела «Доступные мне»).
     async openSharedSession(s) {
@@ -625,6 +730,7 @@ createApp({
       this.authorNote = "";
       this.sessionPersonaId = null;
       this.sessionBg = s.background || "";
+      this.sessionTimezone = s.timezone || ""; // чужой чат: пояс владельца, не перезаписываем
       this.closeSidebarOnMobile();
       this.notifOpen = false;
       await this.loadMessages(true);   // свежее открытие — грузим последнюю порцию
@@ -890,6 +996,12 @@ createApp({
         this.scrollDown();
       } else if (ev.type === "speaker_done") {
         // ничего: пузырь остаётся на экране до перечитки истории
+      } else if (ev.type === "fallback") {
+        // Основная модель не ответила — сервер повторяет ход запасной.
+        // Частичный текст основной сбрасываем: ответ придёт с чистого листа.
+        this.currentReply = "";
+        this.liveBubbles = [];
+        this.showToast("⚠ Основная модель не ответила — пробую запасную: " + (ev.model || ""));
       } else if (ev.type === "done") this.finishStream();
       else if (ev.type === "error") {
         // Ошибку НЕ прячем — показываем баннером, чтобы было видно причину.
@@ -1011,7 +1123,7 @@ createApp({
       const attachments = this._cleanAtts(this.pendingAttachments);
       const replyTo = this.replyToId;
       // Оптимистично показываем своё сообщение сразу (с вложениями — их видно в пузыре).
-      this.messages.push({ id: "tmp", role: "user", content, attachments, swipes: [content], active_swipe: 0 });
+      this.messages.push({ id: "tmp", role: "user", content, attachments, swipes: [content], active_swipe: 0, created_at: new Date().toISOString() });
       this.currentReply = "";
       this.liveBubbles = [];
       this.streaming = true;
@@ -1054,14 +1166,20 @@ createApp({
     // Повторить последний ход: если ответ так и не родился (ошибка/обрыв/остановка) —
     // сервер сгенерирует его заново БЕЗ дублирования реплики пользователя;
     // если ответ есть — добавит новый свайп (как обычная перегенерация).
-    retryGeneration() {
+    // useFallback=true — повторить ход ЗАПАСНОЙ моделью (кнопка в баннере ошибки).
+    retryGeneration(useFallback = false) {
       if (!this.connected || this.streaming) return;
       this.chatError = "";
       this.currentReply = "";
       this.liveBubbles = [];
       this.streaming = true;
       this._lastEvtAt = Date.now();
-      this.ws.send(JSON.stringify({ type: "retry", params: this.params }));
+      // Строгое сравнение: из шаблона метод зовут как обработчик клика,
+      // и первым аргументом прилетает MouseEvent (он truthy).
+      const params = (useFallback === true && this.fallbackModel)
+        ? { ...this.params, model: this.fallbackModel }
+        : this.params;
+      this.ws.send(JSON.stringify({ type: "retry", params }));
       this.scrollDown();
     },
     stop() {
@@ -1148,17 +1266,27 @@ createApp({
     attachLabel(a) {
       if (a.type === "document") return "📄 " + (a.name || "файл");
       if (a.type === "audio") return "🎤 аудио";
+      if (a.type === "video") return "🎬 " + (a.name || "видео");
       return "🖼 фото";
     },
     // Добавить файлы во вложения текущего сообщения (общий код для 📎, вставки и DnD).
     // Плашка появляется СРАЗУ со спиннером, а data дочитывается асинхронно — так видно,
     // что файл грузится, а send() дожидается готовности всех вложений (см. attachmentsLoading).
     addFiles(files) {
+      // Больше ~20 МБ inline не принимает сам Gemini (лимит запроса) — честно
+      // отказываем сразу, вместо загадочной ошибки после отправки.
+      const MAX_ATTACH = 20 * 1024 * 1024;
       for (const file of [...files]) {
         const mime = file.type || "application/octet-stream";
         let type = "image";
         if (mime.startsWith("audio")) type = "audio";
+        else if (mime.startsWith("video")) type = "video";
         else if (!mime.startsWith("image")) type = "document"; // pdf/docx/txt/...
+        if (file.size > MAX_ATTACH) {
+          this.showToast("«" + (file.name || "файл") + "» слишком большой: " + this.fmtSize(file.size)
+            + " (лимит нейросети ~20 МБ). Сожмите или обрежьте файл.");
+          continue;
+        }
         const raw = {
           id: (this._attSeq = (this._attSeq || 0) + 1),
           type, mime, name: file.name || "файл", size: file.size || 0,
@@ -1601,7 +1729,11 @@ createApp({
       if (!this.sessionId) return;
       await this.api("/sessions/" + this.sessionId, {
         method: "PATCH",
-        body: JSON.stringify({ author_note: this.authorNote, persona_id: this.sessionPersonaId }),
+        body: JSON.stringify({
+          author_note: this.authorNote,
+          persona_id: this.sessionPersonaId,
+          timezone: this.sessionTimezone || "",
+        }),
       });
     },
 
@@ -1990,6 +2122,7 @@ createApp({
           <div style="padding: 6px 12px"><button @click="newChat" style="width:100%">+ Новый чат</button></div>
           <div v-for="s in sessions" :key="s.id"
                :class="['list-item', s.id === sessionId ? 'active' : '']"
+               :title="s.title + ' — чат #' + s.id"
                @click="openSession(s)">
             <span v-if="pendingChats.includes(s.id)" class="reply-dot" title="Пришёл новый ответ"></span>
             <div class="grow">{{ s.title }} <span class="muted">#{{ s.id }}</span></div>
@@ -2011,6 +2144,7 @@ createApp({
           <div style="padding: 6px 12px"><button @click="openGroupModal" style="width:100%">+ Группа</button></div>
           <div v-for="g in groups" :key="g.id"
                :class="['list-item', g.id === sessionId ? 'active' : '']"
+               :title="g.title + ' — чат #' + g.id"
                @click="openSession({ id: g.id })">
             <span v-if="pendingChats.includes(g.id)" class="reply-dot" title="Пришёл новый ответ"></span>
             <div class="grow">{{ g.title }}
@@ -2048,7 +2182,9 @@ createApp({
       <div class="chat-header">
         <button class="btn-icon hamburger" @click="sidebarOpen=!sidebarOpen" title="Меню">☰</button>
         <button v-if="canvasOpen" class="btn-icon only-mobile" @click="mobilePane='canvas'" title="Открыть Canvas">📋</button>
-        <span class="title">{{ sharedView ? ('🔗 ' + sharedView.title) : (currentIsGroup ? currentGroup.title : (selectedCharacter ? selectedCharacter.name : 'TaleEngine')) }}</span>
+        <span class="title" :title="sessionId ? (currentSessionTitle + ' — чат #' + sessionId) : ''">{{ sharedView ? ('🔗 ' + sharedView.title) : (currentIsGroup ? currentGroup.title : (selectedCharacter ? selectedCharacter.name : 'TaleEngine')) }}</span>
+        <!-- Полное имя чата и его номер: по нему удобно ссылаться на конкретный чат -->
+        <span v-if="sessionId" class="pill chat-id-pill" :title="currentSessionTitle + ' — чат #' + sessionId">💬 {{ currentSessionTitle || 'чат' }} · #{{ sessionId }}</span>
         <span v-if="currentIsGroup" class="pill hide-mobile" title="Участники группы">👥 {{ currentGroup.members.map(m => m.name).join(', ') }}</span>
         <span :class="['pill', connected ? 'status-ok' : 'status-err']"
               :title="connected ? 'Соединение с сервером активно' : 'Переподключение…'">{{ connected ? 'online' : '⟳ реконнект' }}</span>
@@ -2154,6 +2290,7 @@ createApp({
                      у загруженных из БД — тянем лениво по attUrl (кэшируется браузером). -->
                 <img v-if="a.type==='image'" :src="a.data || attUrl(m, ai)" loading="lazy" class="att-img" @click="lightbox = a.data || attUrl(m, ai)" title="Открыть" />
                 <audio v-else-if="a.type==='audio'" :src="a.data || attUrl(m, ai)" controls preload="none" class="att-audio"></audio>
+                <video v-else-if="a.type==='video' || ((a.mime || '').startsWith('video'))" :src="a.data || attUrl(m, ai)" controls preload="metadata" class="att-video"></video>
                 <a v-else class="att-doc" :href="a.data || attUrl(m, ai)" :download="a.name || 'файл'" title="Скачать">📄 {{ a.name || 'документ' }}</a>
               </template>
             </div>
@@ -2166,6 +2303,8 @@ createApp({
               {{ m.active_swipe + 1 }}/{{ (m.swipes || [m.content]).length }}
               <button class="btn-icon" @click="swipe(m, 1)" :title="m.id === lastAssistantId ? 'Ещё вариант' : ''">▶</button>
             </span>
+            <!-- Время: у user — когда отправил, у assistant — когда пришёл ответ (в поясе чата) -->
+            <span v-if="m.created_at" class="tag msg-time" :title="fmtWhenFull(m.created_at)">🕒 {{ fmtWhen(m.created_at) }}</span>
             <span v-if="m.model_used" class="tag">{{ m.model_used }}</span>
             <button v-if="!m.canvas_id" class="btn-icon" @click="copyMessage(m)" title="Скопировать текст">📋</button>
             <template v-if="!m.canvas_id">
@@ -2202,12 +2341,16 @@ createApp({
         <div v-if="chatError" class="error-banner">
           Ошибка генерации: {{ chatError }}
           <a v-if="!streaming" href="#" @click.prevent="retryGeneration">↻ повторить</a>
+          <a v-if="!streaming && fallbackModel" href="#" @click.prevent="retryGeneration(true)"
+             :title="'Повторить ход запасной моделью ' + fallbackModel">⚡ запасной моделью</a>
           <a href="#" @click.prevent="chatError=''">скрыть</a>
         </div>
         <!-- Ответ не пришёл (ошибка/обрыв/остановка) — предлагаем повторить ход -->
         <div v-else-if="canRetry" class="art-indicator retry-bar">
           ⚠ Ответ на последнее сообщение не получен.
           <a href="#" @click.prevent="retryGeneration">↻ Повторить генерацию</a>
+          <a v-if="fallbackModel" href="#" @click.prevent="retryGeneration(true)"
+             :title="'Повторить ход запасной моделью ' + fallbackModel">⚡ Запасной моделью</a>
         </div>
         <!-- Индикатор «отвечаю на сообщение» -->
         <div v-if="replyToMsg" class="reply-bar">
@@ -2241,6 +2384,7 @@ createApp({
             <template v-else>
               <img v-if="a.type==='image'" :src="a.data" class="att-thumb" @click="lightbox=a.data" title="Открыть" />
               <audio v-else-if="a.type==='audio'" :src="a.data" controls class="att-audio-sm"></audio>
+              <span v-else-if="a.type==='video'" class="att-state">🎬</span>
               <span v-else class="att-state">📄</span>
             </template>
             <span class="att-name" v-if="a.loading || a.error || a.type!=='image'">
@@ -2265,8 +2409,8 @@ createApp({
               <button @click="generateArt('overview'); plusMenu=false">🌅 Арт по общей картине</button>
             </div>
           </div>
-          <label class="btn-icon" style="margin:0; cursor:pointer" title="Прикрепить файл: фото, аудио или документ (Word/PDF/текст)">
-            📎<input type="file" multiple accept="image/*,audio/*,.pdf,.doc,.docx,.odt,.rtf,.txt,.md,.csv" style="display:none" @change="onAttach" />
+          <label class="btn-icon" style="margin:0; cursor:pointer" title="Прикрепить файл: фото, аудио, видео или документ (Word/PDF/текст)">
+            📎<input type="file" multiple accept="image/*,audio/*,video/*,.pdf,.doc,.docx,.odt,.rtf,.txt,.md,.csv" style="display:none" @change="onAttach" />
           </label>
           <!-- Голос — отдельной кнопкой: запись/стоп в один клик -->
           <button class="btn-icon" :class="recording ? 'rec-active' : ''" @click="toggleRecord"
@@ -2402,6 +2546,13 @@ createApp({
           <label>Модель по умолчанию<input v-model="connection.default_model" placeholder="gpt-4o" /></label>
           <label>Модель для генерации артов (необязательно)<input v-model="connection.image_model" placeholder="например imagen-4 / nano-banana" /></label>
           <label class="check"><input type="checkbox" v-model="connection.image_via_chat" /> Арт через чат (nano-banana: модель «видит» аватары и фото из чата). Иначе — image_generation (imagen).</label>
+          <div class="hr"></div>
+          <h3>Запасная модель</h3>
+          <p class="muted">Если основная модель не ответила (ошибка провайдера, пустой ответ) — ход можно повторить запасной: автоматически или кнопкой «⚡ запасной моделью» в баннере ошибки.</p>
+          <label>Запасная модель (пусто = выключено)
+            <input v-model="connection.fallback_model" list="models-list" placeholder="например gemini-2.5-flash" />
+          </label>
+          <label class="check"><input type="checkbox" v-model="connection.auto_fallback" /> Автоматически отвечать запасной моделью при сбое основной</label>
           <div class="row">
             <button class="btn-primary" @click="testConnection">Проверить и загрузить модели</button>
             <button @click="saveConnection">Сохранить</button>
@@ -2545,6 +2696,17 @@ createApp({
               </div>
             </div>
             <p class="muted" style="margin-top:8px">Делиться чатом: откройте чат в списке слева и нажмите 🔗 — друг увидит его в разделе «Доступные мне». Так же делятся и групповые чаты.</p>
+          </div>
+
+          <div class="hr"></div>
+          <h3>Часовой пояс этого чата 🕒</h3>
+          <p class="muted">Нейросеть видит ваше текущее время (утро/ночь, день недели) и метки времени сообщений показываются в этом поясе. Настройка сохраняется для каждого чата отдельно; по умолчанию берётся из браузера.</p>
+          <label>Часовой пояс
+            <input v-model="sessionTimezone" list="tz-list" placeholder="например Europe/Moscow" @change="applySessionMeta" />
+            <datalist id="tz-list"><option v-for="tz in tzOptions" :key="tz" :value="tz"></option></datalist>
+          </label>
+          <div class="row">
+            <button @click="_autoTimezone(); applySessionMeta()">📍 Определить по браузеру</button>
           </div>
 
           <div class="hr"></div>

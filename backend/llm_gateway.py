@@ -37,16 +37,37 @@ GEMINI_SAFETY_OFF = [
 ]
 
 
+def _attachment_data_uri(att: AttachmentIn, default_mime: str) -> str:
+    """data:URI вложения (данные могут прийти и голым base64, и готовым data:URI)."""
+    data = (att.data or "").strip()
+    if data.startswith("data:"):
+        return data
+    return f"data:{att.mime or default_mime};base64,{data}"
+
+
 def _content_from_attachment(att: AttachmentIn) -> dict:
     """Превращает вложение в content-блок формата OpenAI/LiteLLM."""
-    if att.type == "image":
+    kind = att.type
+    mime = (att.mime or "").lower().split(";")[0].strip()
+    # Старые записи: до появления типа "video" фронтенд помечал видео (и любые
+    # не-картинки/не-аудио) как document — тогда бинарник декодировался как текст
+    # и в контекст уходили мегабайты мусора. Перенаправляем по mime.
+    if kind == "document" and mime.startswith("video/"):
+        kind = "video"
+    elif kind == "document" and mime.startswith("audio/"):
+        kind = "audio"
+    if kind == "image":
         return {"type": "image_url", "image_url": {"url": att.data}}
-    if att.type == "audio":
+    if kind == "video":
+        # Тот же проверенный путь, что и PDF: data:URI внутри image_url —
+        # LiteLLM определит mime и отправит Gemini как inline_data (видео нативно).
+        return {"type": "image_url", "image_url": {"url": _attachment_data_uri(att, "video/mp4")}}
+    if kind == "audio":
         # Gemini 1.5 Pro принимает аудио НАТИВНО — Whisper не нужен.
         b64 = att.data.split(",")[-1]  # отрезаем 'data:audio/...;base64,' если он есть
         fmt = (att.mime or "audio/wav").split("/")[-1]
         return {"type": "input_audio", "input_audio": {"data": b64, "format": fmt}}
-    if att.type == "document":
+    if kind == "document":
         # Word/PDF/текст: конвертируем в PDF или извлекаем текст (см. document_service).
         from backend.document_service import prepare_document
 
@@ -111,6 +132,13 @@ def _route_kwargs(connection: Optional[dict], model_name: str) -> dict:
             "api_key": api_key or DUMMY_PROXY_KEY,
         }
     return {"model": model_name}
+
+
+def effective_model(params: Optional[GenerationParams], connection: Optional[dict]) -> str:
+    """Какая модель реально пойдёт в запрос: UI > настройки подключения > .env."""
+    if params and params.model:
+        return params.model.strip()
+    return ((connection or {}).get("default_model") or settings.DEFAULT_MODEL).strip()
 
 
 def _apply_connection(call_kwargs: dict, params, connection: Optional[dict]) -> None:

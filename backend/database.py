@@ -111,6 +111,7 @@ def _sqlite_add_missing_columns(sync_conn) -> None:
             "director": "BOOLEAN DEFAULT 0",
             "owner_id": "INTEGER",
             "scenario": "TEXT DEFAULT ''",
+            "timezone": "VARCHAR(64) DEFAULT ''",
         },
         "messages": {
             "swipes": "JSON",

@@ -73,6 +73,9 @@ class ChatSession(Base):
     persona_id: Mapped[int | None] = mapped_column(
         ForeignKey("personas.id"), nullable=True
     )
+    # Часовой пояс пользователя ДЛЯ ЭТОГО чата (IANA-имя или смещение "+03:00").
+    # Нейросеть видит по нему текущее время собеседника; настраивается в UI на чат.
+    timezone: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     character = relationship("Character", back_populates="sessions")

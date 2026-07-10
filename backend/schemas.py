@@ -37,8 +37,8 @@ class GenerationParams(BaseModel):
 
 
 class AttachmentIn(BaseModel):
-    """Вложение к сообщению (картинка, аудио или документ Word/PDF/текст)."""
-    type: Literal["image", "audio", "document"]
+    """Вложение к сообщению (картинка, аудио, видео или документ Word/PDF/текст)."""
+    type: Literal["image", "audio", "video", "document"]
     # base64 (можно с префиксом data URI) или внешний URL.
     data: str
     mime: Optional[str] = None
@@ -123,6 +123,10 @@ class ConnectionSettings(BaseModel):
     # image_via_chat=True -> генерируем картинку через чат (nano-banana/*-image),
     # передавая модели РЕФЕРЕНС-картинки (аватары, фото из чата). Иначе — image_generation.
     image_via_chat: bool = False
+    # Запасная модель: если основная не ответила (ошибка провайдера, пустой ответ),
+    # генерация повторяется ею — автоматически (auto_fallback) или вручную из баннера.
+    fallback_model: str = ""
+    auto_fallback: bool = True
 
 
 # ----- Персоны пользователя -----
@@ -157,6 +161,9 @@ class SessionUpdate(BaseModel):
     background: Optional[str] = None
     director: Optional[bool] = None
     scenario: Optional[str] = None
+    # Часовой пояс пользователя ДЛЯ ЭТОГО чата (IANA-имя вида Europe/Moscow или
+    # смещение "+03:00"): нейросеть видит текущее время пользователя.
+    timezone: Optional[str] = None
 
 
 class GroupCreate(BaseModel):
