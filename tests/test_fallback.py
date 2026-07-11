@@ -18,7 +18,7 @@ def _fake_stream(failing_models):
     """Мок stream_completion: модели из failing_models падают, остальные отвечают."""
     calls = []
 
-    async def fake(messages, params=None, connection=None):
+    async def fake(messages, params=None, connection=None, on_thought=None):
         model = (params.model if params and params.model else None) or (
             (connection or {}).get("default_model") or "gpt-4o"
         )

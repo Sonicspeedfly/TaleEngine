@@ -381,6 +381,13 @@ label span { color: var(--text); }
 .att-audio { height: 36px; max-width: 260px; }
 .att-video { max-width: 320px; max-height: 240px; border-radius: 10px; border: 1px solid var(--border); background: #000; }
 
+/* Live-размышления модели (thinking): свёрнутый блок над печатающимся ответом. */
+.thought-box { font-size: 12px; color: var(--muted); background: var(--bg2);
+  border: 1px dashed var(--border); border-radius: 10px; padding: 6px 10px; max-width: 560px; }
+.thought-box summary { cursor: pointer; user-select: none; }
+.thought-box summary i { font-style: normal; opacity: 0.7; }
+.thought-text { margin-top: 6px; white-space: pre-wrap; max-height: 220px; overflow-y: auto; }
+
 /* Полоса прогресса отправки файлов на сервер (над композером). */
 .upload-bar i { font-style: normal; opacity: 0.8; }
 .upload-track { display: block; height: 6px; margin-top: 6px; border-radius: 4px;

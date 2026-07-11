@@ -124,8 +124,10 @@ class GenerationManager:
             asyncio.create_task(self._cleanup_later(job.job_id))
 
     async def _run(self, job, messages, params, on_complete, connection=None) -> None:
+        # Размышления модели транслируем клиентам live (в ответ они не входят).
+        thought = lambda t: job.broadcast({"type": "thought", "content": t})  # noqa: E731
         try:
-            async for token in stream_completion(messages, params, connection):
+            async for token in stream_completion(messages, params, connection, on_thought=thought):
                 job.buffer += token
                 job.broadcast({"type": "token", "content": token})
         except asyncio.CancelledError:
@@ -171,8 +173,9 @@ class GenerationManager:
             params.model_copy(update={"model": fb_model})
             if params else GenerationParams(model=fb_model)
         )
+        thought = lambda t: job.broadcast({"type": "thought", "content": t})  # noqa: E731
         try:
-            async for token in stream_completion(messages, fparams, connection):
+            async for token in stream_completion(messages, fparams, connection, on_thought=thought):
                 job.buffer += token
                 job.broadcast({"type": "token", "content": token})
         except asyncio.CancelledError:

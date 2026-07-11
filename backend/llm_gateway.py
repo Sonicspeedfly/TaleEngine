@@ -123,6 +123,36 @@ def _request_timeout(messages: list[dict]) -> int:
     return settings.REQUEST_TIMEOUT
 
 
+def _has_media_blocks(messages: list[dict]) -> bool:
+    """Есть ли в запросе вложения (image_url/input_audio — фото, видео, PDF, аудио)."""
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, list) and any(
+            isinstance(b, dict) and b.get("type") in ("image_url", "input_audio")
+            for b in c
+        ):
+            return True
+    return False
+
+
+def effective_reasoning(params: Optional[GenerationParams], messages: list[dict]) -> str:
+    """
+    Итоговый уровень рассуждений (reasoning_effort для LiteLLM):
+      * явный выбор пользователя ("disable"/"low"/"medium"/"high") — как есть;
+      * "auto"/пусто + в запросе есть файлы + включён file_reasoning — "medium":
+        Gemini местами не думает над файлами без явного бюджета размышлений;
+      * иначе "" — параметр не передаём, решает провайдер.
+    """
+    if params is None:
+        return ""
+    effort = (params.reasoning_effort or "").strip().lower()
+    if effort == "auto":
+        effort = ""
+    if not effort and params.file_reasoning and _has_media_blocks(messages):
+        return "medium"
+    return effort
+
+
 def _merge_params(params: Optional[GenerationParams]) -> dict:
     """Сливает дефолты из .env с тем, что пришло из UI (UI имеет приоритет)."""
     merged = {
@@ -134,9 +164,10 @@ def _merge_params(params: Optional[GenerationParams]) -> dict:
     }
     if params:
         for key, value in params.model_dump(exclude_none=True).items():
-            # model/disable_safety/web_access/send_avatars обрабатываются отдельно,
-            # не как сэмплинг-параметры litellm.
-            if key in ("model", "disable_safety", "web_access", "send_avatars"):
+            # model/disable_safety/web_access/send_avatars/reasoning_* обрабатываются
+            # отдельно, не как сэмплинг-параметры litellm.
+            if key in ("model", "disable_safety", "web_access", "send_avatars",
+                       "reasoning_effort", "file_reasoning"):
                 continue
             merged[key] = value
     return merged
@@ -195,10 +226,14 @@ async def stream_completion(
     messages: list[dict],
     params: Optional[GenerationParams] = None,
     connection: Optional[dict] = None,
+    on_thought=None,
 ) -> AsyncGenerator[str, None]:
     """
     Стримит ответ модели по токенам (async generator).
     Используется и веб-сервером (WS/SSE), и Telegram-ботом — логика единая.
+
+    :param on_thought: колбэк для «размышлений» модели (reasoning_content) —
+        они не входят в ответ, но их можно показать пользователю live.
     """
     call_kwargs: dict = {
         "messages": messages,
@@ -208,6 +243,13 @@ async def stream_completion(
         **_merge_params(params),
     }
     _apply_connection(call_kwargs, params, connection)
+
+    # Рассуждения (thinking): уровень пользователя или авто-включение при файлах.
+    # LiteLLM транслирует reasoning_effort в thinkingBudget Gemini; провайдеры без
+    # поддержки отбросят его через drop_params.
+    reasoning = effective_reasoning(params, messages)
+    if reasoning:
+        call_kwargs["reasoning_effort"] = reasoning
 
     # Доступ в интернет: подключаем инструмент веб-поиска (Google Search grounding
     # у Gemini). Неподдерживающие провайдеры отбросят его через drop_params.
@@ -229,6 +271,7 @@ async def stream_completion(
             "messages": debug_log.summarize_messages(messages),
             "params": {k: call_kwargs.get(k) for k in ("temperature", "top_p", "max_tokens")},
             "safety_off": safety_off,
+            "reasoning": reasoning or "auto",
         },
     )
     try:
@@ -244,10 +287,15 @@ async def stream_completion(
             if fr:
                 finish_reason = fr
             # «Думающие» модели (Gemini 3.x и т.п.) стримят рассуждения отдельным
-            # полем — в ответ они не идут, но их объём полезен для диагностики.
+            # полем — в ответ они не идут, но их можно показать пользователю live.
             rc = getattr(choice.delta, "reasoning_content", None)
             if rc:
                 thought_len += len(rc)
+                if on_thought:
+                    try:
+                        on_thought(rc)
+                    except Exception:  # noqa: BLE001 — показ мыслей не роняет стрим
+                        pass
             delta = choice.delta.content
             if delta:
                 text += delta

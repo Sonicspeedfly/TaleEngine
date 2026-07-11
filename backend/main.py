@@ -1837,7 +1837,8 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
                     send_avatars=bool(params and params.send_avatars),
                 )
             text = ""
-            async for tok in stream_completion(messages, params, connection):
+            _thought = lambda t: job.broadcast({"type": "thought", "content": t})  # noqa: E731
+            async for tok in stream_completion(messages, params, connection, on_thought=_thought):
                 text += tok
                 job.broadcast({"type": "token", "content": tok})
             async with AsyncSessionLocal() as rdb:

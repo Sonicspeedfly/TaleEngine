@@ -167,6 +167,95 @@ def test_build_user_content_with_image_returns_blocks():
     assert content[1]["type"] == "image_url"
 
 
+# ----- Рассуждения (thinking / reasoning_effort) -----
+@pytest.mark.asyncio
+async def test_reasoning_effort_passed_when_set():
+    """Явный выбор пользователя уходит в LiteLLM как reasoning_effort."""
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        _ = [t async for t in stream_completion(
+            [{"role": "user", "content": "hi"}], GenerationParams(reasoning_effort="high")
+        )]
+    assert _fake_acompletion.captured["reasoning_effort"] == "high"
+
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        _ = [t async for t in stream_completion(
+            [{"role": "user", "content": "hi"}], GenerationParams(reasoning_effort="disable")
+        )]
+    assert _fake_acompletion.captured["reasoning_effort"] == "disable"
+
+
+@pytest.mark.asyncio
+async def test_reasoning_auto_boosts_for_files():
+    """Файл в запросе + режим «авто» -> форсируем medium (Gemini не думает над файлами сам)."""
+    att = AttachmentIn(type="video", data="data:video/mp4;base64,AAAA", mime="video/mp4")
+    content = build_user_content("что на видео?", [att])
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        _ = [t async for t in stream_completion(
+            [{"role": "user", "content": content}], GenerationParams()
+        )]
+    assert _fake_acompletion.captured["reasoning_effort"] == "medium"
+
+
+@pytest.mark.asyncio
+async def test_reasoning_not_forced_without_files_or_when_off():
+    # Текст без файлов: авто -> параметр не передаём (решает провайдер).
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        _ = [t async for t in stream_completion([{"role": "user", "content": "hi"}], GenerationParams())]
+    assert "reasoning_effort" not in _fake_acompletion.captured
+
+    # Файл есть, но галка file_reasoning снята -> тоже не передаём.
+    att = AttachmentIn(type="image", data="data:image/png;base64,AAAA")
+    content = build_user_content("", [att])
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        _ = [t async for t in stream_completion(
+            [{"role": "user", "content": content}], GenerationParams(file_reasoning=False)
+        )]
+    assert "reasoning_effort" not in _fake_acompletion.captured
+
+
+def _thinking_chunk(thought=None, text=None):
+    """Чанк с reasoning_content (мысли) и/или content (ответ)."""
+    class _Delta:
+        pass
+
+    d = _Delta()
+    d.content = text
+    d.reasoning_content = thought
+
+    class _Choice:
+        pass
+
+    c = _Choice()
+    c.delta = d
+    c.finish_reason = None
+
+    class _Chunk:
+        pass
+
+    ch = _Chunk()
+    ch.choices = [c]
+    return ch
+
+
+async def _fake_thinking_completion(*args, **kwargs):
+    async def gen():
+        yield _thinking_chunk(thought="прикидываю варианты…")
+        yield _thinking_chunk(text="Ответ")
+    return gen()
+
+
+@pytest.mark.asyncio
+async def test_on_thought_callback_receives_reasoning():
+    """Мысли модели идут в колбэк on_thought, а в ответ не попадают."""
+    thoughts = []
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_thinking_completion):
+        tokens = [t async for t in stream_completion(
+            [{"role": "user", "content": "hi"}], None, None, on_thought=thoughts.append
+        )]
+    assert thoughts == ["прикидываю варианты…"]
+    assert "".join(tokens) == "Ответ"
+
+
 @pytest.mark.asyncio
 async def test_large_multimodal_payload_gets_bigger_timeout():
     """Большое inline-видео не должно падать по обычному 120-с таймауту."""

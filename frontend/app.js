@@ -56,6 +56,7 @@ createApp({
       copied: false,                    // флаг «код скопирован» для кнопки тулбара
       streaming: false,
       currentReply: "",
+      currentThought: "",   // live-«размышления» модели (reasoning_content), в ответ не входят
       currentJobId: null,
       connected: false,
       ws: null,
@@ -84,6 +85,8 @@ createApp({
         disable_safety: true,
         send_avatars: false,
         web_access: false,
+        reasoning_effort: "",   // "" авто | disable | low | medium | high
+        file_reasoning: true,   // авто-включать рассуждения при файлах
       },
       presets: [],
       presetName: "",
@@ -781,6 +784,7 @@ createApp({
       this.streaming = false;
       this.currentJobId = null;
       this.currentReply = "";
+      this.currentThought = "";
       this.liveBubbles = [];
     },
     _trackBackgroundJob(sid, jobId) {
@@ -1030,12 +1034,16 @@ createApp({
         if (this.liveBubbles.length) this.liveBubbles[this.liveBubbles.length - 1].content += ev.content;
         else this.currentReply += ev.content;
         this.scrollDown();
+      } else if (ev.type === "thought") {
+        // Размышления модели: копятся отдельно от ответа, показываются свёрнуто.
+        this.currentThought += ev.content;
       } else if (ev.type === "speaker_done") {
         // ничего: пузырь остаётся на экране до перечитки истории
       } else if (ev.type === "fallback") {
         // Основная модель не ответила — сервер повторяет ход запасной.
         // Частичный текст основной сбрасываем: ответ придёт с чистого листа.
         this.currentReply = "";
+        this.currentThought = "";
         this.liveBubbles = [];
         this.showToast("⚠ Основная модель не ответила — пробую запасную: " + (ev.model || ""));
       } else if (ev.type === "done") this.finishStream();
@@ -1051,6 +1059,7 @@ createApp({
       // Сервер — источник истины: перечитываем сообщения (там уже новый ответ/свайп).
       await this.loadMessages();
       this.currentReply = "";
+      this.currentThought = "";
       this.liveBubbles = [];
       if (this.soundOn) this.playChime();
     },
@@ -1073,6 +1082,7 @@ createApp({
       // SSE отдаёт НАКОПЛЕННЫЙ буфер целиком — сбрасываем live-текст,
       // иначе уже полученные по WS токены задвоятся на экране.
       this.currentReply = "";
+      this.currentThought = "";
       this.liveBubbles = [];
       const es = (this._sse = new EventSource("/sse/job/" + jobId));
       es.onmessage = (e) => {
@@ -1161,6 +1171,7 @@ createApp({
       // Оптимистично показываем своё сообщение сразу (с вложениями — их видно в пузыре).
       this.messages.push({ id: "tmp", role: "user", content, attachments, swipes: [content], active_swipe: 0, created_at: new Date().toISOString() });
       this.currentReply = "";
+      this.currentThought = "";
       this.liveBubbles = [];
       this.streaming = true;
       this._lastEvtAt = Date.now();
@@ -1193,6 +1204,7 @@ createApp({
       if (!this.connected || this.streaming) return;
       this.chatError = "";
       this.currentReply = "";
+      this.currentThought = "";
       this.liveBubbles = [];
       this.streaming = true;
       this._lastEvtAt = Date.now();
@@ -1206,6 +1218,7 @@ createApp({
       if (!this.connected || this.streaming) return;
       this.chatError = "";
       this.currentReply = "";
+      this.currentThought = "";
       this.liveBubbles = [];
       this.streaming = true;
       this._lastEvtAt = Date.now();
@@ -1590,6 +1603,7 @@ createApp({
       if (!this.connected || this.streaming) return;
       this.chatError = "";
       this.currentReply = "";
+      this.currentThought = "";
       this.liveBubbles = [];
       this.streaming = true;
       this._lastEvtAt = Date.now();
@@ -2352,6 +2366,13 @@ createApp({
           </div>
         </div>
 
+        <!-- live-размышления модели (thinking): свёрнуты, в ответ не входят -->
+        <div v-if="streaming && currentThought" class="msg assistant thought-msg">
+          <details class="thought-box">
+            <summary>💭 Модель размышляет… <i>{{ (currentThought.length / 1000).toFixed(1) }}к симв.</i></summary>
+            <div class="thought-text">{{ currentThought }}</div>
+          </details>
+        </div>
         <!-- стриминг: группа (несколько персонажей по очереди) -->
         <div v-for="(b, i) in liveBubbles" :key="'live'+i" class="msg assistant">
           <div class="speaker">{{ b.name }}</div>
@@ -2552,6 +2573,20 @@ createApp({
           <label class="check danger-text"><input type="checkbox" v-model="params.disable_safety" /> Zero-Censorship — снять фильтры (вкл. по умолчанию; порог OFF)</label>
           <label class="check"><input type="checkbox" v-model="params.send_avatars" /> Показывать нейросети аватары (внешность персонажа и ролевика)</label>
           <label class="check"><input type="checkbox" v-model="params.web_access" /> 🌐 Доступ в интернет (веб-поиск на каждый запрос)</label>
+
+          <div class="hr"></div>
+          <h3>Рассуждения (thinking) 💭</h3>
+          <label>Бюджет размышлений модели
+            <select v-model="params.reasoning_effort">
+              <option value="">авто (решает модель)</option>
+              <option value="disable">выключены</option>
+              <option value="low">низкие</option>
+              <option value="medium">средние</option>
+              <option value="high">высокие</option>
+            </select>
+          </label>
+          <label class="check"><input type="checkbox" v-model="params.file_reasoning" /> 📎 Включать рассуждения при работе с файлами (если выше «авто» — Gemini местами не думает над файлами сам)</label>
+          <p class="muted" style="margin:2px 0">Размышления видны live в чате (блок 💭), в ответ не входят. Учтите: при малом Max tokens длинные размышления могут «съесть» лимит ответа.</p>
 
           <template v-if="isAdmin">
             <div class="hr"></div>

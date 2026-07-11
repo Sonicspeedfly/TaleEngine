@@ -34,6 +34,14 @@ class GenerationParams(BaseModel):
     # Доступ в интернет: подключает инструмент веб-поиска (Google Search grounding
     # у Gemini) на КАЖДЫЙ запрос — модель сможет искать актуальную информацию.
     web_access: bool = False
+    # Рассуждения (thinking) модели: "" / "auto" — решает провайдер,
+    # "disable" — выключить, "low"/"medium"/"high" — бюджет размышлений.
+    # LiteLLM транслирует reasoning_effort в thinkingBudget у Gemini.
+    reasoning_effort: Optional[str] = None
+    # Включать рассуждения при работе с ФАЙЛАМИ: если reasoning_effort = авто,
+    # а в запросе есть вложения (видео/фото/аудио/документ) — форсируем "medium".
+    # Gemini местами «ленится» думать над файлами без явного бюджета.
+    file_reasoning: bool = True
 
 
 class AttachmentIn(BaseModel):
