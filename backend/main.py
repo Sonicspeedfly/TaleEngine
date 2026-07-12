@@ -44,6 +44,13 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi import Header, Request
 
 from backend import accounts, admin_service, debug_log, group_chat, models, native_io, telegram_runtime
+from backend.attachments import (
+    attachment_data,
+    delete_message_blobs,
+    hydrate_export_attachments,
+    message_attachments_in,
+    store_attachments,
+)
 from backend.characters import (
     build_character_book,
     decode_png_card,
@@ -55,7 +62,7 @@ from backend.chat_import import parse_sillytavern_chat
 from backend.config import settings
 from backend.database import AsyncSessionLocal, get_session, init_db
 from backend.generation import generation_manager
-from backend.horae_memory import build_context_from_db, messages_to_history
+from backend.horae_memory import build_context_from_db, messages_to_history_db
 from backend.llm_gateway import (
     build_user_content,
     complete,
@@ -673,6 +680,10 @@ async def delete_session(
     sess = await db.get(models.ChatSession, session_id)
     if not await _can_access_session(db, sess, user):
         raise HTTPException(403, "Нет доступа к этому чату")
+    # Данные вложений сообщений этого чата (blob-таблица) — до удаления сообщений.
+    await delete_message_blobs(
+        db, select(models.Message.id).where(models.Message.session_id == session_id)
+    )
     # Все дочерние таблицы, ссылающиеся на session_id (глобальные Horae с session_id
     # IS NULL не затрагиваются — они не привязаны к этому чату).
     for model in (
@@ -725,7 +736,10 @@ async def get_attachment(
     atts = msg.attachments or []
     if not (0 <= idx < len(atts)) or not isinstance(atts[idx], dict):
         raise HTTPException(404, "Вложение не найдено")
-    data = atts[idx].get("data") or ""
+    # data: инлайн (легаси) или из blob-таблицы (тяжёлый base64 хранится отдельно).
+    data = await attachment_data(db, atts[idx])
+    if not data:
+        raise HTTPException(404, "Данные вложения не найдены")
     mime = atts[idx].get("mime") or "application/octet-stream"
     b64 = data.split(",", 1)[1] if data.startswith("data:") and "," in data else data
     try:
@@ -891,6 +905,7 @@ async def edit_message(
 async def delete_message(message_id: int, db: AsyncSession = Depends(get_session)):
     msg = await db.get(models.Message, message_id)
     if msg:
+        await delete_message_blobs(db, [message_id])  # данные вложений — тоже
         await db.delete(msg)
         await db.commit()
     return {"ok": True}
@@ -1135,7 +1150,10 @@ async def export_session(
             c = await db.get(models.Character, gm.character_id)
             if c:
                 members.append(c)
-    return native_io.build_chat_export(sess, character, persona, messages, horae, members)
+    data = native_io.build_chat_export(sess, character, persona, messages, horae, members)
+    # Полный экспорт: данные вложений подтягиваем из blob-таблицы в файл.
+    await hydrate_export_attachments(db, data, messages)
+    return data
 
 
 async def _import_native_chat(db, data: dict, owner_id, user) -> dict:
@@ -1239,11 +1257,13 @@ async def _import_native_chat(db, data: dict, owner_id, user) -> dict:
             swipes=m.get("swipes") or [m.get("content", "")],
             active_swipe=m.get("active_swipe") or 0,
             speaker_name=m.get("speaker_name"),
-            attachments=m.get("attachments") or [],
+            attachments=[],
             model_used=m.get("model_used"),
         )
         db.add(msg)
         await db.flush()  # получаем msg.id, не закрывая транзакцию
+        # Данные вложений из файла экспорта — в blob-таблицу, в строке — мета.
+        msg.attachments = await store_attachments(db, msg.id, m.get("attachments") or [])
         idx_to_id[m.get("idx")] = msg.id
         if m.get("reply_to_idx") is not None:
             pending_replies.append((msg, m["reply_to_idx"]))
@@ -1655,11 +1675,11 @@ async def canvas_generate(
     connection = await get_connection(db)
     params = GenerationParams(**(payload.get("params") or {}))
 
-    # 1. Сообщение пользователя — в чат как обычно.
-    db.add(models.Message(
-        session_id=session_id, role="user", content=prompt,
-        attachments=[a.model_dump() for a in attachments],
-    ))
+    # 1. Сообщение пользователя — в чат как обычно (данные вложений — в blobs).
+    user_msg = models.Message(session_id=session_id, role="user", content=prompt, attachments=[])
+    db.add(user_msg)
+    await db.flush()
+    user_msg.attachments = await store_attachments(db, user_msg.id, attachments)
     await db.commit()
 
     # 2. Генерация (нестриминговая): просим ПОЛНЫЙ документ/код.
@@ -1772,10 +1792,13 @@ async def _collect_reference_images(db, session_id, character, msgs) -> list[str
         if p and p.avatar_path and _is_image(p.avatar_path):
             refs.append(p.avatar_path)
     # Свежие картинки из переписки (последние сообщения с вложениями-изображениями).
+    # Данные тянем точечно (blob-таблица); тяжёлые не-картинки не читаются вовсе.
     for m in msgs[-8:]:
         for att in (m.attachments or []):
-            if isinstance(att, dict) and att.get("type") == "image" and _is_image(att.get("data", "")):
-                refs.append(att["data"])
+            if isinstance(att, dict) and att.get("type") == "image":
+                data = await attachment_data(db, att)
+                if _is_image(data):
+                    refs.append(data)
     # Без дублей, не больше 4.
     seen, uniq = set(), []
     for r in refs:
@@ -1918,13 +1941,13 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
     director = sess.director
 
     if save_user:
-        db.add(
-            models.Message(
-                session_id=session_id, role="user", content=content,
-                attachments=[a.model_dump() for a in attachments],
-                reply_to_id=reply_to_message_id,
-            )
+        msg = models.Message(
+            session_id=session_id, role="user", content=content,
+            attachments=[], reply_to_id=reply_to_message_id,
         )
+        db.add(msg)
+        await db.flush()
+        msg.attachments = await store_attachments(db, msg.id, attachments)
         await db.commit()
 
     model_used = _effective_model(params, connection)
@@ -2018,15 +2041,17 @@ async def _start_user_turn(session_id, content, attachments, params, db, reply_t
         db, sess, character, model_text, user_content, _ctx_budget(params),
         send_avatars=bool(params and params.send_avatars),
     )
-    db.add(
-        models.Message(
-            session_id=session_id,
-            role="user",
-            content=content,
-            attachments=[a.model_dump() for a in attachments],
-            reply_to_id=reply_to_message_id,
-        )
+    msg = models.Message(
+        session_id=session_id,
+        role="user",
+        content=content,
+        attachments=[],
+        reply_to_id=reply_to_message_id,
     )
+    db.add(msg)
+    await db.flush()
+    # Тяжёлый base64 — в blob-таблицу, в сообщении остаётся лёгкая мета.
+    msg.attachments = await store_attachments(db, msg.id, attachments)
     await db.commit()
 
     job_id = uuid.uuid4().hex
@@ -2070,8 +2095,8 @@ async def _start_regenerate(session_id, params, db) -> str:
     )
     user_text = last_user.content if last_user else ""
     boundary_id = last_user.id if last_user else target.id
-    # messages_to_history сохраняет вложения истории (модель «видит» прежние файлы).
-    history = messages_to_history([m for m in msgs if m.id < boundary_id])
+    # История сохраняет вложения (модель «видит» прежние файлы); данные — из blobs.
+    history = await messages_to_history_db(db, [m for m in msgs if m.id < boundary_id])
     user_content = build_user_content(
         user_text,
         [],  # вложения прошлой реплики при перегенерации не пересобираем
@@ -2124,8 +2149,8 @@ async def _start_continue(session_id, params, db) -> str:
     )
     user_text = last_user.content if last_user else ""
     boundary_id = last_user.id if last_user else target.id
-    # messages_to_history сохраняет вложения истории (модель «видит» прежние файлы).
-    history = messages_to_history([m for m in msgs if m.id < boundary_id])
+    # История сохраняет вложения (модель «видит» прежние файлы); данные — из blobs.
+    history = await messages_to_history_db(db, [m for m in msgs if m.id < boundary_id])
     user_content = build_user_content(user_text, [])
     messages = await build_context_from_db(
         db, sess, character, user_text, user_content, _ctx_budget(params),
@@ -2177,11 +2202,12 @@ async def _start_retry(session_id, params, db) -> str:
 
     character = await db.get(models.Character, sess.character_id)
     connection = await get_connection(db)
-    atts = [AttachmentIn(**a) for a in (last.attachments or []) if isinstance(a, dict)]
+    # ПОЛНЫЕ вложения повторяемой реплики (данные — из blob-таблицы).
+    atts = await message_attachments_in(db, last)
     user_content = build_user_content(last.content, atts)
     # Контекст: история ДО последней реплики + сама реплика как текущее сообщение —
     # ровно то же, что видел бы _start_user_turn, но без повторного сохранения.
-    history = messages_to_history([m for m in msgs if m.id < last.id])
+    history = await messages_to_history_db(db, [m for m in msgs if m.id < last.id])
     messages = await build_context_from_db(
         db, sess, character, last.content, user_content, _ctx_budget(params),
         history=history, send_avatars=bool(params and params.send_avatars),

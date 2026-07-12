@@ -19,3 +19,4 @@ frontend/dist/
 # IDE
 .vscode/
 .idea/
+data/*.bak*

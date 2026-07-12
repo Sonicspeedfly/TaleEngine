@@ -119,6 +119,23 @@ class Message(Base):
     session = relationship("ChatSession", back_populates="messages")
 
 
+class AttachmentBlob(Base):
+    """
+    ДАННЫЕ (base64) вложения — отдельно от строки сообщения.
+
+    В messages.attachments хранится только лёгкая мета {type, mime, name, size,
+    blob_id}. Раньше base64 лежал прямо в JSON-колонке — и каждый ход/открытие
+    чата поднимал в память сотни МБ (чат с парой видео = 170+ МБ на КАЖДОЕ
+    чтение истории). Теперь тяжёлые данные достаются точечно и только когда
+    реально нужны (показ вложения, retry, экспорт, вложения истории в лимите).
+    """
+    __tablename__ = "attachment_blobs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    message_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    data: Mapped[str] = mapped_column(Text, default="")
+
+
 class GroupMember(Base):
     """Участник группового чата (связь сессия ↔ персонаж)."""
     __tablename__ = "group_members"

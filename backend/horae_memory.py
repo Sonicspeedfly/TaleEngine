@@ -102,7 +102,7 @@ def _att_label(a: dict) -> str:
     return "вложение"
 
 
-def messages_to_history(msgs) -> list[dict]:
+def messages_to_history(msgs, att_map: dict | None = None) -> list[dict]:
     """
     Превращает ORM-сообщения в историю для контекста, СОХРАНЯЯ вложения (картинки,
     аудио, документы) — чтобы модель «видела» присланный ранее файл и на последующих
@@ -113,36 +113,59 @@ def messages_to_history(msgs) -> list[dict]:
     бы знала о факте вложения. Мультимодальный контент собираем только для реплик
     пользователя (у ассистента вложений в норме нет, а image в assistant часть
     провайдеров не принимает).
+
+    :param att_map: {message_id: [att dict С data]} — вложения, уже отобранные под
+        лимит и гидратированные из blob-таблицы (см. attachments.load_history_attachments).
+        None — легаси-режим: данные берутся прямо из сообщений (инлайн base64).
     """
     from backend.llm_gateway import build_user_content
     from backend.schemas import AttachmentIn
 
-    keep: dict = {}
-    used = 0
-    for m in reversed(msgs):
-        atts = [a for a in (m.attachments or []) if isinstance(a, dict) and a.get("data")]
-        size = sum(len(a.get("data") or "") for a in atts)
-        if atts and used + size <= _MAX_HISTORY_ATT_BYTES:
-            keep[m.id] = True
-            used += size
-        else:
-            keep[m.id] = False
+    if att_map is None:
+        # Легаси: инлайн-данные в самих сообщениях (старые БД, юнит-тесты).
+        att_map = {}
+        used = 0
+        for m in reversed(msgs):
+            atts = [a for a in (m.attachments or []) if isinstance(a, dict) and a.get("data")]
+            size = sum(len(a.get("data") or "") for a in atts)
+            if atts and used + size <= _MAX_HISTORY_ATT_BYTES:
+                att_map[m.id] = atts
+                used += size
 
     out: list[dict] = []
     for m in msgs:
-        atts = [a for a in (m.attachments or []) if isinstance(a, dict) and a.get("data")]
-        if atts and keep.get(m.id) and m.role == "user":
+        all_atts = [a for a in (m.attachments or []) if isinstance(a, dict)]
+        kept = att_map.get(m.id)
+        if kept and m.role == "user":
             try:
-                content = build_user_content(m.content or "", [AttachmentIn(**a) for a in atts])
+                content = build_user_content(m.content or "", [
+                    AttachmentIn(
+                        type=a.get("type") or "document", data=a.get("data") or "",
+                        mime=a.get("mime"), name=a.get("name"),
+                    )
+                    for a in kept
+                ])
             except Exception:  # noqa: BLE001 — битое вложение не должно рушить контекст
                 content = m.content or ""
-        elif atts:
-            note = " ".join(f"[{_att_label(a)}]" for a in atts)
+        elif all_atts:
+            note = " ".join(f"[{_att_label(a)}]" for a in all_atts)
             content = f"{m.content} {note}".strip() if m.content else note
         else:
             content = m.content or ""
         out.append({"role": m.role, "content": content})
     return out
+
+
+async def messages_to_history_db(db, msgs) -> list[dict]:
+    """
+    То же, что messages_to_history, но данные вложений подтягиваются из
+    blob-таблицы ТОЧЕЧНО: большие вложения отбрасываются по мете, их base64
+    даже не читается из БД (раньше каждый ход поднимал в память весь чат).
+    """
+    from backend.attachments import load_history_attachments
+
+    att_map = await load_history_attachments(db, msgs, _MAX_HISTORY_ATT_BYTES)
+    return messages_to_history(msgs, att_map)
 
 
 @dataclass
@@ -449,8 +472,9 @@ async def build_context_from_db(
             .order_by(Message.id)
         )
         msgs = (await session_db.execute(hq)).scalars().all()
-        # СОХРАНЯЕМ вложения истории — иначе модель не «видит» присланный ранее файл.
-        history = messages_to_history(msgs)
+        # СОХРАНЯЕМ вложения истории (в пределах лимита) — данные тянутся из
+        # blob-таблицы точечно, большие файлы в память не поднимаются.
+        history = await messages_to_history_db(session_db, msgs)
 
     char_dict = {
         "name": character.name,

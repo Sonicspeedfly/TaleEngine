@@ -40,6 +40,7 @@ from sqlalchemy import func, or_, select
 from backend import accounts, admin_service, group_chat, models
 from backend.config import settings
 from backend.database import AsyncSessionLocal
+from backend.attachments import store_attachments
 from backend.document_service import is_document
 from backend.horae_memory import build_context_from_db
 from backend.llm_gateway import build_user_content, complete, stream_completion
@@ -262,12 +263,10 @@ async def _generate_reply(session_id: int, text: str, attachments: list[Attachme
         messages = await build_context_from_db(
             db, sess, character, text, user_content, settings.CONTEXT_TOKEN_BUDGET
         )
-        db.add(
-            models.Message(
-                session_id=session_id, role="user", content=text,
-                attachments=[a.model_dump() for a in attachments],
-            )
-        )
+        msg = models.Message(session_id=session_id, role="user", content=text, attachments=[])
+        db.add(msg)
+        await db.flush()
+        msg.attachments = await store_attachments(db, msg.id, attachments)
         await db.commit()
 
     reply = ""
@@ -299,10 +298,10 @@ async def _generate_group_reply(
         members = await group_chat.load_members(db, session_id)
         connection = await get_connection(db)
         director = bool(sess and sess.director)
-        db.add(models.Message(
-            session_id=session_id, role="user", content=text,
-            attachments=[a.model_dump() for a in attachments],
-        ))
+        msg = models.Message(session_id=session_id, role="user", content=text, attachments=[])
+        db.add(msg)
+        await db.flush()
+        msg.attachments = await store_attachments(db, msg.id, attachments)
         await db.commit()
         msgs = (await db.execute(
             select(models.Message)

@@ -70,8 +70,65 @@ async def init_db() -> None:
         # Лёгкая dev-миграция: дозаливаем недостающие колонки в уже существующую БД,
         # чтобы при обновлении схемы не приходилось удалять файл aichat.db вручную.
         await conn.run_sync(_sqlite_add_missing_columns)
+        # Переносим base64-данные вложений из строк сообщений в attachment_blobs
+        # (одноразово; см. докстринг — иначе каждый ход тянет в память сотни МБ).
+        await conn.run_sync(_migrate_attachment_blobs)
         # Разовая чистка «сирот» от старого некаскадного удаления чатов (см. ниже).
         await conn.run_sync(_cleanup_orphans)
+
+
+def _migrate_attachment_blobs(sync_conn) -> None:
+    """
+    Одноразовая (идемпотентная) миграция: инлайн-`data` из messages.attachments
+    переезжает в таблицу attachment_blobs, в сообщении остаётся мета с blob_id.
+    Без этого чат с видео весил сотни МБ ПРЯМО в строках таблицы, и каждое
+    чтение истории (каждый ход, каждое открытие чата) поднимало их в память.
+    """
+    import json as _json
+
+    from sqlalchemy import inspect, text
+
+    tables = set(inspect(sync_conn).get_table_names())
+    if "messages" not in tables or "attachment_blobs" not in tables:
+        return
+    rows = sync_conn.execute(text(
+        "SELECT id, attachments FROM messages "
+        "WHERE attachments IS NOT NULL AND attachments LIKE '%\"data\"%'"
+    )).fetchall()
+    moved = 0
+    for mid, raw in rows:
+        try:
+            atts = _json.loads(raw)
+        except Exception:  # noqa: BLE001 — битый JSON не должен ломать старт
+            continue
+        if not isinstance(atts, list):
+            continue
+        changed = False
+        new_atts = []
+        for a in atts:
+            if isinstance(a, dict) and a.get("data"):
+                data = a["data"]
+                res = sync_conn.execute(
+                    text("INSERT INTO attachment_blobs (message_id, data) VALUES (:m, :d)"),
+                    {"m": mid, "d": data},
+                )
+                new_atts.append({
+                    "type": a.get("type"), "mime": a.get("mime"), "name": a.get("name"),
+                    "size": a.get("size") or int(len(data) * 0.75),
+                    "blob_id": res.lastrowid,
+                })
+                changed = True
+                moved += 1
+            else:
+                new_atts.append(a)
+        if changed:
+            sync_conn.execute(
+                text("UPDATE messages SET attachments = :a WHERE id = :i"),
+                {"a": _json.dumps(new_atts, ensure_ascii=False), "i": mid},
+            )
+    if moved:
+        print(f"[migrate] Вложения вынесены из сообщений в attachment_blobs: {moved} шт. "
+              "(файл БД можно ужать командой VACUUM при желании)")
 
 
 def _cleanup_orphans(sync_conn) -> None:
@@ -99,6 +156,11 @@ def _cleanup_orphans(sync_conn) -> None:
         sync_conn.execute(text(
             "DELETE FROM horae_entries WHERE session_id IS NOT NULL "
             "AND session_id NOT IN (SELECT id FROM chat_sessions)"
+        ))
+    if "attachment_blobs" in tables:  # данные вложений удалённых сообщений
+        sync_conn.execute(text(
+            "DELETE FROM attachment_blobs WHERE message_id IS NOT NULL "
+            "AND message_id NOT IN (SELECT id FROM messages)"
         ))
     # 2. Дубли участников группы: оставляем по одной строке на (чат, персонаж).
     if "group_members" in tables:
