@@ -84,7 +84,7 @@ createApp({
         top_k: 40,
         max_tokens: 8192,       // длина ОДНОГО ОТВЕТА (вывод); рассуждения тратят его же
         repetition_penalty: 1.1,
-        context_tokens: 64000,  // окно контекста: сколько истории видит модель («память»)
+        context_tokens: 1000000, // окно контекста («память»): по умолчанию максимум Gemini
         disable_safety: true,
         send_avatars: false,
         web_access: false,
@@ -1778,10 +1778,11 @@ createApp({
       const ui = await this.api("/settings/ui");
       if (applyParams && ui && ui.params) this.params = { ...this.params, ...ui.params };
       // Мягкая миграция старых сохранённых настроек: прежний дефолт max_tokens=1024
-      // резал ответы (особенно с рассуждениями), а окна контекста вовсе не было.
+      // резал ответы (особенно с рассуждениями), а окно контекста было 64000
+      // (прошлый дефолт) — теперь по умолчанию максимум Gemini (1 млн).
       if (applyParams) {
         if (!this.params.max_tokens || this.params.max_tokens <= 1024) this.params.max_tokens = 8192;
-        if (!this.params.context_tokens) this.params.context_tokens = 64000;
+        if (!this.params.context_tokens || this.params.context_tokens === 64000) this.params.context_tokens = 1000000;
       }
       if (ui && Number(ui.message_preload) > 0) this.messagePreload = Number(ui.message_preload);
       if (ui && "auto_summary" in ui) this.autoSummary = ui.auto_summary !== false;
@@ -2716,9 +2717,14 @@ createApp({
           <label>Max tokens — длина ОТВЕТА <span class="range-val">{{ params.max_tokens }}</span>
             <input type="number" min="256" step="256" v-model.number="params.max_tokens" /></label>
           <p class="muted" style="margin:2px 0 10px">Это лимит ВЫВОДА (одного ответа), не памяти. Рассуждения 💭 тратят этот же лимит — при «высоких» держите 8000+.</p>
-          <label>🧠 Окно контекста — память диалога (токенов) <span class="range-val">{{ params.context_tokens }}</span>
-            <input type="number" min="4000" step="4000" v-model.number="params.context_tokens" /></label>
-          <p class="muted" style="margin:2px 0 10px">Сколько ИСТОРИИ чата видит модель на каждый ход. Больше — помнит дальше, но дороже и медленнее. Gemini тянет до ~1 млн; разумно 32–200 тыс. Что не влезло — сохраняет авто-сводка (вкладка «Память»).</p>
+          <label>🧠 Окно контекста — память диалога (токенов) <span class="range-val">{{ params.context_tokens >= 1000000 ? '1 млн (максимум)' : params.context_tokens }}</span>
+            <input type="number" min="4000" max="1000000" step="4000" v-model.number="params.context_tokens" /></label>
+          <div class="row" style="gap:6px; margin:-4px 0 6px; flex-wrap:wrap">
+            <button v-for="p in [[32000,'32к'],[128000,'128к'],[200000,'200к'],[1000000,'1 млн']]" :key="p[0]"
+                    :class="params.context_tokens === p[0] ? 'btn-primary' : ''"
+                    @click="params.context_tokens = p[0]">{{ p[1] }}</button>
+          </div>
+          <p class="muted" style="margin:2px 0 10px">Сколько ИСТОРИИ чата видит модель на каждый ход. По умолчанию — 1 млн (максимум Gemini): модель помнит весь чат. Уменьшите, если ходы станут дорогими или медленными (свыше ~200 тыс. Gemini тарифицирует дороже). Что не влезло — сохранит авто-сводка (вкладка «Память»).</p>
           <label>Repetition penalty <span class="range-val">{{ params.repetition_penalty }}</span>
             <input type="range" min="0.8" max="2" step="0.05" v-model.number="params.repetition_penalty" /></label>
           <label class="check danger-text"><input type="checkbox" v-model="params.disable_safety" /> Zero-Censorship — снять фильтры (вкл. по умолчанию; порог OFF)</label>
