@@ -82,8 +82,9 @@ createApp({
         temperature: 0.9,
         top_p: 0.95,
         top_k: 40,
-        max_tokens: 1024,
+        max_tokens: 8192,       // длина ОДНОГО ОТВЕТА (вывод); рассуждения тратят его же
         repetition_penalty: 1.1,
+        context_tokens: 64000,  // окно контекста: сколько истории видит модель («память»)
         disable_safety: true,
         send_avatars: false,
         web_access: false,
@@ -104,6 +105,9 @@ createApp({
 
       // --- Память Horae (вкладка Memory) ---
       horae: [],
+      // Авто-сводка сюжета: каждые ~12 сообщений ИИ обновляет запись
+      // «Сводка сюжета (авто)» — старые события не выпадают из памяти.
+      autoSummary: true,
       // Пустая форма записи памяти (тот же объект возвращает метод blankHorae()).
       horaeEdit: { id: null, category: "lore", title: "", content: "", keywords: "", always_on: false, enabled: true, priority: 0, scope: "global" },
 
@@ -1773,7 +1777,14 @@ createApp({
     async loadUiPrefs(applyParams = true) {
       const ui = await this.api("/settings/ui");
       if (applyParams && ui && ui.params) this.params = { ...this.params, ...ui.params };
+      // Мягкая миграция старых сохранённых настроек: прежний дефолт max_tokens=1024
+      // резал ответы (особенно с рассуждениями), а окна контекста вовсе не было.
+      if (applyParams) {
+        if (!this.params.max_tokens || this.params.max_tokens <= 1024) this.params.max_tokens = 8192;
+        if (!this.params.context_tokens) this.params.context_tokens = 64000;
+      }
       if (ui && Number(ui.message_preload) > 0) this.messagePreload = Number(ui.message_preload);
+      if (ui && "auto_summary" in ui) this.autoSummary = ui.auto_summary !== false;
     },
     saveUiPrefs() {
       // Дебаунс, чтобы не дёргать сервер на каждое движение ползунка.
@@ -1781,7 +1792,11 @@ createApp({
       this._uiSaveTimer = setTimeout(() => {
         this.api("/settings/ui", {
           method: "PUT",
-          body: JSON.stringify({ params: this.params, message_preload: this.msgPageSize }),
+          body: JSON.stringify({
+            params: this.params,
+            message_preload: this.msgPageSize,
+            auto_summary: this.autoSummary,
+          }),
         }).catch(() => {});
       }, 600);
     },
@@ -2698,8 +2713,12 @@ createApp({
             <input type="range" min="0" max="1" step="0.01" v-model.number="params.top_p" /></label>
           <label>Top K <span class="range-val">{{ params.top_k }}</span>
             <input type="number" v-model.number="params.top_k" /></label>
-          <label>Max tokens <span class="range-val">{{ params.max_tokens }}</span>
-            <input type="number" v-model.number="params.max_tokens" /></label>
+          <label>Max tokens — длина ОТВЕТА <span class="range-val">{{ params.max_tokens }}</span>
+            <input type="number" min="256" step="256" v-model.number="params.max_tokens" /></label>
+          <p class="muted" style="margin:2px 0 10px">Это лимит ВЫВОДА (одного ответа), не памяти. Рассуждения 💭 тратят этот же лимит — при «высоких» держите 8000+.</p>
+          <label>🧠 Окно контекста — память диалога (токенов) <span class="range-val">{{ params.context_tokens }}</span>
+            <input type="number" min="4000" step="4000" v-model.number="params.context_tokens" /></label>
+          <p class="muted" style="margin:2px 0 10px">Сколько ИСТОРИИ чата видит модель на каждый ход. Больше — помнит дальше, но дороже и медленнее. Gemini тянет до ~1 млн; разумно 32–200 тыс. Что не влезло — сохраняет авто-сводка (вкладка «Память»).</p>
           <label>Repetition penalty <span class="range-val">{{ params.repetition_penalty }}</span>
             <input type="range" min="0.8" max="2" step="0.05" v-model.number="params.repetition_penalty" /></label>
           <label class="check danger-text"><input type="checkbox" v-model="params.disable_safety" /> Zero-Censorship — снять фильтры (вкл. по умолчанию; порог OFF)</label>
@@ -2813,6 +2832,9 @@ createApp({
         <!-- ВКЛАДКА: Память Horae -->
         <div v-if="drawerTab==='memory'">
           <h3>Память Horae 🧠</h3>
+          <label class="check"><input type="checkbox" v-model="autoSummary" @change="saveUiPrefs" />
+            📜 Авто-сводка сюжета: каждые ~12 сообщений ИИ обновляет запись «Сводка сюжета (авто)» этого чата — события, выпавшие из окна контекста, остаются в памяти модели.</label>
+          <div class="hr"></div>
           <p class="muted">Долговременная память ролей. <b>always_on</b> — подмешивается в КАЖДЫЙ запрос (состояние, инвентарь, факты); иначе срабатывает по ключевым словам, как World Info. Области:
             <span class="scope-tag global">🌐 глоб.</span> во всех чатах,
             <span class="scope-tag session">💬 чат</span> только в этом,

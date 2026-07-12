@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.pool import NullPool
 
 from backend.config import settings
 
@@ -22,7 +23,21 @@ class Base(DeclarativeBase):
 
 
 # echo=settings.DEBUG — печатать выполняемый SQL в консоль в режиме отладки.
-engine = create_async_engine(settings.DATABASE_URL, echo=settings.DEBUG, future=True)
+# SQLite-нюансы:
+#   * у файла ЕДИНСТВЕННЫЙ писатель, а фоновые задачи (авто-сводка Horae) пишут
+#     параллельно с ходами — соединение должно ЖДАТЬ снятия блокировки
+#     (connect_args timeout), а не падать сразу с "database is locked";
+#   * NullPool: не переиспользуем соединения. Отмена asyncio-задачи посреди
+#     запроса может вернуть в пул соединение с НЕЗАКРЫТОЙ транзакцией — оно
+#     держит файл залоченным для всех. Свежее соединение на сессию дёшево.
+_is_sqlite = settings.DATABASE_URL.startswith("sqlite")
+engine = create_async_engine(
+    settings.DATABASE_URL,
+    echo=settings.DEBUG,
+    future=True,
+    connect_args={"timeout": 30} if _is_sqlite else {},
+    **({"poolclass": NullPool} if _is_sqlite else {}),
+)
 
 # Фабрика сессий. expire_on_commit=False — чтобы ORM-объекты оставались
 # пригодными к чтению после commit (удобно для возврата из эндпоинтов).

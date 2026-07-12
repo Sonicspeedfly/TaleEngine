@@ -171,10 +171,10 @@ def _merge_params(params: Optional[GenerationParams]) -> dict:
     }
     if params:
         for key, value in params.model_dump(exclude_none=True).items():
-            # model/disable_safety/web_access/send_avatars/reasoning_* обрабатываются
-            # отдельно, не как сэмплинг-параметры litellm.
+            # model/disable_safety/web_access/send_avatars/reasoning_*/context_tokens
+            # обрабатываются отдельно, не как сэмплинг-параметры litellm.
             if key in ("model", "disable_safety", "web_access", "send_avatars",
-                       "reasoning_effort", "file_reasoning"):
+                       "reasoning_effort", "file_reasoning", "context_tokens"):
                 continue
             merged[key] = value
     return merged

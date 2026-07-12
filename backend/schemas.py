@@ -21,8 +21,13 @@ class GenerationParams(BaseModel):
     temperature: Optional[float] = Field(default=None, ge=0, le=2)
     top_p: Optional[float] = Field(default=None, ge=0, le=1)
     top_k: Optional[int] = Field(default=None, ge=0)
+    # Лимит длины ОДНОГО ОТВЕТА (вывода). НЕ память и не вход: рассуждения
+    # «думающих» моделей тратят этот же лимит.
     max_tokens: Optional[int] = Field(default=None, ge=1)
     repetition_penalty: Optional[float] = Field(default=None, ge=0)
+    # Окно контекста: сколько токенов ИСТОРИИ диалога видит модель на каждый ход
+    # («память»). Не передаётся провайдеру — управляет обрезкой истории у нас.
+    context_tokens: Optional[int] = Field(default=None, ge=1000, le=2_000_000)
     frequency_penalty: Optional[float] = None
     presence_penalty: Optional[float] = None
     # Главный тумблер "Zero-Censorship": снимает настраиваемые фильтры провайдера.

@@ -17,6 +17,7 @@ import asyncio
 import base64
 import hmac
 import json
+import logging
 import re
 import uuid
 from contextlib import asynccontextmanager
@@ -92,6 +93,18 @@ from backend.settings_service import (
 )
 
 
+# Фоновые задачи процесса (авто-сводка Horae и т.п.): регистрируем, чтобы при
+# остановке приложения корректно их погасить — брошенная на полпути задача
+# оставляет незакрытую транзакцию SQLite («database is locked»).
+_bg_tasks: set = set()
+
+
+def _spawn_bg(coro) -> None:
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()  # создаём/мигрируем таблицы при старте
@@ -106,6 +119,15 @@ async def lifespan(app: FastAPI):
             pass
     yield
     await telegram_runtime.stop()
+    # Даём фоновым задачам дозавершиться (обычно это быстрые чтения БД);
+    # зависших — отменяем. Резкая отмена посреди SQL-запроса опасна, поэтому
+    # сначала мягкое ожидание.
+    if _bg_tasks:
+        _done, pending = await asyncio.wait(list(_bg_tasks), timeout=8)
+        for t in pending:
+            t.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
 
 app = FastAPI(title=settings.APP_NAME, lifespan=lifespan)
@@ -258,6 +280,104 @@ def _effective_model(params, connection: dict) -> str:
     return connection.get("default_model") or settings.DEFAULT_MODEL
 
 
+def _ctx_budget(params) -> int:
+    """
+    Окно контекста («память» диалога): значение из UI (params.context_tokens)
+    важнее дефолта из .env. Управляет тем, сколько истории видит модель.
+    """
+    if params and params.context_tokens:
+        return max(1000, int(params.context_tokens))
+    return settings.CONTEXT_TOKEN_BUDGET
+
+
+# ==================== АВТО-СВОДКА СЮЖЕТА (память Horae) ====================
+# Каждые ~N новых сообщений фоновая задача сжимает их в запись Horae
+# «Сводка сюжета (авто)» (always_on): даже когда старая история выпадает из окна
+# контекста, её суть остаётся видимой модели. Это и есть «долгая память» чата.
+_AUTO_SUMMARY_EVERY = 12          # сообщений между обновлениями сводки
+_AUTO_SUMMARY_MARK = "__auto__"   # метка авто-записи в keywords
+_AUTO_SUMMARY_TITLE = "📜 Сводка сюжета (авто)"
+
+logger = logging.getLogger("aichat.summary")
+
+
+async def _maybe_update_summary(session_id: int) -> None:
+    """Фоновое обновление авто-сводки чата. Любая ошибка здесь не роняет ход."""
+    try:
+        async with AsyncSessionLocal() as db:
+            # Выключатель (вкладка «Память»): settings/ui -> auto_summary=false.
+            ui = await db.get(models.AppSetting, "ui")
+            if ui and isinstance(ui.value, dict) and ui.value.get("auto_summary") is False:
+                return
+            entry = (await db.execute(
+                select(models.HoraeEntry).where(
+                    models.HoraeEntry.session_id == session_id,
+                    models.HoraeEntry.category == "summary",
+                )
+            )).scalars().first()
+            last_id = 0
+            for kw in ((entry.keywords if entry else None) or []):
+                if isinstance(kw, str) and kw.startswith("last:"):
+                    try:
+                        last_id = int(kw[5:])
+                    except ValueError:
+                        pass
+            fresh = (await db.execute(
+                select(models.Message).where(
+                    models.Message.session_id == session_id,
+                    models.Message.id > last_id,
+                ).order_by(models.Message.id)
+            )).scalars().all()
+            fresh = [m for m in fresh if (m.content or "").strip()]
+            if len(fresh) < _AUTO_SUMMARY_EVERY:
+                return  # ещё рано — копим события
+            transcript = "\n".join(
+                f"{m.speaker_name or ('Пользователь' if m.role == 'user' else 'Персонаж')}: "
+                + (m.content or "")[:1500]
+                for m in fresh
+            )[:24000]
+            prev = (entry.content if entry else "") or "(пока пусто)"
+            connection = await get_connection(db)
+            newest_id = fresh[-1].id
+
+        # LLM-вызов ВНЕ сессии БД (может занять десятки секунд).
+        summary = (await complete(
+            [
+                {"role": "system", "content": (
+                    "Ты ведёшь сжатую память ролевого чата. Объедини старую сводку и новые "
+                    "события в ЕДИНЫЙ связный конспект до 1500 символов: ключевые факты, "
+                    "имена, отношения, решения, состояние персонажей, незакрытые сюжетные "
+                    "линии. Пиши в прошедшем времени, без вступлений и пояснений — только "
+                    "текст сводки."
+                )},
+                {"role": "user", "content": f"[Старая сводка]\n{prev}\n\n[Новые события]\n{transcript}"},
+            ],
+            None, connection,
+        )).strip()
+        if not summary:
+            return
+
+        async with AsyncSessionLocal() as db:
+            entry = (await db.execute(
+                select(models.HoraeEntry).where(
+                    models.HoraeEntry.session_id == session_id,
+                    models.HoraeEntry.category == "summary",
+                )
+            )).scalars().first()
+            if entry is None:
+                entry = models.HoraeEntry(session_id=session_id, category="summary")
+                db.add(entry)
+            entry.title = _AUTO_SUMMARY_TITLE
+            entry.content = summary[:4000]
+            entry.keywords = [_AUTO_SUMMARY_MARK, f"last:{newest_id}"]
+            entry.always_on = True
+            entry.enabled = True
+            entry.priority = 50  # сводка важнее рядовых записей, но ниже ручных «100+»
+            await db.commit()
+    except Exception:  # noqa: BLE001 — фоновая задача не должна ничего ронять
+        logger.exception("Авто-сводка чата %s не обновилась", session_id)
+
+
 # ---- Колбэки сохранения ответа ассистента (после завершения генерации) ----
 # model_override приходит от менеджера генерации, если ответ дала ЗАПАСНАЯ модель.
 def _make_persist_new(model_used: str):
@@ -276,6 +396,8 @@ def _make_persist_new(model_used: str):
                 )
             )
             await db.commit()
+        # Ход завершён — возможно, пора освежить авто-сводку (фоном, не ждём).
+        _spawn_bg(_maybe_update_summary(session_id))
 
     return cb
 
@@ -1543,7 +1665,7 @@ async def canvas_generate(
     # 2. Генерация (нестриминговая): просим ПОЛНЫЙ документ/код.
     user_content = build_user_content(prompt, attachments)
     messages = await build_context_from_db(
-        db, sess, character, prompt, user_content, settings.CONTEXT_TOKEN_BUDGET
+        db, sess, character, prompt, user_content, _ctx_budget(params)
     )
     messages.append({"role": "system", "content": (
         "Сгенерируй по запросу пользователя ПОЛНЫЙ, законченный материал (документ, "
@@ -1841,7 +1963,7 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
             async with AsyncSessionLocal() as rdb:
                 rsess = await rdb.get(models.ChatSession, session_id)
                 messages = await group_chat.build_group_messages(
-                    rdb, rsess, character, settings.CONTEXT_TOKEN_BUDGET,
+                    rdb, rsess, character, _ctx_budget(params),
                     send_avatars=bool(params and params.send_avatars),
                 )
             text = ""
@@ -1859,6 +1981,8 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
                 )
                 await rdb.commit()
             job.broadcast({"type": "speaker_done", "name": character.name})
+        # Ход группы завершён — освежаем авто-сводку сюжета (фоном).
+        _spawn_bg(_maybe_update_summary(session_id))
 
     job_id = uuid.uuid4().hex
     await generation_manager.start_runner(job_id, session_id, runner)
@@ -1891,7 +2015,7 @@ async def _start_user_turn(session_id, content, attachments, params, db, reply_t
     user_content = build_user_content(model_text, attachments)
     # Контекст строим ДО сохранения нового сообщения (иначе оно задвоится).
     messages = await build_context_from_db(
-        db, sess, character, model_text, user_content, settings.CONTEXT_TOKEN_BUDGET,
+        db, sess, character, model_text, user_content, _ctx_budget(params),
         send_avatars=bool(params and params.send_avatars),
     )
     db.add(
@@ -1958,7 +2082,7 @@ async def _start_regenerate(session_id, params, db) -> str:
         character,
         user_text,
         user_content,
-        settings.CONTEXT_TOKEN_BUDGET,
+        _ctx_budget(params),
         history=history,
     )
 
@@ -2004,7 +2128,7 @@ async def _start_continue(session_id, params, db) -> str:
     history = messages_to_history([m for m in msgs if m.id < boundary_id])
     user_content = build_user_content(user_text, [])
     messages = await build_context_from_db(
-        db, sess, character, user_text, user_content, settings.CONTEXT_TOKEN_BUDGET,
+        db, sess, character, user_text, user_content, _ctx_budget(params),
         history=history,
     )
     # Уже написанный ответ + явная просьба продолжить именно его.
@@ -2059,7 +2183,7 @@ async def _start_retry(session_id, params, db) -> str:
     # ровно то же, что видел бы _start_user_turn, но без повторного сохранения.
     history = messages_to_history([m for m in msgs if m.id < last.id])
     messages = await build_context_from_db(
-        db, sess, character, last.content, user_content, settings.CONTEXT_TOKEN_BUDGET,
+        db, sess, character, last.content, user_content, _ctx_budget(params),
         history=history, send_avatars=bool(params and params.send_avatars),
     )
     job_id = uuid.uuid4().hex

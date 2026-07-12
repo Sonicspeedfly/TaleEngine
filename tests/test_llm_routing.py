@@ -167,6 +167,16 @@ def test_build_user_content_with_image_returns_blocks():
     assert content[1]["type"] == "image_url"
 
 
+@pytest.mark.asyncio
+async def test_context_tokens_is_local_param_not_sent_to_provider():
+    """context_tokens управляет обрезкой истории у НАС — провайдеру не уходит."""
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        _ = [t async for t in stream_completion(
+            [{"role": "user", "content": "hi"}], GenerationParams(context_tokens=64000)
+        )]
+    assert "context_tokens" not in _fake_acompletion.captured
+
+
 # ----- Рассуждения (thinking / reasoning_effort) -----
 @pytest.mark.asyncio
 async def test_reasoning_effort_passed_when_set():
