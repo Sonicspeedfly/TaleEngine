@@ -74,6 +74,9 @@ class CharacterRead(CharacterBase):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    # Аватар персонажа. Раньше поля здесь НЕ было, и API молча вырезал его из
+    # ответов — аватарки «не были видны нигде», хотя в БД сохранялись.
+    avatar_path: Optional[str] = None
 
 
 class HoraeEntryBase(BaseModel):

@@ -26,6 +26,7 @@ from fastapi import (
     Depends,
     FastAPI,
     File,
+    Form,
     HTTPException,
     UploadFile,
     WebSocket,
@@ -63,6 +64,7 @@ from backend.llm_gateway import (
 )
 from backend.horae_memory import _is_image
 from backend.schemas import (
+    AttachmentIn,
     CharacterCreate,
     CharacterRead,
     CharacterUpdate,
@@ -456,7 +458,9 @@ async def list_shared_sessions(user=Depends(current_user), db: AsyncSession = De
             "id": s.id, "title": s.title, "is_group": s.is_group,
             "character_id": s.character_id,
             "character_name": ch.name if ch else "",
+            "character_avatar": ch.avatar_path if ch else None,
             "owner": owner.username if owner else "",
+            "timezone": s.timezone or "",
         })
     return out
 
@@ -686,7 +690,11 @@ async def list_groups(user=Depends(current_user), db: AsyncSession = Depends(get
                 "director": s.director,
                 "scenario": s.scenario,
                 "timezone": s.timezone or "",
-                "members": [{"id": c.id, "name": c.name} for c in members],
+                # avatar_path нужен для аватарок реплик в групповом чате.
+                "members": [
+                    {"id": c.id, "name": c.name, "avatar_path": c.avatar_path}
+                    for c in members
+                ],
             }
         )
     return result
@@ -2199,6 +2207,59 @@ async def http_send(
     job_id = await _start_user_turn(
         session_id, msg.content, msg.attachments, msg.params, db,
         reply_to_message_id=msg.reply_to_message_id,
+    )
+    return {"job_id": job_id}
+
+
+@app.post("/api/sessions/{session_id}/send_form")
+async def http_send_form(
+    session_id: int,
+    payload: str = Form(...),
+    files: list[UploadFile] = File(default=[]),
+    user=Depends(current_user), db: AsyncSession = Depends(get_session),
+):
+    """
+    Отправка хода MULTIPART'ом — для БОЛЬШИХ файлов. Браузер шлёт файл бинарно,
+    прямо с диска: без FileReader и base64 на клиенте (то есть без троекратного
+    расхода памяти на телефоне) и на треть меньше трафика, чем JSON-путь /send.
+    `payload` — JSON {content, params, reply_to_message_id, attachments}, где
+    вложение либо инлайновое (есть `data`), либо ссылается на файл формы
+    по `file_index`. В base64 файл переводит уже СЕРВЕР.
+    """
+    sess = await db.get(models.ChatSession, session_id)
+    if not await _can_access_session(db, sess, user):
+        raise HTTPException(403, "Нет доступа к этому чату")
+    try:
+        data = json.loads(payload)
+        assert isinstance(data, dict)
+    except Exception:  # noqa: BLE001
+        raise HTTPException(422, "Некорректный payload")
+
+    attachments: list[AttachmentIn] = []
+    for meta in (data.get("attachments") or []):
+        if not isinstance(meta, dict):
+            continue
+        idx = meta.get("file_index")
+        if idx is None:
+            attachments.append(AttachmentIn(**meta))  # маленькое инлайн-вложение
+            continue
+        idx = int(idx)
+        if not (0 <= idx < len(files)):
+            raise HTTPException(422, f"file_index {idx} вне диапазона")
+        upload = files[idx]
+        raw = await upload.read()
+        mime = meta.get("mime") or upload.content_type or "application/octet-stream"
+        attachments.append(AttachmentIn(
+            type=meta.get("type") or "document",
+            data=f"data:{mime};base64," + base64.b64encode(raw).decode(),
+            mime=mime,
+            name=meta.get("name") or upload.filename or "файл",
+        ))
+
+    params = GenerationParams(**(data.get("params") or {})) if data.get("params") else None
+    job_id = await _start_user_turn(
+        session_id, (data.get("content") or ""), attachments, params, db,
+        reply_to_message_id=data.get("reply_to_message_id"),
     )
     return {"job_id": job_id}
 

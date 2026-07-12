@@ -215,6 +215,15 @@ createApp({
     fallbackModel() {
       return ((this.connection && this.connection.fallback_model) || "").trim();
     },
+    // Аватар в шапке чата: персонаж; для группы — первый участник с аватаркой.
+    headerAvatar() {
+      if (this.sharedView) return this.sharedView.character_avatar || "";
+      if (this.currentIsGroup) {
+        const withAva = (this.currentGroup.members || []).find((m) => m.avatar_path);
+        return withAva ? withAva.avatar_path : "";
+      }
+      return (this.selectedCharacter && this.selectedCharacter.avatar_path) || "";
+    },
     // Список часовых поясов для настройки чата (браузер знает полный список IANA).
     tzOptions() {
       try {
@@ -416,11 +425,13 @@ createApp({
     // POST с прогрессом загрузки (XMLHttpRequest — fetch не умеет upload.onprogress).
     // Используется для отправки сообщений с файлами: видно, сколько уже ушло на
     // сервер, а сторож стриминга не считает долгую загрузку «зависанием».
-    _postWithProgress(path, bodyObj) {
+    _postWithProgress(path, body) {
       return new Promise((resolve, reject) => {
+        const isForm = (typeof FormData !== "undefined") && body instanceof FormData;
         const xhr = new XMLHttpRequest();
         xhr.open("POST", "/api" + path);
-        xhr.setRequestHeader("Content-Type", "application/json");
+        // Для FormData Content-Type ставит браузер (multipart с boundary).
+        if (!isForm) xhr.setRequestHeader("Content-Type", "application/json");
         const h = this.authHeaders();
         for (const k in h) xhr.setRequestHeader(k, h[k]);
         xhr.upload.onprogress = (e) => {
@@ -445,7 +456,7 @@ createApp({
         };
         xhr.onerror = () => { this.uploadProgress = null; reject(new Error("сеть: не удалось загрузить файл на сервер")); };
         xhr.onabort = () => { this.uploadProgress = null; reject(new Error("загрузка отменена")); };
-        xhr.send(JSON.stringify(bodyObj));
+        xhr.send(isForm ? body : JSON.stringify(body));
       });
     },
     // Заголовки авторизации БЕЗ Content-Type — для загрузки файлов (multipart).
@@ -1166,10 +1177,17 @@ createApp({
         }
       }
       this.chatError = "";
-      const attachments = this._cleanAtts(this.pendingAttachments);
+      const pend = this.pendingAttachments.slice();
+      const attFiles = this._attFiles || {};
+      const bigList = pend.filter((a) => !a.data && attFiles[a.id]); // файлы для multipart
+      const attachments = this._cleanAtts(pend);                     // инлайновые (data:URI)
       const replyTo = this.replyToId;
-      // Оптимистично показываем своё сообщение сразу (с вложениями — их видно в пузыре).
-      this.messages.push({ id: "tmp", role: "user", content, attachments, swipes: [content], active_swipe: 0, created_at: new Date().toISOString() });
+      // Оптимистично показываем своё сообщение сразу; для больших файлов
+      // в пузыре работает лёгкое превью (objectURL), а не base64.
+      const displayAtts = pend.map((a) => ({
+        type: a.type, mime: a.mime, name: a.name, size: a.size, data: a.data, preview: a.preview,
+      }));
+      this.messages.push({ id: "tmp", role: "user", content, attachments: displayAtts, swipes: [content], active_swipe: 0, created_at: new Date().toISOString() });
       this.currentReply = "";
       this.currentThought = "";
       this.liveBubbles = [];
@@ -1180,7 +1198,29 @@ createApp({
       this.replyToId = null;
       this.resetComposerHeight();
       this.scrollDown();
-      if (attachments.length) {
+      if (bigList.length) {
+        // БОЛЬШИЕ файлы: multipart — браузер шлёт байты прямо с диска (без
+        // base64 в памяти), сервер сам кодирует. Прогресс загрузки — тот же XHR.
+        const metas = [];
+        let fi = 0;
+        for (const a of pend) {
+          if (a.data) metas.push({ type: a.type, data: a.data, mime: a.mime, name: a.name });
+          else metas.push({ type: a.type, mime: a.mime, name: a.name, file_index: fi++ });
+        }
+        const fd = new FormData();
+        fd.append("payload", JSON.stringify({
+          content, attachments: metas, params: this.params, reply_to_message_id: replyTo,
+        }));
+        for (const a of bigList) fd.append("files", attFiles[a.id], a.name || "file");
+        for (const a of bigList) delete attFiles[a.id];
+        this._postWithProgress("/sessions/" + this.sessionId + "/send_form", fd).then((r) => {
+          this.currentJobId = r.job_id;
+          this.resumeSSE(r.job_id);
+        }).catch((e) => {
+          this.chatError = "Не удалось отправить файл: " + e.message;
+          this.finishStream();
+        });
+      } else if (attachments.length) {
         // Вложения (особенно аудио/видео) не влезают в WebSocket-кадр (~16 МБ) —
         // отправляем ход по HTTP с ПРОГРЕССОМ загрузки, ответ слушаем по SSE.
         this._postWithProgress("/sessions/" + this.sessionId + "/send", {
@@ -1321,29 +1361,37 @@ createApp({
     // Плашка появляется СРАЗУ со спиннером, а data дочитывается асинхронно — так видно,
     // что файл грузится, а send() дожидается готовности всех вложений (см. attachmentsLoading).
     addFiles(files) {
-      // Размер НЕ ограничиваем: сколько реально пройдёт — зависит от провайдера
-      // и прокси (напрямую в Gemini inline ~20 МБ, через Vertex/Files API — больше).
-      // Для очень крупных файлов лишь предупреждаем, чтобы отказ не был загадкой.
-      const WARN_ATTACH = 20 * 1024 * 1024;
+      // Размер НЕ ограничиваем: сколько реально пройдёт — зависит от провайдера.
+      // Маленькие файлы читаем в data:URI (нужны для превью и истории «как раньше»),
+      // а БОЛЬШИЕ не читаем вовсе: браузер отправит их с диска multipart'ом
+      // (см. send) — без base64 в памяти (на телефоне 64-МБ видео в base64 —
+      // это ~350 МБ RAM и зависший интерфейс) и на треть меньше трафика.
+      const INLINE_MAX = 6 * 1024 * 1024;
+      this._attFiles = this._attFiles || {}; // File-объекты вне реактивности Vue
       for (const file of [...files]) {
         const mime = file.type || "application/octet-stream";
         let type = "image";
         if (mime.startsWith("audio")) type = "audio";
         else if (mime.startsWith("video")) type = "video";
         else if (!mime.startsWith("image")) type = "document"; // pdf/docx/txt/...
-        if (file.size > WARN_ATTACH) {
-          this.showToast("«" + (file.name || "файл") + "» — " + this.fmtSize(file.size)
-            + ". Отправлю как есть; если провайдер не примет такой объём — ответ придёт с ошибкой, тогда сожмите файл.");
-        }
         const raw = {
           id: (this._attSeq = (this._attSeq || 0) + 1),
           type, mime, name: file.name || "файл", size: file.size || 0,
-          data: null, loading: true, error: false,
+          data: null, preview: null, loading: true, error: false,
         };
         this.pendingAttachments.push(raw);
         // Берём РЕАКТИВНУЮ ссылку из массива (Vue оборачивает элемент) — иначе
         // мутация полей не вызовет перерисовку спиннера/превью.
         const att = this.pendingAttachments[this.pendingAttachments.length - 1];
+        if (file.size > INLINE_MAX) {
+          // Большой файл: оставляем на диске, превью — лёгкий objectURL.
+          this._attFiles[raw.id] = file;
+          if (type === "image" || type === "video") {
+            try { att.preview = URL.createObjectURL(file); } catch (e) {}
+          }
+          att.loading = false;
+          continue;
+        }
         const reader = new FileReader();
         reader.onload = () => { att.data = reader.result; att.loading = false; };
         reader.onerror = () => {
@@ -1370,7 +1418,14 @@ createApp({
       if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(0) + " КБ";
       return (bytes / 1024 / 1024).toFixed(1) + " МБ";
     },
-    removeAttachment(i) { this.pendingAttachments.splice(i, 1); },
+    removeAttachment(i) {
+      const a = this.pendingAttachments[i];
+      if (a) {
+        if (this._attFiles) delete this._attFiles[a.id];
+        if (a.preview) { try { URL.revokeObjectURL(a.preview); } catch (e) {} }
+      }
+      this.pendingAttachments.splice(i, 1);
+    },
     // Промис, который завершается, когда ВСЕ вложения дочитаны (data готова или ошибка).
     _awaitAttachments() {
       return new Promise((resolve) => {
@@ -1379,12 +1434,18 @@ createApp({
       });
     },
     // Убрать неудавшиеся/пустые вложения перед отправкой.
+    // Валидное вложение: либо дочитанный data:URI, либо File на диске (multipart).
     _dropBadAttachments() {
-      this.pendingAttachments = this.pendingAttachments.filter((a) => a.data && !a.error);
+      const files = this._attFiles || {};
+      this.pendingAttachments = this.pendingAttachments.filter(
+        (a) => (a.data || files[a.id]) && !a.error
+      );
     },
     // Чистый payload для бэкенда: только поля AttachmentIn (без служебных id/size/loading).
+    // Файловые (без data) вложения сюда не попадают — их шлёт multipart-путь send().
     _cleanAtts(list) {
-      return list.map((a) => ({ type: a.type, data: a.data, mime: a.mime, name: a.name }));
+      return list.filter((a) => a.data)
+        .map((a) => ({ type: a.type, data: a.data, mime: a.mime, name: a.name }));
     },
     onAttach(e) {
       this.addFiles(e.target.files);   // несколько файлов сразу
@@ -1588,6 +1649,38 @@ createApp({
       } catch (e) {
         this.chatError = "Арт не удался: " + e.message;
       }
+    },
+
+    // ---------- Аватарки в чате ----------
+    // Аватар участника группового чата по имени (реплики группы несут speaker_name).
+    memberAvatar(name) {
+      const g = this.currentGroup;
+      const mem = g && (g.members || []).find((x) => x.name === name);
+      return (mem && mem.avatar_path) || "";
+    },
+    // Аватар для пузыря сообщения: ассистент — персонаж/участник группы,
+    // пользователь — персона этого чата или аватар профиля.
+    msgAvatar(m) {
+      if (m.role === "assistant") {
+        return (m.speaker_name && this.memberAvatar(m.speaker_name))
+          || (this.sharedView && this.sharedView.character_avatar)
+          || (this.selectedCharacter && this.selectedCharacter.avatar_path) || "";
+      }
+      const p = this.personas.find((x) => x.id === this.sessionPersonaId);
+      return (p && p.avatar_path) || (this.currentUserObj && this.currentUserObj.avatar_path) || "";
+    },
+    // Буква-заглушка, когда аватарки нет (первая буква имени).
+    msgAvatarLetter(m) {
+      let name;
+      if (m.role === "assistant") {
+        name = m.speaker_name
+          || (this.sharedView && this.sharedView.character_name)
+          || (this.selectedCharacter && this.selectedCharacter.name) || "ИИ";
+      } else {
+        const p = this.personas.find((x) => x.id === this.sessionPersonaId);
+        name = (p && p.name) || (this.currentUserObj && this.currentUserObj.username) || "Вы";
+      }
+      return (name || "?").charAt(0).toUpperCase();
     },
 
     // ---------- Ответ на конкретное сообщение ----------
@@ -2230,6 +2323,11 @@ createApp({
       <div class="chat-header">
         <button class="btn-icon hamburger" @click="sidebarOpen=!sidebarOpen" title="Меню">☰</button>
         <button v-if="canvasOpen" class="btn-icon only-mobile" @click="mobilePane='canvas'" title="Открыть Canvas">📋</button>
+        <!-- Аватарка персонажа (для группы — первого участника с аватаркой) -->
+        <span v-if="sessionId" class="header-ava">
+          <img v-if="headerAvatar" :src="headerAvatar" />
+          <span v-else>{{ currentIsGroup ? '👥' : (currentSessionTitle || 'T').charAt(0).toUpperCase() }}</span>
+        </span>
         <span class="title" :title="sessionId ? (currentSessionTitle + ' — чат #' + sessionId) : ''">{{ sharedView ? ('🔗 ' + sharedView.title) : (currentIsGroup ? currentGroup.title : (selectedCharacter ? selectedCharacter.name : 'TaleEngine')) }}</span>
         <!-- Полное имя чата и его номер: по нему удобно ссылаться на конкретный чат -->
         <span v-if="sessionId" class="pill chat-id-pill" :title="currentSessionTitle + ' — чат #' + sessionId">💬 {{ currentSessionTitle || 'чат' }} · #{{ sessionId }}</span>
@@ -2304,6 +2402,13 @@ createApp({
         <div v-else-if="sessionId && messages.length >= msgPageSize && noMoreMessages" class="load-older muted">— начало чата —</div>
 
         <div v-for="m in messages" :key="m.id" :class="['msg', m.role]">
+          <!-- Аватарка: персонаж/участник группы у ответа, персона/профиль у пользователя -->
+          <div v-if="m.role === 'user' || m.role === 'assistant'" class="msg-ava"
+               :title="m.role === 'assistant' ? (m.speaker_name || (selectedCharacter && selectedCharacter.name) || '') : ''">
+            <img v-if="msgAvatar(m)" :src="msgAvatar(m)" loading="lazy" />
+            <span v-else>{{ msgAvatarLetter(m) }}</span>
+          </div>
+          <div class="msg-body">
           <div v-if="m.speaker_name" class="speaker">{{ m.speaker_name }}</div>
           <div v-if="m.reply_to_id" class="reply-quote">↪ {{ quoteOf(m.reply_to_id) }}</div>
           <div class="bubble">
@@ -2336,10 +2441,10 @@ createApp({
               <template v-for="(a, ai) in m.attachments" :key="ai">
                 <!-- a.data есть только у своего свежеотправленного (оптимистичного) сообщения;
                      у загруженных из БД — тянем лениво по attUrl (кэшируется браузером). -->
-                <img v-if="a.type==='image'" :src="a.data || attUrl(m, ai)" loading="lazy" class="att-img" @click="lightbox = a.data || attUrl(m, ai)" title="Открыть" />
-                <audio v-else-if="a.type==='audio'" :src="a.data || attUrl(m, ai)" controls preload="none" class="att-audio"></audio>
-                <video v-else-if="a.type==='video' || ((a.mime || '').startsWith('video'))" :src="a.data || attUrl(m, ai)" controls preload="metadata" class="att-video"></video>
-                <a v-else class="att-doc" :href="a.data || attUrl(m, ai)" :download="a.name || 'файл'" title="Скачать">📄 {{ a.name || 'документ' }}</a>
+                <img v-if="a.type==='image'" :src="a.data || a.preview || attUrl(m, ai)" loading="lazy" class="att-img" @click="lightbox = a.data || a.preview || attUrl(m, ai)" title="Открыть" />
+                <audio v-else-if="a.type==='audio'" :src="a.data || a.preview || attUrl(m, ai)" controls preload="none" class="att-audio"></audio>
+                <video v-else-if="a.type==='video' || ((a.mime || '').startsWith('video'))" :src="a.data || a.preview || attUrl(m, ai)" controls preload="metadata" class="att-video"></video>
+                <a v-else class="att-doc" :href="a.data || a.preview || attUrl(m, ai)" :download="a.name || 'файл'" title="Скачать">📄 {{ a.name || 'документ' }}</a>
               </template>
             </div>
           </div>
@@ -2364,6 +2469,7 @@ createApp({
             </template>
             <button class="btn-icon" @click="deleteMessage(m)" title="Удалить">🗑</button>
           </div>
+          </div><!-- /.msg-body -->
         </div>
 
         <!-- live-размышления модели (thinking): свёрнуты, в ответ не входят -->
@@ -2375,14 +2481,26 @@ createApp({
         </div>
         <!-- стриминг: группа (несколько персонажей по очереди) -->
         <div v-for="(b, i) in liveBubbles" :key="'live'+i" class="msg assistant">
-          <div class="speaker">{{ b.name }}</div>
-          <div class="bubble"><div v-html="renderMd(b.content)"></div><span class="typing">▌</span></div>
+          <div class="msg-ava">
+            <img v-if="memberAvatar(b.name)" :src="memberAvatar(b.name)" />
+            <span v-else>{{ (b.name || '?').charAt(0).toUpperCase() }}</span>
+          </div>
+          <div class="msg-body">
+            <div class="speaker">{{ b.name }}</div>
+            <div class="bubble"><div v-html="renderMd(b.content)"></div><span class="typing">▌</span></div>
+          </div>
         </div>
         <!-- стриминг: одиночный ответ -->
         <div v-if="streaming && !liveBubbles.length" class="msg assistant">
-          <div class="bubble">
-            <div v-html="renderMd(currentReply)"></div>
-            <span class="typing">▌</span>
+          <div class="msg-ava">
+            <img v-if="msgAvatar({ role: 'assistant' })" :src="msgAvatar({ role: 'assistant' })" />
+            <span v-else>{{ msgAvatarLetter({ role: 'assistant' }) }}</span>
+          </div>
+          <div class="msg-body">
+            <div class="bubble">
+              <div v-html="renderMd(currentReply)"></div>
+              <span class="typing">▌</span>
+            </div>
           </div>
         </div>
         <!-- генерация документа в Canvas (нестриминговая) -->
@@ -2437,7 +2555,7 @@ createApp({
             <span v-if="a.loading" class="att-state">⏳</span>
             <span v-else-if="a.error" class="att-state">⚠</span>
             <template v-else>
-              <img v-if="a.type==='image'" :src="a.data" class="att-thumb" @click="lightbox=a.data" title="Открыть" />
+              <img v-if="a.type==='image'" :src="a.data || a.preview" class="att-thumb" @click="lightbox=a.data || a.preview" title="Открыть" />
               <audio v-else-if="a.type==='audio'" :src="a.data" controls class="att-audio-sm"></audio>
               <span v-else-if="a.type==='video'" class="att-state">🎬</span>
               <span v-else class="att-state">📄</span>

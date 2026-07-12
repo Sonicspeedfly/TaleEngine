@@ -326,6 +326,44 @@ def test_http_send_with_attachment_streams_via_sse(client):
     assert any(m["role"] == "assistant" for m in msgs)  # ответ пришёл
 
 
+def test_http_send_form_multipart_binary_file(client):
+    """
+    Большие файлы уходят multipart'ом: браузер шлёт БИНАРНЫЕ байты (без base64
+    на клиенте), сервер сам кодирует и запускает генерацию. Байты не искажаются.
+    """
+    cid = client.post("/api/characters", json={"name": "Видео"}).json()["id"]
+    sid = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]
+    raw = b"\x00\x00\x00\x18ftypmp42" + b"x" * 5000  # псевдо-mp4 с бинарной шапкой
+    payload = json.dumps({
+        "content": "что в ролике?",
+        "attachments": [
+            {"type": "video", "mime": "video/mp4", "name": "clip.mp4", "file_index": 0}
+        ],
+    })
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        r = client.post(
+            f"/api/sessions/{sid}/send_form",
+            data={"payload": payload},
+            files=[("files", ("clip.mp4", raw, "video/mp4"))],
+        )
+        assert r.status_code == 200
+        jid = r.json()["job_id"]
+        with client.stream("GET", f"/sse/job/{jid}") as resp:
+            for line in resp.iter_lines():
+                if line and ('"done"' in line or '"error"' in line):
+                    break
+    msgs = client.get(f"/api/sessions/{sid}/messages").json()
+    umsg = [m for m in msgs if m["role"] == "user"][-1]
+    att = umsg["attachments"][0]
+    assert att["type"] == "video" and att["name"] == "clip.mp4"
+    assert abs(att["size"] - len(raw)) < 64  # размер ~сырой (оценка из base64)
+    # Байты вернулись без искажений через эндпоинт вложения.
+    resp = client.get(f"/api/messages/{umsg['id']}/att/0")
+    assert resp.content == raw
+    assert resp.headers["content-type"].startswith("video/mp4")
+    assert any(m["role"] == "assistant" for m in msgs)  # генерация прошла
+
+
 def test_cancel_job_endpoint(client):
     """POST /api/jobs/{id}/cancel не падает (job уже мог завершиться/не существовать)."""
     assert client.post("/api/jobs/nonexistent/cancel").status_code == 200

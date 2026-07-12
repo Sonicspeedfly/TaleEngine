@@ -151,6 +151,7 @@ HTTP Basic Auth поверх всего нужен ещё заголовок `Au
 | Метод | Путь | Назначение |
 |------|------|-----------|
 | POST | `/api/sessions/{id}/send` | Отправить ход `{content, attachments, params, reply_to_message_id}` по HTTP (у тела нет 16-МБ лимита WS); возвращает `{job_id}`. Ответ слушается по SSE |
+| POST | `/api/sessions/{id}/send_form` | То же multipart'ом — для БОЛЬШИХ файлов: поле `payload` (тот же JSON, но вложение может ссылаться на файл формы через `file_index`) + файлы `files` БИНАРНО. Браузер не кодирует base64 (экономия памяти и трафика) — кодирует сервер |
 | POST | `/api/jobs/{job_id}/cancel` | Остановить генерацию по id задачи (для WS- и HTTP-хода) |
 
 Фронт: есть вложения → `POST /send` + `EventSource /sse/job/{job_id}`; только текст →
