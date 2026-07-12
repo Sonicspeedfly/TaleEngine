@@ -28,6 +28,10 @@ class GenerationParams(BaseModel):
     # Окно контекста: сколько токенов ИСТОРИИ диалога видит модель на каждый ход
     # («память»). Не передаётся провайдеру — управляет обрезкой истории у нас.
     context_tokens: Optional[int] = Field(default=None, ge=1000, le=2_000_000)
+    # Лимит ФАЙЛОВ истории (МБ на ход): 0 — без лимита (модель заново «видит»
+    # ВСЕ прежние вложения), N — от свежих к старым до N МБ, остальные — пометкой.
+    # Провайдеру не передаётся; None — дефолт из .env (HISTORY_FILES_MB).
+    history_files_mb: Optional[int] = Field(default=None, ge=0, le=1000)
     frequency_penalty: Optional[float] = None
     presence_penalty: Optional[float] = None
     # Главный тумблер "Zero-Censorship": снимает настраиваемые фильтры провайдера.

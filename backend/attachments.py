@@ -81,11 +81,14 @@ async def message_attachments_in(db, msg) -> list[AttachmentIn]:
     return out
 
 
-async def load_history_attachments(db, msgs, budget_chars: int) -> dict:
+async def load_history_attachments(db, msgs, budget_chars: int | None) -> dict:
     """
-    Вложения для ИСТОРИИ контекста: от свежих сообщений к старым, пока суммарный
-    объём не превысит budget_chars. Возвращает {message_id: [att dict С data]}.
-    Большие вложения отбрасываются по мете — их данные вообще не читаются из БД.
+    Вложения для ИСТОРИИ контекста: возвращает {message_id: [att dict С data]}.
+
+    budget_chars=None — БЕЗ лимита: модель заново «видит» ВСЕ прежние файлы
+    (полная память, режим по умолчанию). Иначе — от свежих сообщений к старым,
+    пока суммарный объём не превысит budget_chars; не влезшие отбрасываются по
+    мете, их данные вообще не читаются из БД.
     """
     out: dict = {}
     used = 0
@@ -96,9 +99,11 @@ async def load_history_attachments(db, msgs, budget_chars: int) -> dict:
         ]
         if not atts:
             continue
-        size = sum(meta_size(a) for a in atts)
-        if used + size > budget_chars:
-            continue  # это сообщение не влезло — более старые могут быть меньше
+        if budget_chars is not None:
+            size = sum(meta_size(a) for a in atts)
+            if used + size > budget_chars:
+                continue  # это сообщение не влезло — более старые могут быть меньше
+            used += size
         hydrated = []
         for a in atts:
             data = await attachment_data(db, a)
@@ -106,7 +111,6 @@ async def load_history_attachments(db, msgs, budget_chars: int) -> dict:
                 hydrated.append({**a, "data": data})
         if hydrated:
             out[m.id] = hydrated
-            used += size
     return out
 
 

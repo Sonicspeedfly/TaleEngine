@@ -156,15 +156,17 @@ def messages_to_history(msgs, att_map: dict | None = None) -> list[dict]:
     return out
 
 
-async def messages_to_history_db(db, msgs) -> list[dict]:
+async def messages_to_history_db(db, msgs, files_limit_chars: int | None = None) -> list[dict]:
     """
     То же, что messages_to_history, но данные вложений подтягиваются из
-    blob-таблицы ТОЧЕЧНО: большие вложения отбрасываются по мете, их base64
-    даже не читается из БД (раньше каждый ход поднимал в память весь чат).
+    blob-таблицы ТОЧЕЧНО и только когда нужны.
+
+    :param files_limit_chars: лимит файлов истории в символах base64;
+        None — БЕЗ лимита (модель заново видит все прежние файлы, дефолт).
     """
     from backend.attachments import load_history_attachments
 
-    att_map = await load_history_attachments(db, msgs, _MAX_HISTORY_ATT_BYTES)
+    att_map = await load_history_attachments(db, msgs, files_limit_chars)
     return messages_to_history(msgs, att_map)
 
 
@@ -444,6 +446,7 @@ async def build_context_from_db(
     token_budget: int,
     history: list[dict] | None = None,
     send_avatars: bool = False,
+    history_files_limit: int | None = None,
 ) -> list[dict]:
     """
     Достаёт из БД память Horae, персону, заметку автора и историю сообщений,
@@ -472,9 +475,9 @@ async def build_context_from_db(
             .order_by(Message.id)
         )
         msgs = (await session_db.execute(hq)).scalars().all()
-        # СОХРАНЯЕМ вложения истории (в пределах лимита) — данные тянутся из
-        # blob-таблицы точечно, большие файлы в память не поднимаются.
-        history = await messages_to_history_db(session_db, msgs)
+        # СОХРАНЯЕМ вложения истории — данные тянутся из blob-таблицы точечно.
+        # history_files_limit=None — без лимита (полная память по файлам).
+        history = await messages_to_history_db(session_db, msgs, history_files_limit)
 
     char_dict = {
         "name": character.name,

@@ -93,3 +93,29 @@ async def test_auto_summary_creates_entry_and_tracks_progress():
         row.value = {**(row.value or {}), "auto_summary": True}
         await db.commit()
     await engine.dispose()  # не оставляем соединения этого event loop другим тестам
+
+
+@pytest.mark.asyncio
+async def test_history_files_unlimited_by_default():
+    """Файлы истории: по умолчанию БЕЗ лимита (полная память), лимит — опция."""
+    from types import SimpleNamespace
+
+    from backend.attachments import load_history_attachments
+    from backend.main import _hist_files_limit
+    from backend.schemas import GenerationParams
+
+    big = "data:video/mp4;base64," + "A" * 8_000_000  # больше старого 5-МБ лимита
+    msgs = [SimpleNamespace(id=1, role="user", content="видео",
+                            attachments=[{"type": "video", "data": big, "mime": "video/mp4"}])]
+
+    # Дефолт (params нет / 0): лимита нет — большое видео включается в историю.
+    assert _hist_files_limit(None) is None
+    assert _hist_files_limit(GenerationParams(history_files_mb=0)) is None
+    att_map = await load_history_attachments(None, msgs, None)
+    assert 1 in att_map and att_map[1][0]["data"] == big
+
+    # Явный лимит 5 МБ: большое видео в историю не пересылается.
+    limit = _hist_files_limit(GenerationParams(history_files_mb=5))
+    assert limit is not None
+    att_map = await load_history_attachments(None, msgs, limit)
+    assert att_map == {}

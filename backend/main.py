@@ -297,6 +297,19 @@ def _ctx_budget(params) -> int:
     return settings.CONTEXT_TOKEN_BUDGET
 
 
+def _hist_files_limit(params) -> int | None:
+    """
+    Лимит ФАЙЛОВ истории в символах base64 (то, сколько прежних вложений модель
+    заново «видит» на каждом ходу). None — БЕЗ лимита: полная память по файлам.
+    UI (params.history_files_mb) важнее дефолта из .env; 0 — без лимита.
+    """
+    mb = params.history_files_mb if params and params.history_files_mb is not None \
+        else settings.HISTORY_FILES_MB
+    if not mb or mb <= 0:
+        return None
+    return int(mb * 1024 * 1024 * 4 / 3)  # size хранится «сырым», base64 длиннее
+
+
 # ==================== АВТО-СВОДКА СЮЖЕТА (память Horae) ====================
 # Каждые ~N новых сообщений фоновая задача сжимает их в запись Horae
 # «Сводка сюжета (авто)» (always_on): даже когда старая история выпадает из окна
@@ -2040,6 +2053,7 @@ async def _start_user_turn(session_id, content, attachments, params, db, reply_t
     messages = await build_context_from_db(
         db, sess, character, model_text, user_content, _ctx_budget(params),
         send_avatars=bool(params and params.send_avatars),
+        history_files_limit=_hist_files_limit(params),
     )
     msg = models.Message(
         session_id=session_id,
@@ -2096,7 +2110,9 @@ async def _start_regenerate(session_id, params, db) -> str:
     user_text = last_user.content if last_user else ""
     boundary_id = last_user.id if last_user else target.id
     # История сохраняет вложения (модель «видит» прежние файлы); данные — из blobs.
-    history = await messages_to_history_db(db, [m for m in msgs if m.id < boundary_id])
+    history = await messages_to_history_db(
+        db, [m for m in msgs if m.id < boundary_id], _hist_files_limit(params)
+    )
     user_content = build_user_content(
         user_text,
         [],  # вложения прошлой реплики при перегенерации не пересобираем
@@ -2150,7 +2166,9 @@ async def _start_continue(session_id, params, db) -> str:
     user_text = last_user.content if last_user else ""
     boundary_id = last_user.id if last_user else target.id
     # История сохраняет вложения (модель «видит» прежние файлы); данные — из blobs.
-    history = await messages_to_history_db(db, [m for m in msgs if m.id < boundary_id])
+    history = await messages_to_history_db(
+        db, [m for m in msgs if m.id < boundary_id], _hist_files_limit(params)
+    )
     user_content = build_user_content(user_text, [])
     messages = await build_context_from_db(
         db, sess, character, user_text, user_content, _ctx_budget(params),
@@ -2207,7 +2225,9 @@ async def _start_retry(session_id, params, db) -> str:
     user_content = build_user_content(last.content, atts)
     # Контекст: история ДО последней реплики + сама реплика как текущее сообщение —
     # ровно то же, что видел бы _start_user_turn, но без повторного сохранения.
-    history = await messages_to_history_db(db, [m for m in msgs if m.id < last.id])
+    history = await messages_to_history_db(
+        db, [m for m in msgs if m.id < last.id], _hist_files_limit(params)
+    )
     messages = await build_context_from_db(
         db, sess, character, last.content, user_content, _ctx_budget(params),
         history=history, send_avatars=bool(params and params.send_avatars),

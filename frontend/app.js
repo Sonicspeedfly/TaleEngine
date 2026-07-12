@@ -85,6 +85,7 @@ createApp({
         max_tokens: 8192,       // длина ОДНОГО ОТВЕТА (вывод); рассуждения тратят его же
         repetition_penalty: 1.1,
         context_tokens: 1000000, // окно контекста («память»): по умолчанию максимум Gemini
+        history_files_mb: 0,     // файлы истории: 0 = ВСЕ пересылаются модели (полная память)
         disable_safety: true,
         send_avatars: false,
         web_access: false,
@@ -2725,6 +2726,14 @@ createApp({
                     @click="params.context_tokens = p[0]">{{ p[1] }}</button>
           </div>
           <p class="muted" style="margin:2px 0 10px">Сколько ИСТОРИИ чата видит модель на каждый ход. По умолчанию — 1 млн (максимум Gemini): модель помнит весь чат. Уменьшите, если ходы станут дорогими или медленными (свыше ~200 тыс. Gemini тарифицирует дороже). Что не влезло — сохранит авто-сводка (вкладка «Память»).</p>
+          <label>📎 Файлы в памяти диалога
+            <select v-model.number="params.history_files_mb">
+              <option :value="0">все файлы — полная память (по умолчанию)</option>
+              <option :value="20">до ~20 МБ на ход</option>
+              <option :value="5">до ~5 МБ на ход (экономно)</option>
+            </select>
+          </label>
+          <p class="muted" style="margin:2px 0 10px">Прежние фото/аудио/видео пересылаются модели заново на каждом ходу — она их «видит», а не вспоминает по пометкам. «Все файлы»: в чате с тяжёлыми видео каждый ход несёт их целиком — дольше и дороже; лимиты шлют свежие файлы до N МБ, старые заменяются пометкой [видео: имя].</p>
           <label>Repetition penalty <span class="range-val">{{ params.repetition_penalty }}</span>
             <input type="range" min="0.8" max="2" step="0.05" v-model.number="params.repetition_penalty" /></label>
           <label class="check danger-text"><input type="checkbox" v-model="params.disable_safety" /> Zero-Censorship — снять фильтры (вкл. по умолчанию; порог OFF)</label>
