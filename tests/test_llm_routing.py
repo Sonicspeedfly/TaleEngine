@@ -271,6 +271,39 @@ async def test_large_multimodal_payload_gets_bigger_timeout():
 
 
 @pytest.mark.asyncio
+async def test_timeout_scales_with_payload_size():
+    """Очень большой файл получает таймаут пропорционально размеру (~10 с/МБ):
+    в таймаут входит и заливка payload'а из прокси в Vertex."""
+    big = AttachmentIn(
+        type="video", data="data:video/mp4;base64," + "A" * 120_000_000, mime="video/mp4"
+    )
+    content = build_user_content("", [big])
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        _ = [t async for t in stream_completion([{"role": "user", "content": content}])]
+    # ~114 МБ -> больше базового LARGE_REQUEST_TIMEOUT (900 с), но в пределах потолка.
+    assert 900 < _fake_acompletion.captured["timeout"] <= 1800
+
+
+async def _conn_error_acompletion(*args, **kwargs):
+    raise Exception("litellm.InternalServerError: Litellm_proxyException - Connection error.")
+
+
+@pytest.mark.asyncio
+async def test_connection_error_on_big_payload_gets_friendly_message():
+    """Обрыв соединения на большом файле объясняется по-человечески (не голым
+    «Connection error»), исходный текст ошибки сохраняется для отладки."""
+    big = AttachmentIn(
+        type="video", data="data:video/mp4;base64," + "A" * 10_000_000, mime="video/mp4"
+    )
+    content = build_user_content("", [big])
+    with patch("backend.llm_gateway.litellm.acompletion", new=_conn_error_acompletion):
+        with pytest.raises(RuntimeError) as ei:
+            _ = [t async for t in stream_completion([{"role": "user", "content": content}])]
+    assert "Соединение оборвалось" in str(ei.value)
+    assert "Connection error" in str(ei.value)
+
+
+@pytest.mark.asyncio
 async def test_small_payload_keeps_default_timeout():
     from backend.config import settings
 

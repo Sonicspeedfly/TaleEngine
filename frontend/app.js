@@ -39,6 +39,8 @@ createApp({
       // Прогресс загрузки сообщения с файлами на сервер: null или
       // { percent (0..100 | null), loaded, total } — полоса над композером.
       uploadProgress: null,
+      // Файл уже НА СЕРВЕРЕ, нейросеть получает/обрабатывает его (до первого токена).
+      processingNote: false,
       plusMenu: false,          // выпадашка [+]: голос/арт (второстепенные действия)
       dragOver: false,          // подсветка зоны при перетаскивании файла
       lightbox: null,           // data:URI картинки для полноэкранного предпросмотра
@@ -1036,6 +1038,10 @@ createApp({
     },
     onWsEvent(ev) {
       this._lastEvtAt = Date.now(); // метка для сторожа зависшего стриминга
+      // Нейросеть подала признаки жизни — плашка «обрабатывает файл» больше не нужна.
+      if (ev.type === "token" || ev.type === "thought" || ev.type === "done" || ev.type === "error") {
+        this.processingNote = false;
+      }
       if (ev.type === "job") this.currentJobId = ev.job_id;
       else if (ev.type === "speaker") {
         // Групповой чат: начинается реплика нового персонажа.
@@ -1067,6 +1073,7 @@ createApp({
     async finishStream() {
       this.streaming = false;
       this.currentJobId = null;
+      this.processingNote = false;
       // Сервер — источник истины: перечитываем сообщения (там уже новый ответ/свайп).
       await this.loadMessages();
       this.currentReply = "";
@@ -1215,6 +1222,7 @@ createApp({
         for (const a of bigList) delete attFiles[a.id];
         this._postWithProgress("/sessions/" + this.sessionId + "/send_form", fd).then((r) => {
           this.currentJobId = r.job_id;
+          this.processingNote = true; // файл на сервере — дальше работает нейросеть
           this.resumeSSE(r.job_id);
         }).catch((e) => {
           this.chatError = "Не удалось отправить файл: " + e.message;
@@ -1227,6 +1235,7 @@ createApp({
           content, attachments, params: this.params, reply_to_message_id: replyTo,
         }).then((r) => {
           this.currentJobId = r.job_id;
+          this.processingNote = true;
           this.resumeSSE(r.job_id);
         }).catch((e) => {
           this.chatError = "Не удалось отправить вложение: " + e.message;
@@ -2576,6 +2585,11 @@ createApp({
           {{ uploadProgress.percent != null ? uploadProgress.percent + '%' : '…' }}
           <i v-if="uploadProgress.total"> ({{ fmtSize(uploadProgress.loaded) }} из {{ fmtSize(uploadProgress.total) }})</i>
           <span class="upload-track"><span class="upload-fill" :style="{ width: (uploadProgress.percent || 0) + '%' }"></span></span>
+        </div>
+        <!-- Файл уже на сервере — идёт передача нейросети и обработка (до первого токена) -->
+        <div v-else-if="processingNote && streaming && !currentReply && !currentThought && !liveBubbles.length"
+             class="art-indicator files-bar">
+          📡 Файл загружен на сервер — нейросеть получает и обрабатывает его… Большие файлы обрабатываются до нескольких минут.
         </div>
         <div class="row">
           <!-- [+] второстепенные действия: документ, арт -->

@@ -117,10 +117,17 @@ def _request_timeout(messages: list[dict]) -> int:
     Таймаут под размер запроса: большие мультимодальные payload'ы (видео, аудио)
     добираются до Vertex и обрабатываются моделью значительно дольше 120 секунд —
     иначе крупный файл стабильно падал бы по таймауту, хотя провайдер его принимает.
+
+    ВАЖНО: отсчёт идёт с момента запроса к LLM — файл к этому времени УЖЕ на нашем
+    сервере (загрузка с устройства в таймаут не входит), но заливка payload'а
+    «сервер → прокси → Vertex» входит. Поэтому даём время пропорционально размеру:
+    ~10 секунд на МБ, минимум LARGE_REQUEST_TIMEOUT, потолок — полчаса.
     """
-    if _payload_bytes(messages) > _LARGE_PAYLOAD_BYTES:
-        return max(settings.REQUEST_TIMEOUT, settings.LARGE_REQUEST_TIMEOUT)
-    return settings.REQUEST_TIMEOUT
+    size = _payload_bytes(messages)
+    if size <= _LARGE_PAYLOAD_BYTES:
+        return settings.REQUEST_TIMEOUT
+    mb = size // (1024 * 1024)
+    return max(settings.LARGE_REQUEST_TIMEOUT, min(1800, mb * 10))
 
 
 def _has_media_blocks(messages: list[dict]) -> bool:
@@ -240,6 +247,9 @@ async def stream_completion(
         "stream": True,
         # Большой мультимодальный запрос (видео/аудио) получает увеличенный таймаут.
         "timeout": _request_timeout(messages),
+        # Сеть/прокси моргнули (connection error и т.п.) — LiteLLM тихо повторит
+        # запрос один раз, прежде чем отдавать ошибку наверх.
+        "num_retries": 1,
         **_merge_params(params),
     }
     _apply_connection(call_kwargs, params, connection)
@@ -318,8 +328,24 @@ async def stream_completion(
             raise RuntimeError(msg)
         debug_log.finish(entry, "ok", preview=text[:400])
     except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        # Обрыв соединения на БОЛЬШОМ запросе — объясняем по-человечески: голое
+        # «Connection error» не говорит, что прокси/провайдер оборвали связь
+        # именно во время передачи крупного файла (лимит размера или память).
+        size = _payload_bytes(messages)
+        if size > _LARGE_PAYLOAD_BYTES and "connection" in msg.lower():
+            mb = size // (1024 * 1024)
+            friendly = (
+                f"Соединение оборвалось на большом запросе (~{mb} МБ с учётом base64): "
+                "прокси или провайдер закрыли связь во время передачи файла. Обычно это "
+                "лимит размера запроса или нехватка памяти у LiteLLM-прокси (смотрите его "
+                f"консоль/лог) либо ограничение провайдера. Исходная ошибка: {msg}"
+            )
+            if entry.get("status") != "error":
+                debug_log.finish(entry, "error", error=friendly)
+            raise RuntimeError(friendly) from exc
         if entry.get("status") != "error":  # не перетираем детальную запись о пустом ответе
-            debug_log.finish(entry, "error", error=str(exc))
+            debug_log.finish(entry, "error", error=msg)
         raise
 
 
