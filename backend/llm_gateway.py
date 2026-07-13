@@ -149,15 +149,24 @@ def effective_reasoning(params: Optional[GenerationParams], messages: list[dict]
       * "auto"/пусто + в запросе есть файлы + включён file_reasoning — "medium":
         Gemini местами не думает над файлами без явного бюджета размышлений;
       * иначе "" — параметр не передаём, решает провайдер.
+
+    ВАЖНО: авто-форс thinking НЕ применяем при включённом Zero-Censorship
+    (disable_safety). У Gemini режим рассуждений добавляет СОБСТВЕННУЮ модерацию
+    во время reasoning, которая душит контент даже при safety_settings=OFF —
+    то есть авто-thinking незаметно ломал обход цензуры. Явный выбор уровня
+    пользователем уважаем всегда: он сам решает баланс «рассуждения ↔ свобода».
     """
     if params is None:
         return ""
     effort = (params.reasoning_effort or "").strip().lower()
     if effort == "auto":
         effort = ""
-    if not effort and params.file_reasoning and _has_media_blocks(messages):
+    if effort:
+        return effort  # явный выбор пользователя — всегда как есть
+    # Автовключение — только когда фильтры НЕ сняты (иначе thinking их вернёт).
+    if not params.disable_safety and params.file_reasoning and _has_media_blocks(messages):
         return "medium"
-    return effort
+    return ""
 
 
 def _merge_params(params: Optional[GenerationParams]) -> dict:

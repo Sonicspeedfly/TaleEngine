@@ -117,9 +117,11 @@ async def lifespan(app: FastAPI):
     await init_db()  # создаём/мигрируем таблицы при старте
     async with AsyncSessionLocal() as db:
         await admin_service.load_caches(db)  # код доступа, пароль админа, настройки TG
-    # Автозапуск Telegram-бота, если он включён в админке и задан токен.
+    # Автозапуск Telegram-бота, если он включён в админке, задан токен И не
+    # запрещён через TELEGRAM_AUTOSTART (защита от двойного polling — Conflict 409,
+    # когда второй/тестовый инстанс делит БД с боевым сервером).
     tg = admin_service.telegram_cache()
-    if tg.get("enabled") and tg.get("token"):
+    if settings.TELEGRAM_AUTOSTART and tg.get("enabled") and tg.get("token"):
         try:
             await telegram_runtime.start()
         except Exception:  # noqa: BLE001 — не мешаем старту веб-сервера

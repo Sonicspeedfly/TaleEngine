@@ -195,22 +195,53 @@ async def test_reasoning_effort_passed_when_set():
 
 
 @pytest.mark.asyncio
-async def test_reasoning_auto_boosts_for_files():
-    """Файл в запросе + режим «авто» -> форсируем medium (Gemini не думает над файлами сам)."""
+async def test_reasoning_auto_boosts_for_files_when_safety_on():
+    """Файл + авто + фильтры НЕ сняты -> форсируем medium (Gemini не думает над файлами сам)."""
     att = AttachmentIn(type="video", data="data:video/mp4;base64,AAAA", mime="video/mp4")
     content = build_user_content("что на видео?", [att])
     with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
         _ = [t async for t in stream_completion(
-            [{"role": "user", "content": content}], GenerationParams()
+            [{"role": "user", "content": content}], GenerationParams(disable_safety=False)
         )]
     assert _fake_acompletion.captured["reasoning_effort"] == "medium"
+
+
+@pytest.mark.asyncio
+async def test_reasoning_not_auto_forced_when_zero_censorship():
+    """
+    Zero-Censorship (disable_safety=True, ДЕФОЛТ): авто-thinking НЕ включаем даже
+    при файлах — иначе reasoning-модерация Gemini душит контент при snятых
+    фильтрах. Регресс «обход цензуры сломался как будто».
+    """
+    att = AttachmentIn(type="video", data="data:video/mp4;base64,AAAA", mime="video/mp4")
+    content = build_user_content("что на видео?", [att])
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        _ = [t async for t in stream_completion(
+            [{"role": "user", "content": content}], GenerationParams()  # disable_safety=True по умолчанию
+        )]
+    assert "reasoning_effort" not in _fake_acompletion.captured
+    # Но фильтры при этом сняты (safety_settings=OFF) — свобода на месте.
+    assert _fake_acompletion.captured.get("safety_settings")
+
+
+@pytest.mark.asyncio
+async def test_explicit_reasoning_respected_even_with_zero_censorship():
+    """Явный выбор уровня уважаем всегда — даже при Zero-Censorship (осознанный выбор)."""
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        _ = [t async for t in stream_completion(
+            [{"role": "user", "content": "hi"}],
+            GenerationParams(disable_safety=True, reasoning_effort="high"),
+        )]
+    assert _fake_acompletion.captured["reasoning_effort"] == "high"
 
 
 @pytest.mark.asyncio
 async def test_reasoning_not_forced_without_files_or_when_off():
     # Текст без файлов: авто -> параметр не передаём (решает провайдер).
     with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
-        _ = [t async for t in stream_completion([{"role": "user", "content": "hi"}], GenerationParams())]
+        _ = [t async for t in stream_completion(
+            [{"role": "user", "content": "hi"}], GenerationParams(disable_safety=False)
+        )]
     assert "reasoning_effort" not in _fake_acompletion.captured
 
     # Файл есть, но галка file_reasoning снята -> тоже не передаём.
@@ -218,7 +249,8 @@ async def test_reasoning_not_forced_without_files_or_when_off():
     content = build_user_content("", [att])
     with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
         _ = [t async for t in stream_completion(
-            [{"role": "user", "content": content}], GenerationParams(file_reasoning=False)
+            [{"role": "user", "content": content}],
+            GenerationParams(disable_safety=False, file_reasoning=False),
         )]
     assert "reasoning_effort" not in _fake_acompletion.captured
 

@@ -92,6 +92,11 @@ class Settings(BaseSettings):
     TELEGRAM_BOT_TOKEN: Optional[str] = None
     # С каким персонажем начинать чат в Telegram, если у пользователя ещё нет сессии.
     TELEGRAM_DEFAULT_CHARACTER_ID: Optional[int] = None
+    # Автозапуск бота при старте сервера. Поставьте False на ВТОРОМ/тестовом
+    # инстансе, работающем с той же БД (например, локальная копия для отладки):
+    # иначе два процесса опрашивают одного бота и Telegram отдаёт Conflict 409
+    # («terminated by other getUpdates request»). Боевой сервер — оставляет True.
+    TELEGRAM_AUTOSTART: bool = True
 
     @field_validator(
         "TELEGRAM_DEFAULT_CHARACTER_ID", "VERTEX_PROJECT", mode="before"
