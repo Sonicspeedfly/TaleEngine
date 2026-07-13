@@ -602,7 +602,9 @@ async def _attachment_from_message(message: TgMessage) -> AttachmentIn | None:
         f = await _bot.get_file(message.photo[-1].file_id)  # самый большой размер
         buf = await _bot.download_file(f.file_path)
         b64 = base64.b64encode(buf.read()).decode()
-        return AttachmentIn(type="image", data="data:image/jpeg;base64," + b64, mime="image/jpeg")
+        # У фото из Telegram нет имени файла — даём осмысленное с датой.
+        name = f"photo_{message.date:%Y%m%d_%H%M%S}.jpg" if message.date else "photo.jpg"
+        return AttachmentIn(type="image", data="data:image/jpeg;base64," + b64, mime="image/jpeg", name=name)
     if message.document:
         doc = message.document
         f = await _bot.get_file(doc.file_id)
@@ -640,7 +642,10 @@ async def _attachment_from_message(message: TgMessage) -> AttachmentIn | None:
         f = await _bot.get_file(message.audio.file_id)
         buf = await _bot.download_file(f.file_path)
         b64 = base64.b64encode(buf.read()).decode()
-        return AttachmentIn(type="audio", data=b64, mime=message.audio.mime_type or "audio/mpeg")
+        name = message.audio.file_name or (message.audio.title and f"{message.audio.title}.mp3") or "аудио.mp3"
+        return AttachmentIn(
+            type="audio", data=b64, mime=message.audio.mime_type or "audio/mpeg", name=name,
+        )
     return None
 
 
@@ -963,7 +968,8 @@ def _register(dp: Dispatcher) -> None:
         file = await _bot.get_file(message.voice.file_id)
         buf = await _bot.download_file(file.file_path)
         audio_b64 = base64.b64encode(buf.read()).decode()
-        att = AttachmentIn(type="audio", data=audio_b64, mime="audio/ogg")
+        name = f"voice_{message.date:%Y%m%d_%H%M%S}.ogg" if message.date else "voice.ogg"
+        att = AttachmentIn(type="audio", data=audio_b64, mime="audio/ogg", name=name)
         await _respond(message, session_id, "", [att])
 
     @dp.message(F.photo)

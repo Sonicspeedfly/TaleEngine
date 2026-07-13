@@ -76,13 +76,26 @@ def _content_from_attachment(att: AttachmentIn) -> dict:
 
 
 def build_user_content(text: str, attachments: list[AttachmentIn]):
-    """Собирает контент сообщения: строка без вложений, иначе список блоков."""
+    """Собирает контент сообщения: строка без вложений, иначе список блоков.
+
+    Перед каждым медиа-вложением (фото/видео/аудио) добавляем текстовую пометку
+    с ИМЕНЕМ файла — иначе модель видит содержимое, но не знает, как файл назван
+    (у документов имя уже внутри их блока, поэтому там пометку не дублируем).
+    """
     if not attachments:
         return text
     blocks: list = []
     if text:
         blocks.append({"type": "text", "text": text})
     for att in attachments:
+        name = (att.name or "").strip()
+        mime = (att.mime or "").lower()
+        is_media = att.type in ("image", "audio", "video") or (
+            att.type == "document"
+            and (mime.startswith("video/") or mime.startswith("audio/") or mime.startswith("image/"))
+        )
+        if name and is_media:
+            blocks.append({"type": "text", "text": f"[Имя файла: «{name}»]"})
         blocks.append(_content_from_attachment(att))
     return blocks
 

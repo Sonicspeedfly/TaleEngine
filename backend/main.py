@@ -19,6 +19,7 @@ import hmac
 import json
 import logging
 import re
+import urllib.parse
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -761,8 +762,16 @@ async def get_attachment(
         raw = base64.b64decode(b64)
     except Exception:  # noqa: BLE001
         raise HTTPException(422, "Не удалось декодировать вложение")
-    # Вложения неизменяемы — можно смело кэшировать в браузере.
-    return Response(content=raw, media_type=mime, headers={"Cache-Control": "private, max-age=604800"})
+    # Content-Disposition с ОРИГИНАЛЬНЫМ именем: при «Сохранить как» браузер даёт
+    # файлу то же имя, что было при загрузке (в т.ч. кириллица — filename* / RFC 5987).
+    # inline — чтобы фото/видео/аудио всё равно открывались прямо в странице.
+    headers = {"Cache-Control": "private, max-age=604800"}  # вложения неизменяемы — кэшируем
+    name = (atts[idx].get("name") or "").strip()
+    if name:
+        ascii_name = name.encode("ascii", "ignore").decode() or "attachment"
+        quoted = urllib.parse.quote(name, safe="")
+        headers["Content-Disposition"] = f'inline; filename="{ascii_name}"; filename*=UTF-8\'\'{quoted}'
+    return Response(content=raw, media_type=mime, headers=headers)
 
 
 @app.get("/api/sessions/{session_id}/messages")

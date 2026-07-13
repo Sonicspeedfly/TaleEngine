@@ -154,6 +154,26 @@ async def test_ui_model_overrides_connection_default():
     assert _fake_acompletion.captured["model"] == "litellm_proxy/claude-3-5-sonnet"
 
 
+def test_build_user_content_prepends_filename_for_media():
+    """Модель получает ИМЯ файла отдельным текстовым блоком перед медиа."""
+    for att in (
+        AttachmentIn(type="image", data="data:image/png;base64,AAAA", name="кот.png"),
+        AttachmentIn(type="video", data="data:video/mp4;base64,AAAA", mime="video/mp4", name="ролик.mp4"),
+        AttachmentIn(type="audio", data="data:audio/ogg;base64,QUJD", mime="audio/ogg", name="запись.ogg"),
+    ):
+        content = build_user_content("смотри", [att])
+        labels = [b["text"] for b in content if b.get("type") == "text"]
+        assert any("Имя файла" in t and att.name in t for t in labels)
+
+
+def test_build_user_content_no_filename_label_for_documents():
+    """У документов имя уже внутри их блока — пометку не дублируем."""
+    att = AttachmentIn(type="document", data="data:text/plain;base64,QUJD", mime="text/plain", name="лор.txt")
+    content = build_user_content("", [att])
+    labels = [b.get("text", "") for b in content if b.get("type") == "text"]
+    assert not any("Имя файла" in t for t in labels)
+
+
 def test_build_user_content_text_only_returns_string():
     # Без вложений — простая строка (дешевле и совместимее).
     assert build_user_content("hello", []) == "hello"
@@ -359,8 +379,8 @@ def test_build_user_content_with_video_data_uri():
     # LiteLLM превращает его в inline_data для Gemini (видео нативно).
     att = AttachmentIn(type="video", data="data:video/mp4;base64,AAAA", mime="video/mp4", name="clip.mp4")
     content = build_user_content("смотри", [att])
-    assert content[1]["type"] == "image_url"
-    assert content[1]["image_url"]["url"].startswith("data:video/mp4;base64,")
+    img = next(b for b in content if b.get("type") == "image_url")
+    assert img["image_url"]["url"].startswith("data:video/mp4;base64,")
 
 
 def test_build_user_content_video_bare_base64_gets_data_uri():
@@ -375,8 +395,8 @@ def test_legacy_video_saved_as_document_is_rerouted():
     # текст-мусор). Такие старые записи в истории перенаправляются по mime.
     att = AttachmentIn(type="document", data="data:video/mp4;base64,AAAA", mime="video/mp4", name="старое.mp4")
     content = build_user_content("", [att])
-    assert content[0]["type"] == "image_url"
-    assert content[0]["image_url"]["url"].startswith("data:video/mp4;base64,")
+    img = next(b for b in content if b.get("type") == "image_url")
+    assert img["image_url"]["url"].startswith("data:video/mp4;base64,")
 
 
 def test_build_user_content_with_audio_strips_data_uri():

@@ -1371,6 +1371,14 @@ createApp({
       if (a.type === "video") return "🎬 " + (a.name || "видео");
       return "🖼 фото";
     },
+    // Иконка по типу вложения (для подписи с именем файла).
+    attIcon(a) {
+      const t = a.type, mime = a.mime || "";
+      if (t === "image" || mime.startsWith("image")) return "🖼";
+      if (t === "audio" || mime.startsWith("audio")) return "🎵";
+      if (t === "video" || mime.startsWith("video")) return "🎬";
+      return "📄";
+    },
     // Добавить файлы во вложения текущего сообщения (общий код для 📎, вставки и DnD).
     // Плашка появляется СРАЗУ со спиннером, а data дочитывается асинхронно — так видно,
     // что файл грузится, а send() дожидается готовности всех вложений (см. attachmentsLoading).
@@ -2467,10 +2475,18 @@ createApp({
               <template v-for="(a, ai) in m.attachments" :key="ai">
                 <!-- a.data есть только у своего свежеотправленного (оптимистичного) сообщения;
                      у загруженных из БД — тянем лениво по attUrl (кэшируется браузером). -->
-                <img v-if="a.type==='image'" :src="a.data || a.preview || attUrl(m, ai)" loading="lazy" class="att-img" @click="lightbox = a.data || a.preview || attUrl(m, ai)" title="Открыть" />
-                <audio v-else-if="a.type==='audio'" :src="a.data || a.preview || attUrl(m, ai)" controls preload="none" class="att-audio"></audio>
-                <video v-else-if="a.type==='video' || ((a.mime || '').startsWith('video'))" :src="a.data || a.preview || attUrl(m, ai)" controls preload="metadata" class="att-video"></video>
-                <a v-else class="att-doc" :href="a.data || a.preview || attUrl(m, ai)" :download="a.name || 'файл'" title="Скачать">📄 {{ a.name || 'документ' }}</a>
+                <div class="att-item">
+                  <img v-if="a.type==='image'" :src="a.data || a.preview || attUrl(m, ai)" loading="lazy" class="att-img" @click="lightbox = a.data || a.preview || attUrl(m, ai)" title="Открыть" />
+                  <audio v-else-if="a.type==='audio'" :src="a.data || a.preview || attUrl(m, ai)" controls preload="none" class="att-audio"></audio>
+                  <video v-else-if="a.type==='video' || ((a.mime || '').startsWith('video'))" :src="a.data || a.preview || attUrl(m, ai)" controls preload="metadata" class="att-video"></video>
+                  <a v-else class="att-doc" :href="a.data || a.preview || attUrl(m, ai)" :download="a.name || 'файл'" title="Скачать">{{ attIcon(a) }} {{ a.name || 'документ' }}</a>
+                  <!-- Подпись с ОРИГИНАЛЬНЫМ именем файла + размер + скачать (для всех типов) -->
+                  <div v-if="a.type!=='document'" class="att-caption">
+                    <span class="att-fname" :title="a.name || ''">{{ attIcon(a) }} {{ a.name || 'файл' }}</span>
+                    <i v-if="a.size"> · {{ fmtSize(a.size) }}</i>
+                    <a class="att-dl" :href="a.data || a.preview || attUrl(m, ai)" :download="a.name || 'файл'" :title="'Скачать «' + (a.name || 'файл') + '»'">⬇ скачать</a>
+                  </div>
+                </div>
               </template>
             </div>
           </div>
@@ -2586,8 +2602,8 @@ createApp({
               <span v-else-if="a.type==='video'" class="att-state">🎬</span>
               <span v-else class="att-state">📄</span>
             </template>
-            <span class="att-name" v-if="a.loading || a.error || a.type!=='image'">
-              {{ a.error ? 'ошибка' : (a.type==='audio' ? '🎤 голос' : a.name) }}<i v-if="a.size"> · {{ fmtSize(a.size) }}</i>
+            <span class="att-name" :title="a.name || ''">
+              {{ a.error ? 'ошибка' : (a.name || (a.type==='audio' ? 'аудио' : 'файл')) }}<i v-if="a.size"> · {{ fmtSize(a.size) }}</i>
             </span>
             <a href="#" class="att-x" @click.prevent="removeAttachment(i)" title="Убрать">✕</a>
           </span>

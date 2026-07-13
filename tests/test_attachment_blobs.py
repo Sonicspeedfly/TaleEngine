@@ -97,6 +97,29 @@ def test_send_stores_blob_not_inline_and_serves_bytes(client):
     assert left == 0
 
 
+def test_attachment_served_with_original_filename(client):
+    """Скачивание вложения сохраняет ОРИГИНАЛЬНОЕ имя (Content-Disposition, кириллица)."""
+    cid = client.post("/api/characters", json={"name": "Имя"}).json()["id"]
+    sid = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]
+    raw = b"named-bytes" * 20
+    data_uri = "data:image/png;base64," + base64.b64encode(raw).decode()
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        r = client.post(f"/api/sessions/{sid}/send", json={
+            "content": "фото", "attachments": [
+                {"type": "image", "data": data_uri, "mime": "image/png", "name": "мой кот.png"}
+            ],
+        })
+        _wait_done(client, r.json()["job_id"])
+    msgs = client.get(f"/api/sessions/{sid}/messages").json()
+    mid = [m for m in msgs if m["role"] == "user"][-1]["id"]
+    resp = client.get(f"/api/messages/{mid}/att/0")
+    cd = resp.headers.get("content-disposition", "")
+    # RFC 5987: кириллица уходит через filename*=UTF-8''… (проценты).
+    assert "filename*=UTF-8''" in cd
+    assert "%D0%BA%D0%BE%D1%82" in cd  # «кот» percent-encoded
+    assert resp.content == raw
+
+
 def test_history_hydrates_blob_attachment_for_model(client):
     """На следующем ходу модель «видит» ранее присланную картинку (данные из blobs)."""
     cid = client.post("/api/characters", json={"name": "Гидра"}).json()["id"]
