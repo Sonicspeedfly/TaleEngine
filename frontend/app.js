@@ -520,7 +520,9 @@ createApp({
         body: JSON.stringify({
           name: c.name, description: c.description, personality: c.personality,
           scenario: c.scenario, first_message: c.first_message,
-          system_prompt: c.system_prompt, model: c.model, avatar_path: c.avatar_path,
+          system_prompt: c.system_prompt, mes_example: c.mes_example || "",
+          post_history_instructions: c.post_history_instructions || "",
+          model: c.model, avatar_path: c.avatar_path,
         }),
       });
       await this.loadCharacters();
@@ -2853,6 +2855,13 @@ createApp({
             <label>Системный промпт
               <textarea rows="4" v-model="charEdit.system_prompt" @change="saveCharacter"
                         placeholder="Прямые инструкции модели: стиль ответов, ограничения, формат"></textarea></label>
+            <label>Примеры реплик (держат «голос» персонажа)
+              <textarea rows="3" v-model="charEdit.mes_example" @change="saveCharacter"
+                        placeholder="Образцы того, как персонаж говорит (диалоги-примеры). Модель подстроит стиль под них."></textarea></label>
+            <label>Инструкции перед ответом (Post-History / «джейлбрейк»)
+              <textarea rows="3" v-model="charEdit.post_history_instructions" @change="saveCharacter"
+                        placeholder="Переинъектируются в САМЫЙ конец контекста, прямо перед ответом — сильнее всего держат характер и правила в длинных чатах."></textarea></label>
+            <p class="muted" style="margin:-4px 0 10px">💡 «Инструкции перед ответом» — самая мощная позиция: то, что персонаж обязан соблюдать всегда. Подхватываются и из карточек SillyTavern.</p>
             <label>Модель персонажа (необязательно)
               <input v-model="charEdit.model" placeholder="пусто — модель из настроек генерации" @change="saveCharacter" /></label>
             <button class="btn-primary" @click="saveCharacter">💾 Сохранить сейчас</button>

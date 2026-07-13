@@ -34,6 +34,12 @@ class Character(Base):
     scenario: Mapped[str] = mapped_column(Text, default="")
     first_message: Mapped[str] = mapped_column(Text, default="")
     system_prompt: Mapped[str] = mapped_column(Text, default="")
+    # Примеры реплик персонажа (SillyTavern mes_example) — держат «голос»/стиль.
+    mes_example: Mapped[str] = mapped_column(Text, default="")
+    # Post-History Instructions (SillyTavern «jailbreak»/UJB): инструкции, которые
+    # ПЕРЕинъектируются в самый конец контекста, прямо перед ответом — сильнейшая
+    # позиция против «размывания» характера в длинном окне.
+    post_history_instructions: Mapped[str] = mapped_column(Text, default="")
     # Аватар: data URI (base64) или путь/URL. Для простоты — строка.
     avatar_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Персональные параметры генерации, переопределяющие дефолты из .env.

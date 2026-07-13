@@ -207,6 +207,8 @@ def _sqlite_add_missing_columns(sync_conn) -> None:
         },
         "characters": {
             "owner_id": "INTEGER",
+            "mes_example": "TEXT DEFAULT ''",
+            "post_history_instructions": "TEXT DEFAULT ''",
         },
         "personas": {
             "owner_id": "INTEGER",

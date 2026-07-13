@@ -39,6 +39,28 @@ def test_parse_character_json_v2():
     assert card.first_message == "О, новый слушатель!"
 
 
+def test_parse_character_v2_mes_example_and_post_history():
+    """SillyTavern V2: примеры реплик и Post-History Instructions подхватываются."""
+    raw = {
+        "spec": "chara_card_v2",
+        "data": {
+            "name": "Zed",
+            "mes_example": "{{char}}: Хех, попробуй догони.",
+            "post_history_instructions": "Всегда оставайся дерзким и в образе.",
+        },
+    }
+    card = parse_character_json(raw)
+    assert "догони" in card.mes_example
+    assert "дерзким" in card.post_history_instructions
+
+
+def test_parse_post_history_from_depth_prompt_extension():
+    """Запасной источник jailbreak — extensions.depth_prompt.prompt."""
+    raw = {"data": {"name": "X", "extensions": {"depth_prompt": {"prompt": "Не ломай роль."}}}}
+    card = parse_character_json(raw)
+    assert card.post_history_instructions == "Не ломай роль."
+
+
 def test_parse_character_json_v1_root_level():
     raw = {"name": "Old", "description": "Карточка старого формата."}
     card = parse_character_json(raw)

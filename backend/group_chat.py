@@ -169,15 +169,15 @@ async def build_group_messages(
     recent_text = " ".join(m.content for m in msgs[-6:] if m.content)
     activated = _scan_text_for_triggers(recent_text, records)
 
-    char_block = _render_character_block(
-        {
-            "name": target_character.name,
-            "description": target_character.description,
-            "personality": target_character.personality,
-            "scenario": target_character.scenario,
-            "system_prompt": target_character.system_prompt,
-        }
-    )
+    char_dict = {
+        "name": target_character.name,
+        "description": target_character.description,
+        "personality": target_character.personality,
+        "scenario": target_character.scenario,
+        "system_prompt": target_character.system_prompt,
+        "mes_example": getattr(target_character, "mes_example", "") or "",
+    }
+    char_block = _render_character_block(char_dict)
     others = [n for n in member_names if n != target_character.name]
     group_instr = (
         "[Групповой чат] Участники: " + ", ".join(member_names) + ". Ты — "
@@ -188,8 +188,10 @@ async def build_group_messages(
     # Общая «сцена» группы (сеттинг ролевой) — влияет на всех участников.
     scene = (session.scenario or "").strip()
     scene_block = f"[Сцена] {scene}" if scene else ""
+    from backend.horae_memory import BEHAVIOR_GUIDE
     system = "\n\n".join(
-        p for p in [char_block, _render_persona_block(persona), scene_block, group_instr, _render_horae_block(activated)] if p
+        p for p in [char_block, _render_persona_block(persona), scene_block, group_instr,
+                    _render_horae_block(activated), BEHAVIOR_GUIDE] if p
     )
 
     lines = []
@@ -210,5 +212,11 @@ async def build_group_messages(
         )
     if author_note and author_note.strip():
         messages.append({"role": "system", "content": f"[Author's Note]\n{author_note.strip()}"})
+    # Якорь характера + post-history перед ответом (личность не «плывёт»).
+    from backend.horae_memory import _render_char_anchor
+    messages.append({"role": "system", "content": _render_char_anchor(char_dict)})
+    phi = (getattr(target_character, "post_history_instructions", "") or "").strip()
+    if phi:
+        messages.append({"role": "system", "content": phi})
     messages.append({"role": "user", "content": transcript + f"\n\n{target_character.name}:"})
     return messages

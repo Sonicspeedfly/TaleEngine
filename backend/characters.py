@@ -17,6 +17,13 @@ def parse_character_json(raw: dict) -> CharacterCreate:
     """Нормализует JSON карточки (V1 или V2) в нашу схему CharacterCreate."""
     # В Tavern Card V2 полезные данные лежат в ключе 'data', в V1 — в корне.
     data = raw.get("data", raw)
+    # Post-History Instructions (SillyTavern «jailbreak»/UJB). У некоторых карточек
+    # он лежит в extensions.depth_prompt.prompt — используем как запасной вариант.
+    phi = data.get("post_history_instructions", "")
+    if not phi:
+        dp = (data.get("extensions") or {}).get("depth_prompt") or {}
+        if isinstance(dp, dict):
+            phi = dp.get("prompt", "") or ""
     return CharacterCreate(
         name=data.get("name", "Unnamed"),
         description=data.get("description", ""),
@@ -24,6 +31,8 @@ def parse_character_json(raw: dict) -> CharacterCreate:
         scenario=data.get("scenario", ""),
         first_message=data.get("first_mes", ""),
         system_prompt=data.get("system_prompt", ""),
+        mes_example=data.get("mes_example", "") or "",
+        post_history_instructions=phi,
     )
 
 

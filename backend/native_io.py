@@ -31,6 +31,8 @@ def character_to_dict(ch) -> dict:
         "scenario": ch.scenario or "",
         "first_message": ch.first_message or "",
         "system_prompt": ch.system_prompt or "",
+        "mes_example": getattr(ch, "mes_example", "") or "",
+        "post_history_instructions": getattr(ch, "post_history_instructions", "") or "",
         "avatar_path": ch.avatar_path,
         "generation_params": ch.generation_params or {},
         "model": ch.model,

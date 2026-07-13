@@ -8,12 +8,38 @@
 from types import SimpleNamespace
 
 from backend.horae_memory import (
+    BEHAVIOR_GUIDE,
     HoraeRecord,
     assemble_context,
     estimate_content_tokens,
     estimate_tokens,
     messages_to_history,
 )
+
+
+def test_behavior_guide_in_system_prompt():
+    """Базовые правила (характер / файлы / анти-выдумки) есть в системном промпте."""
+    messages = assemble_context(character=_char(), horae_records=[], history=[], user_message="hi")
+    system = messages[0]["content"]
+    assert "в образе" in system and "изучи" in system.lower()
+
+
+def test_file_manifest_when_attachments_present():
+    """Есть вложения -> в контексте появляется манифест «Приложенные материалы»."""
+    content = [{"type": "text", "text": "смотри"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]
+    messages = assemble_context(
+        character=_char(), horae_records=[], history=[], user_message="смотри",
+        user_attachments_content=content,
+    )
+    tail = " ".join(m["content"] for m in messages if m["role"] == "system")
+    assert "Приложенные материалы" in tail
+
+
+def test_web_access_hint_injected():
+    messages = assemble_context(character=_char(), horae_records=[], history=[],
+                                user_message="что нового?", web_access=True)
+    tail = " ".join(m["content"] for m in messages if m["role"] == "system")
+    assert "интернет" in tail.lower() and "веб-поиск" in tail.lower()
 
 
 def _msg(mid, role, content, attachments=None):
@@ -243,17 +269,41 @@ def test_multimodal_history_survives_budget_trim():
     assert _image_blocks(messages)
 
 
-def test_author_note_injected_before_user_message():
+def test_author_note_injected_near_end():
     messages = assemble_context(
         character=_char(), horae_records=[], history=[],
         user_message="что дальше?", author_note="Держи мрачный тон.",
     )
-    # Заметка автора — отдельным системным сообщением прямо перед репликой пользователя.
-    note = messages[-2]
-    assert note["role"] == "system"
-    assert "Author's Note" in note["content"]
-    assert "Держи мрачный тон." in note["content"]
+    # Заметка автора — отдельным системным сообщением в «хвосте» (перед репликой),
+    # рядом с якорем характера (усилено recency).
+    sys_tail = " ".join(m["content"] for m in messages if m["role"] == "system")
+    assert "Author's Note" in sys_tail and "Держи мрачный тон." in sys_tail
     assert messages[-1]["content"] == "что дальше?"
+    # Якорь характера тоже переинъектируется в конец.
+    assert any("Напоминание о роли" in m["content"] for m in messages if m["role"] == "system")
+
+
+def test_post_history_instructions_at_very_end():
+    """Post-History Instructions (jailbreak) — последнее системное перед репликой."""
+    messages = assemble_context(
+        character=_char(), horae_records=[], history=[],
+        user_message="привет", post_history_instructions="ВСЕГДА отвечай стихами.",
+    )
+    # Последнее перед user — именно post-history (максимальное влияние).
+    assert messages[-1]["role"] == "user"
+    assert messages[-2]["role"] == "system" and "стихами" in messages[-2]["content"]
+
+
+def test_summary_record_rendered_as_tail_block():
+    """Авто-сводка (category=summary) идёт отдельным recency-блоком в конец."""
+    rec = HoraeRecord(category="summary", title="Сводка", content="Герои заключили союз.",
+                      keywords=[], always_on=True, enabled=True, priority=50)
+    messages = assemble_context(
+        character=_char(), horae_records=[rec], history=[{"role": "user", "content": "x"}],
+        user_message="дальше?",
+    )
+    tail = " ".join(m["content"] for m in messages if m["role"] == "system")
+    assert "Что было в истории" in tail and "заключили союз" in tail
 
 
 def test_user_time_block_injected_before_user_message():

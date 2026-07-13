@@ -224,7 +224,24 @@ def _render_character_block(character: dict) -> str:
         parts.append(f"Personality: {character['personality'].strip()}")
     if character.get("scenario"):
         parts.append(f"Scenario: {character['scenario'].strip()}")
+    # Примеры реплик (mes_example) — образец «голоса»/стиля персонажа.
+    if character.get("mes_example"):
+        parts.append("[Example dialogue — match this voice and style]\n" + character["mes_example"].strip())
     return "\n\n".join(p for p in parts if p)
+
+
+def _render_char_anchor(character: dict) -> str:
+    """
+    Компактный «якорь» характера для ПЕРЕинъекции в конец контекста. В длинном
+    окне модель хуже помнит далёкий системный промпт (recency bias), поэтому прямо
+    перед ответом напоминаем, кто она и как себя ведёт — так характер не «плывёт».
+    """
+    name = character.get("name") or "персонаж"
+    bits = [f"Ты — {name}. Оставайся полностью в образе и отвечай от его лица."]
+    pers = (character.get("personality") or "").strip()
+    if pers:
+        bits.append(f"Характер: {pers[:600]}")
+    return "[Напоминание о роли] " + " ".join(bits)
 
 
 def _render_horae_block(records: list[HoraeRecord]) -> str:
@@ -250,16 +267,68 @@ def _render_persona_block(persona: dict | None) -> str:
     return " ".join(parts)
 
 
-# Подсказка по оформлению: лёгкая разметка, без таблиц/HTML — одинаково аккуратно
-# выглядит во всех клиентах (веб-приложение, Telegram-бот).
+# Базовые правила поведения. Держим модель в образе, гоним прочь галлюцинации и
+# заставляем реально СМОТРЕТЬ в приложенные файлы, а не выдумывать.
 # ВАЖНО: конкретные мессенджеры здесь НЕ называем — если в системном промпте написано
 # «Telegram», модель временами начинает считать, что общается именно там.
+BEHAVIOR_GUIDE = (
+    "[Как отвечать] Ты полностью вживаешься в свою роль и остаёшься в образе на "
+    "протяжении всего диалога: сохраняй характер, манеру речи и мотивацию персонажа, "
+    "не ломай роль и не добавляй мета-комментариев от «нейросети», если тебя об этом "
+    "прямо не просят.\n"
+    "[Работа с материалами] Если к сообщению приложены файлы (изображение, видео, "
+    "аудио, документ) или пользователь ссылается на ранее присланный файл — сначала "
+    "ВНИМАТЕЛЬНО изучи его содержимое и опирайся на факты из него. НЕ выдумывай того, "
+    "чего в материале нет; если чего-то в файле не хватает или он нечитаем — честно "
+    "скажи об этом, а не сочиняй.\n"
+    "[Точность] Не придумывай факты, имена и события. Если не уверен — так и скажи "
+    "или уточни у пользователя, вместо того чтобы фантазировать."
+)
+
 STYLE_GUIDE = (
     "[Оформление ответа] Пиши естественной прозой. Лёгкую разметку используй "
     "умеренно: *курсив* для действий и мыслей, **жирный** для акцентов, "
     "`моноширинный` и блоки кода в тройных кавычках для технического текста, "
     "«> » для цитат, «- » для списков. Не используй таблицы и HTML-разметку."
 )
+
+
+def _attachment_manifest(history: list[dict], current_content) -> str:
+    """
+    Манифест приложенных файлов: короткий список того, что физически есть в
+    контексте (по типам). Модель видит, что «файлы реально приложены», и понимает,
+    что к ним можно обращаться — а не отвечать «файла не вижу».
+    """
+    counts = {"image": 0, "video": 0, "audio": 0, "document": 0}
+    def _scan(content):
+        if not isinstance(content, list):
+            return
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            t = b.get("type")
+            if t == "image_url":
+                url = ((b.get("image_url") or {}).get("url")) or ""
+                if url.startswith("data:application/pdf") or "pdf" in url[:40]:
+                    counts["document"] += 1
+                elif url.startswith("data:video"):
+                    counts["video"] += 1
+                else:
+                    counts["image"] += 1
+            elif t == "input_audio":
+                counts["audio"] += 1
+    for m in history:
+        _scan(m.get("content"))
+    _scan(current_content)
+    total = sum(counts.values())
+    if not total:
+        return ""
+    ru = {"image": "изображений", "video": "видео", "audio": "аудио", "document": "документов"}
+    parts = [f"{ru[k]}: {v}" for k, v in counts.items() if v]
+    return (
+        "[Приложенные материалы] В этом диалоге модели доступны файлы (" + ", ".join(parts)
+        + "). Они реально приложены к сообщениям — изучай их и отвечай по их содержимому."
+    )
 
 
 def assemble_context(
@@ -276,6 +345,8 @@ def assemble_context(
     persona_avatar=None,
     send_avatars: bool = False,
     user_time: str = "",
+    post_history_instructions: str = "",
+    web_access: bool = False,
 ) -> list[dict]:
     """
     ЧИСТАЯ функция сборки контекста. Возвращает messages для LiteLLM:
@@ -299,12 +370,17 @@ def assemble_context(
         if isinstance(m.get("content"), str)
     )
     activated = _scan_text_for_triggers(recent_text, horae_records)
+    # Авто-сводку сюжета (category=summary) вынимаем из общего блока — она пойдёт
+    # ОТДЕЛЬНЫМ recency-блоком в конец, где влияет сильнее (иначе тонула в начале).
+    summary_recs = [r for r in activated if r.category == "summary"]
+    lore_recs = [r for r in activated if r.category != "summary"]
 
-    # 2. Системный промпт = паспорт персонажа + персона пользователя + память Horae.
+    # 2. Системный промпт = паспорт персонажа + персона + лор Horae + правила поведения.
     system_parts = [
         _render_character_block(character),
         _render_persona_block(persona),
-        _render_horae_block(activated),
+        _render_horae_block(lore_recs),
+        BEHAVIOR_GUIDE,
         STYLE_GUIDE,
     ]
     system_prompt = "\n\n".join(p for p in system_parts if p)
@@ -329,17 +405,47 @@ def assemble_context(
     if send_avatars:
         messages.extend(_avatar_messages(character, character_avatar, persona_avatar))
     messages.extend(trimmed_history)
-    # Текущее время пользователя (часовой пояс — настройка чата): модель понимает,
-    # утро сейчас у собеседника или глубокая ночь, и может на это опираться.
+
+    # ===== Переинъекция в КОНЕЦ (сильнейшая позиция — recency bias) =====
+    # Здесь всё, что должно «весить» на ответ несмотря на длину истории: сводка
+    # сюжета, якорь характера, post-history инструкции, заметка автора, файлы.
+    tail: list[dict] = []
+
+    # Что было в диалоге раньше (авто-сводка Horae) — как отдельный свежий блок.
+    if summary_recs:
+        body = "\n".join(f"- {(r.title or 'Сводка')}: {r.content.strip()}" for r in summary_recs)
+        tail.append({"role": "system", "content": "[Что было в истории — помни это]\n" + body})
+
+    # Манифест приложенных файлов + напоминание изучать их.
+    manifest = _attachment_manifest(trimmed_history, user_attachments_content)
+    if manifest:
+        tail.append({"role": "system", "content": manifest})
+
+    # Веб-поиск включён — прямо просим искать факты, а не выдумывать.
+    if web_access:
+        tail.append({"role": "system", "content": (
+            "[Доступ в интернет включён] Если для ответа нужны актуальные или точные "
+            "факты, которых нет в контексте, — ВОСПОЛЬЗУЙСЯ веб-поиском и опирайся на "
+            "найденное, а не придумывай."
+        )})
+
+    # Текущее время пользователя (часовой пояс — настройка чата).
     if user_time:
-        messages.append({
-            "role": "system",
-            "content": f"[Время пользователя] Сейчас у пользователя {user_time}.",
-        })
-    # Author's Note: вставляем системным сообщением прямо перед репликой пользователя,
-    # чтобы у заметки была максимальная «свежесть» и влияние на ответ.
+        tail.append({"role": "system", "content": f"[Время пользователя] Сейчас у пользователя {user_time}."})
+
+    # Author's Note (заметка автора) — у самого конца.
     if author_note and author_note.strip():
-        messages.append({"role": "system", "content": f"[Author's Note]\n{author_note.strip()}"})
+        tail.append({"role": "system", "content": f"[Author's Note]\n{author_note.strip()}"})
+
+    # Якорь характера — чтобы личность не «плыла» в длинном окне.
+    tail.append({"role": "system", "content": _render_char_anchor(character)})
+
+    # Post-History Instructions (jailbreak/UJB) — САМЫЙ конец: максимальное влияние.
+    if post_history_instructions and post_history_instructions.strip():
+        tail.append({"role": "system", "content": post_history_instructions.strip()})
+
+    messages.extend(tail)
+
     # Текущее сообщение: либо мультимодальный контент, либо просто текст.
     messages.append(
         {
@@ -447,6 +553,7 @@ async def build_context_from_db(
     history: list[dict] | None = None,
     send_avatars: bool = False,
     history_files_limit: int | None = None,
+    web_access: bool = False,
 ) -> list[dict]:
     """
     Достаёт из БД память Horae, персону, заметку автора и историю сообщений,
@@ -485,6 +592,7 @@ async def build_context_from_db(
         "personality": character.personality,
         "scenario": character.scenario,
         "system_prompt": character.system_prompt,
+        "mes_example": getattr(character, "mes_example", "") or "",
     }
 
     return assemble_context(
@@ -500,4 +608,6 @@ async def build_context_from_db(
         persona_avatar=(persona or {}).get("avatar"),
         send_avatars=send_avatars,
         user_time=session_user_time(session),
+        post_history_instructions=getattr(character, "post_history_instructions", "") or "",
+        web_access=web_access,
     )

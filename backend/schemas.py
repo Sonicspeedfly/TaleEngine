@@ -70,6 +70,8 @@ class CharacterBase(BaseModel):
     scenario: str = ""
     first_message: str = ""
     system_prompt: str = ""
+    mes_example: str = ""
+    post_history_instructions: str = ""
     model: Optional[str] = None
     generation_params: dict[str, Any] = Field(default_factory=dict)
 
@@ -118,6 +120,8 @@ class CharacterUpdate(BaseModel):
     scenario: Optional[str] = None
     first_message: Optional[str] = None
     system_prompt: Optional[str] = None
+    mes_example: Optional[str] = None
+    post_history_instructions: Optional[str] = None
     model: Optional[str] = None
     avatar_path: Optional[str] = None
     generation_params: Optional[dict[str, Any]] = None

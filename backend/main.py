@@ -574,6 +574,8 @@ async def export_character(character_id: int, db: AsyncSession = Depends(get_ses
             "scenario": char.scenario,
             "first_mes": char.first_message,
             "system_prompt": char.system_prompt,
+            "mes_example": char.mes_example or "",
+            "post_history_instructions": char.post_history_instructions or "",
             "character_book": build_character_book(book_entries) if book_entries else None,
         },
     }
@@ -1193,6 +1195,8 @@ async def _import_native_chat(db, data: dict, owner_id, user) -> dict:
             scenario=d.get("scenario", ""),
             first_message=d.get("first_message", ""),
             system_prompt=d.get("system_prompt", ""),
+            mes_example=d.get("mes_example", "") or "",
+            post_history_instructions=d.get("post_history_instructions", "") or "",
             avatar_path=d.get("avatar_path"),
             generation_params=d.get("generation_params") or {},
             model=d.get("model"),
@@ -2065,6 +2069,7 @@ async def _start_user_turn(session_id, content, attachments, params, db, reply_t
         db, sess, character, model_text, user_content, _ctx_budget(params),
         send_avatars=bool(params and params.send_avatars),
         history_files_limit=_hist_files_limit(params),
+        web_access=bool(params and params.web_access),
     )
     msg = models.Message(
         session_id=session_id,
@@ -2136,6 +2141,7 @@ async def _start_regenerate(session_id, params, db) -> str:
         user_content,
         _ctx_budget(params),
         history=history,
+        web_access=bool(params and params.web_access),
     )
 
     job_id = uuid.uuid4().hex
@@ -2183,7 +2189,7 @@ async def _start_continue(session_id, params, db) -> str:
     user_content = build_user_content(user_text, [])
     messages = await build_context_from_db(
         db, sess, character, user_text, user_content, _ctx_budget(params),
-        history=history,
+        history=history, web_access=bool(params and params.web_access),
     )
     # Уже написанный ответ + явная просьба продолжить именно его.
     messages.append({"role": "assistant", "content": target.content})
@@ -2242,6 +2248,7 @@ async def _start_retry(session_id, params, db) -> str:
     messages = await build_context_from_db(
         db, sess, character, last.content, user_content, _ctx_budget(params),
         history=history, send_avatars=bool(params and params.send_avatars),
+        web_access=bool(params and params.web_access),
     )
     job_id = uuid.uuid4().hex
     await generation_manager.start(
