@@ -278,16 +278,25 @@ async def stream_completion(
     _apply_connection(call_kwargs, params, connection)
 
     # Рассуждения (thinking): уровень пользователя или авто-включение при файлах.
-    # LiteLLM транслирует reasoning_effort в thinkingBudget Gemini; провайдеры без
-    # поддержки отбросят его через drop_params.
+    # LiteLLM транслирует reasoning_effort в thinkingBudget Gemini.
+    # ВАЖНО: у нас модель идёт как 'litellm_proxy/…', и внешний LiteLLM с
+    # drop_params=True НЕ знает, что прокси-модель поддерживает reasoning_effort —
+    # и ТИХО выкидывает его (поэтому «высокие» размышления не доходили до Gemini).
+    # allowed_openai_params форсирует проброс параметра в прокси как есть.
     reasoning = effective_reasoning(params, messages)
+    allowed_params: list[str] = []
     if reasoning:
         call_kwargs["reasoning_effort"] = reasoning
+        allowed_params.append("reasoning_effort")
 
-    # Доступ в интернет: подключаем инструмент веб-поиска (Google Search grounding
-    # у Gemini). Неподдерживающие провайдеры отбросят его через drop_params.
+    # Доступ в интернет: инструмент веб-поиска (Google Search grounding у Gemini).
+    # Тоже пробрасываем принудительно, иначе drop_params может его выкинуть.
     if params and params.web_access:
         call_kwargs["tools"] = [{"googleSearch": {}}]
+        allowed_params.append("tools")
+
+    if allowed_params:
+        call_kwargs["allowed_openai_params"] = allowed_params
 
     # Полная свобода по умолчанию: снимаем настраиваемые фильтры, если пользователь
     # их не включил явно (disable_safety=True — дефолт) ИЛИ это служебный вызов

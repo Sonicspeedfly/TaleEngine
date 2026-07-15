@@ -4,7 +4,9 @@ uvicorn[standard]>=0.29
 python-multipart>=0.0.9      # для загрузки файлов (импорт карточек)
 
 # --- LLM шлюз ---
-litellm>=1.40
+# >=1.55: нужен allowed_openai_params, чтобы reasoning_effort (высокие размышления)
+# гарантированно доходил до Gemini через litellm_proxy и не выкидывался drop_params.
+litellm>=1.55
 
 # --- Документы (Word -> текст/PDF; экспорт канваса в Docx/PDF) ---
 python-docx>=1.1            # чтение/создание .docx

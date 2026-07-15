@@ -256,6 +256,24 @@ async def test_explicit_reasoning_respected_even_with_zero_censorship():
 
 
 @pytest.mark.asyncio
+async def test_reasoning_forced_through_proxy_drop_params():
+    """
+    Регресс «высокие размышления не доходят»: reasoning_effort должен
+    ПРИНУДИТЕЛЬНО пробрасываться (allowed_openai_params), иначе LiteLLM с
+    drop_params=True тихо выкидывает его для litellm_proxy-моделей.
+    """
+    conn = {"use_proxy": True, "base_url": "http://localhost:4000", "default_model": "gemini-3.1-pro-preview"}
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        _ = [t async for t in stream_completion(
+            [{"role": "user", "content": "hi"}],
+            GenerationParams(reasoning_effort="high"), conn,
+        )]
+    cap = _fake_acompletion.captured
+    assert cap["reasoning_effort"] == "high"
+    assert "reasoning_effort" in cap.get("allowed_openai_params", [])
+
+
+@pytest.mark.asyncio
 async def test_reasoning_not_forced_without_files_or_when_off():
     # Текст без файлов: авто -> параметр не передаём (решает провайдер).
     with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
