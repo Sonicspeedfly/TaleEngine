@@ -231,6 +231,38 @@ def test_group_create_and_list(client):
     assert len(grp["members"]) == 2
 
 
+def test_promote_solo_chat_to_group_and_manage_members(client):
+    """Обычный чат превращается в групповой; участников можно добавлять и убирать."""
+    a = client.post("/api/characters", json={"name": "Соло"}).json()
+    b = client.post("/api/characters", json={"name": "Второй"}).json()
+    c = client.post("/api/characters", json={"name": "Третий"}).json()
+    sid = client.post(f"/api/sessions?character_id={a['id']}").json()["session_id"]
+
+    # 1-на-1 -> группа добавлением второго персонажа.
+    r = client.post(f"/api/sessions/{sid}/members", json={"character_ids": [b["id"]]})
+    assert r.status_code == 200 and r.json()["is_group"] is True
+    grp = [x for x in client.get("/api/groups").json() if x["id"] == sid][0]
+    names = {m["name"] for m in grp["members"]}
+    assert names == {"Соло", "Второй"}  # ведущий стал первым участником
+
+    # Добавляем третьего.
+    client.post(f"/api/sessions/{sid}/members", json={"character_ids": [c["id"]]})
+    grp = [x for x in client.get("/api/groups").json() if x["id"] == sid][0]
+    assert len(grp["members"]) == 3
+
+    # Убираем ведущего — ведущим становится другой, участников 2.
+    client.delete(f"/api/sessions/{sid}/members/{a['id']}")
+    grp = [x for x in client.get("/api/groups").json() if x["id"] == sid][0]
+    assert a["id"] not in {m["id"] for m in grp["members"]}
+    assert len(grp["members"]) == 2
+
+    # Последнего убрать нельзя.
+    client.delete(f"/api/sessions/{sid}/members/{b['id']}")
+    grp = [x for x in client.get("/api/groups").json() if x["id"] == sid][0]
+    left = client.delete(f"/api/sessions/{sid}/members/{grp['members'][0]['id']}")
+    assert left.status_code == 400
+
+
 def test_group_turn_one_speaker_responds(client):
     a = client.post("/api/characters", json={"name": "Алиса"}).json()
     b = client.post("/api/characters", json={"name": "Боб"}).json()

@@ -283,15 +283,23 @@ def test_author_note_injected_near_end():
     assert any("Напоминание о роли" in m["content"] for m in messages if m["role"] == "system")
 
 
-def test_post_history_instructions_at_very_end():
-    """Post-History Instructions (jailbreak) — последнее системное перед репликой."""
+def test_post_history_instructions_near_end():
+    """Post-History Instructions (jailbreak) — среди хвостовых системных блоков."""
     messages = assemble_context(
         character=_char(), horae_records=[], history=[],
         user_message="привет", post_history_instructions="ВСЕГДА отвечай стихами.",
     )
-    # Последнее перед user — именно post-history (максимальное влияние).
     assert messages[-1]["role"] == "user"
-    assert messages[-2]["role"] == "system" and "стихами" in messages[-2]["content"]
+    tail = " ".join(m["content"] for m in messages if m["role"] == "system")
+    assert "стихами" in tail
+    # Перед самой репликой — «фокус на текущем сообщении».
+    assert "Отвечай на это сообщение" in messages[-2]["content"]
+
+
+def test_current_message_focus_reminder():
+    """Прямо перед репликой — напоминание опираться на само сообщение (анти-выдумки)."""
+    messages = assemble_context(character=_char(), horae_records=[], history=[], user_message="вот песня")
+    assert "не придумывай" in messages[-2]["content"].lower() or "НЕ придумывай" in messages[-2]["content"]
 
 
 def test_summary_record_rendered_as_tail_block():

@@ -137,6 +137,11 @@ label span { color: var(--text); }
   background: var(--bg3); border: 1px solid var(--border); display: inline-grid;
   place-items: center; font-size: 13px; }
 .header-ava img { width: 100%; height: 100%; object-fit: cover; display: block; }
+/* Аватарка участника в модалке «Участники группы» */
+.member-ava { width: 30px; height: 30px; border-radius: 50%; flex: none; overflow: hidden;
+  background: var(--bg3); border: 1px solid var(--border); display: inline-grid;
+  place-items: center; font-weight: 600; text-transform: uppercase; }
+.member-ava img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .bubble { padding: 10px 14px; border-radius: 14px; white-space: normal; }
 .msg.user .bubble { background: var(--user); }
 .msg.assistant .bubble { background: var(--assistant); }

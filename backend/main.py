@@ -317,9 +317,9 @@ def _hist_files_limit(params) -> int | None:
 # Каждые ~N новых сообщений фоновая задача сжимает их в запись Horae
 # «Сводка сюжета (авто)» (always_on): даже когда старая история выпадает из окна
 # контекста, её суть остаётся видимой модели. Это и есть «долгая память» чата.
-_AUTO_SUMMARY_EVERY = 12          # сообщений между обновлениями сводки
+_AUTO_SUMMARY_EVERY = 6           # сообщений между обновлениями сводки (чаще = точнее)
 _AUTO_SUMMARY_MARK = "__auto__"   # метка авто-записи в keywords
-_AUTO_SUMMARY_TITLE = "📜 Сводка сюжета (авто)"
+_AUTO_SUMMARY_TITLE = "📜 Память чата (авто)"
 
 logger = logging.getLogger("aichat.summary")
 
@@ -364,16 +364,28 @@ async def _maybe_update_summary(session_id: int) -> None:
             newest_id = fresh[-1].id
 
         # LLM-вызов ВНЕ сессии БД (может занять десятки секунд).
+        # СТРУКТУРА памяти: чтобы не терялись сущности, локации и хронология —
+        # держим их по разделам, а не одним «плоским» абзацем.
         summary = (await complete(
             [
                 {"role": "system", "content": (
-                    "Ты ведёшь сжатую память ролевого чата. Объедини старую сводку и новые "
-                    "события в ЕДИНЫЙ связный конспект до 1500 символов: ключевые факты, "
-                    "имена, отношения, решения, состояние персонажей, незакрытые сюжетные "
-                    "линии. Пиши в прошедшем времени, без вступлений и пояснений — только "
-                    "текст сводки."
+                    "Ты ведёшь СТРУКТУРИРОВАННУЮ память ролевого чата. Обнови память: слей "
+                    "старую версию с новыми событиями, ничего важного не теряя. Верни ТОЛЬКО "
+                    "текст памяти по разделам (пустые разделы опускай), без вступлений:\n\n"
+                    "### Персонажи и сущности\n"
+                    "(имена, кто есть кто, роли, отношения, ключевые черты/состояние каждого)\n"
+                    "### Локации и мир\n"
+                    "(где происходит действие, важные места, правила мира)\n"
+                    "### Хронология\n"
+                    "(ключевые события по порядку — маркированным списком, кратко)\n"
+                    "### Текущее состояние\n"
+                    "(где все сейчас, что происходит прямо сейчас, важные предметы/факты)\n"
+                    "### Незакрытые линии\n"
+                    "(обещания, загадки, цели, что ещё не разрешилось)\n\n"
+                    "Пиши сжато и по делу. Обновляй факты (если состояние изменилось — "
+                    "заменяй старое новым), не раздувай объём бесконечно."
                 )},
-                {"role": "user", "content": f"[Старая сводка]\n{prev}\n\n[Новые события]\n{transcript}"},
+                {"role": "user", "content": f"[Текущая память]\n{prev}\n\n[Новые события]\n{transcript}"},
             ],
             None, connection,
         )).strip()
@@ -391,7 +403,7 @@ async def _maybe_update_summary(session_id: int) -> None:
                 entry = models.HoraeEntry(session_id=session_id, category="summary")
                 db.add(entry)
             entry.title = _AUTO_SUMMARY_TITLE
-            entry.content = summary[:4000]
+            entry.content = summary[:6000]
             entry.keywords = [_AUTO_SUMMARY_MARK, f"last:{newest_id}"]
             entry.always_on = True
             entry.enabled = True
@@ -898,6 +910,79 @@ async def create_group(
             )
     await db.commit()
     return {"session_id": sess.id}
+
+
+async def _add_members(db, session_id: int, char_ids: list[int], greet: bool = True) -> list[int]:
+    """Добавить персонажей в группу (без дублей). Возвращает реально добавленные id."""
+    existing = {c.id for c in await group_chat.load_members(db, session_id)}
+    added: list[int] = []
+    for cid in dict.fromkeys(char_ids):
+        if cid in existing:
+            continue
+        ch = await db.get(models.Character, cid)
+        if not ch:
+            continue
+        db.add(models.GroupMember(session_id=session_id, character_id=cid))
+        added.append(cid)
+        # Приветствие нового участника — как реплика (чтобы он «вошёл» в сцену).
+        if greet and ch.first_message:
+            db.add(models.Message(
+                session_id=session_id, role="assistant", content=ch.first_message,
+                swipes=[ch.first_message], active_swipe=0, speaker_name=ch.name,
+            ))
+    if added:
+        await db.commit()
+    return added
+
+
+@app.post("/api/sessions/{session_id}/members")
+async def add_group_members(
+    session_id: int, payload: dict, user=Depends(current_user), db: AsyncSession = Depends(get_session)
+):
+    """
+    Добавить персонажей в чат. Если чат был 1-на-1 — он ПРЕВРАЩАЕТСЯ в групповой
+    (ведущий персонаж становится первым участником). {character_ids:[...]}.
+    """
+    sess = await db.get(models.ChatSession, session_id)
+    if not await _can_access_session(db, sess, user):
+        raise HTTPException(403, "Нет доступа к этому чату")
+    char_ids = [int(c) for c in (payload.get("character_ids") or []) if c]
+    if not char_ids:
+        raise HTTPException(400, "Нужен хотя бы один персонаж")
+    # Превращение обычного чата в групповой.
+    if not sess.is_group:
+        sess.is_group = True
+        if not (sess.title or "").strip() or sess.title == "Новый чат":
+            sess.title = "Групповой чат"
+        await db.commit()
+        # Ведущий персонаж чата — первый участник группы.
+        await _add_members(db, session_id, [sess.character_id], greet=False)
+    added = await _add_members(db, session_id, char_ids)
+    return {"ok": True, "added": added, "is_group": True}
+
+
+@app.delete("/api/sessions/{session_id}/members/{character_id}")
+async def remove_group_member(
+    session_id: int, character_id: int, user=Depends(current_user), db: AsyncSession = Depends(get_session)
+):
+    """Убрать персонажа из группового чата (его прошлые реплики остаются в истории)."""
+    sess = await db.get(models.ChatSession, session_id)
+    if not await _can_access_session(db, sess, user):
+        raise HTTPException(403, "Нет доступа к этому чату")
+    members = await group_chat.load_members(db, session_id)
+    if len(members) <= 1:
+        raise HTTPException(400, "Нельзя убрать последнего участника группы")
+    await db.execute(sql_delete(models.GroupMember).where(
+        models.GroupMember.session_id == session_id,
+        models.GroupMember.character_id == character_id,
+    ))
+    # Ведущий персонаж чата ушёл — назначаем ведущим первого оставшегося.
+    if sess.character_id == character_id:
+        rest = [c for c in members if c.id != character_id]
+        if rest:
+            sess.character_id = rest[0].id
+    await db.commit()
+    return {"ok": True}
 
 
 # ============================ СООБЩЕНИЯ ============================

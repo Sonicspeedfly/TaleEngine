@@ -31,6 +31,22 @@ def test_match_names_longest_first_no_substring_clash():
     assert got[0].name == "Bot редактор"
 
 
+def test_name_in_text_declensions_and_typos():
+    """Умное распознавание: склонения, опечатки, но без ложных срабатываний."""
+    assert group_chat.name_in_text("Джеми", "дай слово Джемику")      # склонение
+    assert group_chat.name_in_text("Нейкон", "поговори с Нейконом")   # склонение
+    assert group_chat.name_in_text("Нейкон", "эй Нейкан, ты тут?")    # опечатка (Lev=1)
+    assert group_chat.name_in_text("Элис", "Элис, привет")            # прямое
+    assert not group_chat.name_in_text("Аня", "привет Ваня")          # не подстрока
+    assert not group_chat.name_in_text("Элис", "текст без имени")
+
+
+def test_mentioned_responders_uses_fuzzy():
+    ms = _members("Джеми", "Нейкон")
+    got = group_chat.mentioned_responders("Джемику слово, а потом Нейкону", ms)
+    assert {m.name for m in got} == {"Джеми", "Нейкон"}
+
+
 # ---------- Режиссёр: фолбэк вместо падения ----------
 def _fake_chunk(text):
     return SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=text),

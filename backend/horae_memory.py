@@ -421,6 +421,19 @@ def assemble_context(
     if manifest:
         tail.append({"role": "system", "content": manifest})
 
+    # Напоминание об аватарах (внешности) — картинки приложены в начале, в длинном
+    # контексте про них легко забыть, поэтому освежаем ссылку на них у конца.
+    if send_avatars and (_is_image(character_avatar) or _is_image(persona_avatar)):
+        who = []
+        if _is_image(character_avatar):
+            who.append("персонажа")
+        if _is_image(persona_avatar):
+            who.append("собеседника")
+        tail.append({"role": "system", "content": (
+            "[Внешность] Выше в диалоге приложены изображения-аватары " + " и ".join(who)
+            + ". Учитывай эту внешность, когда описываешь их вид."
+        )})
+
     # Веб-поиск включён — прямо просим искать факты, а не выдумывать.
     if web_access:
         tail.append({"role": "system", "content": (
@@ -443,6 +456,20 @@ def assemble_context(
     # Post-History Instructions (jailbreak/UJB) — САМЫЙ конец: максимальное влияние.
     if post_history_instructions and post_history_instructions.strip():
         tail.append({"role": "system", "content": post_history_instructions.strip()})
+
+    # Фокус на текущем ходе: в огромном контексте (вся история + все файлы) модель
+    # может «утопить» свежую реплику и начать выдумывать то, что уже прислано
+    # (например, сочинять текст песни, которая ЕСТЬ в сообщении). Явно велим
+    # опираться на само сообщение и приложенные к нему материалы.
+    has_current_media = isinstance(user_attachments_content, list)
+    focus = (
+        "[Отвечай на это сообщение] Ниже — АКТУАЛЬНАЯ реплика пользователя. Внимательно "
+        "прочитай её и"
+        + (" приложенные к ней материалы" if has_current_media else " весь её текст")
+        + " и отвечай именно по ним. Если нужный текст, данные или файл УЖЕ есть в "
+        "сообщении — используй их дословно, НЕ придумывай и не заменяй своей выдумкой."
+    )
+    tail.append({"role": "system", "content": focus})
 
     messages.extend(tail)
 
@@ -532,14 +559,32 @@ async def _load_horae_records(session_db, session_id: int, character_id=None) ->
 
 
 async def _load_persona_and_note(session_db, session) -> tuple[dict | None, str]:
-    """Достаёт персону пользователя и заметку автора для сессии."""
-    from backend.models import Persona
+    """Достаёт персону пользователя и заметку автора для сессии.
+
+    Аватар персоны: сначала свой (Persona.avatar_path), иначе — аватар аккаунта
+    владельца чата (чтобы модель «видела» пользователя, даже если у персоны своей
+    картинки нет). Так аватарка персоны реально доходит до нейросети.
+    """
+    from backend.models import Persona, User
+
+    owner_avatar = None
+    if getattr(session, "owner_id", None):
+        u = await session_db.get(User, session.owner_id)
+        if u and _is_image(u.avatar_path):
+            owner_avatar = u.avatar_path
 
     persona = None
     if session.persona_id:
         p = await session_db.get(Persona, session.persona_id)
         if p:
-            persona = {"name": p.name, "description": p.description, "avatar": p.avatar_path}
+            persona = {
+                "name": p.name,
+                "description": p.description,
+                "avatar": p.avatar_path if _is_image(p.avatar_path) else owner_avatar,
+            }
+    elif owner_avatar:
+        # Персона не выбрана, но у пользователя есть аватар — покажем хотя бы его.
+        persona = {"name": "", "description": "", "avatar": owner_avatar}
     return persona, session.author_note or ""
 
 

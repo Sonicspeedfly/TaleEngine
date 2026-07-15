@@ -9,6 +9,8 @@
 Контекст для каждого персонажа собирается так, чтобы он отвечал ТОЛЬКО за себя,
 видя реплики остальных как обычный диалог с подписями имён.
 """
+import re
+
 from sqlalchemy import select
 
 from backend.horae_memory import (
@@ -21,6 +23,57 @@ from backend.horae_memory import (
 )
 from backend.llm_gateway import complete
 from backend.models import Character, GroupMember, Message
+
+
+def _lev(a: str, b: str) -> int:
+    """Расстояние Левенштейна (для устойчивости к опечаткам в именах)."""
+    if a == b:
+        return 0
+    if not a or not b:
+        return len(a) or len(b)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def _tokens(text: str) -> list[str]:
+    """Слова текста в нижнем регистре (юникод — кириллица тоже)."""
+    return re.findall(r"[^\W\d_]+", (text or "").lower(), re.UNICODE)
+
+
+def name_in_text(name: str, text: str) -> bool:
+    """
+    Упомянут ли персонаж в тексте — УМНО, а не побуквенно:
+      * многословное имя — как подстрока;
+      * склонения (Джеми → Джемику, Джемой): токен начинается с основы имени;
+      * опечатки: расстояние Левенштейна ≤1 для имён от 5 букв.
+    """
+    name = (name or "").lower().strip()
+    if not name:
+        return False
+    low = (text or "").lower()
+    if " " in name:  # составное имя — ищем как есть
+        return name in low
+    toks = _tokens(text)
+    if name in toks:
+        return True
+    # Основа для склонений: отбрасываем 1–2 последних буквы (окончание меняется).
+    stem = name[:-1] if len(name) >= 5 else name
+    for t in toks:
+        # «джеми» ⊂ «джемику»: токен начинается с полного имени (добавлено окончание).
+        if len(t) >= len(name) and t.startswith(name):
+            return True
+        # Склонение с изменением окончания: общая основа + близкая длина.
+        if len(name) >= 5 and t.startswith(stem) and abs(len(t) - len(name)) <= 3:
+            return True
+        # Опечатка: одна замена/вставка/удаление.
+        if len(name) >= 5 and _lev(t, name) <= 1:
+            return True
+    return False
 
 
 async def load_members(db, session_id: int) -> list:
@@ -73,9 +126,8 @@ async def dedupe_members(db, session_id: int) -> int:
 
 
 def mentioned_responders(user_text: str, members: list) -> list:
-    """Персонажи, чьё имя встретилось в реплике пользователя."""
-    low = (user_text or "").lower()
-    return [m for m in members if m.name and m.name.lower() in low]
+    """Персонажи, чьё имя УМНО встретилось в реплике (склонения, опечатки)."""
+    return [m for m in members if m.name and name_in_text(m.name, user_text)]
 
 
 def round_robin_next(members: list, last_speaker_name: str | None) -> list:
@@ -94,14 +146,14 @@ def _match_names(members: list, text: str) -> list:
 
     Длинные имена проверяем раньше, чтобы «Bot редактор» не перекрывался «Bot»;
     результат упорядочиваем по позиции имени в тексте (кого режиссёр назвал первым).
+    Распознавание умное (склонения/опечатки — как в name_in_text).
     """
     low = (text or "").lower()
     picked: list = []
     for m in sorted(members, key=lambda x: -len(x.name or "")):
-        name = (m.name or "").lower()
-        if name and name in low and m not in picked:
+        if m.name and name_in_text(m.name, text) and m not in picked:
             picked.append(m)
-    picked.sort(key=lambda m: low.find((m.name or "").lower()))
+    picked.sort(key=lambda m: low.find((m.name or "").lower()) if (m.name or "").lower() in low else 9999)
     return picked
 
 

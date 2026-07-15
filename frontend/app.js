@@ -170,6 +170,8 @@ createApp({
       groupScenario: "",
       groupSelectedIds: [],
       groupInviteSelected: [],  // друзья, приглашаемые в группу при создании
+      membersOpen: false,       // модалка «участники группы» (добавить/убрать)
+      memberAddSelected: [],    // выбранные для добавления персонажи
       // Аккордеон сайдбара: какие разделы раскрыты (по умолчанию — персонажи и чаты).
       openSections: { characters: true, chats: true, groups: false, shared: false },
       groupDirector: false,
@@ -767,8 +769,42 @@ createApp({
       // Пользователь может сменить его во вкладке «Персона» (настройка на чат).
       if (!this.sessionTimezone) this._autoTimezone();
       this.closeSidebarOnMobile(); // на мобильном прячем сайдбар после выбора
+      // Запоминаем последний открытый чат — восстановим при перезагрузке страницы.
+      this._rememberLastChat();
       await this.loadMessages(true);   // свежее открытие — грузим последнюю порцию
       this.connectWs();
+    },
+    // Сохранить/восстановить последний открытый чат (чтобы после F5 сразу писать).
+    _rememberLastChat() {
+      try {
+        localStorage.setItem("lastChat", JSON.stringify({
+          sessionId: this.sessionId,
+          characterId: this.selectedCharacterId,
+          isGroup: this.currentIsGroup,
+        }));
+      } catch (e) {}
+    },
+    async _restoreLastChat() {
+      let saved;
+      try { saved = JSON.parse(localStorage.getItem("lastChat") || "null"); } catch (e) {}
+      if (!saved || !saved.sessionId) return false;
+      // Группа: открываем по id из списка групп.
+      if (saved.isGroup) {
+        const g = this.groups.find((x) => x.id === saved.sessionId);
+        if (g) { await this.openSession({ id: g.id }); return true; }
+      }
+      // Обычный чат: выбираем персонажа и открываем именно этот чат.
+      if (saved.characterId) {
+        const c = this.characters.find((x) => x.id === saved.characterId);
+        if (c) {
+          this.selectedCharacterId = c.id;
+          this.charEdit = { ...c, generation_params: c.generation_params || {} };
+          await this.loadSessions();
+          const s = this.sessions.find((x) => x.id === saved.sessionId);
+          if (s) { await this.openSession(s); return true; }
+        }
+      }
+      return false;
     },
     // Определить часовой пояс по браузеру и тихо сохранить его за текущим чатом.
     _autoTimezone() {
@@ -964,6 +1000,50 @@ createApp({
       const val = !this.currentGroup.director;
       await this.api("/sessions/" + this.sessionId, { method: "PATCH", body: JSON.stringify({ director: val }) });
       await this.loadGroups();
+    },
+    // ---------- Управление участниками (добавить/убрать, чат→группа) ----------
+    openMembers() {
+      // Кандидаты — персонажи, которых ещё нет в этом чате.
+      const inChat = new Set((this.currentGroup ? this.currentGroup.members : []).map((m) => m.id));
+      if (!this.currentIsGroup && this.selectedCharacterId) inChat.add(this.selectedCharacterId);
+      this.memberAddSelected = [];
+      this.membersOpen = true;
+    },
+    toggleMemberAdd(id) {
+      const i = this.memberAddSelected.indexOf(id);
+      if (i >= 0) this.memberAddSelected.splice(i, 1);
+      else this.memberAddSelected.push(id);
+    },
+    // Персонажи, доступные для добавления (кого ещё нет в этом чате).
+    availableToAdd() {
+      const ids = new Set((this.currentGroup ? this.currentGroup.members : []).map((m) => m.id));
+      if (!this.currentIsGroup && this.selectedCharacterId) ids.add(this.selectedCharacterId);
+      return this.characters.filter((c) => !ids.has(c.id));
+    },
+    async addMembers() {
+      if (!this.sessionId || !this.memberAddSelected.length) { this.membersOpen = false; return; }
+      const wasGroup = this.currentIsGroup;
+      try {
+        await this.api("/sessions/" + this.sessionId + "/members", {
+          method: "POST", body: JSON.stringify({ character_ids: this.memberAddSelected }),
+        });
+        this.membersOpen = false;
+        this.memberAddSelected = [];
+        await this.loadGroups();
+        await this.loadSessions();
+        // Чат стал групповым — переоткрываем как группу, чтобы подхватить участников.
+        if (!wasGroup) { this.selectedCharacterId = null; await this.openSession({ id: this.sessionId }); }
+        await this.loadMessages();
+        this.showToast("Участники добавлены");
+      } catch (e) { this.showToast("Не удалось добавить: " + e.message); }
+    },
+    async removeMember(m) {
+      if (!(await this.askConfirm("Убрать «" + m.name + "» из группы? Его прошлые реплики останутся.", { okText: "Убрать" }))) return;
+      try {
+        await this.api("/sessions/" + this.sessionId + "/members/" + m.id, { method: "DELETE" });
+        await this.loadGroups();
+        this.showToast("Персонаж убран из группы");
+      } catch (e) { this.showToast(e.message); }
     },
     // Загрузка окна сообщений (не всей истории). fresh=true — свежее открытие чата
     // (последние 40 + скролл вниз); иначе обновление текущего окна (после хода/правки).
@@ -2156,7 +2236,10 @@ createApp({
       if (def) { this.applyPreset(def); await this.loadUiPrefs(false); }
       else await this.loadUiPrefs();
       await Promise.all([this.loadCharacters(), this.loadPersonas(), this.loadHorae(), this.loadGroups(), this.loadFriends()]);
-      if (this.characters.length) this.selectCharacter(this.characters[0]);
+      // Восстанавливаем последний открытый чат (после F5 сразу можно писать);
+      // если не вышло — открываем первого персонажа, как раньше.
+      const restored = await this._restoreLastChat();
+      if (!restored && this.characters.length) this.selectCharacter(this.characters[0]);
       // Периодически подтягиваем заявки в друзья/общие чаты — чтобы уведомления
       // в колокольчике появлялись без перезагрузки страницы.
       clearInterval(this._friendsTimer);
@@ -2186,6 +2269,7 @@ createApp({
           if (this.plusMenu) { this.plusMenu = false; return; }
           if (this.notifOpen) { this.notifOpen = false; return; }
           if (this.inviteOpen) { this.inviteOpen = false; return; }
+          if (this.membersOpen) { this.membersOpen = false; return; }
           if (this.groupModal) { this.groupModal = false; return; }
           if (this.profileOpen) { this.profileOpen = false; return; }
           if (this.debugOpen) { this.debugOpen = false; return; }
@@ -2373,6 +2457,8 @@ createApp({
         <span class="pill hide-mobile">{{ params.model || connection.default_model }}</span>
         <span v-if="connection.use_proxy" class="pill hide-mobile" title="Запросы идут в LiteLLM-прокси">proxy {{ connection.base_url }}</span>
         <div style="flex:1"></div>
+        <button v-if="sessionId && !sharedView" class="btn-icon hide-mobile" @click="openMembers"
+                :title="currentIsGroup ? 'Участники группы (добавить/убрать)' : 'Добавить персонажа (сделать групповым)'">👥➕</button>
         <button v-if="currentIsGroup" class="btn-icon hide-mobile" :class="currentGroup.director ? 'rec-active' : ''"
                 @click="toggleDirector" title="ИИ-режиссёр: решает, кто ответит">🎬</button>
         <!-- Колокольчик уведомлений: входящие заявки в друзья -->
@@ -2405,6 +2491,7 @@ createApp({
           <button class="btn-icon" @click="headerMenu=!headerMenu" title="Ещё">⋯</button>
           <div v-if="headerMenu" class="plus-backdrop" @click="headerMenu=false"></div>
           <div v-if="headerMenu" class="plus-menu header-menu">
+            <button v-if="sessionId && !sharedView" @click="openMembers(); headerMenu=false">👥➕ {{ currentIsGroup ? 'Участники группы' : 'Добавить персонажа' }}</button>
             <button v-if="currentIsGroup" @click="toggleDirector(); headerMenu=false">🎬 ИИ-режиссёр: {{ currentGroup.director ? 'вкл' : 'выкл' }}</button>
             <button @click="soundOn=!soundOn; headerMenu=false">{{ soundOn ? '🔊 Звук вкл' : '🔇 Звук выкл' }}</button>
             <button v-if="currentUserObj" @click="openProfile(); headerMenu=false">👤 Профиль {{ currentUserObj.username }}</button>
@@ -3090,6 +3177,44 @@ createApp({
           </div>
         </div>
       </div>
+    </div>
+  </div>
+
+  <!-- ===== Модалка участников (добавить/убрать, чат→группа) ===== -->
+  <div v-if="membersOpen" class="modal-backdrop" @click.self="membersOpen=false">
+    <div class="modal" style="width:440px">
+      <div class="row-between" style="margin-bottom:10px">
+        <h3 style="margin:0">{{ currentIsGroup ? 'Участники группы' : 'Добавить персонажа' }}</h3>
+        <button class="btn-icon" @click="membersOpen=false">✕</button>
+      </div>
+      <p v-if="!currentIsGroup" class="muted" style="margin-top:0">Добавив персонажа, вы превратите этот чат в групповой. Ведущий персонаж останется в группе.</p>
+
+      <!-- Текущие участники (у группы) — с кнопкой убрать -->
+      <template v-if="currentIsGroup && currentGroup">
+        <p class="muted" style="margin:4px 0">В группе сейчас:</p>
+        <div class="card" v-for="m in currentGroup.members" :key="'m'+m.id">
+          <div class="row-between">
+            <span class="row" style="gap:8px">
+              <span class="member-ava"><img v-if="m.avatar_path" :src="m.avatar_path" /><span v-else>{{ (m.name||'?').charAt(0) }}</span></span>
+              <b>{{ m.name }}</b>
+            </span>
+            <button class="btn-danger" :disabled="currentGroup.members.length <= 1" @click="removeMember(m)" title="Убрать из группы">Убрать</button>
+          </div>
+        </div>
+        <div class="hr"></div>
+      </template>
+
+      <!-- Кого добавить -->
+      <p class="muted" style="margin:4px 0">Добавить в чат:</p>
+      <div v-if="!availableToAdd().length" class="muted" style="font-size:13px">Все персонажи уже в чате — создайте нового во вкладке слева.</div>
+      <div class="card" v-for="c in availableToAdd()" :key="'add'+c.id">
+        <label class="check"><input type="checkbox" :checked="memberAddSelected.includes(c.id)" @change="toggleMemberAdd(c.id)" />
+          <span class="row" style="gap:8px"><span class="member-ava"><img v-if="c.avatar_path" :src="c.avatar_path" /><span v-else>{{ (c.name||'?').charAt(0) }}</span></span> {{ c.name }}</span>
+        </label>
+      </div>
+      <button class="btn-primary" style="margin-top:12px" :disabled="!memberAddSelected.length" @click="addMembers">
+        {{ currentIsGroup ? 'Добавить выбранных' : 'Создать группу с выбранными' }}
+      </button>
     </div>
   </div>
 
