@@ -259,7 +259,7 @@ async def _generate_reply(session_id: int, text: str, attachments: list[Attachme
         sess = await db.get(models.ChatSession, session_id)
         character = await db.get(models.Character, sess.character_id)
         connection = await get_connection(db)
-        user_content = build_user_content(text, attachments)
+        user_content = build_user_content(text, attachments, current=True)
         messages = await build_context_from_db(
             db, sess, character, text, user_content, settings.CONTEXT_TOKEN_BUDGET
         )

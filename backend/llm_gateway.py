@@ -75,27 +75,59 @@ def _content_from_attachment(att: AttachmentIn) -> dict:
     raise ValueError(f"Неизвестный тип вложения: {att.type}")
 
 
-def build_user_content(text: str, attachments: list[AttachmentIn]):
+def _is_media_att(att: AttachmentIn) -> bool:
+    """Медиа-вложение (фото/видео/аудио), в т.ч. легаси-видео/аудио под типом document."""
+    mime = (att.mime or "").lower()
+    return att.type in ("image", "audio", "video") or (
+        att.type == "document"
+        and (mime.startswith("video/") or mime.startswith("audio/") or mime.startswith("image/"))
+    )
+
+
+def _media_kind_ru(att: AttachmentIn) -> str:
+    mime = (att.mime or "").lower()
+    if att.type == "video" or mime.startswith("video/"):
+        return "видео"
+    if att.type == "audio" or mime.startswith("audio/"):
+        return "аудио"
+    if att.type == "image" or mime.startswith("image/"):
+        return "изображение"
+    return "файл"
+
+
+def build_user_content(text: str, attachments: list[AttachmentIn], current: bool = False):
     """Собирает контент сообщения: строка без вложений, иначе список блоков.
 
     Перед каждым медиа-вложением (фото/видео/аудио) добавляем текстовую пометку
-    с ИМЕНЕМ файла — иначе модель видит содержимое, но не знает, как файл назван
-    (у документов имя уже внутри их блока, поэтому там пометку не дублируем).
+    с ИМЕНЕМ файла — иначе модель видит содержимое, но не знает, как файл назван.
+
+    :param current: это файлы ТЕКУЩЕГО (самого свежего) сообщения. Тогда явно их
+        выделяем — при «полной памяти» в контексте висят десятки старых файлов, и
+        модель путает свежий файл с ранее присланными (узнаёт «не того»).
     """
     if not attachments:
         return text
     blocks: list = []
     if text:
         blocks.append({"type": "text", "text": text})
+    media = [a for a in attachments if _is_media_att(a)]
+    if current and media:
+        kinds = ", ".join(sorted({_media_kind_ru(a) for a in media}))
+        blocks.append({"type": "text", "text": (
+            f"[⬇ ВНИМАНИЕ: ниже — {kinds} из ЭТОГО, самого свежего сообщения. Речь идёт "
+            "именно об этих файлах. Проанализируй КАЖДЫЙ из них напрямую и целиком "
+            "(видео — просмотри по кадрам, кто/что в кадре; аудио — прослушай полностью). "
+            "НЕ путай их с файлами из более ранних сообщений и не переноси выводы оттуда.]"
+        )})
     for att in attachments:
         name = (att.name or "").strip()
-        mime = (att.mime or "").lower()
-        is_media = att.type in ("image", "audio", "video") or (
-            att.type == "document"
-            and (mime.startswith("video/") or mime.startswith("audio/") or mime.startswith("image/"))
-        )
-        if name and is_media:
-            blocks.append({"type": "text", "text": f"[Имя файла: «{name}»]"})
+        if _is_media_att(att):
+            where = "в этом сообщении" if current else "ранее присланный"
+            label = f"[Файл {where}"
+            if name:
+                label += f": «{name}»"
+            label += f" — {_media_kind_ru(att)}]"
+            blocks.append({"type": "text", "text": label})
         blocks.append(_content_from_attachment(att))
     return blocks
 

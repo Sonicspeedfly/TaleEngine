@@ -163,15 +163,24 @@ def test_build_user_content_prepends_filename_for_media():
     ):
         content = build_user_content("смотри", [att])
         labels = [b["text"] for b in content if b.get("type") == "text"]
-        assert any("Имя файла" in t and att.name in t for t in labels)
+        assert any("Файл" in t and att.name in t for t in labels)
+
+
+def test_build_user_content_marks_current_vs_history_files():
+    """Текущий файл выделяется отдельно от ранее присланных (борьба с путаницей)."""
+    att = AttachmentIn(type="video", data="data:video/mp4;base64,AAAA", mime="video/mp4", name="new.mp4")
+    cur = " ".join(b["text"] for b in build_user_content("что тут", [att], current=True) if b.get("type") == "text")
+    assert "в этом сообщении" in cur and "свеж" in cur
+    hist = " ".join(b["text"] for b in build_user_content("что тут", [att]) if b.get("type") == "text")
+    assert "ранее присланный" in hist
 
 
 def test_build_user_content_no_filename_label_for_documents():
-    """У документов имя уже внутри их блока — пометку не дублируем."""
+    """У документов имя уже внутри их блока — медиа-пометку не даём."""
     att = AttachmentIn(type="document", data="data:text/plain;base64,QUJD", mime="text/plain", name="лор.txt")
     content = build_user_content("", [att])
     labels = [b.get("text", "") for b in content if b.get("type") == "text"]
-    assert not any("Имя файла" in t for t in labels)
+    assert not any("Файл" in t for t in labels)
 
 
 def test_build_user_content_text_only_returns_string():
@@ -183,8 +192,9 @@ def test_build_user_content_with_image_returns_blocks():
     att = AttachmentIn(type="image", data="data:image/png;base64,AAAA")
     content = build_user_content("look at this", [att])
     assert isinstance(content, list)
+    # Первый блок — текст пользователя; где-то есть image_url.
     assert content[0]["type"] == "text"
-    assert content[1]["type"] == "image_url"
+    assert any(b.get("type") == "image_url" for b in content)
 
 
 @pytest.mark.asyncio
@@ -405,7 +415,8 @@ def test_build_user_content_video_bare_base64_gets_data_uri():
     # Голый base64 (например из Telegram) оборачивается в data:URI по mime.
     att = AttachmentIn(type="video", data="AAAA", mime="video/webm")
     content = build_user_content("", [att])
-    assert content[0]["image_url"]["url"] == "data:video/webm;base64,AAAA"
+    img = next(b for b in content if b.get("type") == "image_url")
+    assert img["image_url"]["url"] == "data:video/webm;base64,AAAA"
 
 
 def test_legacy_video_saved_as_document_is_rerouted():
@@ -423,8 +434,7 @@ def test_build_user_content_with_audio_strips_data_uri():
         type="audio", data="data:audio/ogg;base64,QUJD", mime="audio/ogg"
     )
     content = build_user_content("", [att])
-    block = content[0]
-    assert block["type"] == "input_audio"
+    block = next(b for b in content if b.get("type") == "input_audio")
     assert block["input_audio"]["data"] == "QUJD"   # префикс data URI отрезан
     assert block["input_audio"]["format"] == "ogg"
 

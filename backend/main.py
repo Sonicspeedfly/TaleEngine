@@ -1796,7 +1796,7 @@ async def canvas_generate(
     await db.commit()
 
     # 2. Генерация (нестриминговая): просим ПОЛНЫЙ документ/код.
-    user_content = build_user_content(prompt, attachments)
+    user_content = build_user_content(prompt, attachments, current=True)
     messages = await build_context_from_db(
         db, sess, character, prompt, user_content, _ctx_budget(params)
     )
@@ -2148,7 +2148,7 @@ async def _start_user_turn(session_id, content, attachments, params, db, reply_t
 
     # Для модели добавляем ссылку на сообщение, на которое отвечает пользователь.
     model_text = (await _reply_prefix(db, reply_to_message_id)) + content
-    user_content = build_user_content(model_text, attachments)
+    user_content = build_user_content(model_text, attachments, current=True)
     # Контекст строим ДО сохранения нового сообщения (иначе оно задвоится).
     messages = await build_context_from_db(
         db, sess, character, model_text, user_content, _ctx_budget(params),
@@ -2324,7 +2324,7 @@ async def _start_retry(session_id, params, db) -> str:
     connection = await get_connection(db)
     # ПОЛНЫЕ вложения повторяемой реплики (данные — из blob-таблицы).
     atts = await message_attachments_in(db, last)
-    user_content = build_user_content(last.content, atts)
+    user_content = build_user_content(last.content, atts, current=True)
     # Контекст: история ДО последней реплики + сама реплика как текущее сообщение —
     # ровно то же, что видел бы _start_user_turn, но без повторного сохранения.
     history = await messages_to_history_db(
