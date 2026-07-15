@@ -57,11 +57,16 @@ def _content_from_attachment(att: AttachmentIn) -> dict:
     elif kind == "document" and mime.startswith("audio/"):
         kind = "audio"
     if kind == "image":
-        return {"type": "image_url", "image_url": {"url": att.data}}
+        img_mime = mime if mime.startswith("image/") else "image/jpeg"
+        # format — ЯВНАЯ подсказка mime: старый конвертер LiteLLM на прокси иначе
+        # может ошибиться с типом. Для картинок это тоже страховка.
+        return {"type": "image_url", "image_url": {"url": att.data, "format": img_mime}}
     if kind == "video":
-        # Тот же проверенный путь, что и PDF: data:URI внутри image_url —
-        # LiteLLM определит mime и отправит Gemini как inline_data (видео нативно).
-        return {"type": "image_url", "image_url": {"url": _attachment_data_uri(att, "video/mp4")}}
+        # data:URI внутри image_url + ЯВНЫЙ format=video/… — LiteLLM создаёт для
+        # Gemini inline_data именно как ВИДЕО (а не один кадр image/jpeg, чем грешит
+        # старый конвертер на прокси). Отсюда и «слабый анализ видео».
+        vmime = mime if mime.startswith("video/") else "video/mp4"
+        return {"type": "image_url", "image_url": {"url": _attachment_data_uri(att, vmime), "format": vmime}}
     if kind == "audio":
         # Gemini 1.5 Pro принимает аудио НАТИВНО — Whisper не нужен.
         b64 = att.data.split(",")[-1]  # отрезаем 'data:audio/...;base64,' если он есть

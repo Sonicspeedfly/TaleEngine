@@ -24,9 +24,20 @@ def summarize_messages(messages: list[dict]) -> list[dict]:
                 if t == "text":
                     parts.append(f"text:{len(b.get('text', ''))}")
                 elif t == "image_url":
-                    parts.append("🖼 image")
+                    # Различаем видео/pdf/картинку — иначе непонятно, что реально
+                    # уходит в Gemini (частая причина «слабого анализа видео»).
+                    iu = b.get("image_url") or {}
+                    fmt = (iu.get("format") or "").lower()
+                    url = (iu.get("url") or "")[:40].lower()
+                    if "video" in fmt or url.startswith("data:video"):
+                        parts.append("🎬 video")
+                    elif "pdf" in fmt or "pdf" in url:
+                        parts.append("📄 pdf")
+                    else:
+                        parts.append("🖼 image")
                 elif t == "input_audio":
-                    parts.append("🎤 audio")
+                    fmt = (b.get("input_audio") or {}).get("format") or ""
+                    parts.append(f"🎤 audio/{fmt}" if fmt else "🎤 audio")
                 else:
                     parts.append(t or "?")
             desc = " + ".join(parts)

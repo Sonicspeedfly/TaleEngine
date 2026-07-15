@@ -411,6 +411,14 @@ def test_build_user_content_with_video_data_uri():
     assert img["image_url"]["url"].startswith("data:video/mp4;base64,")
 
 
+def test_video_block_has_explicit_format_hint():
+    """Видео уходит с ЯВНЫМ format=video/… — чтобы старый конвертер на прокси не
+    сделал из него один кадр image/jpeg («слабый анализ видео»)."""
+    att = AttachmentIn(type="video", data="data:video/webm;base64,AAAA", mime="video/webm")
+    block = next(b for b in build_user_content("", [att]) if b.get("type") == "image_url")
+    assert block["image_url"]["format"] == "video/webm"
+
+
 def test_build_user_content_video_bare_base64_gets_data_uri():
     # Голый base64 (например из Telegram) оборачивается в data:URI по mime.
     att = AttachmentIn(type="video", data="AAAA", mime="video/webm")
