@@ -45,35 +45,47 @@ def _tokens(text: str) -> list[str]:
     return re.findall(r"[^\W\d_]+", (text or "").lower(), re.UNICODE)
 
 
+def _word_in_tokens(word: str, toks: list[str]) -> bool:
+    """Одно имя-слово встретилось среди токенов (точно/склонение/опечатка)."""
+    word = word.lower().strip()
+    if not word:
+        return False
+    if word in toks:
+        return True
+    stem = word[:-1] if len(word) >= 5 else word  # окончание в склонении меняется
+    for t in toks:
+        if len(t) >= len(word) and t.startswith(word):   # «хорхе» ⊂ «хорхе»/«хорхето»
+            return True
+        if len(word) >= 5 and t.startswith(stem) and abs(len(t) - len(word)) <= 3:
+            return True
+        if len(word) >= 5 and _lev(t, word) <= 1:        # опечатка
+            return True
+    return False
+
+
 def name_in_text(name: str, text: str) -> bool:
     """
     Упомянут ли персонаж в тексте — УМНО, а не побуквенно:
-      * многословное имя — как подстрока;
-      * склонения (Джеми → Джемику, Джемой): токен начинается с основы имени;
-      * опечатки: расстояние Левенштейна ≤1 для имён от 5 букв.
+      * полное имя целиком — как подстрока (напр. «Хорхе Диас»);
+      * ЛЮБАЯ значимая часть составного имени (≥3 букв): «Хорхе» или «Диас»
+        вызывают «Хорхе Диас» — не нужно писать имя полностью;
+      * склонения (Джеми → Джемику): токен начинается с основы имени;
+      * опечатки: расстояние Левенштейна ≤1 для слов от 5 букв.
     """
     name = (name or "").lower().strip()
     if not name:
         return False
     low = (text or "").lower()
-    if " " in name:  # составное имя — ищем как есть
-        return name in low
     toks = _tokens(text)
-    if name in toks:
-        return True
-    # Основа для склонений: отбрасываем 1–2 последних буквы (окончание меняется).
-    stem = name[:-1] if len(name) >= 5 else name
-    for t in toks:
-        # «джеми» ⊂ «джемику»: токен начинается с полного имени (добавлено окончание).
-        if len(t) >= len(name) and t.startswith(name):
+    if " " in name:
+        if name in low:  # полное составное имя целиком
             return True
-        # Склонение с изменением окончания: общая основа + близкая длина.
-        if len(name) >= 5 and t.startswith(stem) and abs(len(t) - len(name)) <= 3:
-            return True
-        # Опечатка: одна замена/вставка/удаление.
-        if len(name) >= 5 and _lev(t, name) <= 1:
-            return True
-    return False
+        # Иначе — по значимым частям (имя/фамилия), короткие «служебные» слова пропускаем.
+        for part in name.split():
+            if len(part) >= 3 and _word_in_tokens(part, toks):
+                return True
+        return False
+    return _word_in_tokens(name, toks)
 
 
 async def load_members(db, session_id: int) -> list:
@@ -262,6 +274,13 @@ async def build_group_messages(
                 {"name": target_character.name}, target_character.avatar_path, (persona or {}).get("avatar")
             )
         )
+    # База знаний чата — доступна всем персонажам группы.
+    from backend.knowledge import build_knowledge
+    kb_text, kb_media = await build_knowledge(db, session.id)
+    if kb_media:
+        messages.extend(kb_media)
+    if kb_text:
+        messages.append({"role": "system", "content": kb_text})
     if author_note and author_note.strip():
         messages.append({"role": "system", "content": f"[Author's Note]\n{author_note.strip()}"})
     # Якорь характера + post-history перед ответом (личность не «плывёт»).

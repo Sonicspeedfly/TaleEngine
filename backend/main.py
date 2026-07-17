@@ -44,7 +44,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from fastapi import Header, Request
 
-from backend import accounts, admin_service, debug_log, group_chat, models, native_io, telegram_runtime
+from backend import accounts, admin_service, debug_log, group_chat, knowledge, models, native_io, telegram_runtime
 from backend.attachments import (
     attachment_data,
     delete_message_blobs,
@@ -714,11 +714,17 @@ async def delete_session(
     await delete_message_blobs(
         db, select(models.Message.id).where(models.Message.session_id == session_id)
     )
+    # Blob'ы файлов базы знаний этого чата.
+    kb_blob_ids = [
+        f.blob_id for f in await knowledge.list_files(db, session_id) if f.blob_id
+    ]
+    if kb_blob_ids:
+        await db.execute(sql_delete(models.AttachmentBlob).where(models.AttachmentBlob.id.in_(kb_blob_ids)))
     # Все дочерние таблицы, ссылающиеся на session_id (глобальные Horae с session_id
     # IS NULL не затрагиваются — они не привязаны к этому чату).
     for model in (
         models.Message, models.GroupMember, models.SessionShare,
-        models.Canvas, models.HoraeEntry,
+        models.Canvas, models.HoraeEntry, models.KnowledgeFile,
     ):
         await db.execute(sql_delete(model).where(model.session_id == session_id))
     if sess:
@@ -981,6 +987,63 @@ async def remove_group_member(
         rest = [c for c in members if c.id != character_id]
         if rest:
             sess.character_id = rest[0].id
+    await db.commit()
+    return {"ok": True}
+
+
+# ============================ БАЗА ЗНАНИЙ ЧАТА ============================
+def _kb_meta(f) -> dict:
+    """Мета файла базы знаний (без тяжёлых данных/текста)."""
+    return {
+        "id": f.id, "name": f.name, "mime": f.mime, "kind": f.kind,
+        "has_text": bool(f.content), "size": len(f.content) if f.content else None,
+    }
+
+
+@app.get("/api/sessions/{session_id}/knowledge")
+async def list_knowledge(
+    session_id: int, user=Depends(current_user), db: AsyncSession = Depends(get_session)
+):
+    """Файлы базы знаний чата (только мета)."""
+    sess = await db.get(models.ChatSession, session_id)
+    if not await _can_access_session(db, sess, user):
+        raise HTTPException(403, "Нет доступа к этому чату")
+    return [_kb_meta(f) for f in await knowledge.list_files(db, session_id)]
+
+
+@app.post("/api/sessions/{session_id}/knowledge")
+async def add_knowledge(
+    session_id: int, payload: AttachmentIn, user=Depends(current_user), db: AsyncSession = Depends(get_session)
+):
+    """
+    Добавить файл в базу знаний чата (доступен модели/персонажам в каждом ходе).
+    Тело — как вложение: {type, data, mime, name}. Документы конвертируются в
+    текст (кешируется), медиа/PDF хранятся как есть.
+    """
+    sess = await db.get(models.ChatSession, session_id)
+    if not await _can_access_session(db, sess, user):
+        raise HTTPException(403, "Нет доступа к этому чату")
+    if not payload.data:
+        raise HTTPException(400, "Пустой файл")
+    kf = await knowledge.add_file(
+        db, session_id, (user.id if user else None),
+        payload.name or "файл", payload.mime, payload.data,
+    )
+    return _kb_meta(kf)
+
+
+@app.delete("/api/knowledge/{kid}")
+async def delete_knowledge(kid: int, user=Depends(current_user), db: AsyncSession = Depends(get_session)):
+    """Удалить файл из базы знаний (с его данными)."""
+    kf = await db.get(models.KnowledgeFile, kid)
+    if not kf:
+        return {"ok": True}
+    sess = await db.get(models.ChatSession, kf.session_id)
+    if not await _can_access_session(db, sess, user):
+        raise HTTPException(403, "Нет доступа к этому чату")
+    if kf.blob_id:
+        await db.execute(sql_delete(models.AttachmentBlob).where(models.AttachmentBlob.id == kf.blob_id))
+    await db.delete(kf)
     await db.commit()
     return {"ok": True}
 

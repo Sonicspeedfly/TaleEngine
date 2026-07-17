@@ -47,6 +47,23 @@ def test_mentioned_responders_uses_fuzzy():
     assert {m.name for m in got} == {"Джеми", "Нейкон"}
 
 
+def test_name_in_text_multiword_by_part():
+    """Составное имя вызывается по любой значимой части (имя/фамилия), не только целиком."""
+    assert group_chat.name_in_text("Хорхе Диас", "Хорхе, что скажешь?")   # по имени
+    assert group_chat.name_in_text("Хорхе Диас", "эй Диас")               # по фамилии
+    assert group_chat.name_in_text("Хорхе Диас", "скажи Диасу")           # склонение части
+    assert group_chat.name_in_text("Хорхе Диас", "Хорхе Диас ответь")     # целиком
+    assert not group_chat.name_in_text("Хорхе Диас", "просто текст")
+
+
+def test_mentioned_responders_multiword_first_name():
+    ms = _members("Хорхе Диас", "Тадео")
+    got = group_chat.mentioned_responders("Хорхе, ответь", ms)
+    assert [m.name for m in got] == ["Хорхе Диас"]
+    got2 = group_chat.mentioned_responders("Тадео, а ты?", ms)
+    assert [m.name for m in got2] == ["Тадео"]
+
+
 # ---------- Режиссёр: фолбэк вместо падения ----------
 def _fake_chunk(text):
     return SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=text),

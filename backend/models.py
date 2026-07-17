@@ -142,6 +142,28 @@ class AttachmentBlob(Base):
     data: Mapped[str] = mapped_column(Text, default="")
 
 
+class KnowledgeFile(Base):
+    """
+    Файл «базы знаний» чата — постоянный справочный материал, доступный модели/
+    персонажам В КАЖДОМ ходе (в отличие от разовых вложений сообщения). Документы
+    хранятся извлечённым ТЕКСТОМ (дёшево пересылать каждый ход), медиа/PDF — как
+    данные в attachment_blobs (blob_id).
+    """
+    __tablename__ = "knowledge_files"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("chat_sessions.id"), index=True)
+    owner_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    name: Mapped[str] = mapped_column(String(300), default="файл")
+    mime: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    kind: Mapped[str] = mapped_column(String(20), default="document")  # image|audio|video|document
+    # Извлечённый текст документа (для docx/txt/csv/…); у медиа/PDF пусто.
+    content: Mapped[str] = mapped_column(Text, default="")
+    # Данные медиа/PDF — в attachment_blobs (переиспользуем хранилище вложений).
+    blob_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 class GroupMember(Base):
     """Участник группового чата (связь сессия ↔ персонаж)."""
     __tablename__ = "group_members"

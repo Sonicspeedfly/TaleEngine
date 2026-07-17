@@ -347,6 +347,8 @@ def assemble_context(
     user_time: str = "",
     post_history_instructions: str = "",
     web_access: bool = False,
+    knowledge_text: str = "",
+    knowledge_media: list | None = None,
 ) -> list[dict]:
     """
     ЧИСТАЯ функция сборки контекста. Возвращает messages для LiteLLM:
@@ -404,12 +406,19 @@ def assemble_context(
     # Аватары: показываем нейросети внешность персонажа и пользователя (если включено).
     if send_avatars:
         messages.extend(_avatar_messages(character, character_avatar, persona_avatar))
+    # База знаний — медиа/PDF-файлы (справочные), до истории: модель «видит» их всегда.
+    if knowledge_media:
+        messages.extend(knowledge_media)
     messages.extend(trimmed_history)
 
     # ===== Переинъекция в КОНЕЦ (сильнейшая позиция — recency bias) =====
     # Здесь всё, что должно «весить» на ответ несмотря на длину истории: сводка
     # сюжета, якорь характера, post-history инструкции, заметка автора, файлы.
     tail: list[dict] = []
+
+    # База знаний чата (текст документов) — справочный материал, всегда доступный.
+    if knowledge_text:
+        tail.append({"role": "system", "content": knowledge_text})
 
     # Что было в диалоге раньше (авто-сводка Horae) — как отдельный свежий блок.
     if summary_recs:
@@ -629,6 +638,10 @@ async def build_context_from_db(
         session_db, session.id, getattr(character, "id", None)
     )
     persona, author_note = await _load_persona_and_note(session_db, session)
+    # База знаний чата (справочные файлы) — доступна модели в каждом ходе.
+    from backend.knowledge import build_knowledge
+
+    knowledge_text, knowledge_media = await build_knowledge(session_db, session.id)
 
     if history is None:
         hq = (
@@ -665,4 +678,6 @@ async def build_context_from_db(
         user_time=session_user_time(session),
         post_history_instructions=getattr(character, "post_history_instructions", "") or "",
         web_access=web_access,
+        knowledge_text=knowledge_text,
+        knowledge_media=knowledge_media,
     )

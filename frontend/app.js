@@ -172,6 +172,9 @@ createApp({
       groupInviteSelected: [],  // друзья, приглашаемые в группу при создании
       membersOpen: false,       // модалка «участники группы» (добавить/убрать)
       memberAddSelected: [],    // выбранные для добавления персонажи
+      kbOpen: false,            // модалка «база знаний» чата
+      kbFiles: [],              // список файлов базы знаний текущего чата
+      kbUploading: false,       // идёт загрузка файла в базу знаний
       // Аккордеон сайдбара: какие разделы раскрыты (по умолчанию — персонажи и чаты).
       openSections: { characters: true, chats: true, groups: false, shared: false },
       groupDirector: false,
@@ -1044,6 +1047,58 @@ createApp({
         await this.loadGroups();
         this.showToast("Персонаж убран из группы");
       } catch (e) { this.showToast(e.message); }
+    },
+
+    // ---------- База знаний чата (постоянные справочные файлы) ----------
+    async openKnowledge() {
+      if (!this.sessionId) return;
+      this.kbOpen = true;
+      await this.loadKnowledge();
+    },
+    async loadKnowledge() {
+      if (!this.sessionId) { this.kbFiles = []; return; }
+      try { this.kbFiles = await this.api("/sessions/" + this.sessionId + "/knowledge"); }
+      catch (e) { this.kbFiles = []; }
+    },
+    // Загрузка файлов в базу знаний (читаем в data:URI и шлём на сервер).
+    onKnowledgeFiles(e) {
+      const files = [...(e.target.files || [])];
+      e.target.value = "";
+      for (const file of files) this._uploadKnowledge(file);
+    },
+    _uploadKnowledge(file) {
+      const reader = new FileReader();
+      this.kbUploading = true;
+      reader.onload = async () => {
+        try {
+          let type = "document";
+          const mime = file.type || "application/octet-stream";
+          if (mime.startsWith("image")) type = "image";
+          else if (mime.startsWith("audio")) type = "audio";
+          else if (mime.startsWith("video")) type = "video";
+          await this.api("/sessions/" + this.sessionId + "/knowledge", {
+            method: "POST",
+            body: JSON.stringify({ type, data: reader.result, mime, name: file.name || "файл" }),
+          });
+          await this.loadKnowledge();
+        } catch (err) { this.showToast("Не удалось добавить в базу знаний: " + err.message); }
+        finally { this.kbUploading = false; }
+      };
+      reader.onerror = () => { this.kbUploading = false; this.showToast("Не удалось прочитать файл: " + (file.name || "")); };
+      reader.readAsDataURL(file);
+    },
+    async deleteKnowledge(f) {
+      if (!(await this.askConfirm("Удалить «" + f.name + "» из базы знаний?", { okText: "Удалить" }))) return;
+      try {
+        await this.api("/knowledge/" + f.id, { method: "DELETE" });
+        await this.loadKnowledge();
+      } catch (e) { this.showToast(e.message); }
+    },
+    kbIcon(f) {
+      if (f.kind === "image") return "🖼";
+      if (f.kind === "audio") return "🎵";
+      if (f.kind === "video") return "🎬";
+      return "📄";
     },
     // Загрузка окна сообщений (не всей истории). fresh=true — свежее открытие чата
     // (последние 40 + скролл вниз); иначе обновление текущего окна (после хода/правки).
@@ -2270,6 +2325,7 @@ createApp({
           if (this.notifOpen) { this.notifOpen = false; return; }
           if (this.inviteOpen) { this.inviteOpen = false; return; }
           if (this.membersOpen) { this.membersOpen = false; return; }
+          if (this.kbOpen) { this.kbOpen = false; return; }
           if (this.groupModal) { this.groupModal = false; return; }
           if (this.profileOpen) { this.profileOpen = false; return; }
           if (this.debugOpen) { this.debugOpen = false; return; }
@@ -2457,6 +2513,8 @@ createApp({
         <span class="pill hide-mobile">{{ params.model || connection.default_model }}</span>
         <span v-if="connection.use_proxy" class="pill hide-mobile" title="Запросы идут в LiteLLM-прокси">proxy {{ connection.base_url }}</span>
         <div style="flex:1"></div>
+        <button v-if="sessionId" class="btn-icon hide-mobile" @click="openKnowledge"
+                title="База знаний чата: файлы, которые персонажи всегда учитывают">📚</button>
         <button v-if="sessionId && !sharedView" class="btn-icon hide-mobile" @click="openMembers"
                 :title="currentIsGroup ? 'Участники группы (добавить/убрать)' : 'Добавить персонажа (сделать групповым)'">👥➕</button>
         <button v-if="currentIsGroup" class="btn-icon hide-mobile" :class="currentGroup.director ? 'rec-active' : ''"
@@ -2491,6 +2549,7 @@ createApp({
           <button class="btn-icon" @click="headerMenu=!headerMenu" title="Ещё">⋯</button>
           <div v-if="headerMenu" class="plus-backdrop" @click="headerMenu=false"></div>
           <div v-if="headerMenu" class="plus-menu header-menu">
+            <button v-if="sessionId" @click="openKnowledge(); headerMenu=false">📚 База знаний</button>
             <button v-if="sessionId && !sharedView" @click="openMembers(); headerMenu=false">👥➕ {{ currentIsGroup ? 'Участники группы' : 'Добавить персонажа' }}</button>
             <button v-if="currentIsGroup" @click="toggleDirector(); headerMenu=false">🎬 ИИ-режиссёр: {{ currentGroup.director ? 'вкл' : 'выкл' }}</button>
             <button @click="soundOn=!soundOn; headerMenu=false">{{ soundOn ? '🔊 Звук вкл' : '🔇 Звук выкл' }}</button>
@@ -3175,6 +3234,35 @@ createApp({
               </span>
             </div>
           </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Модалка «База знаний чата» ===== -->
+  <div v-if="kbOpen" class="modal-backdrop" @click.self="kbOpen=false">
+    <div class="modal" style="width:460px">
+      <div class="row-between" style="margin-bottom:10px">
+        <h3 style="margin:0">📚 База знаний чата</h3>
+        <button class="btn-icon" @click="kbOpen=false">✕</button>
+      </div>
+      <p class="muted" style="margin-top:0">Файлы, которые персонажи учитывают в КАЖДОМ ответе (в личном и групповом чате). Документы (PDF, Word, txt) читаются как текст; картинки/аудио/видео прикладываются целиком. Добавляйте при создании чата и в любой момент.</p>
+      <div class="row" style="margin:8px 0">
+        <label class="btn-primary" style="margin:0; cursor:pointer">
+          {{ kbUploading ? '⏳ Загрузка…' : '➕ Добавить файлы' }}
+          <input type="file" multiple style="display:none" :disabled="kbUploading"
+                 accept="image/*,audio/*,video/*,.pdf,.doc,.docx,.odt,.rtf,.txt,.md,.csv" @change="onKnowledgeFiles" />
+        </label>
+      </div>
+      <div v-if="!kbFiles.length" class="muted" style="font-size:13px; padding:6px 0">База знаний пуста. Добавьте справочные файлы — лор, документы, картинки, аудио.</div>
+      <div class="card" v-for="f in kbFiles" :key="f.id">
+        <div class="row-between">
+          <span class="row" style="gap:8px; min-width:0">
+            <span class="kb-ico">{{ kbIcon(f) }}</span>
+            <span class="grow" style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap" :title="f.name">{{ f.name }}</span>
+            <span v-if="f.has_text" class="tag" title="Документ прочитан как текст">текст</span>
+          </span>
+          <button class="btn-danger" @click="deleteKnowledge(f)" title="Удалить из базы знаний">🗑</button>
         </div>
       </div>
     </div>
