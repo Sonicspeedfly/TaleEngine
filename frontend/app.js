@@ -175,6 +175,7 @@ createApp({
       kbOpen: false,            // модалка «база знаний» чата
       kbFiles: [],              // список файлов базы знаний текущего чата
       kbUploading: false,       // идёт загрузка файла в базу знаний
+      directorBar: false,       // показывать режиссёрскую панель (группа)
       // Аккордеон сайдбара: какие разделы раскрыты (по умолчанию — персонажи и чаты).
       openSections: { characters: true, chats: true, groups: false, shared: false },
       groupDirector: false,
@@ -347,6 +348,7 @@ createApp({
       if (this.canvasCmdMode) return "Что сделать с Canvas…";
       if (this.canvasGenMode) return "Опишите документ или код для генерации…";
       if (this.artMode) return "Опишите картинку для генерации…";
+      if (this.currentIsGroup) return "Сообщение… Режиссура: +Имя вызвать, -Имя исключить (🎬)";
       return this.isTouch
         ? "Сообщение… (Enter — перенос строки)"
         : "Сообщение… (Enter — отправить, Shift+Enter — перенос)";
@@ -1099,6 +1101,17 @@ createApp({
       if (f.kind === "audio") return "🎵";
       if (f.kind === "video") return "🎬";
       return "📄";
+    },
+    // ---------- Режиссёрские команды (группа): вставка +Имя / -Имя ----------
+    // sign «+» — вызвать (порядок кликов = порядок ответов), «-» — исключить.
+    dirInsert(sign, name) {
+      const token = sign + name;
+      const cur = this.input;
+      // Не дублируем уже добавленную команду.
+      const re = new RegExp("(^|\\s)" + sign.replace("-", "\\-") + name + "(?=\\s|$)");
+      if (re.test(cur)) return;
+      this.input = (cur ? cur.replace(/\s+$/, "") + " " : "") + token + " ";
+      this.$nextTick(() => { if (this.$refs.composer) { this.$refs.composer.focus(); this.autoGrow({ target: this.$refs.composer }); } });
     },
     // Загрузка окна сообщений (не всей истории). fresh=true — свежее открытие чата
     // (последние 40 + скролл вниз); иначе обновление текущего окна (после хода/правки).
@@ -2700,6 +2713,16 @@ createApp({
       </div>
 
       <div class="composer" v-if="sessionId">
+        <!-- Режиссёрская панель (группа): кнопки вызвать/исключить персонажей -->
+        <div v-if="currentIsGroup && directorBar" class="director-bar">
+          <span class="dir-hint">🎬 Режиссёр: клик по имени — вызвать (порядок кликов = порядок ответов), «−» — исключить. Можно писать вручную: <code>+Хорхе −Джеми</code></span>
+          <div class="dir-chips">
+            <span v-for="m in currentGroup.members" :key="'d'+m.id" class="dir-chip">
+              <button class="dir-add" @click="dirInsert('+', m.name)" :title="'Вызвать ' + m.name">+ {{ m.name }}</button>
+              <button class="dir-ex" @click="dirInsert('-', m.name)" :title="'Исключить ' + m.name">−</button>
+            </span>
+          </div>
+        </div>
         <!-- Баннер ошибки генерации: НЕ прячем, чтобы было видно причину -->
         <div v-if="chatError" class="error-banner">
           Ошибка генерации: {{ chatError }}
@@ -2790,6 +2813,9 @@ createApp({
           <!-- Голос — отдельной кнопкой: запись/стоп в один клик -->
           <button class="btn-icon" :class="recording ? 'rec-active' : ''" @click="toggleRecord"
                   :title="recording ? 'Остановить запись' : 'Записать голос'">{{ recording ? '⏺ стоп' : '🎤' }}</button>
+          <!-- Режиссёр (только в группе): панель кнопок «вызвать/исключить» -->
+          <button v-if="currentIsGroup" class="btn-icon" :class="directorBar ? 'rec-active' : ''"
+                  @click="directorBar = !directorBar" title="Режиссёр: кто отвечает и в каком порядке">🎬</button>
           <textarea ref="composer" v-model="input" rows="1" class="composer-input"
                     :placeholder="composerPlaceholder"
                     @input="autoGrow" @keydown="onComposerKeydown" @paste="onPaste"></textarea>

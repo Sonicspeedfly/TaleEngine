@@ -142,6 +142,58 @@ def mentioned_responders(user_text: str, members: list) -> list:
     return [m for m in members if m.name and name_in_text(m.name, user_text)]
 
 
+# Режиссёрские команды в реплике: +Имя (вызвать, порядок = порядок ответа),
+# -Имя (исключить). Имя — часть/склонение (Хорхе → «Хорхе Диас»). Знак должен
+# стоять у границы слова, за ним буква (чтобы «+1», «5-7» не считались командой).
+_DIRECTIVE_RE = __import__("re").compile(
+    r"(?<![^\s\[(«\"'])([+\-])([А-Яа-яЁёA-Za-z][\wА-Яа-яЁё'’-]{1,})"
+)
+
+
+def _resolve_member(word: str, members: list):
+    """Найти персонажа по слову-команде (частичное/склонение), длинные имена — первыми."""
+    for m in sorted(members, key=lambda x: -len(x.name or "")):
+        if m.name and name_in_text(m.name, word):
+            return m
+    return None
+
+
+def parse_director_directives(text: str, members: list):
+    """
+    Разбирает режиссёрские команды в реплике пользователя.
+
+    Возвращает (forced, excluded, cleaned):
+      * forced   — персонажи из +Имя В ПОРЯДКЕ упоминания (кто отвечает и в какой
+                   очерёдности); дубли убраны;
+      * excluded — персонажи из -Имя (не дают отвечать в этом ходу);
+      * cleaned  — текст БЕЗ команд (то, что увидит модель как реплику).
+    Команды, не сопоставленные ни с одним персонажем, НЕ трогаем (это обычный текст,
+    например реплика с тире).
+    """
+    forced: list = []
+    excluded: list = []
+
+    def _repl(mm):
+        sign, word = mm.group(1), mm.group(2)
+        m = _resolve_member(word, members)
+        if not m:
+            return mm.group(0)  # не персонаж — оставляем как есть (обычный текст)
+        if sign == "+":
+            if m not in forced:
+                forced.append(m)
+        else:
+            if m not in excluded:
+                excluded.append(m)
+        return ""  # команду вырезаем из текста для модели
+
+    cleaned = _DIRECTIVE_RE.sub(_repl, text or "")
+    # Подчищаем осевшие пустые скобки/лишние пробелы от вырезанных команд.
+    import re as _re
+    cleaned = _re.sub(r"\[\s*[,;]*\s*\]", "", cleaned)
+    cleaned = _re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+    return forced, excluded, cleaned
+
+
 def round_robin_next(members: list, last_speaker_name: str | None) -> list:
     """Следующий персонаж по кругу после последнего говорившего."""
     if not members:

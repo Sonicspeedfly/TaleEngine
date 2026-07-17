@@ -307,6 +307,33 @@ def test_group_mention_targets_named_character(client):
     assert speakers == ["Боб"]  # ответил только упомянутый
 
 
+def test_group_director_directives_order_and_exclude(client):
+    """+Имя задаёт КТО и в каком порядке отвечает; -Имя исключает; команды не видны модели."""
+    a = client.post("/api/characters", json={"name": "Алиса"}).json()
+    b = client.post("/api/characters", json={"name": "Боб"}).json()
+    c = client.post("/api/characters", json={"name": "Вера"}).json()
+    g = client.post(
+        "/api/groups", json={"name": "G", "character_ids": [a["id"], b["id"], c["id"]]}
+    ).json()
+    sid = g["session_id"]
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        with client.websocket_connect(f"/ws/chat/{sid}") as ws:
+            # Порядок: сначала Вера, потом Алиса; Боб исключён.
+            ws.send_json({"type": "user_message", "content": "Все ждут. +Вера +Алиса -Боб"})
+            speakers = []
+            for _ in range(150):
+                ev = ws.receive_json()
+                if ev["type"] == "speaker":
+                    speakers.append(ev["name"])
+                if ev["type"] in ("done", "error"):
+                    break
+    assert speakers == ["Вера", "Алиса"]  # именно в этом порядке, без Боба
+    # В сохранённой реплике команды вырезаны (модель их не видит как текст).
+    msgs = client.get(f"/api/sessions/{sid}/messages").json()
+    user_msg = [m for m in msgs if m["role"] == "user"][-1]
+    assert user_msg["content"] == "Все ждут." and "+Вера" not in user_msg["content"]
+
+
 def test_reply_to_message_saved(client):
     cid = client.post("/api/characters", json={"name": "Rep", "first_message": "привет"}).json()["id"]
     sid = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]

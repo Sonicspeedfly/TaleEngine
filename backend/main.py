@@ -2116,6 +2116,12 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
     connection = await get_connection(db)
     director = sess.director
 
+    # Режиссёрские команды пользователя: +Имя (вызвать, по порядку), -Имя (исключить).
+    forced, excluded, cleaned = group_chat.parse_director_directives(content, members)
+    forced_ids = [m.id for m in forced]
+    excluded_ids = {m.id for m in excluded}
+    content = cleaned  # модель видит реплику БЕЗ служебных команд
+
     if save_user:
         msg = models.Message(
             session_id=session_id, role="user", content=content,
@@ -2147,15 +2153,26 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
             for m in msgs
         )
 
-        chosen = group_chat.mentioned_responders(content, rmembers)
-        if not chosen and director:
-            chosen = await group_chat.director_pick(
-                rmembers, transcript, connection, params=params, last_user=content
-            )
-        if not chosen:
-            # Никто не упомянут и режиссёр выключен/промолчал — отвечает следующий
-            # по кругу. Так на реплику пользователя ВСЕГДА кто-то реагирует.
-            chosen = group_chat.round_robin_next(rmembers, last_speaker)
+        if forced_ids:
+            # Явный приказ «+Имя»: отвечают ровно эти и в заданном порядке.
+            by_id = {m.id: m for m in rmembers}
+            chosen = [by_id[i] for i in forced_ids if i in by_id]
+        else:
+            chosen = group_chat.mentioned_responders(content, rmembers)
+            if not chosen and director:
+                chosen = await group_chat.director_pick(
+                    rmembers, transcript, connection, params=params, last_user=content
+                )
+            if not chosen:
+                # Никто не упомянут и режиссёр выключен/промолчал — отвечает следующий
+                # по кругу. Так на реплику пользователя ВСЕГДА кто-то реагирует.
+                chosen = group_chat.round_robin_next(rmembers, last_speaker)
+        # Исключения «-Имя» убирают персонажей из очереди.
+        if excluded_ids:
+            chosen = [m for m in chosen if m.id not in excluded_ids]
+            if not chosen and not forced_ids:
+                allowed = [m for m in rmembers if m.id not in excluded_ids]
+                chosen = group_chat.round_robin_next(allowed, last_speaker) if allowed else []
 
         for character in chosen:
             job.broadcast({"type": "speaker", "name": character.name, "character_id": character.id})

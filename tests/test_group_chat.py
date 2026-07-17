@@ -64,6 +64,33 @@ def test_mentioned_responders_multiword_first_name():
     assert [m.name for m in got2] == ["Тадео"]
 
 
+# ---------- Режиссёрские команды +Имя / -Имя ----------
+def test_directives_order_exclude_and_clean():
+    ms = _members("Хорхе Диас", "Тадео", "Джеми")
+    forced, excluded, cleaned = group_chat.parse_director_directives(
+        "Все замерли. +Тадео +Хорхе -Джеми", ms
+    )
+    assert [m.name for m in forced] == ["Тадео", "Хорхе Диас"]   # порядок сохранён
+    assert [m.name for m in excluded] == ["Джеми"]
+    assert cleaned == "Все замерли."                              # команды вырезаны
+
+
+def test_directives_partial_name_and_declension():
+    ms = _members("Хорхе Диас", "Тадео")
+    forced, _, _ = group_chat.parse_director_directives("+Диасу слово", ms)
+    assert [m.name for m in forced] == ["Хорхе Диас"]
+
+
+def test_directives_ignore_nonmember_tokens():
+    """«-5 градусов», тире-диалог и «+что-то» не считаются командами."""
+    ms = _members("Хорхе Диас", "Тадео")
+    forced, excluded, cleaned = group_chat.parse_director_directives(
+        "— Холодно, -5 градусов. +привет всем", ms
+    )
+    assert forced == [] and excluded == []
+    assert cleaned == "— Холодно, -5 градусов. +привет всем"
+
+
 # ---------- Режиссёр: фолбэк вместо падения ----------
 def _fake_chunk(text):
     return SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=text),
