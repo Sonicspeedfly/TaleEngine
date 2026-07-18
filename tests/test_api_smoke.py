@@ -307,6 +307,31 @@ def test_group_mention_targets_named_character(client):
     assert speakers == ["Боб"]  # ответил только упомянутый
 
 
+def test_group_partial_text_saved_on_error(client):
+    """Сбой во время ответа персонажа (напр. [Errno 5]) НЕ теряет уже написанный текст."""
+    a = client.post("/api/characters", json={"name": "Ника"}).json()
+    b = client.post("/api/characters", json={"name": "Марк"}).json()
+    g = client.post("/api/groups", json={"name": "G", "character_ids": [a["id"], b["id"]]}).json()
+    sid = g["session_id"]
+
+    async def _partial_then_boom(*args, **kwargs):
+        async def gen():
+            yield _fake_chunk("Начало реплики")
+            raise OSError(5, "Input/output error")  # обрыв посреди генерации
+        return gen()
+
+    with patch("backend.llm_gateway.litellm.acompletion", new=_partial_then_boom):
+        with client.websocket_connect(f"/ws/chat/{sid}") as ws:
+            ws.send_json({"type": "user_message", "content": "Ника, начни"})
+            for _ in range(60):
+                if ws.receive_json()["type"] in ("done", "error"):
+                    break
+    # Частичный текст сохранён (не «исчез»), несмотря на ошибку.
+    msgs = client.get(f"/api/sessions/{sid}/messages").json()
+    saved = [m for m in msgs if m["role"] == "assistant" and m["content"] == "Начало реплики"]
+    assert saved, "частичный ответ персонажа должен сохраниться при сбое"
+
+
 def test_group_director_directives_order_and_exclude(client):
     """+Имя задаёт КТО и в каком порядке отвечает; -Имя исключает; команды не видны модели."""
     a = client.post("/api/characters", json={"name": "Алиса"}).json()

@@ -38,14 +38,21 @@ async def add_file(db, session_id: int, owner_id, name: str, mime: str | None, d
     blob_id = None
 
     if kind == "document":
-        # Один раз извлекаем: docx/txt/csv/md -> текст; PDF -> остаётся файлом.
+        # Один раз извлекаем текст: docx/txt/csv/md — через prepare_document;
+        # PDF — через pypdf. Текст ДЁШЕВО слать каждый ход (вместо тяжёлого файла).
         block = prepare_document(data, mime, name)
         if block.get("type") == "text":
             content = block.get("text", "")
         else:
-            # PDF (или иной файл-блок) — храним данные, будем слать как файл.
-            metas = await store_attachments(db, None, [AttachmentIn(type="document", data=data, mime=mime, name=name)])
-            blob_id = (metas[0].get("blob_id") if metas else None)
+            # PDF-блок: пробуем вытащить текст, иначе храним файл (скан без текста).
+            from backend.document_service import _decode, extract_pdf_text
+
+            pdf_text = extract_pdf_text(_decode(data))
+            if pdf_text:
+                content = f"[Документ «{name}» — содержимое ниже]\n\n{pdf_text}"
+            else:
+                metas = await store_attachments(db, None, [AttachmentIn(type="document", data=data, mime=mime, name=name)])
+                blob_id = (metas[0].get("blob_id") if metas else None)
     else:
         metas = await store_attachments(db, None, [AttachmentIn(type=kind, data=data, mime=mime, name=name)])
         blob_id = (metas[0].get("blob_id") if metas else None)

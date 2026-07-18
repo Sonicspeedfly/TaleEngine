@@ -10,6 +10,7 @@
 
 Вся обработка — на сервере: браузер только шлёт текст и слушает токены.
 """
+import logging
 from typing import AsyncGenerator, Optional
 
 import litellm
@@ -21,6 +22,19 @@ from backend.schemas import AttachmentIn, GenerationParams
 # Не роняем запрос, если провайдер не поддерживает какой-то параметр (например top_k
 # у OpenAI). LiteLLM просто отбросит лишнее.
 litellm.drop_params = True
+
+# LiteLLM по умолчанию печатает предупреждения/инфо прямо в stdout. На сервере под
+# tmux/nohup поток вывода может «отвалиться», и тогда запись лога падает с
+# OSError [Errno 5] Input/output error — ПРЯМО во время запроса, обрывая генерацию
+# (в чате это «Ошибка генерации: [Errno 5]» и пропавший текст). Глушим болтливость
+# LiteLLM, чтобы её логи не могли уронить запрос через сломанный stdout.
+litellm.suppress_debug_info = True
+try:
+    litellm.set_verbose = False  # deprecated в новых версиях — не критично
+except Exception:  # noqa: BLE001
+    pass
+logging.getLogger("LiteLLM").setLevel(logging.ERROR)
+logging.getLogger("litellm").setLevel(logging.ERROR)
 
 
 # Полное снятие настраиваемых фильтров для Gemini / Vertex AI.

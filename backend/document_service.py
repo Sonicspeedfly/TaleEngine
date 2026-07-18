@@ -176,6 +176,28 @@ def _pdf_block(pdf_bytes: bytes) -> dict:
     return {"type": "image_url", "image_url": {"url": data_uri}}
 
 
+def extract_pdf_text(pdf_bytes: bytes, max_pages: int = 100) -> str:
+    """
+    Текст из PDF (pypdf, если установлен). Нужен для БАЗЫ ЗНАНИЙ: хранить и слать
+    модели дешёвый текст вместо тяжёлого PDF-файла на каждый ход. Пусто, если
+    pypdf нет или PDF без текстового слоя (сканы) — тогда шлём PDF как файл.
+    """
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return ""
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        parts: list[str] = []
+        for page in reader.pages[:max_pages]:
+            t = (page.extract_text() or "").strip()
+            if t:
+                parts.append(t)
+        return "\n\n".join(parts).strip()
+    except Exception:  # noqa: BLE001 — битый PDF не должен ронять загрузку
+        return ""
+
+
 def prepare_document(data: str, mime: str | None, name: str | None) -> dict:
     """
     Готовит content-блок для LLM из документа.

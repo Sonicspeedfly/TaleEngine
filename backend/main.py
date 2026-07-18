@@ -113,9 +113,45 @@ def _spawn_bg(coro) -> None:
     task.add_done_callback(_bg_tasks.discard)
 
 
+async def _migrate_kb_pdfs() -> None:
+    """
+    Одноразово: PDF в базе знаний, загруженные ДО извлечения текста, переводим из
+    тяжёлого файла (blob, шлётся каждый ход) в дешёвый текст. Так у уже собранных
+    баз знаний перестаёт раздуваться каждый запрос (и уходят ошибки [Errno 5]).
+    """
+    from backend.attachments import load_blob
+    from backend.document_service import _decode, extract_pdf_text
+
+    try:
+        async with AsyncSessionLocal() as db:
+            rows = (await db.execute(
+                select(models.KnowledgeFile).where(
+                    models.KnowledgeFile.blob_id.is_not(None),
+                    (models.KnowledgeFile.content == "") | (models.KnowledgeFile.content.is_(None)),
+                )
+            )).scalars().all()
+            for kf in rows:
+                if not (kf.mime or "").lower().startswith("application/pdf") and \
+                   not (kf.name or "").lower().endswith(".pdf"):
+                    continue
+                data = await load_blob(db, kf.blob_id)
+                if not data:
+                    continue
+                text = extract_pdf_text(_decode(data))
+                if not text:
+                    continue
+                kf.content = f"[Документ «{kf.name}» — содержимое ниже]\n\n{text}"[:200_000]
+                await db.execute(sql_delete(models.AttachmentBlob).where(models.AttachmentBlob.id == kf.blob_id))
+                kf.blob_id = None
+            await db.commit()
+    except Exception:  # noqa: BLE001 — миграция не должна мешать старту
+        logger.exception("Миграция PDF базы знаний не удалась")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()  # создаём/мигрируем таблицы при старте
+    await _migrate_kb_pdfs()  # PDF базы знаний -> текст (разово, чинит раздутые запросы)
     async with AsyncSessionLocal() as db:
         await admin_service.load_caches(db)  # код доступа, пароль админа, настройки TG
     # Автозапуск Telegram-бота, если он включён в админке, задан токен И не
@@ -2174,6 +2210,17 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
                 allowed = [m for m in rmembers if m.id not in excluded_ids]
                 chosen = group_chat.round_robin_next(allowed, last_speaker) if allowed else []
 
+        async def _save_reply(character, text: str) -> None:
+            async with AsyncSessionLocal() as rdb:
+                rdb.add(
+                    models.Message(
+                        session_id=session_id, role="assistant", content=text,
+                        swipes=[text], active_swipe=0,
+                        speaker_name=character.name, model_used=model_used,
+                    )
+                )
+                await rdb.commit()
+
         for character in chosen:
             job.broadcast({"type": "speaker", "name": character.name, "character_id": character.id})
             async with AsyncSessionLocal() as rdb:
@@ -2184,18 +2231,18 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
                 )
             text = ""
             _thought = lambda t: job.broadcast({"type": "thought", "content": t})  # noqa: E731
-            async for tok in stream_completion(messages, params, connection, on_thought=_thought):
-                text += tok
-                job.broadcast({"type": "token", "content": tok})
-            async with AsyncSessionLocal() as rdb:
-                rdb.add(
-                    models.Message(
-                        session_id=session_id, role="assistant", content=text,
-                        swipes=[text], active_swipe=0,
-                        speaker_name=character.name, model_used=model_used,
-                    )
-                )
-                await rdb.commit()
+            try:
+                async for tok in stream_completion(messages, params, connection, on_thought=_thought):
+                    text += tok
+                    job.broadcast({"type": "token", "content": tok})
+            except Exception:  # noqa: BLE001 — сбой одного персонажа (в т.ч. [Errno 5])
+                # НЕ теряем уже написанное: сохраняем частичный текст, затем пробрасываем
+                # ошибку выше (клиент увидит баннер, но реплика не «исчезнет»).
+                if text.strip():
+                    await _save_reply(character, text)
+                    job.broadcast({"type": "speaker_done", "name": character.name})
+                raise
+            await _save_reply(character, text)
             job.broadcast({"type": "speaker_done", "name": character.name})
         # Ход группы завершён — освежаем авто-сводку сюжета (фоном).
         _spawn_bg(_maybe_update_summary(session_id))
