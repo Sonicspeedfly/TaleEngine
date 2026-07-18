@@ -2152,15 +2152,18 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
     connection = await get_connection(db)
     director = sess.director
 
+    original_content = content  # с командами — сохраним в чат, чтобы их было видно
     # Режиссёрские команды пользователя: +Имя (вызвать, по порядку), -Имя (исключить).
     forced, excluded, cleaned = group_chat.parse_director_directives(content, members)
     forced_ids = [m.id for m in forced]
     excluded_ids = {m.id for m in excluded}
-    content = cleaned  # модель видит реплику БЕЗ служебных команд
+    # В ЧАТЕ команды СОХРАНЯЕМ (пользователь видит, что он задал; работает и retry),
+    # а МОДЕЛИ отдаём реплику без команд — их вырезает build_group_messages.
+    content = cleaned  # для выбора отвечающих (mention/режиссёр)
 
     if save_user:
         msg = models.Message(
-            session_id=session_id, role="user", content=content,
+            session_id=session_id, role="user", content=original_content,
             attachments=[], reply_to_id=reply_to_message_id,
         )
         db.add(msg)

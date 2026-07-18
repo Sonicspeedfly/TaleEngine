@@ -313,7 +313,10 @@ async def build_group_messages(
     lines = []
     for m in msgs:
         if m.role == "user":
-            lines.append(f"{persona_name}: {m.content}")
+            # Реплики пользователя очищаем от режиссёрских команд (+Имя/-Имя) —
+            # модель их не должна видеть как часть роль-плея (в чате они остаются).
+            _, _, ctext = parse_director_directives(m.content or "", members)
+            lines.append(f"{persona_name}: {ctext}")
         else:
             lines.append(f"{m.speaker_name or target_character.name}: {m.content}")
     transcript = "\n".join(lines)

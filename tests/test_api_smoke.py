@@ -353,10 +353,38 @@ def test_group_director_directives_order_and_exclude(client):
                 if ev["type"] in ("done", "error"):
                     break
     assert speakers == ["Вера", "Алиса"]  # именно в этом порядке, без Боба
-    # В сохранённой реплике команды вырезаны (модель их не видит как текст).
+    # В ЧАТЕ команды ОСТАЮТСЯ видны пользователю (не «исчезают» из его сообщения).
     msgs = client.get(f"/api/sessions/{sid}/messages").json()
     user_msg = [m for m in msgs if m["role"] == "user"][-1]
-    assert user_msg["content"] == "Все ждут." and "+Вера" not in user_msg["content"]
+    assert "+Вера" in user_msg["content"] and user_msg["content"].startswith("Все ждут.")
+
+
+def test_group_directives_stripped_for_model_but_kept_in_chat(client):
+    """Модель НЕ видит команды +Имя/-Имя (в транскрипте их нет), а в чате они есть."""
+    from backend import group_chat, models
+    from backend.database import AsyncSessionLocal
+
+    a = client.post("/api/characters", json={"name": "Ирис"}).json()
+    b = client.post("/api/characters", json={"name": "Ким"}).json()
+    g = client.post("/api/groups", json={"name": "G", "character_ids": [a["id"], b["id"]]}).json()
+    sid = g["session_id"]
+    captured = {}
+
+    async def _cap(*args, **kwargs):
+        captured["messages"] = kwargs["messages"]
+
+        async def gen():
+            yield _fake_chunk("Привет!")
+        return gen()
+
+    with patch("backend.llm_gateway.litellm.acompletion", new=_cap):
+        with client.websocket_connect(f"/ws/chat/{sid}") as ws:
+            ws.send_json({"type": "user_message", "content": "Сцена в баре. +Ирис"})
+            for _ in range(60):
+                if ws.receive_json()["type"] in ("done", "error"):
+                    break
+    sent = str(captured["messages"])
+    assert "Сцена в баре." in sent and "+Ирис" not in sent  # модель без команды
 
 
 def test_reply_to_message_saved(client):
