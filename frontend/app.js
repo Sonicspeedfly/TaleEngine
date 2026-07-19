@@ -109,6 +109,8 @@ createApp({
       // Авто-сводка сюжета: каждые ~12 сообщений ИИ обновляет запись
       // «Сводка сюжета (авто)» — старые события не выпадают из памяти.
       autoSummary: true,
+      groupReplyDelay: 3,       // пауза (сек) между ответами персонажей в группе
+      groupWaiting: 0,          // идёт пауза перед следующим ответом группы (сек)
       // Пустая форма записи памяти (тот же объект возвращает метод blankHorae()).
       horaeEdit: { id: null, category: "lore", title: "", content: "", keywords: "", always_on: false, enabled: true, priority: 0, scope: "global" },
 
@@ -1198,8 +1200,12 @@ createApp({
         this.processingNote = false;
       }
       if (ev.type === "job") this.currentJobId = ev.job_id;
-      else if (ev.type === "speaker") {
+      else if (ev.type === "waiting") {
+        // Пауза между ответами персонажей в группе (защита от 429).
+        this.groupWaiting = Math.round(ev.seconds || 0);
+      } else if (ev.type === "speaker") {
         // Групповой чат: начинается реплика нового персонажа.
+        this.groupWaiting = 0;
         this.liveBubbles.push({ name: ev.name, content: "" });
         this.scrollDown();
       } else if (ev.type === "token") {
@@ -1229,6 +1235,7 @@ createApp({
       this.streaming = false;
       this.currentJobId = null;
       this.processingNote = false;
+      this.groupWaiting = 0;
       // Сервер — источник истины: перечитываем сообщения (там уже новый ответ/свайп).
       await this.loadMessages();
       this.currentReply = "";
@@ -1945,6 +1952,7 @@ createApp({
       }
       if (ui && Number(ui.message_preload) > 0) this.messagePreload = Number(ui.message_preload);
       if (ui && "auto_summary" in ui) this.autoSummary = ui.auto_summary !== false;
+      if (ui && ui.group_reply_delay != null) this.groupReplyDelay = Number(ui.group_reply_delay);
     },
     saveUiPrefs() {
       // Дебаунс, чтобы не дёргать сервер на каждое движение ползунка.
@@ -1956,6 +1964,7 @@ createApp({
             params: this.params,
             message_preload: this.msgPageSize,
             auto_summary: this.autoSummary,
+            group_reply_delay: this.groupReplyDelay,
           }),
         }).catch(() => {});
       }, 600);
@@ -2693,6 +2702,10 @@ createApp({
             <div class="bubble"><div v-html="renderMd(b.content)"></div><span class="typing">▌</span></div>
           </div>
         </div>
+        <!-- пауза перед ответом следующего персонажа (защита от лимита провайдера) -->
+        <div v-if="streaming && groupWaiting > 0" class="msg assistant">
+          <div class="bubble muted">⏳ Пауза {{ groupWaiting }} с перед следующим персонажем (бережём лимит запросов)…</div>
+        </div>
         <!-- стриминг: одиночный ответ -->
         <div v-if="streaming && !liveBubbles.length" class="msg assistant">
           <div class="msg-ava">
@@ -2924,6 +2937,9 @@ createApp({
             </select>
           </label>
           <p class="muted" style="margin:2px 0 10px">Прежние фото/аудио/видео пересылаются модели заново на каждом ходу — она их «видит», а не вспоминает по пометкам. «Все файлы»: в чате с тяжёлыми видео каждый ход несёт их целиком — дольше и дороже; лимиты шлют свежие файлы до N МБ, старые заменяются пометкой [видео: имя].</p>
+          <label>👥 Пауза между ответами в группе (сек) <span class="range-val">{{ groupReplyDelay }}</span>
+            <input type="range" min="0" max="15" step="1" v-model.number="groupReplyDelay" @change="saveUiPrefs" /></label>
+          <p class="muted" style="margin:2px 0 10px">Когда в групповом чате отвечают несколько персонажей подряд (напр. <code>+A +B +C</code>), запросы быстро выбирают квоту провайдера — и прилетает ошибка «429 Resource exhausted». Пауза разносит ответы во времени. 0 — без паузы.</p>
           <label>Repetition penalty <span class="range-val">{{ params.repetition_penalty }}</span>
             <input type="range" min="0.8" max="2" step="0.05" v-model.number="params.repetition_penalty" /></label>
           <label class="check danger-text"><input type="checkbox" v-model="params.disable_safety" /> Zero-Censorship — снять фильтры (вкл. по умолчанию; порог OFF)</label>

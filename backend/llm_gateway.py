@@ -321,9 +321,9 @@ async def stream_completion(
         "stream": True,
         # Большой мультимодальный запрос (видео/аудио) получает увеличенный таймаут.
         "timeout": _request_timeout(messages),
-        # Сеть/прокси моргнули (connection error и т.п.) — LiteLLM тихо повторит
-        # запрос один раз, прежде чем отдавать ошибку наверх.
-        "num_retries": 1,
+        # Сбой/лимит провайдера (429 RESOURCE_EXHAUSTED, обрыв связи) — LiteLLM
+        # повторяет с экспоненциальным бэкоффом, прежде чем отдать ошибку наверх.
+        "num_retries": settings.LLM_NUM_RETRIES,
         **_merge_params(params),
     }
     _apply_connection(call_kwargs, params, connection)

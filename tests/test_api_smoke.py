@@ -307,6 +307,39 @@ def test_group_mention_targets_named_character(client):
     assert speakers == ["Боб"]  # ответил только упомянутый
 
 
+def test_group_reply_delay_spaces_out_responses(client):
+    """Между ответами персонажей есть пауза (защита от 429); настраивается через /settings/ui."""
+    import backend.main as bmain
+
+    a = client.post("/api/characters", json={"name": "Ая"}).json()
+    b = client.post("/api/characters", json={"name": "Боря"}).json()
+    g = client.post("/api/groups", json={"name": "G", "character_ids": [a["id"], b["id"]]}).json()
+    sid = g["session_id"]
+    # Маленькая, но НЕнулевая пауза, чтобы тест не тормозил.
+    client.put("/api/settings/ui", json={"group_reply_delay": 0.2})
+
+    sleeps = []
+    real_sleep = bmain.asyncio.sleep
+
+    async def _spy_sleep(secs):
+        sleeps.append(secs)
+        await real_sleep(0)  # не ждём по-настоящему
+
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion), \
+         patch("backend.main.asyncio.sleep", new=_spy_sleep):
+        with client.websocket_connect(f"/ws/chat/{sid}") as ws:
+            ws.send_json({"type": "user_message", "content": "+Ая +Боря"})
+            waited = False
+            for _ in range(80):
+                ev = ws.receive_json()
+                if ev["type"] == "waiting":
+                    waited = True
+                if ev["type"] in ("done", "error"):
+                    break
+    # Двое отвечают -> ровно одна пауза (перед вторым), значение — из настройки.
+    assert waited and 0.2 in sleeps
+
+
 def test_group_partial_text_saved_on_error(client):
     """Сбой во время ответа персонажа (напр. [Errno 5]) НЕ теряет уже написанный текст."""
     a = client.post("/api/characters", json={"name": "Ника"}).json()

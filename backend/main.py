@@ -2224,7 +2224,22 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
                 )
                 await rdb.commit()
 
-        for character in chosen:
+        # Пауза между ответами персонажей: несколько запросов подряд быстро
+        # выбирают квоту токенов-в-минуту у Vertex (429). Разносим их во времени.
+        reply_delay = settings.GROUP_REPLY_DELAY
+        async with AsyncSessionLocal() as rdb:
+            ui = await rdb.get(models.AppSetting, "ui")
+        if ui and isinstance(ui.value, dict) and ui.value.get("group_reply_delay") is not None:
+            try:
+                reply_delay = max(0.0, float(ui.value["group_reply_delay"]))
+            except (TypeError, ValueError):
+                pass
+
+        for i, character in enumerate(chosen):
+            # Перед каждым ответом, КРОМЕ первого, — пауза (даёт квоте восстановиться).
+            if i > 0 and reply_delay > 0:
+                job.broadcast({"type": "waiting", "seconds": reply_delay})
+                await asyncio.sleep(reply_delay)
             job.broadcast({"type": "speaker", "name": character.name, "character_id": character.id})
             async with AsyncSessionLocal() as rdb:
                 rsess = await rdb.get(models.ChatSession, session_id)
