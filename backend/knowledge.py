@@ -124,9 +124,5 @@ async def build_knowledge(db, session_id: int) -> tuple[str, list[dict]]:
 
     knowledge_text = ""
     if text_parts:
-        knowledge_text = (
-            "[База знаний чата] Ниже — справочные материалы этого чата. Считай их "
-            "достоверным источником и опирайся на них, когда вопрос касается их "
-            "содержимого.\n\n" + "\n\n".join(text_parts)
-        )
+        knowledge_text = "\n\n".join(text_parts)
     return knowledge_text, media_msgs

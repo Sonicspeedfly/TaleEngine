@@ -42,6 +42,28 @@ def test_web_access_hint_injected():
     assert "интернет" in tail.lower() and "веб-поиск" in tail.lower()
 
 
+def test_knowledge_placed_before_history_not_in_tail():
+    """
+    База знаний — справочник ДО диалога (низкая свежесть), а НЕ в конце: иначе она
+    перетягивает внимание и вытесняет факты чата. Проверяем, что блок стоит раньше
+    истории и последней реплики.
+    """
+    history = [{"role": "user", "content": "реплика из чата ФАКТ-42"},
+               {"role": "assistant", "content": "ответ персонажа"}]
+    messages = assemble_context(
+        character=_char(), horae_records=[], history=history, user_message="что было?",
+        knowledge_text="[Файл «спр.txt»]\nсправочный факт KB-99",
+    )
+    texts = [m["content"] if isinstance(m["content"], str) else "" for m in messages]
+    kb_idx = next(i for i, t in enumerate(texts) if "СПРАВОЧНАЯ БАЗА ЗНАНИЙ" in t)
+    hist_idx = next(i for i, t in enumerate(texts) if "ФАКТ-42" in t)
+    end_idx = next(i for i, t in enumerate(texts) if "КОНЕЦ БАЗЫ ЗНАНИЙ" in t)
+    # База знаний открывается и ЗАКРЫВАЕТСЯ до начала истории.
+    assert kb_idx < end_idx < hist_idx
+    # И реплика пользователя — самая последняя (диалог приоритетнее справочника).
+    assert messages[-1]["content"] == "что было?"
+
+
 def _msg(mid, role, content, attachments=None):
     return SimpleNamespace(id=mid, role=role, content=content, attachments=attachments or [])
 

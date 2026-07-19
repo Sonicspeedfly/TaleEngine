@@ -329,13 +329,11 @@ async def build_group_messages(
                 {"name": target_character.name}, target_character.avatar_path, (persona or {}).get("avatar")
             )
         )
-    # База знаний чата — доступна всем персонажам группы.
+    # База знаний чата — справочник, ДО диалога и явно отделён (не вытесняет чат).
+    from backend.horae_memory import knowledge_block
     from backend.knowledge import build_knowledge
     kb_text, kb_media = await build_knowledge(db, session.id)
-    if kb_media:
-        messages.extend(kb_media)
-    if kb_text:
-        messages.append({"role": "system", "content": kb_text})
+    messages.extend(knowledge_block(kb_text, kb_media))
     if author_note and author_note.strip():
         messages.append({"role": "system", "content": f"[Author's Note]\n{author_note.strip()}"})
     # Якорь характера + post-history перед ответом (личность не «плывёт»).

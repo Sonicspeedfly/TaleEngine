@@ -60,7 +60,9 @@ def test_knowledge_document_reaches_model(client):
                 if ws.receive_json()["type"] in ("done", "error"):
                     break
     sent = str(_capture_acompletion.captured["messages"])
-    assert "База знаний" in sent and "город Мар" in sent
+    # Контент дошёл, и он оформлен как ОТДЕЛЁННАЯ справочная база (не часть диалога).
+    assert "город Мар" in sent
+    assert "СПРАВОЧНАЯ БАЗА ЗНАНИЙ" in sent and "КОНЕЦ БАЗЫ ЗНАНИЙ" in sent
 
 
 def test_knowledge_delete(client):
@@ -138,7 +140,7 @@ def test_knowledge_image_stored_as_media(client):
                 if ws.receive_json()["type"] in ("done", "error"):
                     break
     sent = str(_capture_acompletion.captured["messages"])
-    assert "База знаний" in sent and "карта.png" in sent
+    assert "карта.png" in sent and "СПРАВОЧНАЯ БАЗА ЗНАНИЙ" in sent
 
 
 def test_knowledge_deleted_with_chat(client):

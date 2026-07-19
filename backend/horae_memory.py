@@ -230,6 +230,36 @@ def _render_character_block(character: dict) -> str:
     return "\n\n".join(p for p in parts if p)
 
 
+def knowledge_block(knowledge_text: str, knowledge_media: list | None) -> list[dict]:
+    """
+    Блок базы знаний для контекста, ЯВНО отделённый от диалога.
+
+    Кладётся В НАЧАЛО (после системного промпта, до истории) — НИЗКАЯ «свежесть»:
+    иначе справочник перетягивает внимание, и модель «сканирует» его вместо того,
+    чтобы помнить сам диалог и последнюю реплику пользователя. База знаний — это
+    ПОДСОБНЫЙ материал (загляни, если по делу), а не то, что происходит в чате.
+    """
+    if not (knowledge_text or knowledge_media):
+        return []
+    out: list[dict] = [{"role": "system", "content": (
+        "===== СПРАВОЧНАЯ БАЗА ЗНАНИЙ (НЕ часть диалога) =====\n"
+        "Ниже — подсобные материалы чата. Это СПРАВОЧНИК: заглядывай в него ТОЛЬКО "
+        "если вопрос напрямую касается его содержимого. Он НЕ описывает то, что "
+        "происходит в ролевой прямо сейчас, и НЕ заменяет диалог."
+    )}]
+    if knowledge_text:
+        out.append({"role": "system", "content": knowledge_text})
+    if knowledge_media:
+        out.extend(knowledge_media)
+    out.append({"role": "system", "content": (
+        "===== КОНЕЦ БАЗЫ ЗНАНИЙ =====\n"
+        "Дальше идёт САМ ДИАЛОГ: то, что реально писали пользователь и персонажи. "
+        "Держи в голове именно его и последнюю реплику пользователя; базу знаний "
+        "используй лишь как справку, не позволяй ей вытеснять факты из чата."
+    )})
+    return out
+
+
 def _render_char_anchor(character: dict) -> str:
     """
     Компактный «якорь» характера для ПЕРЕинъекции в конец контекста. В длинном
@@ -406,19 +436,16 @@ def assemble_context(
     # Аватары: показываем нейросети внешность персонажа и пользователя (если включено).
     if send_avatars:
         messages.extend(_avatar_messages(character, character_avatar, persona_avatar))
-    # База знаний — медиа/PDF-файлы (справочные), до истории: модель «видит» их всегда.
-    if knowledge_media:
-        messages.extend(knowledge_media)
+
+    # База знаний — ДО истории и явно ОТДЕЛЕНА от диалога (см. knowledge_block).
+    messages.extend(knowledge_block(knowledge_text, knowledge_media))
+
     messages.extend(trimmed_history)
 
     # ===== Переинъекция в КОНЕЦ (сильнейшая позиция — recency bias) =====
     # Здесь всё, что должно «весить» на ответ несмотря на длину истории: сводка
     # сюжета, якорь характера, post-history инструкции, заметка автора, файлы.
     tail: list[dict] = []
-
-    # База знаний чата (текст документов) — справочный материал, всегда доступный.
-    if knowledge_text:
-        tail.append({"role": "system", "content": knowledge_text})
 
     # Что было в диалоге раньше (авто-сводка Horae) — как отдельный свежий блок.
     if summary_recs:
