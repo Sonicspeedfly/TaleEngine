@@ -2246,6 +2246,7 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
                 messages = await group_chat.build_group_messages(
                     rdb, rsess, character, _ctx_budget(params),
                     send_avatars=bool(params and params.send_avatars),
+                    history_files_limit=_hist_files_limit(params),
                 )
             text = ""
             _thought = lambda t: job.broadcast({"type": "thought", "content": t})  # noqa: E731

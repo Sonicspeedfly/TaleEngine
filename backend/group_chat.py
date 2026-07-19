@@ -266,7 +266,8 @@ async def director_pick(
 
 
 async def build_group_messages(
-    db, session, target_character, token_budget: int, send_avatars: bool = False
+    db, session, target_character, token_budget: int, send_avatars: bool = False,
+    history_files_limit: int | None = None,
 ) -> list[dict]:
     """Собирает messages, чтобы target_character ответил как он сам, видя весь диалог."""
     members = await load_members(db, session.id)
@@ -342,5 +343,62 @@ async def build_group_messages(
     phi = (getattr(target_character, "post_history_instructions", "") or "").strip()
     if phi:
         messages.append({"role": "system", "content": phi})
-    messages.append({"role": "user", "content": transcript + f"\n\n{target_character.name}:"})
+
+    # ВЛОЖЕНИЯ пользователя (аудио/фото/видео/документы). Раньше в групповом чате
+    # транскрипт был ЧИСТО ТЕКСТОВЫМ — файлы в модель не уходили вовсе, и персонаж
+    # не мог «услышать» голосовое / «увидеть» фото (отвечал по кругу, игнорируя их).
+    # Теперь свежие вложения прикладываем к финальной реплике как мультимодал.
+    user_content: list = [{"type": "text", "text": transcript + f"\n\n{target_character.name}:"}]
+    att_blocks = await _collect_user_attachments(db, msgs, history_files_limit)
+    if att_blocks:
+        user_content = [{"type": "text", "text": transcript}] + att_blocks + [
+            {"type": "text", "text": (
+                "[⬆ Выше — файлы, приложенные пользователем к его сообщениям в этом чате "
+                "(аудио — прослушай, фото/видео — рассмотри). Учитывай их содержимое, "
+                "отвечая по последней просьбе.]"
+            )},
+            {"type": "text", "text": f"{target_character.name}:"},
+        ]
+    messages.append({"role": "user", "content": user_content})
     return messages
+
+
+async def _collect_user_attachments(db, msgs, files_limit_chars: int | None) -> list[dict]:
+    """
+    Собирает мультимодальные блоки вложений из реплик ПОЛЬЗОВАТЕЛЯ группового чата
+    (от свежих к старым, в пределах лимита). Данные тянутся из blob-таблицы точечно.
+    Возвращает список content-блоков (image_url/input_audio), помеченных именем файла.
+    """
+    from backend.attachments import load_history_attachments
+    from backend.llm_gateway import _content_from_attachment, _media_kind_ru
+    from backend.schemas import AttachmentIn
+
+    user_msgs = [m for m in msgs if m.role == "user"]
+    if not user_msgs:
+        return []
+    att_map = await load_history_attachments(db, user_msgs, files_limit_chars)
+    if not att_map:
+        return []
+    blocks: list[dict] = []
+    newest_id = user_msgs[-1].id
+    for m in user_msgs:  # хронологический порядок
+        for a in att_map.get(m.id, []):
+            try:
+                att = AttachmentIn(
+                    type=a.get("type") or "document", data=a.get("data") or "",
+                    mime=a.get("mime"), name=a.get("name"),
+                )
+            except Exception:  # noqa: BLE001
+                continue
+            where = "в ПОСЛЕДНЕМ сообщении" if m.id == newest_id else "ранее"
+            name = (att.name or "").strip()
+            label = f"[Файл {where}"
+            if name:
+                label += f": «{name}»"
+            label += f" — {_media_kind_ru(att)}]"
+            blocks.append({"type": "text", "text": label})
+            try:
+                blocks.append(_content_from_attachment(att))
+            except Exception:  # noqa: BLE001 — битый файл не должен рушить ход
+                blocks.pop()  # убираем осиротевшую подпись
+    return blocks

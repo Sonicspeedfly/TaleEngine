@@ -307,6 +307,47 @@ def test_group_mention_targets_named_character(client):
     assert speakers == ["Боб"]  # ответил только упомянутый
 
 
+def test_group_chat_sends_user_attachment_to_model(client):
+    """
+    Регресс: в ГРУППОВОМ чате вложения (голосовое/фото) не доходили до персонажа —
+    транскрипт был чисто текстовым. Теперь аудио уходит в модель как input_audio.
+    """
+    import base64
+
+    a = client.post("/api/characters", json={"name": "Ния"}).json()
+    b = client.post("/api/characters", json={"name": "Гор"}).json()
+    g = client.post("/api/groups", json={"name": "G", "character_ids": [a["id"], b["id"]]}).json()
+    sid = g["session_id"]
+    audio_b64 = base64.b64encode(b"FAKE-VOICE-BYTES" * 100).decode()
+    audio = "data:audio/mp3;base64," + audio_b64
+    captured = {}
+
+    async def _cap(*args, **kwargs):
+        captured["messages"] = kwargs["messages"]
+
+        async def gen():
+            yield _fake_chunk("Слушаю.")
+        return gen()
+
+    with patch("backend.llm_gateway.litellm.acompletion", new=_cap):
+        r = client.post(f"/api/sessions/{sid}/send", json={
+            "content": "+Ния прослушай голосовое и ответь",
+            "attachments": [{"type": "audio", "data": audio, "mime": "audio/mp3", "name": "Голосовое.mp3"}],
+        })
+        jid = r.json()["job_id"]
+        with client.stream("GET", f"/sse/job/{jid}") as resp:
+            for line in resp.iter_lines():
+                if line and ('"done"' in line or '"error"' in line):
+                    break
+    # Аудио реально ушло персонажу как мультимодальный блок (а не потерялось).
+    audio_blocks = [
+        blk for m in captured["messages"] if isinstance(m.get("content"), list)
+        for blk in m["content"] if isinstance(blk, dict) and blk.get("type") == "input_audio"
+    ]
+    assert audio_blocks, "голосовое должно уйти персонажу в групповом чате"
+    assert audio_b64 in audio_blocks[0]["input_audio"]["data"]
+
+
 def test_group_reply_delay_spaces_out_responses(client):
     """Между ответами персонажей есть пауза (защита от 429); настраивается через /settings/ui."""
     import backend.main as bmain
