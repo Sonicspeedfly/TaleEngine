@@ -9,8 +9,8 @@
 from backend import models
 from backend.document_service import is_document, prepare_document
 
-# Ограничение объёма текста базы знаний в контексте (символы) — чтобы очень
-# большая база не раздувала каждый запрос до бесконечности.
+# Сколько текста ХРАНИМ у одного файла базы знаний. Хранение дёшево, поэтому
+# потолок щедрый: обрезаем уже на сборке контекста (см. build_knowledge).
 _MAX_KB_TEXT = 200_000
 
 
@@ -77,14 +77,22 @@ async def list_files(db, session_id: int) -> list[models.KnowledgeFile]:
     )).scalars().all())
 
 
-async def build_knowledge(db, session_id: int) -> tuple[str, list[dict]]:
+async def build_knowledge(
+    db, session_id: int, max_chars: int | None = None
+) -> tuple[str, list[dict]]:
     """
     Собирает базу знаний чата для контекста:
       * knowledge_text — склеенный текст документов (один system-блок);
       * media_msgs — user-сообщения с медиа/PDF (каждый помечен как база знаний).
     Пусто, если базы нет.
+
+    :param max_chars: потолок текста справочника В КОНТЕКСТЕ. База уходит в
+        КАЖДЫЙ запрос, поэтому её размер — постоянная статья расхода: 200 тыс.
+        символов ≈ 50 тыс. токенов входа на каждом ходу. None — дефолт из
+        настроек (KNOWLEDGE_TEXT_CHARS); 0 — без ограничения.
     """
     from backend.attachments import load_blob
+    from backend.config import settings
     from backend.llm_gateway import _content_from_attachment
     from backend.schemas import AttachmentIn
 
@@ -92,14 +100,18 @@ async def build_knowledge(db, session_id: int) -> tuple[str, list[dict]]:
     if not files:
         return "", []
 
+    if max_chars is None:
+        max_chars = settings.KNOWLEDGE_TEXT_CHARS
+    budget = max_chars if max_chars and max_chars > 0 else _MAX_KB_TEXT
+
     text_parts: list[str] = []
     media_msgs: list[dict] = []
     used = 0
     for f in files:
         if f.content:
             chunk = f.content
-            if used + len(chunk) > _MAX_KB_TEXT:
-                chunk = chunk[: max(0, _MAX_KB_TEXT - used)]
+            if used + len(chunk) > budget:
+                chunk = chunk[: max(0, budget - used)]
             if chunk:
                 text_parts.append(f"[Файл «{f.name}»]\n{chunk}")
                 used += len(chunk)

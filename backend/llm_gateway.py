@@ -15,7 +15,7 @@ from typing import AsyncGenerator, Optional
 
 import litellm
 
-from backend import debug_log
+from backend import debug_log, usage_stats
 from backend.config import settings
 from backend.schemas import AttachmentIn, GenerationParams
 
@@ -245,13 +245,33 @@ def _merge_params(params: Optional[GenerationParams]) -> dict:
     if params:
         for key, value in params.model_dump(exclude_none=True).items():
             # model/disable_safety/web_access/send_avatars/reasoning_*/context_tokens/
-            # history_files_mb обрабатываются отдельно, не как сэмплинг-параметры litellm.
+            # history_files_* / knowledge_chars обрабатываются отдельно — это наши
+            # настройки сборки контекста, а не сэмплинг-параметры litellm.
             if key in ("model", "disable_safety", "web_access", "send_avatars",
                        "reasoning_effort", "file_reasoning", "context_tokens",
-                       "history_files_mb"):
+                       "history_files_mb", "history_files_turns", "knowledge_chars"):
                 continue
             merged[key] = value
     return merged
+
+
+# Просить ли у провайдера отчёт о потраченных токенах (usage в конце стрима).
+# Без него расход не посчитать: длина текста не учитывает ни файлы, ни кэш, ни
+# размышления. Параметр стандартный (OpenAI-совместимый), но если чей-то прокси
+# его не переварит — флаг гасится САМ на первом же отказе (см. stream_completion),
+# чтобы неизвестный прокси не сломал генерацию целиком.
+_ask_usage = True
+
+# Признаки того, что запрос отвергнут ИМЕННО из-за stream_options, а не по сути.
+_PARAM_ERROR_HINTS = ("stream_options", "unsupported", "unrecognized", "unexpected",
+                      "invalid parameter", "extra fields", "unknown field")
+
+
+def _is_stream_options_rejection(msg: str) -> bool:
+    low = (msg or "").lower()
+    return "stream_options" in low or (
+        "stream" in low and any(h in low for h in _PARAM_ERROR_HINTS)
+    )
 
 
 # Заглушка-ключ: LiteLLM требует api_key даже если прокси работает БЕЗ авторизации.
@@ -308,6 +328,7 @@ async def stream_completion(
     params: Optional[GenerationParams] = None,
     connection: Optional[dict] = None,
     on_thought=None,
+    kind: str = "chat",
 ) -> AsyncGenerator[str, None]:
     """
     Стримит ответ модели по токенам (async generator).
@@ -315,6 +336,9 @@ async def stream_completion(
 
     :param on_thought: колбэк для «размышлений» модели (reasoning_content) —
         они не входят в ответ, но их можно показать пользователю live.
+    :param kind: под каким видом писать расход токенов в статистику
+        (chat / summary / director / canvas / image-prompt). Позволяет увидеть,
+        сколько квоты съедают ФОНОВЫЕ служебные вызовы, а сколько — сам чат.
     """
     call_kwargs: dict = {
         "messages": messages,
@@ -367,12 +391,35 @@ async def stream_completion(
             "reasoning": reasoning or "auto",
         },
     )
+    global _ask_usage
+    if _ask_usage:
+        # Просим провайдера прислать usage в последнем чанке стрима. Без этого
+        # расход токенов не виден вообще: считать «на глазок» по длине текста
+        # бессмысленно (файлы, кэш и размышления так не посчитать).
+        call_kwargs["stream_options"] = {"include_usage": True}
     try:
-        response = await litellm.acompletion(**call_kwargs)
+        try:
+            response = await litellm.acompletion(**call_kwargs)
+        except Exception as first:  # noqa: BLE001
+            # Прокси не принял stream_options — гасим учёт токенов НАВСЕГДА (до
+            # перезапуска) и повторяем запрос без него. Статистика — не повод
+            # ронять генерацию; в 📊 просто не появятся цифры.
+            if not (_ask_usage and _is_stream_options_rejection(str(first))):
+                raise
+            logging.getLogger("aichat.usage").warning(
+                "Прокси не принял stream_options — учёт токенов отключён: %s", first
+            )
+            _ask_usage = False
+            call_kwargs.pop("stream_options", None)
+            response = await litellm.acompletion(**call_kwargs)
         text = ""
         finish_reason = None
         thought_len = 0
+        usage: dict = {}
         async for chunk in response:
+            # usage приходит отдельным служебным чанком в самом конце стрима
+            # (иногда — прицепом к последнему содержательному). Забираем и то, и то.
+            usage = usage_stats.extract_usage(chunk) or usage
             if not getattr(chunk, "choices", None):
                 continue  # служебный чанк без choices (например, usage)
             choice = chunk.choices[0]
@@ -395,6 +442,11 @@ async def stream_completion(
                 yield delta
         if finish_reason:
             entry["finish_reason"] = finish_reason
+        if usage:
+            # Видно прямо в отладочной панели: сколько ушло во вход, сколько из
+            # него взято из кэша провайдера (дешёвая часть) и сколько сгенерировано.
+            entry["usage"] = usage
+            usage_stats.record(kind, call_kwargs["model"], usage)
         if not text:
             # Стрим завершился «успешно», но контента НЕТ (фильтры провайдера,
             # обрезка по токенам во время размышлений и т.п.). Молчать нельзя —
@@ -436,10 +488,17 @@ async def complete(
     messages: list[dict],
     params: Optional[GenerationParams] = None,
     connection: Optional[dict] = None,
+    kind: str = "service",
 ) -> str:
     """Разовый (нестриминговый) ответ — собираем целиком из стрима. Удобно для
-    служебных задач, например «сочини промпт картинки по контексту чата»."""
-    return "".join([chunk async for chunk in stream_completion(messages, params, connection)])
+    служебных задач, например «сочини промпт картинки по контексту чата».
+
+    :param kind: вид запроса для статистики расхода (summary / director / canvas…).
+        По умолчанию «service» — так фоновые вызовы не смешиваются с самим чатом.
+    """
+    return "".join([
+        chunk async for chunk in stream_completion(messages, params, connection, kind=kind)
+    ])
 
 
 async def generate_image(

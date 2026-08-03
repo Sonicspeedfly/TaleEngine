@@ -47,10 +47,12 @@ async def test_auto_summary_creates_entry_and_tracks_progress():
         await db.commit()
         sid = sess.id
 
-    async def fake_complete(messages, params=None, connection=None):
+    async def fake_complete(messages, params=None, connection=None, kind="service"):
         # Суммаризатору передаётся и старая сводка, и новые события.
         joined = str(messages)
         assert "Новые события" in joined and "событие номер 0" in joined
+        # Расход служебных вызовов учитывается отдельно от самого чата.
+        assert kind == "summary"
         return "Герои пережили двенадцать событий и заключили союз."
 
     with patch("backend.main.complete", new=fake_complete):
@@ -96,26 +98,65 @@ async def test_auto_summary_creates_entry_and_tracks_progress():
 
 
 @pytest.mark.asyncio
-async def test_history_files_unlimited_by_default():
-    """Файлы истории: по умолчанию БЕЗ лимита (полная память), лимит — опция."""
+async def test_history_files_limited_by_default():
+    """
+    Файлы истории: по умолчанию действует лимит по ОБЪЁМУ (экономия квоты).
+
+    Раньше дефолтом было «без лимита», и одно присланное видео пересылалось
+    модели заново на КАЖДОМ ходу до конца чата — главная статья перерасхода.
+    Полную память по файлам можно вернуть явно (history_files_mb=0).
+    """
     from types import SimpleNamespace
 
     from backend.attachments import load_history_attachments
     from backend.main import _hist_files_limit
     from backend.schemas import GenerationParams
 
-    big = "data:video/mp4;base64," + "A" * 8_000_000  # больше старого 5-МБ лимита
+    big = "data:video/mp4;base64," + "A" * 20_000_000  # ~20 МБ base64
     msgs = [SimpleNamespace(id=1, role="user", content="видео",
                             attachments=[{"type": "video", "data": big, "mime": "video/mp4"}])]
 
-    # Дефолт (params нет / 0): лимита нет — большое видео включается в историю.
-    assert _hist_files_limit(None) is None
+    # Дефолт: лимит есть — тяжёлое видео в историю повторно НЕ пересылается.
+    limit = _hist_files_limit(None)
+    assert limit is not None
+    assert await load_history_attachments(None, msgs, limit) == {}
+
+    # Полная память по файлам — по явному запросу (0 = без лимита).
     assert _hist_files_limit(GenerationParams(history_files_mb=0)) is None
     att_map = await load_history_attachments(None, msgs, None)
     assert 1 in att_map and att_map[1][0]["data"] == big
 
-    # Явный лимит 5 МБ: большое видео в историю не пересылается.
-    limit = _hist_files_limit(GenerationParams(history_files_mb=5))
-    assert limit is not None
-    att_map = await load_history_attachments(None, msgs, limit)
-    assert att_map == {}
+
+@pytest.mark.asyncio
+async def test_history_files_age_window_drops_old_attachments():
+    """
+    Возрастное окно: файлы несут только N ПОСЛЕДНИХ сообщений.
+
+    Лимит в МБ этого не решает — полсотни мелких картинок по отдельности дёшевы,
+    но вместе висят в каждом запросе до конца жизни чата.
+    """
+    from types import SimpleNamespace
+
+    from backend.attachments import load_history_attachments
+    from backend.main import _hist_files_turns
+    from backend.schemas import GenerationParams
+
+    def _msg(i: int):
+        return SimpleNamespace(
+            id=i, role="user", content=f"фото {i}",
+            attachments=[{"type": "image", "data": f"data:image/png;base64,{i}", "mime": "image/png"}],
+        )
+
+    msgs = [_msg(i) for i in range(1, 11)]  # 10 сообщений с картинками
+
+    # Окно в 3 сообщения: доходят только три последних, остальные — пометкой.
+    att_map = await load_history_attachments(None, msgs, None, 3)
+    assert sorted(att_map) == [8, 9, 10]
+
+    # Без окна (0/None) поведение прежнее — доходят все.
+    all_map = await load_history_attachments(None, msgs, None, None)
+    assert set(all_map) == {m.id for m in msgs}
+
+    # UI может отключить окно, выставив 0; по умолчанию окно включено.
+    assert _hist_files_turns(GenerationParams(history_files_turns=0)) is None
+    assert _hist_files_turns(None) is not None

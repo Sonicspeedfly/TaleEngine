@@ -32,6 +32,15 @@ class GenerationParams(BaseModel):
     # ВСЕ прежние вложения), N — от свежих к старым до N МБ, остальные — пометкой.
     # Провайдеру не передаётся; None — дефолт из .env (HISTORY_FILES_MB).
     history_files_mb: Optional[int] = Field(default=None, ge=0, le=1000)
+    # Возрастное окно файлов истории: вложения пересылаются модели только из N
+    # последних сообщений (0 — без ограничения по возрасту). Главная статья
+    # экономии в долгих чатах: без окна одно видео пересылается заново КАЖДЫЙ ход
+    # до конца чата. None — дефолт из .env (HISTORY_FILES_TURNS).
+    history_files_turns: Optional[int] = Field(default=None, ge=0, le=1000)
+    # Потолок текста базы знаний В КОНТЕКСТЕ (символы; 0 — без ограничения).
+    # База уходит в каждый запрос, поэтому её объём — постоянный расход на ход.
+    # None — дефолт из .env (KNOWLEDGE_TEXT_CHARS).
+    knowledge_chars: Optional[int] = Field(default=None, ge=0, le=1_000_000)
     frequency_penalty: Optional[float] = None
     presence_penalty: Optional[float] = None
     # Главный тумблер "Zero-Censorship": снимает настраиваемые фильтры провайдера.

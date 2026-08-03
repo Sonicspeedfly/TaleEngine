@@ -81,18 +81,36 @@ async def message_attachments_in(db, msg) -> list[AttachmentIn]:
     return out
 
 
-async def load_history_attachments(db, msgs, budget_chars: int | None) -> dict:
+async def load_history_attachments(
+    db, msgs, budget_chars: int | None, turns_window: int | None = None
+) -> dict:
     """
     Вложения для ИСТОРИИ контекста: возвращает {message_id: [att dict С data]}.
 
-    budget_chars=None — БЕЗ лимита: модель заново «видит» ВСЕ прежние файлы
-    (полная память, режим по умолчанию). Иначе — от свежих сообщений к старым,
-    пока суммарный объём не превысит budget_chars; не влезшие отбрасываются по
-    мете, их данные вообще не читаются из БД.
+    Отбор идёт от СВЕЖИХ сообщений к старым по двум независимым ограничениям —
+    срабатывает то, которое жёстче:
+
+    :param budget_chars: суммарный объём данных (символы base64). None — без
+        лимита по объёму. Не влезшие сообщения отбрасываются ПО МЕТЕ, их данные
+        вообще не читаются из БД (иначе чат с видео поднимал бы сотни МБ).
+    :param turns_window: сколько ПОСЛЕДНИХ сообщений вообще имеют право нести
+        файлы. None/0 — без ограничения по возрасту.
+
+    Зачем возрастное окно: лимит в МБ не спасает от «долгих» чатов, где десятки
+    мелких картинок по отдельности дёшевы, но все вместе висят в КАЖДОМ запросе до
+    конца жизни чата. Файл вне окна модель не видит целиком, но знает о нём из
+    текстовой пометки «[изображение] / [видео: имя]» (см. messages_to_history).
     """
+    msgs = list(msgs)
+    # Граница возрастного окна: сообщения старше неё файлы не несут.
+    oldest_allowed_idx = 0
+    if turns_window and turns_window > 0:
+        oldest_allowed_idx = max(0, len(msgs) - turns_window)
+
     out: dict = {}
     used = 0
-    for m in reversed(list(msgs)):
+    for idx in range(len(msgs) - 1, oldest_allowed_idx - 1, -1):
+        m = msgs[idx]
         atts = [
             a for a in (m.attachments or [])
             if isinstance(a, dict) and (a.get("data") or a.get("blob_id"))

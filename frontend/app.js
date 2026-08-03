@@ -84,8 +84,12 @@ createApp({
         top_k: 40,
         max_tokens: 8192,       // длина ОДНОГО ОТВЕТА (вывод); рассуждения тратят его же
         repetition_penalty: 1.1,
-        context_tokens: 1000000, // окно контекста («память»): по умолчанию максимум Gemini
-        history_files_mb: 0,     // файлы истории: 0 = ВСЕ пересылаются модели (полная память)
+        // Окно контекста («память»). 200к — под границей, за которой Gemini
+        // тарифицирует ВЕСЬ вход вдвое дороже. Раньше здесь стоял 1 млн.
+        context_tokens: 200000,
+        history_files_mb: 8,       // файлы истории: сколько МБ вложений уходит модели за ход
+        history_files_turns: 12,   // и из скольких ПОСЛЕДНИХ сообщений (0 = без ограничения)
+        knowledge_chars: 60000,    // потолок текста базы знаний в контексте (0 = без лимита)
         disable_safety: true,
         send_avatars: false,
         web_access: false,
@@ -109,8 +113,23 @@ createApp({
       // Авто-сводка сюжета: каждые ~12 сообщений ИИ обновляет запись
       // «Сводка сюжета (авто)» — старые события не выпадают из памяти.
       autoSummary: true,
+      summaryEvery: 10,         // каждые сколько сообщений обновлять сводку (это платный запрос)
       groupReplyDelay: 3,       // пауза (сек) между ответами персонажей в группе
       groupWaiting: 0,          // идёт пауза перед следующим ответом группы (сек)
+
+      // --- Расход токенов (кнопка 📊) ---
+      usageOpen: false,
+      usage: null,
+      // Готовые наборы «сколько платим за ход». Меняют три настройки разом:
+      // окно контекста, пересылку прежних файлов и объём базы знаний.
+      economyModes: [
+        { id: "eco", label: "🪙 Экономия", hint: "Минимум токенов на ход: короткая память, файлы только из свежих сообщений",
+          v: { context_tokens: 64000, history_files_mb: 3, history_files_turns: 6, knowledge_chars: 20000 } },
+        { id: "balance", label: "⚖️ Баланс", hint: "Рекомендуется: почти полная память, но без удвоенного тарифа и вечной пересылки файлов",
+          v: { context_tokens: 200000, history_files_mb: 8, history_files_turns: 12, knowledge_chars: 60000 } },
+        { id: "max", label: "🔥 Максимум", hint: "Прежнее поведение: помнит всё и пересылает все файлы каждый ход. Дорого!",
+          v: { context_tokens: 1000000, history_files_mb: 0, history_files_turns: 0, knowledge_chars: 0 } },
+      ],
       // Пустая форма записи памяти (тот же объект возвращает метод blankHorae()).
       horaeEdit: { id: null, category: "lore", title: "", content: "", keywords: "", always_on: false, enabled: true, priority: 0, scope: "global" },
 
@@ -1943,16 +1962,25 @@ createApp({
     async loadUiPrefs(applyParams = true) {
       const ui = await this.api("/settings/ui");
       if (applyParams && ui && ui.params) this.params = { ...this.params, ...ui.params };
-      // Мягкая миграция старых сохранённых настроек: прежний дефолт max_tokens=1024
-      // резал ответы (особенно с рассуждениями), а окно контекста было 64000
-      // (прошлый дефолт) — теперь по умолчанию максимум Gemini (1 млн).
+      // Мягкая миграция старых сохранённых настроек.
       if (applyParams) {
+        // Прежний дефолт max_tokens=1024 резал ответы (особенно с рассуждениями).
         if (!this.params.max_tokens || this.params.max_tokens <= 1024) this.params.max_tokens = 8192;
-        if (!this.params.context_tokens || this.params.context_tokens === 64000) this.params.context_tokens = 1000000;
+        // Сохранённое окно в 1 млн — прошлый дефолт «максимум Gemini». Он незаметно
+        // уводил КАЖДЫЙ ход в удвоенный тариф (у Gemini вход свыше ~200 тыс. стоит
+        // вдвое), поэтому один раз опускаем до 200к. Захотите обратно — выставьте
+        // 1 млн вручную, повторно настройка не перетирается.
+        if (!this.params.context_tokens || this.params.context_tokens === 1000000) {
+          this.params.context_tokens = 200000;
+        }
+        // Новые настройки экономии могли не сохраниться в старых профилях.
+        if (this.params.history_files_turns == null) this.params.history_files_turns = 12;
+        if (this.params.knowledge_chars == null) this.params.knowledge_chars = 60000;
       }
       if (ui && Number(ui.message_preload) > 0) this.messagePreload = Number(ui.message_preload);
       if (ui && "auto_summary" in ui) this.autoSummary = ui.auto_summary !== false;
       if (ui && ui.group_reply_delay != null) this.groupReplyDelay = Number(ui.group_reply_delay);
+      if (ui && ui.summary_every != null) this.summaryEvery = Number(ui.summary_every);
     },
     saveUiPrefs() {
       // Дебаунс, чтобы не дёргать сервер на каждое движение ползунка.
@@ -1965,6 +1993,7 @@ createApp({
             message_preload: this.msgPageSize,
             auto_summary: this.autoSummary,
             group_reply_delay: this.groupReplyDelay,
+            summary_every: this.summaryEvery,
           }),
         }).catch(() => {});
       }, 600);
@@ -2193,6 +2222,32 @@ createApp({
     },
     async clearDebug() { await this.api("/debug/log", { method: "DELETE" }); this.debugEntries = []; },
 
+    // ---------- Расход токенов ----------
+    async loadUsage() {
+      try { this.usage = await this.api("/usage?days=7"); } catch (e) { this.usage = null; }
+    },
+    // Красивое число: 1234567 -> «1.23 млн», 45678 -> «45.7 тыс.»
+    fmtTokens(n) {
+      n = Number(n || 0);
+      if (n >= 1e6) return (n / 1e6).toFixed(2) + " млн";
+      if (n >= 1e3) return (n / 1e3).toFixed(1) + " тыс.";
+      return String(n);
+    },
+    // Какая доля входа пришла из кэша провайдера (чем больше, тем дешевле ход).
+    cacheHitPct(row) {
+      const p = Number((row && row.prompt) || 0);
+      if (!p) return 0;
+      return Math.round((Number(row.cached || 0) / p) * 100);
+    },
+    isEconomyMode(m) {
+      return Object.keys(m.v).every((k) => Number(this.params[k]) === Number(m.v[k]));
+    },
+    applyEconomyMode(m) {
+      this.params = { ...this.params, ...m.v };
+      this.saveUiPrefs();
+      this.showToast(`Режим расхода: ${m.label}`);
+    },
+
     // ---------- Профиль / привязка Telegram ----------
     openProfile() { this.profileOpen = true; this.linkCode = ""; },
     async linkTelegram() {
@@ -2351,6 +2406,7 @@ createApp({
           if (this.groupModal) { this.groupModal = false; return; }
           if (this.profileOpen) { this.profileOpen = false; return; }
           if (this.debugOpen) { this.debugOpen = false; return; }
+          if (this.usageOpen) { this.usageOpen = false; return; }
           if (this.adminOpen) { this.adminOpen = false; return; }
           if (this.drawerTab) { this.drawerTab = null; }
         });
@@ -2921,6 +2977,16 @@ createApp({
           <label>Max tokens — длина ОТВЕТА <span class="range-val">{{ params.max_tokens }}</span>
             <input type="number" min="256" step="256" v-model.number="params.max_tokens" /></label>
           <p class="muted" style="margin:2px 0 10px">Это лимит ВЫВОДА (одного ответа), не памяти. Рассуждения 💭 тратят этот же лимит — при «высоких» держите 8000+.</p>
+          <div class="hr"></div>
+          <h3>💰 Расход квоты</h3>
+          <p class="muted" style="margin:2px 0 8px">Три настройки ниже определяют, сколько токенов уходит провайдеру на КАЖДОМ ходу. Готовые режимы:</p>
+          <div class="row" style="gap:6px; margin:0 0 6px; flex-wrap:wrap">
+            <button v-for="m in economyModes" :key="m.id"
+                    :class="isEconomyMode(m) ? 'btn-primary' : ''"
+                    :title="m.hint" @click="applyEconomyMode(m)">{{ m.label }}</button>
+            <button @click="usageOpen = true; loadUsage()" title="Сколько токенов реально потрачено">📊 Расход</button>
+          </div>
+
           <label>🧠 Окно контекста — память диалога (токенов) <span class="range-val">{{ params.context_tokens >= 1000000 ? '1 млн (максимум)' : params.context_tokens }}</span>
             <input type="number" min="4000" max="1000000" step="4000" v-model.number="params.context_tokens" /></label>
           <div class="row" style="gap:6px; margin:-4px 0 6px; flex-wrap:wrap">
@@ -2928,15 +2994,35 @@ createApp({
                     :class="params.context_tokens === p[0] ? 'btn-primary' : ''"
                     @click="params.context_tokens = p[0]">{{ p[1] }}</button>
           </div>
-          <p class="muted" style="margin:2px 0 10px">Сколько ИСТОРИИ чата видит модель на каждый ход. По умолчанию — 1 млн (максимум Gemini): модель помнит весь чат. Уменьшите, если ходы станут дорогими или медленными (свыше ~200 тыс. Gemini тарифицирует дороже). Что не влезло — сохранит авто-сводка (вкладка «Память»).</p>
+          <p class="muted" style="margin:2px 0 10px">Сколько ИСТОРИИ чата видит модель на каждый ход. <b>Важно про цену:</b> у Gemini вход свыше ~200 тыс. токенов тарифицируется <b>вдвое дороже — целиком</b>, поэтому 200к выгоднее 1 млн почти без потери памяти. Что не влезло — сохранит авто-сводка (вкладка «Память»).</p>
+
           <label>📎 Файлы в памяти диалога
             <select v-model.number="params.history_files_mb">
-              <option :value="0">все файлы — полная память (по умолчанию)</option>
+              <option :value="0">все файлы — полная память (дорого)</option>
               <option :value="20">до ~20 МБ на ход</option>
-              <option :value="5">до ~5 МБ на ход (экономно)</option>
+              <option :value="8">до ~8 МБ на ход (по умолчанию)</option>
+              <option :value="3">до ~3 МБ на ход (экономно)</option>
             </select>
           </label>
-          <p class="muted" style="margin:2px 0 10px">Прежние фото/аудио/видео пересылаются модели заново на каждом ходу — она их «видит», а не вспоминает по пометкам. «Все файлы»: в чате с тяжёлыми видео каждый ход несёт их целиком — дольше и дороже; лимиты шлют свежие файлы до N МБ, старые заменяются пометкой [видео: имя].</p>
+          <label>📎 …и только из последних сообщений
+            <select v-model.number="params.history_files_turns">
+              <option :value="0">без ограничения по возрасту (дорого)</option>
+              <option :value="24">из последних 24</option>
+              <option :value="12">из последних 12 (по умолчанию)</option>
+              <option :value="6">из последних 6 (экономно)</option>
+            </select>
+          </label>
+          <p class="muted" style="margin:2px 0 10px"><b>Главная статья расхода в долгих чатах.</b> Прежние фото/аудио/видео пересылаются модели заново на КАЖДОМ ходу — она их «видит», а не вспоминает по пометкам. Одно видео без ограничений = десятки тысяч токенов входа в каждом ходу до конца чата. Файл вне окна модель по-прежнему знает по пометке <code>[видео: имя]</code>.</p>
+
+          <label>📚 База знаний в контексте
+            <select v-model.number="params.knowledge_chars">
+              <option :value="0">без ограничения (дорого)</option>
+              <option :value="200000">до 200 тыс. символов</option>
+              <option :value="60000">до 60 тыс. символов (по умолчанию)</option>
+              <option :value="20000">до 20 тыс. символов (экономно)</option>
+            </select>
+          </label>
+          <p class="muted" style="margin:2px 0 10px">Справочные файлы чата уходят модели в каждом запросе. 200 тыс. символов ≈ 50 тыс. токенов входа на каждом ходу — за сотню ходов это 5 млн токенов только на справочник.</p>
           <label>👥 Пауза между ответами в группе (сек) <span class="range-val">{{ groupReplyDelay }}</span>
             <input type="range" min="0" max="15" step="1" v-model.number="groupReplyDelay" @change="saveUiPrefs" /></label>
           <p class="muted" style="margin:2px 0 10px">Когда в групповом чате отвечают несколько персонажей подряд (напр. <code>+A +B +C</code>), запросы быстро выбирают квоту провайдера — и прилетает ошибка «429 Resource exhausted». Пауза разносит ответы во времени. 0 — без паузы.</p>
@@ -3061,7 +3147,15 @@ createApp({
         <div v-if="drawerTab==='memory'">
           <h3>Память Horae 🧠</h3>
           <label class="check"><input type="checkbox" v-model="autoSummary" @change="saveUiPrefs" />
-            📜 Авто-сводка сюжета: каждые ~12 сообщений ИИ обновляет запись «Сводка сюжета (авто)» этого чата — события, выпавшие из окна контекста, остаются в памяти модели.</label>
+            📜 Авто-сводка сюжета: ИИ обновляет запись «Память чата (авто)» — события, выпавшие из окна контекста, остаются в памяти модели.</label>
+          <label v-if="autoSummary">Как часто обновлять сводку
+            <select v-model.number="summaryEvery" @change="saveUiPrefs">
+              <option :value="6">каждые 6 сообщений (точнее, дороже)</option>
+              <option :value="10">каждые 10 сообщений (по умолчанию)</option>
+              <option :value="20">каждые 20 сообщений (экономно)</option>
+            </select>
+          </label>
+          <p class="muted" style="margin:2px 0 10px">Каждое обновление сводки — <b>отдельный платный запрос</b> к модели, помимо самого ответа в чате. Реже = дешевле, но память чуть грубее. Расход видно в 📊 (строка <code>summary</code>).</p>
           <div class="hr"></div>
           <p class="muted">Долговременная память ролей. <b>always_on</b> — подмешивается в КАЖДЫЙ запрос (состояние, инвентарь, факты); иначе срабатывает по ключевым словам, как World Info. Области:
             <span class="scope-tag global">🌐 глоб.</span> во всех чатах,
@@ -3457,7 +3551,56 @@ createApp({
         <div v-if="e.prompt" class="muted" style="font-size:12px">prompt: {{ e.prompt }}</div>
         <div v-if="e.error" class="danger-text" style="font-size:12px; white-space:pre-wrap; margin-top:4px">{{ e.error }}</div>
         <div v-else-if="e.preview" class="muted" style="font-size:12px; margin-top:4px">→ {{ e.preview }}</div>
+        <div v-if="e.usage" class="muted" style="font-size:12px; margin-top:4px">
+          🔢 вход {{ fmtTokens(e.usage.prompt) }}
+          <span v-if="e.usage.cached">(из кэша {{ cacheHitPct(e.usage) }}%)</span>
+          · ответ {{ fmtTokens(e.usage.completion) }}
+          <span v-if="e.usage.reasoning">· размышления {{ fmtTokens(e.usage.reasoning) }}</span>
+        </div>
       </div>
+    </div>
+  </div>
+
+  <!-- ===== Расход токенов ===== -->
+  <div v-if="usageOpen" class="modal-backdrop" @click.self="usageOpen=false">
+    <div class="modal" style="width:640px">
+      <div class="row-between" style="margin-bottom:8px">
+        <h3 style="margin:0">📊 Расход токенов</h3>
+        <span><button @click="loadUsage">Обновить</button> <button class="btn-icon" @click="usageOpen=false">✕</button></span>
+      </div>
+      <p class="muted">Сколько токенов реально ушло провайдеру за последние 7 дней. <b>Вход</b> — весь контекст, который мы отправили; <b>из кэша</b> — та его часть, что стоила в разы дешевле; <b>ответ</b> и <b>размышления</b> — вывод, самый дорогой вид токенов.</p>
+      <p v-if="!usage" class="muted">Загрузка…</p>
+      <template v-else-if="!usage.total.requests">
+        <p class="muted">Пока пусто. Учёт начинается с этой версии — отправьте сообщение, и цифры появятся. Если их так и нет, значит ваш прокси не возвращает usage в стриме.</p>
+      </template>
+      <template v-else>
+        <div class="card">
+          <div class="row-between"><b>Сегодня</b><span>{{ usage.today.requests }} запр.</span></div>
+          <div>вход {{ fmtTokens(usage.today.prompt) }} (из кэша {{ cacheHitPct(usage.today) }}%) · ответ {{ fmtTokens(usage.today.completion) }}<span v-if="usage.today.reasoning"> · размышления {{ fmtTokens(usage.today.reasoning) }}</span></div>
+          <div class="hr"></div>
+          <div class="row-between"><b>За 7 дней</b><span>{{ usage.total.requests }} запр.</span></div>
+          <div>вход {{ fmtTokens(usage.total.prompt) }} (из кэша {{ cacheHitPct(usage.total) }}%) · ответ {{ fmtTokens(usage.total.completion) }}<span v-if="usage.total.reasoning"> · размышления {{ fmtTokens(usage.total.reasoning) }}</span></div>
+        </div>
+
+        <h4 style="margin:12px 0 4px">На что уходит</h4>
+        <p class="muted" style="margin:0 0 6px; font-size:12px">chat — сам чат; summary — авто-сводка сюжета; director — выбор отвечающего в группе; canvas / image-prompt — служебные.</p>
+        <div class="card" v-for="k in usage.by_kind" :key="k.kind">
+          <div class="row-between"><b>{{ k.kind }}</b><span class="muted">{{ k.requests }} запр.</span></div>
+          <div style="font-size:12px">вход {{ fmtTokens(k.prompt) }} · ответ {{ fmtTokens(k.completion) }}</div>
+        </div>
+
+        <h4 style="margin:12px 0 4px">По моделям</h4>
+        <div class="card" v-for="m in usage.by_model" :key="m.model">
+          <div class="row-between"><b>{{ m.model || '—' }}</b><span class="muted">{{ m.requests }} запр.</span></div>
+          <div style="font-size:12px">вход {{ fmtTokens(m.prompt) }} (из кэша {{ cacheHitPct(m) }}%) · ответ {{ fmtTokens(m.completion) }}</div>
+        </div>
+
+        <h4 style="margin:12px 0 4px">По дням</h4>
+        <div class="card" v-for="d in usage.by_day" :key="d.day">
+          <div class="row-between"><b>{{ d.day }}</b><span class="muted">{{ d.requests }} запр.</span></div>
+          <div style="font-size:12px">вход {{ fmtTokens(d.prompt) }} · ответ {{ fmtTokens(d.completion) }}</div>
+        </div>
+      </template>
     </div>
   </div>
 

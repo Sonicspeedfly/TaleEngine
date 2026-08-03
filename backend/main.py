@@ -44,7 +44,17 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from fastapi import Header, Request
 
-from backend import accounts, admin_service, debug_log, group_chat, knowledge, models, native_io, telegram_runtime
+from backend import (
+    accounts,
+    admin_service,
+    debug_log,
+    group_chat,
+    knowledge,
+    models,
+    native_io,
+    telegram_runtime,
+    usage_stats,
+)
 from backend.attachments import (
     attachment_data,
     delete_message_blobs,
@@ -349,11 +359,31 @@ def _hist_files_limit(params) -> int | None:
     return int(mb * 1024 * 1024 * 4 / 3)  # size хранится «сырым», base64 длиннее
 
 
+def _hist_files_turns(params) -> int | None:
+    """
+    Возрастное окно файлов истории: вложения пересылаются модели только из N
+    последних сообщений. None — без ограничения по возрасту.
+
+    Это главный рычаг экономии в долгом чате: лимит в МБ не мешает одному и тому
+    же видео уходить провайдеру заново на КАЖДОМ ходу до конца жизни чата.
+    """
+    turns = params.history_files_turns if params and params.history_files_turns is not None \
+        else settings.HISTORY_FILES_TURNS
+    return turns if turns and turns > 0 else None
+
+
+def _kb_chars(params) -> int | None:
+    """Потолок текста базы знаний в контексте (символы). 0/None — дефолт из .env."""
+    if params and params.knowledge_chars is not None:
+        return params.knowledge_chars
+    return settings.KNOWLEDGE_TEXT_CHARS
+
+
 # ==================== АВТО-СВОДКА СЮЖЕТА (память Horae) ====================
 # Каждые ~N новых сообщений фоновая задача сжимает их в запись Horae
 # «Сводка сюжета (авто)» (always_on): даже когда старая история выпадает из окна
 # контекста, её суть остаётся видимой модели. Это и есть «долгая память» чата.
-_AUTO_SUMMARY_EVERY = 6           # сообщений между обновлениями сводки (чаще = точнее)
+_AUTO_SUMMARY_EVERY = settings.AUTO_SUMMARY_EVERY  # сообщений между обновлениями сводки
 _AUTO_SUMMARY_MARK = "__auto__"   # метка авто-записи в keywords
 _AUTO_SUMMARY_TITLE = "📜 Память чата (авто)"
 
@@ -388,7 +418,15 @@ async def _maybe_update_summary(session_id: int) -> None:
                 ).order_by(models.Message.id)
             )).scalars().all()
             fresh = [m for m in fresh if (m.content or "").strip()]
-            if len(fresh) < _AUTO_SUMMARY_EVERY:
+            # Порог настраивается в UI (вкладка «Память»): реже = дешевле, ведь
+            # каждое обновление сводки — ОТДЕЛЬНЫЙ платный запрос к модели.
+            every = _AUTO_SUMMARY_EVERY
+            if ui and isinstance(ui.value, dict) and ui.value.get("summary_every"):
+                try:
+                    every = max(2, int(ui.value["summary_every"]))
+                except (TypeError, ValueError):
+                    pass
+            if len(fresh) < every:
                 return  # ещё рано — копим события
             transcript = "\n".join(
                 f"{m.speaker_name or ('Пользователь' if m.role == 'user' else 'Персонаж')}: "
@@ -423,7 +461,7 @@ async def _maybe_update_summary(session_id: int) -> None:
                 )},
                 {"role": "user", "content": f"[Текущая память]\n{prev}\n\n[Новые события]\n{transcript}"},
             ],
-            None, connection,
+            None, connection, kind="summary",
         )).strip()
         if not summary:
             return
@@ -1765,7 +1803,7 @@ async def revise_canvas(
         )
         new_fragment = _strip_fence(await complete(
             [{"role": "system", "content": system}, {"role": "user", "content": user_msg}],
-            None, connection,
+            None, connection, kind="canvas",
         ))
         _push_history(canvas)
         canvas.content = content[:start] + new_fragment + content[end:]
@@ -1778,7 +1816,7 @@ async def revise_canvas(
         user_msg = f"Текущее содержимое:\n\n{content}\n\n---\nЧто сделать: {instruction}"
         new_content = _strip_fence(await complete(
             [{"role": "system", "content": system}, {"role": "user", "content": user_msg}],
-            None, connection,
+            None, connection, kind="canvas",
         ))
         _push_history(canvas)
         canvas.content = new_content
@@ -1897,14 +1935,17 @@ async def canvas_generate(
     # 2. Генерация (нестриминговая): просим ПОЛНЫЙ документ/код.
     user_content = build_user_content(prompt, attachments, current=True)
     messages = await build_context_from_db(
-        db, sess, character, prompt, user_content, _ctx_budget(params)
+        db, sess, character, prompt, user_content, _ctx_budget(params),
+        history_files_limit=_hist_files_limit(params),
+        history_files_turns=_hist_files_turns(params),
+        knowledge_chars=_kb_chars(params),
     )
     messages.append({"role": "system", "content": (
         "Сгенерируй по запросу пользователя ПОЛНЫЙ, законченный материал (документ, "
         "статью, план или код). Верни ТОЛЬКО готовый материал в Markdown — без "
         "приветствий и разговорных вставок. Если это код — оберни его в один блок ```."
     )})
-    result = await complete(messages, params, connection)
+    result = await complete(messages, params, connection, kind="canvas")
 
     kind, language, content = _detect_canvas(result)
     title = _canvas_title(content, kind)
@@ -1971,7 +2012,7 @@ async def canvas_edit(
     user_msg = f"Текущее содержимое:\n\n{canvas.content}\n\n---\nЧто сделать: {prompt}"
     new_content = _strip_fence(await complete(
         [{"role": "system", "content": system}, {"role": "user", "content": user_msg}],
-        params, connection,
+        params, connection, kind="canvas",
     ))
     _push_history(canvas)
     canvas.content = new_content
@@ -2068,7 +2109,7 @@ async def _build_art_context(db, session_id: int, payload: ImagePrompt, conn: di
             uc.append({"type": "image_url", "image_url": {"url": r}})
         crafted = (await complete(
             [{"role": "system", "content": instruction}, {"role": "user", "content": uc}],
-            None, conn,
+            None, conn, kind="image-prompt",
         )).strip()
         return (crafted or payload.prompt or character.name), refs
 
@@ -2101,6 +2142,7 @@ async def _build_art_context(db, session_id: int, payload: ImagePrompt, conn: di
         [{"role": "system", "content": instruction}, {"role": "user", "content": user_content}],
         None,
         conn,
+        kind="image-prompt",
     )).strip()
     return (crafted or payload.prompt or character.name), refs
 
@@ -2247,6 +2289,8 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
                     rdb, rsess, character, _ctx_budget(params),
                     send_avatars=bool(params and params.send_avatars),
                     history_files_limit=_hist_files_limit(params),
+                    history_files_turns=_hist_files_turns(params),
+                    knowledge_chars=_kb_chars(params),
                 )
             text = ""
             _thought = lambda t: job.broadcast({"type": "thought", "content": t})  # noqa: E731
@@ -2300,6 +2344,8 @@ async def _start_user_turn(session_id, content, attachments, params, db, reply_t
         db, sess, character, model_text, user_content, _ctx_budget(params),
         send_avatars=bool(params and params.send_avatars),
         history_files_limit=_hist_files_limit(params),
+        history_files_turns=_hist_files_turns(params),
+        knowledge_chars=_kb_chars(params),
         web_access=bool(params and params.web_access),
     )
     msg = models.Message(
@@ -2358,7 +2404,8 @@ async def _start_regenerate(session_id, params, db) -> str:
     boundary_id = last_user.id if last_user else target.id
     # История сохраняет вложения (модель «видит» прежние файлы); данные — из blobs.
     history = await messages_to_history_db(
-        db, [m for m in msgs if m.id < boundary_id], _hist_files_limit(params)
+        db, [m for m in msgs if m.id < boundary_id],
+        _hist_files_limit(params), _hist_files_turns(params),
     )
     user_content = build_user_content(
         user_text,
@@ -2372,6 +2419,7 @@ async def _start_regenerate(session_id, params, db) -> str:
         user_content,
         _ctx_budget(params),
         history=history,
+        knowledge_chars=_kb_chars(params),
         web_access=bool(params and params.web_access),
     )
 
@@ -2415,12 +2463,14 @@ async def _start_continue(session_id, params, db) -> str:
     boundary_id = last_user.id if last_user else target.id
     # История сохраняет вложения (модель «видит» прежние файлы); данные — из blobs.
     history = await messages_to_history_db(
-        db, [m for m in msgs if m.id < boundary_id], _hist_files_limit(params)
+        db, [m for m in msgs if m.id < boundary_id],
+        _hist_files_limit(params), _hist_files_turns(params),
     )
     user_content = build_user_content(user_text, [])
     messages = await build_context_from_db(
         db, sess, character, user_text, user_content, _ctx_budget(params),
-        history=history, web_access=bool(params and params.web_access),
+        history=history, knowledge_chars=_kb_chars(params),
+        web_access=bool(params and params.web_access),
     )
     # Уже написанный ответ + явная просьба продолжить именно его.
     messages.append({"role": "assistant", "content": target.content})
@@ -2474,11 +2524,13 @@ async def _start_retry(session_id, params, db) -> str:
     # Контекст: история ДО последней реплики + сама реплика как текущее сообщение —
     # ровно то же, что видел бы _start_user_turn, но без повторного сохранения.
     history = await messages_to_history_db(
-        db, [m for m in msgs if m.id < last.id], _hist_files_limit(params)
+        db, [m for m in msgs if m.id < last.id],
+        _hist_files_limit(params), _hist_files_turns(params),
     )
     messages = await build_context_from_db(
         db, sess, character, last.content, user_content, _ctx_budget(params),
         history=history, send_avatars=bool(params and params.send_avatars),
+        knowledge_chars=_kb_chars(params),
         web_access=bool(params and params.web_access),
     )
     job_id = uuid.uuid4().hex
@@ -3089,6 +3141,19 @@ async def debug_log_get():
 async def debug_log_clear():
     debug_log.clear()
     return {"ok": True}
+
+
+@app.get("/api/usage")
+async def usage_get(days: int = 7, db: AsyncSession = Depends(get_session)):
+    """
+    Расход токенов за последние `days` дней: итоги, разбивка по дням, моделям и
+    видам запроса (чат / сводка сюжета / режиссёр группы / канвас / арт).
+
+    Смотреть так: prompt — вход (весь контекст, что мы отправили), cached — та его
+    часть, которую провайдер отдал со скидкой, completion — сгенерированный ответ,
+    reasoning — «размышления» (тарифицируются как вывод, самый дорогой вид).
+    """
+    return await usage_stats.summary(db, max(1, min(90, days)))
 
 
 @app.get("/api/health")

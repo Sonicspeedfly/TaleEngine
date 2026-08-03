@@ -81,6 +81,45 @@ def estimate_content_tokens(content) -> int:
     return estimate_tokens(str(content or ""))
 
 
+# Историю обрезаем «ступенями» по столько сообщений за раз.
+#
+# Зачем: провайдер даёт скидку 75–90% за НАЧАЛО запроса, совпадающее с прошлым
+# запросом байт в байт (кэш промпта). Если резать историю ровно по границе
+# бюджета, то каждый новый ход выталкивает самое старое сообщение — начало
+# контекста сдвигается, и кэш промахивается КАЖДЫЙ раз. Поэтому граница обрезки
+# «залипает» на индексе, кратном ступени, и стоит на месте целую ступень ходов.
+_TRIM_STEP = 16
+
+
+def stable_trim_start(costs: list[int], budget: int, reserved: int = 0) -> int:
+    """
+    С какого индекса истории начинать, чтобы уложиться в бюджет токенов.
+
+    :param costs: стоимость каждого сообщения истории (в порядке от старых к новым).
+    :param reserved: «несжимаемая» часть бюджета (системный промпт, текущая реплика).
+    :return: 0, если влезает всё; иначе индекс начала, ОКРУГЛЁННЫЙ ВВЕРХ до
+        кратного _TRIM_STEP.
+
+    Что это даёт: индекс привязан к абсолютной нумерации сообщений, поэтому новые
+    реплики в конце его не двигают — он «прыгает» только раз в _TRIM_STEP ходов,
+    когда история дорастает до следующей ступени. То есть кэш промпта промахивается
+    примерно на одном ходу из шестнадцати вместо КАЖДОГО хода.
+    """
+    if not budget or budget <= 0:
+        return 0
+    remaining = reserved + sum(costs)
+    if remaining <= budget:
+        return 0
+    start = 0
+    while start < len(costs) and remaining > budget:
+        remaining -= costs[start]
+        start += 1
+    stepped = ((start + _TRIM_STEP - 1) // _TRIM_STEP) * _TRIM_STEP
+    # Если округление вверх съедает вообще всё (даже хвост не влезает в бюджет) —
+    # ступень не применяем, иначе контекст остался бы пустым.
+    return stepped if stepped < len(costs) else start
+
+
 # Сколько байт base64-вложений из ИСТОРИИ разрешаем включить в один запрос. Сверх
 # этого — вложение заменяется текстовой пометкой. Держим НЕБОЛЬШИМ: тяжёлое аудио
 # (14 МБ → ~19 МБ base64) не должно гоняться в контексте КАЖДЫЙ ход — иначе запросы
@@ -156,17 +195,21 @@ def messages_to_history(msgs, att_map: dict | None = None) -> list[dict]:
     return out
 
 
-async def messages_to_history_db(db, msgs, files_limit_chars: int | None = None) -> list[dict]:
+async def messages_to_history_db(
+    db, msgs, files_limit_chars: int | None = None, files_turns: int | None = None
+) -> list[dict]:
     """
     То же, что messages_to_history, но данные вложений подтягиваются из
     blob-таблицы ТОЧЕЧНО и только когда нужны.
 
     :param files_limit_chars: лимит файлов истории в символах base64;
-        None — БЕЗ лимита (модель заново видит все прежние файлы, дефолт).
+        None — БЕЗ лимита по объёму.
+    :param files_turns: возрастное окно — файлы несут только N последних
+        сообщений; None/0 — без ограничения по возрасту.
     """
     from backend.attachments import load_history_attachments
 
-    att_map = await load_history_attachments(db, msgs, files_limit_chars)
+    att_map = await load_history_attachments(db, msgs, files_limit_chars, files_turns)
     return messages_to_history(msgs, att_map)
 
 
@@ -420,14 +463,17 @@ def assemble_context(
     # 3. «Несжимаемый» бюджет: системный промпт + текущее сообщение пользователя.
     used = estimate_tokens(system_prompt) + estimate_tokens(user_message)
 
-    # 4. Добавляем историю с конца (свежие сообщения важнее), пока хватает бюджета.
-    trimmed_history: list[dict] = []
-    for msg in reversed(history):
-        cost = estimate_content_tokens(msg.get("content"))  # учитывает мультимодальные блоки
-        if used + cost > token_budget:
-            break
-        trimmed_history.insert(0, {"role": msg["role"], "content": msg["content"]})
-        used += cost
+    # 4. Обрезаем историю под бюджет: свежие сообщения важнее старых.
+    #
+    # ЭКОНОМИЯ: граница обрезки квантуется по ступеням (см. stable_trim_start) —
+    # тогда начало запроса не меняется от хода к ходу и попадает в кэш промпта
+    # провайдера со скидкой 75–90%. Что выпало — держит авто-сводка сюжета.
+    costs = [estimate_content_tokens(m.get("content")) for m in history]
+    start = stable_trim_start(costs, token_budget, reserved=used)
+    trimmed_history: list[dict] = [
+        {"role": m["role"], "content": m["content"]} for m in history[start:]
+    ]
+    used += sum(costs[start:])
 
     # 5. Финальная сборка messages.
     messages: list[dict] = []
@@ -645,6 +691,8 @@ async def build_context_from_db(
     send_avatars: bool = False,
     history_files_limit: int | None = None,
     web_access: bool = False,
+    history_files_turns: int | None = None,
+    knowledge_chars: int | None = None,
 ) -> list[dict]:
     """
     Достаёт из БД память Horae, персону, заметку автора и историю сообщений,
@@ -668,7 +716,9 @@ async def build_context_from_db(
     # База знаний чата (справочные файлы) — доступна модели в каждом ходе.
     from backend.knowledge import build_knowledge
 
-    knowledge_text, knowledge_media = await build_knowledge(session_db, session.id)
+    knowledge_text, knowledge_media = await build_knowledge(
+        session_db, session.id, knowledge_chars
+    )
 
     if history is None:
         hq = (
@@ -677,9 +727,11 @@ async def build_context_from_db(
             .order_by(Message.id)
         )
         msgs = (await session_db.execute(hq)).scalars().all()
-        # СОХРАНЯЕМ вложения истории — данные тянутся из blob-таблицы точечно.
-        # history_files_limit=None — без лимита (полная память по файлам).
-        history = await messages_to_history_db(session_db, msgs, history_files_limit)
+        # СОХРАНЯЕМ вложения истории — данные тянутся из blob-таблицы точечно,
+        # в пределах лимита по объёму И возрастного окна (см. load_history_attachments).
+        history = await messages_to_history_db(
+            session_db, msgs, history_files_limit, history_files_turns
+        )
 
     char_dict = {
         "name": character.name,

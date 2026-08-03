@@ -232,6 +232,11 @@ async def director_pick(
     Важно: раньше был `complete(..., None, ...)` без params — служебный вызов шёл
     БЕЗ снятия фильтров, и на «остром» контексте Gemini возвращал пустоту, а режиссёр
     молча выбирал первого. Теперь передаём params (фильтры сняты) + низкую температуру.
+
+    ЭКОНОМИЯ: раньше режиссёру уходил ВЕСЬ транскрипт чата — то есть на каждый ход
+    группы шёл второй полноразмерный запрос ради одного слова («кто следующий»).
+    В длинном чате это удваивало расход. Для выбора отвечающего нужен только хвост
+    диалога, поэтому транскрипт обрезаем (DIRECTOR_TRANSCRIPT_CHARS).
     """
     if not members:
         return []
@@ -247,7 +252,13 @@ async def director_pick(
         "— Не выбирай того, кто только что говорил, если в этом нет смысла.\n"
         "— Ответь ТОЛЬКО именем персонажа из списка. Без пояснений, кавычек и лишних слов."
     )
+    # Берём только ХВОСТ диалога — по нему и решается, кто заговорит следующим.
+    from backend.config import settings
+
+    limit = settings.DIRECTOR_TRANSCRIPT_CHARS
     user = transcript
+    if limit and limit > 0 and len(user) > limit:
+        user = "[…начало диалога опущено…]\n" + user[-limit:]
     if last_user:
         user += f"\n\n[Последняя реплика пользователя]: {last_user}\nКто ответит следующим?"
     # Низкая температура и умеренный лимит — решение должно быть коротким и стабильным.
@@ -257,6 +268,7 @@ async def director_pick(
             [{"role": "system", "content": system}, {"role": "user", "content": user}],
             dparams,
             connection,
+            kind="director",
         )
     except Exception:  # noqa: BLE001 — пустой/ошибочный ответ режиссёра не должен ронять ход
         return []
@@ -267,9 +279,17 @@ async def director_pick(
 
 async def build_group_messages(
     db, session, target_character, token_budget: int, send_avatars: bool = False,
-    history_files_limit: int | None = None,
+    history_files_limit: int | None = None, history_files_turns: int | None = None,
+    knowledge_chars: int | None = None,
 ) -> list[dict]:
-    """Собирает messages, чтобы target_character ответил как он сам, видя весь диалог."""
+    """Собирает messages, чтобы target_character ответил как он сам, видя весь диалог.
+
+    ВАЖНО (экономия): token_budget здесь раньше ПРИНИМАЛСЯ, но не применялся —
+    в групповой чат уходил ВЕСЬ транскрипт целиком, сколько бы он ни весил, и
+    настройка «Окно контекста» на группы просто не действовала. А платится это
+    умножением: за один ход отвечают несколько персонажей, и каждому уходит
+    полный контекст отдельным запросом. Теперь бюджет соблюдается.
+    """
     members = await load_members(db, session.id)
     member_names = [c.name for c in members] or [target_character.name]
 
@@ -320,7 +340,7 @@ async def build_group_messages(
             lines.append(f"{persona_name}: {ctext}")
         else:
             lines.append(f"{m.speaker_name or target_character.name}: {m.content}")
-    transcript = "\n".join(lines)
+    transcript = _fit_transcript(lines, system, token_budget)
 
     messages: list[dict] = [{"role": "system", "content": system}]
     if send_avatars:
@@ -333,7 +353,7 @@ async def build_group_messages(
     # База знаний чата — справочник, ДО диалога и явно отделён (не вытесняет чат).
     from backend.horae_memory import knowledge_block
     from backend.knowledge import build_knowledge
-    kb_text, kb_media = await build_knowledge(db, session.id)
+    kb_text, kb_media = await build_knowledge(db, session.id, knowledge_chars)
     messages.extend(knowledge_block(kb_text, kb_media))
     if author_note and author_note.strip():
         messages.append({"role": "system", "content": f"[Author's Note]\n{author_note.strip()}"})
@@ -349,7 +369,9 @@ async def build_group_messages(
     # не мог «услышать» голосовое / «увидеть» фото (отвечал по кругу, игнорируя их).
     # Теперь свежие вложения прикладываем к финальной реплике как мультимодал.
     user_content: list = [{"type": "text", "text": transcript + f"\n\n{target_character.name}:"}]
-    att_blocks = await _collect_user_attachments(db, msgs, history_files_limit)
+    att_blocks = await _collect_user_attachments(
+        db, msgs, history_files_limit, history_files_turns
+    )
     if att_blocks:
         user_content = [{"type": "text", "text": transcript}] + att_blocks + [
             {"type": "text", "text": (
@@ -363,11 +385,40 @@ async def build_group_messages(
     return messages
 
 
-async def _collect_user_attachments(db, msgs, files_limit_chars: int | None) -> list[dict]:
+def _fit_transcript(lines: list[str], system: str, token_budget: int) -> str:
+    """
+    Обрезает транскрипт группы под бюджет контекста — с конца (свежее важнее).
+
+    Граница обрезки квантуется по ступеням (stable_trim_start), как и в личном
+    чате: тогда начало запроса не сдвигается от хода к ходу и попадает в кэш
+    промпта провайдера (скидка 75–90% на вход). Что выпало — не теряется: суть
+    старых событий держит авто-сводка сюжета.
+    """
+    from backend.horae_memory import estimate_tokens, stable_trim_start
+
+    if not token_budget or token_budget <= 0:
+        return "\n".join(lines)
+
+    costs = [estimate_tokens(ln) for ln in lines]
+    start = stable_trim_start(costs, token_budget, reserved=estimate_tokens(system))
+    if start <= 0:
+        return "\n".join(lines)
+    return "\n".join(
+        ["[…начало диалога опущено, его суть — в блоке памяти выше…]"] + lines[start:]
+    )
+
+
+async def _collect_user_attachments(
+    db, msgs, files_limit_chars: int | None, files_turns: int | None = None
+) -> list[dict]:
     """
     Собирает мультимодальные блоки вложений из реплик ПОЛЬЗОВАТЕЛЯ группового чата
-    (от свежих к старым, в пределах лимита). Данные тянутся из blob-таблицы точечно.
-    Возвращает список content-блоков (image_url/input_audio), помеченных именем файла.
+    (от свежих к старым, в пределах лимита по объёму и возрастного окна). Данные
+    тянутся из blob-таблицы точечно. Возвращает список content-блоков
+    (image_url/input_audio), помеченных именем файла.
+
+    В группе эти блоки уходят КАЖДОМУ отвечающему персонажу отдельным запросом,
+    поэтому лишний файл здесь стоит не одну, а N пересылок за ход.
     """
     from backend.attachments import load_history_attachments
     from backend.llm_gateway import _content_from_attachment, _media_kind_ru
@@ -376,7 +427,7 @@ async def _collect_user_attachments(db, msgs, files_limit_chars: int | None) -> 
     user_msgs = [m for m in msgs if m.role == "user"]
     if not user_msgs:
         return []
-    att_map = await load_history_attachments(db, user_msgs, files_limit_chars)
+    att_map = await load_history_attachments(db, user_msgs, files_limit_chars, files_turns)
     if not att_map:
         return []
     blocks: list[dict] = []

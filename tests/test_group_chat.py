@@ -137,6 +137,86 @@ def test_director_says_nobody():
     assert picked == []
 
 
+def test_director_transcript_is_trimmed():
+    """
+    ЭКОНОМИЯ: режиссёру уходит только хвост диалога, а не весь чат.
+
+    Раньше на каждый ход группы шёл ВТОРОЙ полноразмерный запрос ради одного
+    слова «кто следующий» — в длинном чате это удваивало расход токенов.
+    """
+    from backend.config import settings
+
+    ms = _members("Алиса", "Боб")
+    huge = "\n".join(f"строка диалога номер {i}" for i in range(5000))
+    captured = {}
+
+    async def _capture(*a, **k):
+        captured.update(k)
+
+        async def gen():
+            for t in ("Б", "об"):
+                yield SimpleNamespace(choices=[SimpleNamespace(
+                    delta=SimpleNamespace(content=t, reasoning_content=None),
+                    finish_reason=None,
+                )])
+        return gen()
+
+    with patch("backend.llm_gateway.litellm.acompletion", new=_capture):
+        asyncio.run(group_chat.director_pick(ms, huge, {}, last_user="Боб?"))
+
+    sent = captured["messages"][-1]["content"]
+    assert len(sent) < len(huge) / 4, "транскрипт режиссёра должен быть обрезан"
+    assert len(sent) <= settings.DIRECTOR_TRANSCRIPT_CHARS + 500
+    # Хвост (свежие реплики) и сама последняя реплика — на месте.
+    assert "строка диалога номер 4999" in sent and "Боб?" in sent
+
+
+def test_group_transcript_respects_token_budget():
+    """
+    Бюджет контекста ДЕЙСТВУЕТ на групповой чат.
+
+    Раньше token_budget в build_group_messages принимался, но не применялся:
+    каждому отвечающему персонажу уходил ВЕСЬ транскрипт целиком, сколько бы он
+    ни весил — и настройка «Окно контекста» на группы просто не влияла.
+    """
+    lines = [f"Алиса: реплика номер {i} с некоторым текстом внутри" for i in range(4000)]
+    full = group_chat._fit_transcript(lines, "системный промпт", token_budget=0)
+    assert full.count("\n") == len(lines) - 1  # 0 = без бюджета, режем не трогая
+
+    trimmed = group_chat._fit_transcript(lines, "системный промпт", token_budget=2000)
+    from backend.horae_memory import estimate_tokens
+
+    assert estimate_tokens(trimmed) <= 2000
+    assert "реплика номер 3999" in trimmed        # свежее сохраняется
+    assert "реплика номер 0" not in trimmed       # старое выпадает
+    assert "начало диалога опущено" in trimmed    # модель знает, что история обрезана
+
+
+def test_group_transcript_trim_is_stable_for_prompt_cache():
+    """
+    Обрезка идёт «ступенькой» (до 80% бюджета), а не ровно по границе.
+
+    Провайдер даёт скидку 75–90% за совпадающее НАЧАЛО запроса. Если срезать
+    ровно по границе бюджета, каждый новый ход выталкивает одно старое сообщение,
+    начало контекста сдвигается — и кэш промахивается каждый раз.
+    """
+    base = [f"Алиса: реплика номер {i} с некоторым текстом внутри" for i in range(4000)]
+
+    def _first_real_line(text: str) -> str:
+        # [0] — служебная пометка об обрезке, [1] — первая реальная реплика.
+        return text.split("\n")[1]
+
+    start_line = _first_real_line(group_chat._fit_transcript(base, "sys", 2000))
+    # Несколько ходов подряд: граница обрезки должна СТОЯТЬ НА МЕСТЕ, иначе кэш
+    # промпта промахивается на каждом ходу и вход тарифицируется по полной.
+    grown = list(base)
+    for i in range(8):
+        grown.append(f"Боб: новая реплика {i}")
+        got = group_chat._fit_transcript(grown, "sys", 2000)
+        assert _first_real_line(got) == start_line, f"граница уехала на ходу {i}"
+        assert got.rstrip().endswith(f"Боб: новая реплика {i}")  # свежее на месте
+
+
 def test_round_robin_next_after_last_speaker():
     ms = _members("Алиса", "Боб", "Кокос")
     assert group_chat.round_robin_next(ms, "Боб")[0].name == "Кокос"

@@ -318,3 +318,27 @@ class AppSetting(Base):
 
     key: Mapped[str] = mapped_column(String(100), primary_key=True)
     value: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class UsageDay(Base):
+    """
+    Счётчик расхода токенов за день по модели и виду запроса.
+
+    Нужен, чтобы «квота внезапно сгорела» перестало быть загадкой: видно, СКОЛЬКО
+    токенов ушло, на что именно (чат / сводка / режиссёр / арт) и какая доля
+    попала в кэш провайдера (cached — тарифицируется в разы дешевле).
+    Агрегат, а не журнал: одна строка на (день, модель, вид) — база не растёт.
+    """
+    __tablename__ = "usage_days"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    day: Mapped[str] = mapped_column(String(10), index=True)   # YYYY-MM-DD
+    model: Mapped[str] = mapped_column(String(200), default="")
+    kind: Mapped[str] = mapped_column(String(40), default="chat")
+    requests: Mapped[int] = mapped_column(Integer, default=0)
+    prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    # Часть prompt_tokens, которую провайдер взял из кэша (дешёвая).
+    cached_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    # Токены «размышлений» — тарифицируются как ВЫВОД, самый дорогой вид.
+    reasoning_tokens: Mapped[int] = mapped_column(Integer, default=0)

@@ -126,6 +126,14 @@ def _bot_params() -> GenerationParams:
     return GenerationParams(model=model) if model else GenerationParams()
 
 
+def _bot_files_limit() -> int | None:
+    """Лимит файлов истории для бота в символах base64 (0 в .env = без лимита)."""
+    mb = settings.HISTORY_FILES_MB
+    if not mb or mb <= 0:
+        return None
+    return int(mb * 1024 * 1024 * 4 / 3)
+
+
 def _own_sessions_filter(tg_user_id: int, owner_id):
     """
     Условие «чаты этого пользователя». При ПРИВЯЗАННОМ аккаунте — ВСЕ его чаты
@@ -260,8 +268,13 @@ async def _generate_reply(session_id: int, text: str, attachments: list[Attachme
         character = await db.get(models.Character, sess.character_id)
         connection = await get_connection(db)
         user_content = build_user_content(text, attachments, current=True)
+        # Лимиты экономии — те же, что в вебе (см. backend/config.py): без них
+        # бот пересылал модели ВСЕ прежние файлы чата на каждом сообщении.
         messages = await build_context_from_db(
-            db, sess, character, text, user_content, settings.CONTEXT_TOKEN_BUDGET
+            db, sess, character, text, user_content, settings.CONTEXT_TOKEN_BUDGET,
+            history_files_limit=_bot_files_limit(),
+            history_files_turns=(settings.HISTORY_FILES_TURNS or None),
+            knowledge_chars=settings.KNOWLEDGE_TEXT_CHARS,
         )
         msg = models.Message(session_id=session_id, role="user", content=text, attachments=[])
         db.add(msg)
@@ -333,9 +346,12 @@ async def _generate_group_reply(
         async with AsyncSessionLocal() as db:
             rsess = await db.get(models.ChatSession, session_id)
             gmsgs = await group_chat.build_group_messages(
-                db, rsess, character, settings.CONTEXT_TOKEN_BUDGET
+                db, rsess, character, settings.CONTEXT_TOKEN_BUDGET,
+                history_files_limit=_bot_files_limit(),
+                history_files_turns=(settings.HISTORY_FILES_TURNS or None),
+                knowledge_chars=settings.KNOWLEDGE_TEXT_CHARS,
             )
-        reply = await complete(gmsgs, params, connection)
+        reply = await complete(gmsgs, params, connection, kind="chat")
         async with AsyncSessionLocal() as db:
             db.add(models.Message(
                 session_id=session_id, role="assistant", content=reply,
