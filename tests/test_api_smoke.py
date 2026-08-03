@@ -676,6 +676,9 @@ def test_empty_llm_response_is_explicit_error(client):
     assert entry["status"] == "error"
     assert "ПУСТОЙ ответ" in entry["error"]
     assert "content_filter" in entry["error"]  # finish_reason попал в объяснение
+    # Диагноз конкретный: сказано, КАКОЙ фильтр сработал и что с ним можно делать.
+    assert "НАСТРАИВАЕМЫЙ фильтр" in entry["error"]
+    assert entry.get("blocked") is True
 
 
 def test_retry_after_failed_turn_no_user_duplicate(client):

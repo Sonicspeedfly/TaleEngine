@@ -363,6 +363,12 @@ async def build_group_messages(
     phi = (getattr(target_character, "post_history_instructions", "") or "").strip()
     if phi:
         messages.append({"role": "system", "content": phi})
+    # Глобальные инструкции обхода — общие для всех персонажей, поверх карточки.
+    from backend.censorship import load_global_instructions
+
+    gi = await load_global_instructions(db)
+    if gi:
+        messages.append({"role": "system", "content": gi})
 
     # ВЛОЖЕНИЯ пользователя (аудио/фото/видео/документы). Раньше в групповом чате
     # транскрипт был ЧИСТО ТЕКСТОВЫМ — файлы в модель не уходили вовсе, и персонаж

@@ -91,6 +91,8 @@ createApp({
         history_files_turns: 12,   // и из скольких ПОСЛЕДНИХ сообщений (0 = без ограничения)
         knowledge_chars: 60000,    // потолок текста базы знаний в контексте (0 = без лимита)
         disable_safety: true,
+        safety_preset: "off",     // общий порог настраиваемых фильтров провайдера
+        safety_overrides: {},     // точечные пороги по категориям (важнее пресета)
         send_avatars: false,
         web_access: false,
         reasoning_effort: "",   // "" авто | disable | low | medium | high
@@ -116,6 +118,20 @@ createApp({
       summaryEvery: 10,         // каждые сколько сообщений обновлять сводку (это платный запрос)
       groupReplyDelay: 3,       // пауза (сек) между ответами персонажей в группе
       groupWaiting: 0,          // идёт пауза перед следующим ответом группы (сек)
+
+      // --- Обход цензуры ---
+      // Настраиваемые категории Gemini (совпадают с censorship.SAFETY_CATEGORIES).
+      safetyCategories: [
+        ["HARM_CATEGORY_HARASSMENT", "Домогательства и травля"],
+        ["HARM_CATEGORY_HATE_SPEECH", "Ненависть и вражда"],
+        ["HARM_CATEGORY_SEXUALLY_EXPLICIT", "Откровенный контент"],
+        ["HARM_CATEGORY_DANGEROUS_CONTENT", "Опасный контент"],
+        ["HARM_CATEGORY_CIVIC_INTEGRITY", "Гражданская добропорядочность"],
+      ],
+      // Общие инструкции перед ответом — один текст на все чаты + библиотека своих
+      // пресетов. Сам текст пишет пользователь, готовых промптов тут нет.
+      jailbreak: { enabled: false, text: "", presets: [] },
+      jailbreakPresetName: "",
 
       // --- Расход токенов (кнопка 📊) ---
       usageOpen: false,
@@ -234,6 +250,14 @@ createApp({
   computed: {
     selectedCharacter() {
       return this.characters.find((c) => c.id === this.selectedCharacterId) || null;
+    },
+    // Ловушка, которую пользователь сам не свяжет: у Gemini режим размышлений
+    // включает СВОЮ модерацию поверх safety_settings и душит контент даже при
+    // пороге OFF. Авто-включение мы блокируем, но ручной выбор уважаем — значит
+    // про конфликт надо предупредить прямо в настройках (см. backend/censorship.py).
+    reasoningConflict() {
+      const r = (this.params.reasoning_effort || "").toLowerCase();
+      return this.params.disable_safety && r !== "" && r !== "auto" && r !== "disable";
     },
     // Открытая сейчас сессия из списка чатов (для заголовка «имя чата · #номер»).
     currentSession() {
@@ -1976,6 +2000,16 @@ createApp({
         // Новые настройки экономии могли не сохраниться в старых профилях.
         if (this.params.history_files_turns == null) this.params.history_files_turns = 12;
         if (this.params.knowledge_chars == null) this.params.knowledge_chars = 60000;
+        // Настройки обхода цензуры (появились в 1.13.0).
+        if (!this.params.safety_preset) this.params.safety_preset = "off";
+        if (!this.params.safety_overrides) this.params.safety_overrides = {};
+      }
+      if (ui && ui.jailbreak) {
+        this.jailbreak = {
+          enabled: !!ui.jailbreak.enabled,
+          text: ui.jailbreak.text || "",
+          presets: Array.isArray(ui.jailbreak.presets) ? ui.jailbreak.presets : [],
+        };
       }
       if (ui && Number(ui.message_preload) > 0) this.messagePreload = Number(ui.message_preload);
       if (ui && "auto_summary" in ui) this.autoSummary = ui.auto_summary !== false;
@@ -1994,6 +2028,7 @@ createApp({
             auto_summary: this.autoSummary,
             group_reply_delay: this.groupReplyDelay,
             summary_every: this.summaryEvery,
+            jailbreak: this.jailbreak,
           }),
         }).catch(() => {});
       }, 600);
@@ -2239,6 +2274,37 @@ createApp({
       if (!p) return 0;
       return Math.round((Number(row.cached || 0) / p) * 100);
     },
+    // ---------- Обход цензуры ----------
+    setSafetyOverride(category, threshold) {
+      const next = { ...(this.params.safety_overrides || {}) };
+      if (threshold) next[category] = threshold;
+      else delete next[category];   // «как общий порог» = убрать переопределение
+      this.params.safety_overrides = next;
+      this.saveUiPrefs();
+    },
+    saveJailbreakPreset() {
+      const name = (this.jailbreakPresetName || "").trim();
+      const text = (this.jailbreak.text || "").trim();
+      if (!name || !text) { this.showToast("Нужны имя пресета и текст"); return; }
+      const presets = (this.jailbreak.presets || []).filter((p) => p.name !== name);
+      presets.push({ name, text });
+      this.jailbreak = { ...this.jailbreak, presets };
+      this.jailbreakPresetName = "";
+      this.saveUiPrefs();
+      this.showToast(`Пресет «${name}» сохранён`);
+    },
+    applyJailbreakPreset(p) {
+      this.jailbreak = { ...this.jailbreak, text: p.text };
+      this.saveUiPrefs();
+      this.showToast(`Применён пресет «${p.name}»`);
+    },
+    deleteJailbreakPreset(i) {
+      const presets = [...(this.jailbreak.presets || [])];
+      presets.splice(i, 1);
+      this.jailbreak = { ...this.jailbreak, presets };
+      this.saveUiPrefs();
+    },
+
     isEconomyMode(m) {
       return Object.keys(m.v).every((k) => Number(this.params[k]) === Number(m.v[k]));
     },
@@ -3028,7 +3094,60 @@ createApp({
           <p class="muted" style="margin:2px 0 10px">Когда в групповом чате отвечают несколько персонажей подряд (напр. <code>+A +B +C</code>), запросы быстро выбирают квоту провайдера — и прилетает ошибка «429 Resource exhausted». Пауза разносит ответы во времени. 0 — без паузы.</p>
           <label>Repetition penalty <span class="range-val">{{ params.repetition_penalty }}</span>
             <input type="range" min="0.8" max="2" step="0.05" v-model.number="params.repetition_penalty" /></label>
-          <label class="check danger-text"><input type="checkbox" v-model="params.disable_safety" /> Zero-Censorship — снять фильтры (вкл. по умолчанию; порог OFF)</label>
+          <div class="hr"></div>
+          <h3>🛡 Обход цензуры</h3>
+          <label class="check danger-text"><input type="checkbox" v-model="params.disable_safety" /> Zero-Censorship — снять настраиваемые фильтры провайдера</label>
+          <template v-if="params.disable_safety">
+            <label>Порог для всех категорий
+              <select v-model="params.safety_preset">
+                <option value="off">OFF — фильтр выключен полностью (максимум свободы)</option>
+                <option value="none">BLOCK_NONE — не блокировать, но оценивать</option>
+                <option value="high_only">BLOCK_ONLY_HIGH — только явные нарушения</option>
+                <option value="provider">не передавать порог — решает провайдер</option>
+              </select>
+            </label>
+            <p class="muted" style="margin:2px 0 6px">У Gemini 2.5/3 <code>OFF</code> и так дефолт, но мы ставим его явно на все пять категорий — включая «гражданскую добропорядочность», о которой обычно забывают.</p>
+            <details style="margin:0 0 10px">
+              <summary class="muted" style="cursor:pointer">Пороги по отдельным категориям</summary>
+              <p class="muted" style="margin:6px 0">Нужно, когда душит одна конкретная категория, а остальные трогать не хочется.</p>
+              <label v-for="c in safetyCategories" :key="c[0]" style="margin:4px 0">{{ c[1] }}
+                <select :value="params.safety_overrides && params.safety_overrides[c[0]] || ''"
+                        @change="setSafetyOverride(c[0], $event.target.value)">
+                  <option value="">как общий порог выше</option>
+                  <option value="OFF">OFF — выключен</option>
+                  <option value="BLOCK_NONE">BLOCK_NONE</option>
+                  <option value="BLOCK_ONLY_HIGH">BLOCK_ONLY_HIGH</option>
+                </select>
+              </label>
+            </details>
+          </template>
+
+          <p v-if="reasoningConflict" class="danger-text" style="margin:2px 0 10px; font-size:13px">
+            ⚠ <b>Размышления возвращают цензуру.</b> У вас выбран уровень размышлений «{{ params.reasoning_effort }}» вместе со снятыми фильтрами. У Gemini режим размышлений добавляет СВОЮ модерацию поверх <code>safety_settings</code> — она душит контент даже при пороге OFF. Если ловите пустые ответы — поставьте размышления в «выключены».
+          </p>
+
+          <label class="check"><input type="checkbox" v-model="jailbreak.enabled" @change="saveUiPrefs" />
+            📌 Общие инструкции перед ответом (для ВСЕХ персонажей)</label>
+          <template v-if="jailbreak.enabled">
+            <textarea rows="5" v-model="jailbreak.text" @change="saveUiPrefs"
+                      placeholder="Ваши инструкции. Уходят в САМЫЙ конец контекста — после Post-History персонажа, прямо перед ответом."></textarea>
+            <div class="row" style="gap:6px; margin:4px 0; flex-wrap:wrap">
+              <input v-model="jailbreakPresetName" placeholder="имя пресета" style="flex:1; min-width:120px" />
+              <button class="btn-primary" @click="saveJailbreakPreset">Сохранить</button>
+            </div>
+            <div class="row" style="gap:6px; flex-wrap:wrap">
+              <span v-for="(p, i) in jailbreak.presets" :key="i" class="tag" style="cursor:pointer"
+                    @click="applyJailbreakPreset(p)" :title="p.text.slice(0, 200)">
+                {{ p.name }} <a href="#" @click.stop.prevent="deleteJailbreakPreset(i)">✕</a>
+              </span>
+            </div>
+            <p class="muted" style="margin:6px 0 10px">Раньше такой текст приходилось дублировать в карточке КАЖДОГО персонажа («Инструкции перед ответом»). Здесь он общий: пишется один раз и применяется во всех чатах — личных, групповых и в Telegram. Инструкции персонажа при этом никуда не деваются, общие идут после них.</p>
+          </template>
+
+          <details style="margin:0 0 10px">
+            <summary class="muted" style="cursor:pointer">Что снять фильтрами НЕЛЬЗЯ</summary>
+            <p class="muted" style="margin:6px 0">У Google два вида фильтров. Настраиваемые (пять категорий выше) снимаются порогами. А <code>PROHIBITED_CONTENT</code>, <code>SPII</code>, <code>BLOCKLIST</code>, <code>RECITATION</code> — <b>неотключаемые</b>: они срабатывают всегда, никакой порог на них не влияет. Если ответ пуст — приложение теперь пишет, какой именно фильтр сработал и можно ли с ним что-то сделать, вместо общего «попробуйте переформулировать».</p>
+          </details>
           <label class="check"><input type="checkbox" v-model="params.send_avatars" /> Показывать нейросети аватары (внешность персонажа и ролевика)</label>
           <label class="check"><input type="checkbox" v-model="params.web_access" /> 🌐 Доступ в интернет (веб-поиск на каждый запрос)</label>
 

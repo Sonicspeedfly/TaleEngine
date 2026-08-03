@@ -15,7 +15,7 @@ from typing import AsyncGenerator, Optional
 
 import litellm
 
-from backend import debug_log, usage_stats
+from backend import censorship, debug_log, usage_stats
 from backend.config import settings
 from backend.schemas import AttachmentIn, GenerationParams
 
@@ -41,14 +41,9 @@ logging.getLogger("litellm").setLevel(logging.ERROR)
 # Порог "OFF" (а не "BLOCK_NONE") — САМЫЙ пермиссивный: полностью выключает фильтр,
 # тогда как BLOCK_NONE лишь «не блокировать, но оценивать». Для Gemini 2.5/3 "OFF"
 # и так дефолт. Ставим явно на ВСЕ настраиваемые категории (в т.ч. CIVIC_INTEGRITY).
-# Останутся только неотключаемые фильтры Google (например CSAM) — их обойти нельзя.
-GEMINI_SAFETY_OFF = [
-    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "OFF"},
-    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "OFF"},
-    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "OFF"},
-    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "OFF"},
-    {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": "OFF"},
-]
+# Останутся только неотключаемые фильтры Google (PROHIBITED_CONTENT, SPII,
+# BLOCKLIST, RECITATION) — их не снимает никакой порог, см. backend/censorship.py.
+GEMINI_SAFETY_OFF = censorship.safety_settings("off")
 
 
 def _attachment_data_uri(att: AttachmentIn, default_mime: str) -> str:
@@ -249,7 +244,8 @@ def _merge_params(params: Optional[GenerationParams]) -> dict:
             # настройки сборки контекста, а не сэмплинг-параметры litellm.
             if key in ("model", "disable_safety", "web_access", "send_avatars",
                        "reasoning_effort", "file_reasoning", "context_tokens",
-                       "history_files_mb", "history_files_turns", "knowledge_chars"):
+                       "history_files_mb", "history_files_turns", "knowledge_chars",
+                       "safety_preset", "safety_overrides"):
                 continue
             merged[key] = value
     return merged
@@ -377,9 +373,16 @@ async def stream_completion(
     # их не включил явно (disable_safety=True — дефолт) ИЛИ это служебный вызов
     # без params (режиссёр, заголовок канваса и т.п.) — их тоже нельзя блокировать.
     # Для не-Gemini провайдеров LiteLLM отбросит safety_settings (drop_params).
+    #
+    # Порог берётся из настроек обхода цензуры: общий пресет + точечные
+    # переопределения по категориям (⚙ → Генерация → «🛡 Обход цензуры»).
     safety_off = params is None or params.disable_safety
     if safety_off:
-        call_kwargs["safety_settings"] = GEMINI_SAFETY_OFF
+        preset = (params.safety_preset if params else "") or "off"
+        overrides = (params.safety_overrides if params else None) or None
+        settings_list = censorship.safety_settings(preset, overrides)
+        if settings_list:
+            call_kwargs["safety_settings"] = settings_list
 
     # Запись в отладочный лог: что именно уходит в прокси.
     entry = debug_log.log_request(
@@ -448,17 +451,19 @@ async def stream_completion(
             entry["usage"] = usage
             usage_stats.record(kind, call_kwargs["model"], usage)
         if not text:
-            # Стрим завершился «успешно», но контента НЕТ (фильтры провайдера,
-            # обрезка по токенам во время размышлений и т.п.). Молчать нельзя —
-            # иначе пользователь видит «ничего» без объяснений. Бросаем ошибку:
-            # она уйдёт клиенту событием error и попадёт в отладочный лог.
-            extra = f", размышления: {thought_len} симв." if thought_len else ""
-            msg = (
-                f"Модель вернула ПУСТОЙ ответ (finish_reason={finish_reason or 'нет'}{extra}). "
-                "Чаще всего это фильтры контента провайдера (даже при Zero-Censorship) "
-                "или исчерпание max_tokens на размышления. Попробуйте переформулировать, "
-                "сменить модель или повторить генерацию."
+            # Стрим завершился «успешно», но контента НЕТ. Молчать нельзя — иначе
+            # пользователь видит «ничего» без объяснений. Диагноз ставим по
+            # finish_reason: настраиваемый фильтр (лечится порогами), НЕотключаемый
+            # фильтр Google (порогами НЕ лечится) или исчерпанный лимит ответа —
+            # это принципиально разные случаи с разными действиями.
+            msg = censorship.explain_block(
+                finish_reason,
+                thought_len=thought_len,
+                safety_off=safety_off,
+                reasoning=reasoning,
+                max_tokens=call_kwargs.get("max_tokens"),
             )
+            entry["blocked"] = True
             debug_log.finish(entry, "error", error=msg)
             raise RuntimeError(msg)
         debug_log.finish(entry, "ok", preview=text[:400])

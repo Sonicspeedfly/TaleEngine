@@ -422,6 +422,7 @@ def assemble_context(
     web_access: bool = False,
     knowledge_text: str = "",
     knowledge_media: list | None = None,
+    global_instructions: str = "",
 ) -> list[dict]:
     """
     ЧИСТАЯ функция сборки контекста. Возвращает messages для LiteLLM:
@@ -538,6 +539,12 @@ def assemble_context(
     # Post-History Instructions (jailbreak/UJB) — САМЫЙ конец: максимальное влияние.
     if post_history_instructions and post_history_instructions.strip():
         tail.append({"role": "system", "content": post_history_instructions.strip()})
+
+    # Глобальные инструкции обхода: то же место, но общее для ВСЕХ персонажей —
+    # чтобы один и тот же текст не приходилось дублировать в каждой карточке.
+    # Идут ПОСЛЕ инструкций персонажа: общее правило важнее частного.
+    if global_instructions and global_instructions.strip():
+        tail.append({"role": "system", "content": global_instructions.strip()})
 
     # Фокус на текущем ходе: в огромном контексте (вся история + все файлы) модель
     # может «утопить» свежую реплику и начать выдумывать то, что уже прислано
@@ -693,6 +700,7 @@ async def build_context_from_db(
     web_access: bool = False,
     history_files_turns: int | None = None,
     knowledge_chars: int | None = None,
+    global_instructions: str = "",
 ) -> list[dict]:
     """
     Достаёт из БД память Horae, персону, заметку автора и историю сообщений,
@@ -719,6 +727,12 @@ async def build_context_from_db(
     knowledge_text, knowledge_media = await build_knowledge(
         session_db, session.id, knowledge_chars
     )
+    # Глобальные инструкции обхода (общие для всех персонажей) — грузим здесь,
+    # чтобы они применялись во ВСЕХ режимах: веб, Telegram, регенерация, retry.
+    if not global_instructions:
+        from backend.censorship import load_global_instructions
+
+        global_instructions = await load_global_instructions(session_db)
 
     if history is None:
         hq = (
@@ -759,4 +773,5 @@ async def build_context_from_db(
         web_access=web_access,
         knowledge_text=knowledge_text,
         knowledge_media=knowledge_media,
+        global_instructions=global_instructions,
     )
