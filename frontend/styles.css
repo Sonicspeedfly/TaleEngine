@@ -183,6 +183,26 @@ label span { color: var(--text); }
 .bubble em { color: #c7b8ff; }
 .bubble code { background: #0d0f14; padding: 1px 5px; border-radius: 5px; font-family: "Cascadia Code", Consolas, "Courier New", monospace; font-size: 13px; }
 .bubble pre { background: #0d0f14; padding: 10px; border-radius: 8px; overflow-x: auto; border: 1px solid var(--border); font-size: 13px; line-height: 1.45; }
+
+/* ----- Блок кода с шапкой: язык слева, «Копировать» справа ----- */
+.code-block { margin: 8px 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: #0d0f14; }
+.code-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 4px 6px 4px 10px; background: rgba(255,255,255,0.035);
+  border-bottom: 1px solid var(--border);
+}
+.code-lang { font-size: 11px; color: var(--muted); text-transform: lowercase; letter-spacing: 0.3px; }
+.code-copy {
+  font-size: 11px; padding: 3px 9px; border-radius: 6px; cursor: pointer;
+  color: var(--muted); background: transparent; border: 1px solid transparent;
+  transition: color 0.14s ease, background 0.14s ease, border-color 0.14s ease;
+}
+.code-copy:hover { color: var(--text); background: var(--bg3); border-color: var(--border); }
+.code-copy.done { color: var(--ok); border-color: transparent; background: transparent; }
+/* Внутри блока у <pre> своя рамка и отступы уже не нужны — их даёт .code-block. */
+.code-block pre { margin: 0; border: none; border-radius: 0; background: transparent; }
+/* На узком экране кнопка всё равно должна быть нажимаемой пальцем. */
+@media (max-width: 760px) { .code-copy { min-height: 32px; padding: 4px 12px; } }
 .bubble pre code { background: transparent; padding: 0; }
 /* Разметка в духе Telegram: цитаты, ссылки, списки, заголовки. */
 .bubble strong, .bubble b { font-weight: 700; }
@@ -206,6 +226,67 @@ label span { color: var(--text); }
 .msg-meta { display: flex; align-items: center; gap: 6px; margin-top: 4px; font-size: 12px; color: var(--muted); }
 .msg.user .msg-meta { justify-content: flex-end; }
 .swipes { display: inline-flex; align-items: center; gap: 4px; }
+
+/* ============================================================
+   Прогрессивное раскрытие действий
+   ============================================================
+   Проблема была измеримая: на чате из трёх сообщений на экране одновременно
+   57 кнопок — 9 в шапке, 20 в сайдбаре и по 5-12 под каждым сообщением. Все
+   действия показывались ВСЕГДА, и интерфейс читался как приборная панель.
+
+   Решение: редкие действия проявляются при наведении, а не занимают внимание
+   постоянно. Обёрнуто в @media (hover: hover) — на тач-устройствах наведения
+   нет, и там всё остаётся видимым, иначе кнопки стали бы недоступны. */
+@media (hover: hover) and (pointer: fine) {
+  /* Кнопки под сообщением: не пропадают полностью, а притухают — так видно,
+     что действия есть, но они не спорят с текстом за внимание. */
+  .msg-meta .btn-icon,
+  .msg-meta .swipes { opacity: 0; transition: opacity 0.16s ease; }
+  .msg:hover .msg-meta .btn-icon,
+  .msg:hover .msg-meta .swipes,
+  .msg-meta .btn-icon:focus-visible { opacity: 1; }
+  /* Последнее сообщение — самая частая цель действий, его кнопки оставляем. */
+  .msg:last-child .msg-meta .btn-icon,
+  .msg:last-child .msg-meta .swipes { opacity: 0.55; }
+  .msg:last-child:hover .msg-meta .btn-icon,
+  .msg:last-child:hover .msg-meta .swipes { opacity: 1; }
+
+  /* Строки списков (чаты, персонажи): экспорт/переименовать/удалить — редкие
+     операции, незачем держать их перед глазами в каждой строке. */
+  .list-item .btn-icon { opacity: 0; transition: opacity 0.16s ease; }
+  .list-item:hover .btn-icon,
+  .list-item .btn-icon:focus-visible { opacity: 1; }
+}
+
+/* ============================================================
+   Движение: отклик на действия
+   ============================================================ */
+/* Появление сообщения — короткий подъём, чтобы ответ «приходил», а не возникал. */
+@keyframes msg-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: none; }
+}
+.msg { animation: msg-in 0.18s ease-out; }
+
+/* Нажатие: кнопка чуть проседает — тактильная обратная связь без звука и цвета. */
+button, .btn-icon { transition: background 0.14s ease, color 0.14s ease, border-color 0.14s ease, transform 0.08s ease; }
+button:active, .btn-icon:active { transform: scale(0.94); }
+
+/* Видимый фокус с клавиатуры — раньше его не было вовсе. */
+button:focus-visible, .btn-icon:focus-visible, input:focus-visible,
+textarea:focus-visible, select:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+
+/* Уважение к системной настройке «меньше движения»: анимации мешают части
+   людей (укачивание, вестибулярные нарушения) — там отключаем всё разом. */
+@media (prefers-reduced-motion: reduce) {
+  .msg { animation: none; }
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important; animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
 .composer { border-top: 1px solid var(--border); padding: 12px; background: var(--bg2); }
 /* Единый инпут по центру: ограничиваем ширину и центрируем содержимое. */
 .composer > * { max-width: 860px; margin-left: auto; margin-right: auto; }

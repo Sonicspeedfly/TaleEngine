@@ -477,7 +477,83 @@ createApp({
         html = html.replace(/%%MATH-(\d+)%%/g, (_, i) => math[+i] || "");
       }
       // ADD_DATA_URI_TAGS: разрешаем <img src="data:..."> (сгенерированные арты).
-      return DOMPurify.sanitize(html, { ADD_DATA_URI_TAGS: ["img"] });
+      // Панель с кнопкой копирования навешиваем ПОСЛЕ санитайза — иначе DOMPurify
+      // вырезал бы нашу же кнопку.
+      return this._withCodeToolbar(DOMPurify.sanitize(html, { ADD_DATA_URI_TAGS: ["img"] }));
+    },
+
+    // Оборачивает каждый <pre> в блок с шапкой: язык слева, «Копировать» справа.
+    // Работает на готовом HTML через DOM, а не регулярками, чтобы не разбирать
+    // разметку строками и не сломаться на вложенных тегах.
+    _withCodeToolbar(html) {
+      if (!html || html.indexOf("<pre") === -1) return html;
+      const holder = document.createElement("div");
+      holder.innerHTML = html;
+      holder.querySelectorAll("pre").forEach((pre) => {
+        const code = pre.querySelector("code");
+        const cls = (code && code.className) || "";
+        const m = cls.match(/language-([\w+#-]+)/);
+        const wrap = document.createElement("div");
+        wrap.className = "code-block";
+        const bar = document.createElement("div");
+        bar.className = "code-bar";
+        const lang = document.createElement("span");
+        lang.className = "code-lang";
+        lang.textContent = m ? m[1] : "код";   // textContent: язык приходит из ответа модели
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "code-copy";
+        btn.title = "Скопировать код";
+        btn.textContent = "Копировать";
+        bar.appendChild(lang);
+        bar.appendChild(btn);
+        pre.parentNode.insertBefore(wrap, pre);
+        wrap.appendChild(bar);
+        wrap.appendChild(pre);
+      });
+      return holder.innerHTML;
+    },
+
+    async copyText(text) {
+      // Clipboard API работает ТОЛЬКО в защищённом контексте (https или localhost).
+      // Приложение раздаётся по http, поэтому на сервере этот путь недоступен —
+      // без запасного варианта кнопка молча не срабатывала бы именно на проде.
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(text);
+          return true;
+        }
+      } catch (e) { /* пробуем запасной путь ниже */ }
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.setAttribute("readonly", "");
+        ta.style.cssText = "position:fixed;top:-1000px;left:0;opacity:0";
+        document.body.appendChild(ta);
+        ta.select();
+        ta.setSelectionRange(0, ta.value.length);   // iOS иначе не выделяет
+        const ok = document.execCommand("copy");
+        document.body.removeChild(ta);
+        return ok;
+      } catch (e) { return false; }
+    },
+
+    // Один делегированный обработчик на документ вместо слушателя в каждом
+    // сообщении: разметка приходит из v-html и постоянно перерисовывается.
+    async _onDocClick(ev) {
+      const btn = ev.target && ev.target.closest && ev.target.closest(".code-copy");
+      if (!btn) return;
+      const block = btn.closest(".code-block");
+      const pre = block && block.querySelector("pre");
+      if (!pre) return;
+      const ok = await this.copyText(pre.innerText);
+      btn.textContent = ok ? "✓ Скопировано" : "✕ Не вышло";
+      btn.classList.toggle("done", ok);
+      clearTimeout(btn._t);
+      btn._t = setTimeout(() => {
+        btn.textContent = "Копировать";
+        btn.classList.remove("done");
+      }, 1600);
     },
     // Вырезает LaTeX-фрагменты ($$..$$, \[..\], \(..\), $..$) вне код-блоков,
     // складывает готовый HTML KaTeX в out и возвращает текст с плейсхолдерами
@@ -2547,6 +2623,9 @@ createApp({
   },
 
   async mounted() {
+    // Копирование кода: один слушатель на документ (разметка сообщений приходит
+    // из v-html и перерисовывается, вешать обработчики на каждый блок бессмысленно).
+    document.addEventListener("click", this._onDocClick);
     this.accessCode = localStorage.getItem("accessCode") || "";
     this.adminPassword = localStorage.getItem("adminPassword") || "";
     this.userToken = localStorage.getItem("userToken") || "";
