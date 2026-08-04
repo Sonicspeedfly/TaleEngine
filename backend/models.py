@@ -202,6 +202,12 @@ class HoraeEntry(Base):
     always_on: Mapped[bool] = mapped_column(Boolean, default=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     priority: Mapped[int] = mapped_column(Integer, default=0)
+    # Служебные данные записи, невидимые пользователю. Для авто-сводки сюжета
+    # здесь лежит {"last_message_id": N} — до какого сообщения память уже учтена.
+    # Раньше этот указатель хранился МЕТКОЙ В KEYWORDS ("last:123"), а keywords
+    # пользователь редактирует руками — достаточно было поправить ключевые слова
+    # записи «Память чата (авто)», чтобы сводка сломалась.
+    meta: Mapped[dict] = mapped_column(JSON, default=dict)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
     )

@@ -3284,7 +3284,8 @@ createApp({
           <div class="card">
             <input v-model="horaeEdit.title" placeholder="Заголовок" style="margin-bottom:6px" />
             <textarea v-model="horaeEdit.content" rows="3" placeholder="Содержимое" style="margin-bottom:6px"></textarea>
-            <input v-model="horaeEdit.keywords" placeholder="ключевые слова через запятую" style="margin-bottom:6px" />
+            <input v-model="horaeEdit.keywords" placeholder="ключевые слова через запятую" style="margin-bottom:2px" />
+            <p class="muted" style="margin:0 0 6px; font-size:12px">Срабатывают по слову целиком и его склонениям: <code>меч</code> поймает «мечи», «мечом», «мечами», а <code>король</code> — «короля», «королём». На другие слова с тем же началом (<code>кот</code> → «который», «котёл») <b>не</b> срабатывает. Нужно шире — поставьте звёздочку: <code>замк*</code> поймает «замка», «замком», «замковый». Фраза с пробелом (<code>тёмный лес</code>) ищется как есть.</p>
             <div class="row" style="margin-bottom:6px">
               <select v-model="horaeEdit.category"><option>lore</option><option>state</option><option>inventory</option><option>character</option><option>hidden</option></select>
               <input type="number" v-model.number="horaeEdit.priority" placeholder="приоритет" style="width:90px" />

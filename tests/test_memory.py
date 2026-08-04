@@ -66,8 +66,11 @@ async def test_auto_summary_creates_entry_and_tracks_progress():
     assert entry is not None
     assert entry.always_on and entry.enabled  # подмешивается в каждый запрос
     assert "союз" in entry.content
-    last_marks = [k for k in (entry.keywords or []) if str(k).startswith("last:")]
-    assert last_marks, "должна храниться метка последнего учтённого сообщения"
+    # Указатель «до какого сообщения учтено» живёт в служебном meta, а НЕ в
+    # keywords: keywords пользователь правит руками, и раньше правка ключевых
+    # слов записи «Память чата (авто)» ломала сводку.
+    assert (entry.meta or {}).get("last_message_id"), "нужен указатель последнего учтённого"
+    assert not [k for k in (entry.keywords or []) if str(k).startswith("last:")]
 
     # Новых сообщений мало (0) — повторный вызов сводку НЕ трогает.
     async def fail_complete(*a, **kw):  # noqa: ANN001

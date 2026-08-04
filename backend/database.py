@@ -200,6 +200,7 @@ def _sqlite_add_missing_columns(sync_conn) -> None:
         },
         "horae_entries": {
             "character_id": "INTEGER",
+            "meta": "JSON",
         },
         "sampling_presets": {
             "is_default": "BOOLEAN DEFAULT 0",

@@ -38,7 +38,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import delete as sql_delete
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -390,6 +390,34 @@ _AUTO_SUMMARY_TITLE = "📜 Память чата (авто)"
 logger = logging.getLogger("aichat.summary")
 
 
+def _summary_last_id(entry) -> int:
+    """
+    До какого сообщения авто-сводка уже учла события.
+
+    Читаем из служебного поля meta, но поддерживаем и СТАРЫЙ формат — метку
+    "last:123" внутри keywords. Старый формат был хрупким: keywords пользователь
+    правит руками в интерфейсе, и достаточно было тронуть ключевые слова записи
+    «Память чата (авто)», чтобы указатель исчез и сводка пересобиралась заново.
+    """
+    if entry is None:
+        return 0
+    meta = getattr(entry, "meta", None)
+    if isinstance(meta, dict):
+        try:
+            value = int(meta.get("last_message_id") or 0)
+            if value > 0:
+                return value
+        except (TypeError, ValueError):
+            pass
+    for kw in (entry.keywords or []):  # легаси-метка
+        if isinstance(kw, str) and kw.startswith("last:"):
+            try:
+                return int(kw[5:])
+            except ValueError:
+                pass
+    return 0
+
+
 async def _maybe_update_summary(session_id: int) -> None:
     """Фоновое обновление авто-сводки чата. Любая ошибка здесь не роняет ход."""
     try:
@@ -404,13 +432,24 @@ async def _maybe_update_summary(session_id: int) -> None:
                     models.HoraeEntry.category == "summary",
                 )
             )).scalars().first()
-            last_id = 0
-            for kw in ((entry.keywords if entry else None) or []):
-                if isinstance(kw, str) and kw.startswith("last:"):
-                    try:
-                        last_id = int(kw[5:])
-                    except ValueError:
-                        pass
+            last_id = _summary_last_id(entry)
+            # Указатель мог «уехать в будущее»: пользователь удалил последние
+            # сообщения (а SQLite переиспользует id), и тогда условие id > last_id
+            # не выполнялось бы НИКОГДА — сводка молча умирала навсегда. Если в
+            # чате не осталось сообщений новее указателя, сбрасываем его и
+            # пересобираем память по тому, что реально есть.
+            max_id = (await db.execute(
+                select(func.max(models.Message.id)).where(
+                    models.Message.session_id == session_id
+                )
+            )).scalar() or 0
+            if last_id > max_id:
+                logger.info(
+                    "Указатель авто-сводки чата %s указывал на #%s, а последнее "
+                    "сообщение — #%s (сообщения удаляли). Пересобираем память.",
+                    session_id, last_id, max_id,
+                )
+                last_id = 0
             fresh = (await db.execute(
                 select(models.Message).where(
                     models.Message.session_id == session_id,
@@ -478,7 +517,10 @@ async def _maybe_update_summary(session_id: int) -> None:
                 db.add(entry)
             entry.title = _AUTO_SUMMARY_TITLE
             entry.content = summary[:6000]
-            entry.keywords = [_AUTO_SUMMARY_MARK, f"last:{newest_id}"]
+            # Указатель — в служебное meta, а не в keywords: keywords пользователь
+            # редактирует руками, и правка ключевых слов ломала сводку.
+            entry.meta = {**(entry.meta or {}), "last_message_id": newest_id}
+            entry.keywords = [_AUTO_SUMMARY_MARK]
             entry.always_on = True
             entry.enabled = True
             entry.priority = 50  # сводка важнее рядовых записей, но ниже ручных «100+»

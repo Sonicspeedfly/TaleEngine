@@ -228,28 +228,143 @@ class HoraeRecord:
     priority: int
 
 
+import re as _re
+
+# Слова текста (юникод, кириллица тоже); цифры и подчёркивания не считаем словами.
+_WORD_RE = _re.compile(r"[^\W\d_]+", _re.UNICODE)
+
+
+def _text_tokens(text: str) -> list[str]:
+    return _WORD_RE.findall((text or "").lower())
+
+
+# Окончания, которые отпадают при склонении: «король» → «королЕ», «конь» → «конЯ».
+# Срезаем РОВНО ОДНУ такую букву — этого хватает для большинства падежей и почти
+# не даёт ложных склеек. Более агрессивная обрезка начала бы путать разные слова.
+_FLEXION_TAIL = "аеёиоуыэюяьйъ"
+
+
+def _stem(word: str) -> str:
+    """Грубая основа слова: слово без одного окончания-гласной или мягкого знака."""
+    if len(word) >= 4 and word[-1] in _FLEXION_TAIL:
+        return word[:-1]
+    return word
+
+
+# Падежные окончания, которые могут ПРИРАСТИ к ключу: «меч» → «мечом», «мечами».
+# Именно список окончаний, а не «любой хвост до N букв»: иначе «рука» цепляла бы
+# «рукав», «король» — «корольков», а «кот» — «котёл». Слово с посторонним хвостом
+# («-ов», «-ниц», «-азин») теперь не проходит.
+_CASE_ENDINGS = frozenset({
+    "а", "я", "у", "ю", "ы", "и", "е", "ё", "о", "й", "ь",
+    "ой", "ей", "ом", "ем", "ём", "ов", "ев", "ах", "ях", "ам", "ям", "ью",
+    "ии", "ие", "ия", "ый", "ая", "ое", "ые", "ем", "ух",
+    "ами", "ями", "ому", "ему", "ого", "его", "ыми", "ими", "ов", "ей",
+})
+
+
+def keyword_hits(keyword: str, text_low: str, tokens: list[str]) -> bool:
+    """
+    Сработало ли ключевое слово World Info по тексту.
+
+    Раньше здесь была голая проверка подстроки — и запись с ключом «кот»
+    активировалась на слове «который», «мир» — на «мирный», «сон» — на «Сонечку».
+    Лор подмешивался невпопад, и память выглядела сломанной. Теперь:
+
+      * «фраза из слов»  — ищется как подстрока (пробел = явное намерение);
+      * «ключ*»          — любое слово, начинающееся на «ключ» (для сложных
+                           склонений: «замк*» поймает и «замка», и «замком»);
+      * «ключ»           — слово целиком, его склонение («меч» → «мечи»,
+                           «король» → «короле») — но НЕ другое слово с тем же
+                           началом («кот» → «который», «мир» → «мирный»).
+    """
+    kw = (keyword or "").strip().lower()
+    if not kw:
+        return False
+    # Фраза — намеренная подстрока: «тёмный лес», «Джон Смит».
+    if " " in kw:
+        return kw in text_low
+    # Явный шаблон: пользователь сам разрешил широкое совпадение.
+    if kw.endswith("*"):
+        prefix = kw[:-1]
+        return bool(prefix) and any(t.startswith(prefix) for t in tokens)
+    kw_stem = _stem(kw)
+    for t in tokens:
+        if t == kw:
+            return True
+        # Окончание отпало у слова и/или у ключа: «король» ↔ «короле».
+        if _stem(t) == kw_stem:
+            return True
+        # Окончание приросло к основе: «меч» → «мечом», «король» → «королём».
+        # Сравниваем именно с ОСНОВОЙ ключа (у «король» это «корол»), иначе
+        # варианты со сменой последней буквы не ловятся. Принимаем только
+        # НАСТОЯЩИЕ падежные окончания, иначе «рука» снова зацепит «рукав».
+        if t.startswith(kw_stem) and t[len(kw_stem):] in _CASE_ENDINGS:
+            return True
+    return False
+
+
+# Сколько ПОСЛЕДНИХ сообщений просматриваем в поисках ключевых слов.
+_TRIGGER_WINDOW = 6
+
+
+def _plain_text(content) -> str:
+    """
+    Текст сообщения для поиска триггеров — включая МУЛЬТИМОДАЛЬНЫЕ реплики.
+
+    Раньше окно сканирования брало только сообщения со строковым content, а
+    реплика с вложением (content = список блоков) пропускалась ЦЕЛИКОМ вместе со
+    своим текстом. То есть стоило приложить фото — и ключевые слова из этой
+    реплики переставали активировать память. Со стороны это выглядело как
+    «Horae срабатывает через раз».
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            b.get("text", "") for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+    return ""
+
+
+# Сколько активированных по ключевым словам записей пускаем в один запрос.
+# Без потолка полсотни сработавших записей уезжали в системный промпт целиком —
+# и раздували каждый ход, и топили важное в неважном. always_on-записи под лимит
+# НЕ попадают: пользователь пометил их как «всегда», это его явное решение.
+_MAX_KEYWORD_RECORDS = 24
+
+
 def _scan_text_for_triggers(
-    haystack: str, records: list[HoraeRecord]
+    haystack: str, records: list[HoraeRecord], max_keyword_records: int = _MAX_KEYWORD_RECORDS
 ) -> list[HoraeRecord]:
     """
     Возвращает записи, которые нужно активировать:
       * always_on (если enabled) — всегда;
-      * keyword-записи — если хотя бы одно ключевое слово встретилось в тексте.
+      * keyword-записи — если сработало хотя бы одно ключевое слово (см.
+        keyword_hits), но не больше max_keyword_records штук — самые
+        приоритетные.
     Результат сортируется по priority (по убыванию): важное идёт первым.
     """
-    haystack_low = haystack.lower()
-    activated: list[HoraeRecord] = []
+    haystack_low = (haystack or "").lower()
+    tokens = _text_tokens(haystack)
+    always: list[HoraeRecord] = []
+    by_keyword: list[HoraeRecord] = []
 
     for rec in records:
         if not rec.enabled:
             continue
         if rec.always_on:
-            activated.append(rec)
+            always.append(rec)
             continue
-        # Стиль World Info: ищем любое ключевое слово как подстроку (регистр игнорируем).
-        if any(kw.strip().lower() in haystack_low for kw in rec.keywords if kw.strip()):
-            activated.append(rec)
+        if any(keyword_hits(kw, haystack_low, tokens) for kw in rec.keywords):
+            by_keyword.append(rec)
 
+    by_keyword.sort(key=lambda r: r.priority, reverse=True)
+    if max_keyword_records and max_keyword_records > 0:
+        by_keyword = by_keyword[:max_keyword_records]
+
+    activated = always + by_keyword
     activated.sort(key=lambda r: r.priority, reverse=True)
     return activated
 
@@ -441,9 +556,7 @@ def assemble_context(
     """
     # 1. Текст, по которому ищем триггеры памяти: текущее сообщение + хвост истории.
     recent_text = user_message + "\n" + "\n".join(
-        m.get("content", "")
-        for m in history[-4:]
-        if isinstance(m.get("content"), str)
+        _plain_text(m.get("content")) for m in history[-_TRIGGER_WINDOW:]
     )
     activated = _scan_text_for_triggers(recent_text, horae_records)
     # Авто-сводку сюжета (category=summary) вынимаем из общего блока — она пойдёт
