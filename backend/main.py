@@ -15,6 +15,7 @@
 """
 import asyncio
 import base64
+import hashlib
 import hmac
 import json
 import logging
@@ -35,6 +36,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import delete as sql_delete
@@ -257,18 +259,34 @@ async def current_user(
     return await accounts.user_from_token(db, x_user_token)
 
 
-class NoCacheStaticMiddleware(BaseHTTPMiddleware):
+class StaticCacheMiddleware(BaseHTTPMiddleware):
     """
-    Запрещает кэшировать веб-интерфейс (app.js/styles.css/index.html), чтобы
-    обновления применялись сразу, без ручного хард-рефреша у пользователя.
+    Кэширование веб-интерфейса.
+
+    БЫЛО: `no-store` на всё подряд — чтобы обновления применялись сразу, без
+    хард-рефреша. Цель верная, средство слишком грубое: браузер не кэшировал
+    НИЧЕГО, и каждый заход заново тянул ~266 КБ (app.js + styles.css). На мобильном
+    интернете это и есть та самая долгая загрузка.
+
+    СТАЛО: адрес файла версионируется хэшем его содержимого (`/app.js?v=abc123`,
+    подставляется в index.html, см. serve_index). Тогда:
+      * файл не менялся -> адрес прежний -> берётся из кэша мгновенно, сеть не нужна;
+      * файл изменился  -> адрес другой  -> браузер обязан скачать новый.
+    Хард-рефреш по-прежнему не нужен, потому что сам index.html не кэшируется.
     """
 
     async def dispatch(self, request, call_next):
         response = await call_next(request)
         path = request.url.path
-        if not path.startswith("/api") and not path.startswith("/ws"):
-            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-            response.headers["Pragma"] = "no-cache"
+        if path.startswith("/api") or path.startswith("/ws"):
+            return response
+        if request.query_params.get("v"):
+            # Версионированный адрес: содержимое по нему уже никогда не изменится.
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        else:
+            # index.html и всё без версии — перепроверять каждый раз. Это дёшево:
+            # при совпадении ETag сервер ответит 304 без тела.
+            response.headers["Cache-Control"] = "no-cache, must-revalidate"
         return response
 
 
@@ -316,7 +334,11 @@ def _check_basic_auth(request, ba: dict) -> bool:
     return ok_user and ok_pass
 
 
-app.add_middleware(NoCacheStaticMiddleware)
+app.add_middleware(StaticCacheMiddleware)
+# Сжатие: app.js + styles.css это ~266 КБ текста, gzip ужимает их до ~69 КБ
+# (в 3.8 раза). Главный выигрыш при первом заходе и на мобильном интернете.
+# minimum_size — мелкие JSON-ответы API жать смысла нет, только тратить CPU.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(AccessMiddleware)
 app.add_middleware(
     CORSMiddleware,
@@ -3212,5 +3234,42 @@ async def health():
 # Монтируем ПОСЛЕ всех API/WS-маршрутов, чтобы они имели приоритет.
 # html=True -> отдаёт index.html для корня и неизвестных путей (SPA).
 _frontend_dir = Path(__file__).resolve().parent.parent / "frontend"
+
+# Кэш «имя файла -> (mtime, короткий хэш)». Пересчитываем только когда файл
+# изменился, поэтому на запрос приходится один stat(), а не чтение 236 КБ.
+_asset_ver_cache: dict[str, tuple[float, str]] = {}
+
+
+def _asset_version(name: str) -> str:
+    """Короткий хэш содержимого файла — им версионируем его адрес."""
+    path = _frontend_dir / name
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return "0"
+    cached = _asset_ver_cache.get(name)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    digest = hashlib.md5(path.read_bytes()).hexdigest()[:10]
+    _asset_ver_cache[name] = (mtime, digest)
+    return digest
+
+
 if _frontend_dir.exists():
+
+    @app.get("/", include_in_schema=False)
+    async def serve_index():
+        """
+        index.html с версионированными адресами ассетов.
+
+        Зачем не отдать файл как есть: тогда либо кэшируем (и обновление не
+        доедет до пользователя), либо не кэшируем (и каждый заход тянет сотни
+        КБ — та самая медленная загрузка на мобильном). Подстановка хэша
+        снимает выбор: адрес меняется РОВНО тогда, когда изменился файл.
+        """
+        html = (_frontend_dir / "index.html").read_text(encoding="utf-8")
+        for asset in ("app.js", "styles.css"):
+            html = html.replace(f'"/{asset}"', f'"/{asset}?v={_asset_version(asset)}"')
+        return Response(html, media_type="text/html; charset=utf-8")
+
     app.mount("/", StaticFiles(directory=str(_frontend_dir), html=True), name="frontend")

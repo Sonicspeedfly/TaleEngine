@@ -159,7 +159,23 @@ label span { color: var(--text); }
 .dir-ex { border: none; border-left: 1px solid var(--border); background: transparent;
   color: var(--danger); padding: 4px 9px; cursor: pointer; font-weight: 700; }
 .dir-ex:hover { background: var(--danger); color: #fff; }
-.bubble { padding: 10px 14px; border-radius: 14px; white-space: normal; }
+.bubble {
+  padding: 10px 14px; border-radius: 14px; white-space: normal;
+  /* Перенос длинных неразрывных строк. Без этого ссылка, путь к файлу, длинное
+     слово или строка base64 распирали пузырь, и текст вылезал за его границы
+     (на десктопе — вбок за край, на телефоне — за экран).
+     overflow-wrap рвёт только то, что иначе не влезает; обычные слова не трогает. */
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+/* Ссылки и inline-код — самые частые виновники: рвём их принудительно. */
+.bubble a, .bubble code { word-break: break-word; }
+/* Таблицы модель иногда всё же рисует — пусть прокручиваются внутри пузыря, а не
+   растягивают его. white-space: nowrap обязателен: без него таблица не выходит за
+   ширину контейнера, а сплющивается в нечитаемые столбики по букве. */
+.bubble table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; margin: 6px 0; }
+.bubble th, .bubble td { border: 1px solid var(--border); padding: 4px 8px; white-space: nowrap; }
+.bubble th { background: var(--bg3); text-align: left; }
 .msg.user .bubble { background: var(--user); }
 .msg.assistant .bubble { background: var(--assistant); }
 .bubble p:first-child { margin-top: 0; }
@@ -221,6 +237,10 @@ label span { color: var(--text); }
 .drawer .body { overflow-y: auto; padding: 14px; flex: 1; }
 .drawer h3 { margin: 0 0 12px; font-size: 14px; }
 .range-val { color: var(--text); float: right; }
+/* Ползунок: браузер сам добавляет поля по 2px по бокам, и вместе с width:100%
+   он вылезал за подпись на 4px — из-за этого вся панель настроек на телефоне
+   получала горизонтальную прокрутку. Гасим боковые поля. */
+input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
 .hr { height: 1px; background: var(--border); margin: 14px 0; }
 .status-ok { color: var(--ok); }
 .status-err { color: var(--danger); }
@@ -355,6 +375,26 @@ label span { color: var(--text); }
   .composer textarea { min-height: 84px; }
   .composer-input { order: -1; flex: 1 1 100%; }
   .composer .row > .btn-primary, .composer .row > .btn-danger { margin-left: auto; }
+
+  /* --- Поля ввода: 16px обязательно ---
+     iOS Safari зумит страницу при фокусе на поле со шрифтом МЕНЬШЕ 16px и обратно
+     сам не отъезжает. Из-за этого после тапа по любому полю интерфейс уезжал за
+     экран и выглядел «не вмещающимся». Это не косметика, а починка поведения. */
+  input, textarea, select { font-size: 16px; }
+
+  /* --- Размер зоны нажатия ---
+     Кнопки высотой 24-32px трудно попасть пальцем (рекомендация — от 44px).
+     Задаём минимум высоты, не трогая ширину, чтобы плотные ряды не разъезжались. */
+  button, .btn-icon, .tab-btn { min-height: 40px; }
+  .btn-icon { min-width: 40px; display: inline-flex; align-items: center; justify-content: center; }
+  /* Строки списков (чаты, персонажи) — тоже под палец. */
+  .list-item { min-height: 42px; }
+
+  /* --- Вырезы и жесты (iPhone) ---
+     viewport-fit=cover в index.html пускает контент под скруглённые углы и полосу
+     жестов, поэтому нижнюю панель ввода нужно от них отодвинуть вручную. */
+  .composer { padding-bottom: calc(8px + env(safe-area-inset-bottom)); }
+  .sidebar { padding-bottom: env(safe-area-inset-bottom); }
 }
 
 /* ============================================================

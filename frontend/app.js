@@ -236,6 +236,7 @@ createApp({
       notifOpen: false,     // выпадашка уведомлений
       pendingChats: [],     // id чатов, куда пришёл ответ, пока вы были в другом чате
       toasts: [],           // всплывающие уведомления (тосты) в правом нижнем углу
+      katexReady: false,    // KaTeX догрузился лениво -> перерисовать формулы
       dialog: null,         // модальный диалог (подтверждение/ввод) вместо браузерных alert/prompt/confirm
 
       // --- Отладочный лог LLM ---
@@ -419,7 +420,54 @@ createApp({
       return res.status === 204 ? null : res.json();
     },
 
+    // ---------- Ленивая подгрузка тяжёлых библиотек ----------
+    // KaTeX и lamejs вместе весят больше всего остального фронтенда, а нужны
+    // редко: формулы встречаются не в каждом чате, запись голоса — тем более.
+    // Раньше они висели в <head> и их ждал КАЖДЫЙ заход, включая мобильный.
+    _loadOnce(key, urls) {
+      this._loading = this._loading || {};
+      if (this._loading[key]) return this._loading[key];
+      this._loading[key] = Promise.all(urls.map((url) => new Promise((resolve, reject) => {
+        let el;
+        if (url.endsWith(".css")) {
+          el = document.createElement("link");
+          el.rel = "stylesheet";
+          el.href = url;
+        } else {
+          el = document.createElement("script");
+          el.src = url;
+        }
+        el.onload = resolve;
+        el.onerror = reject;
+        document.head.appendChild(el);
+      })));
+      return this._loading[key];
+    },
+    ensureKatex() {
+      if (window.katex) return Promise.resolve();
+      return this._loadOnce("katex", [
+        "https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css",
+        "https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js",
+      ]).then(() => {
+        // Флаг реактивный: renderMd на него подписан, поэтому уже показанные
+        // сообщения перерисуются сами, и формула проявится без перезагрузки.
+        this.katexReady = true;
+      }).catch(() => {});
+    },
+    ensureLame() {
+      if (window.lamejs) return Promise.resolve();
+      return this._loadOnce("lame", [
+        "https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js",
+      ]).catch(() => {});
+    },
+
     renderMd(text) {
+      // Подписка на флаг: когда KaTeX догрузится, Vue перерисует сообщения.
+      void this.katexReady;
+      // Формула в тексте есть, а библиотеки ещё нет — тянем её сейчас.
+      if (!window.katex && /\$\$|\\\[|\\\(|\$[^$\n]+\$/.test(text || "")) {
+        this.ensureKatex();
+      }
       // LaTeX: формулы вырезаются ДО markdown-it (иначе он «съедает» \( \[ и **),
       // рендерятся KaTeX'ом и подставляются обратно уже готовым HTML.
       const math = [];
@@ -1750,6 +1798,7 @@ createApp({
     async _voiceToCompatible(blob) {
       // webm/ogg -> mp3 (lamejs) -> wav (fallback) -> исходник (крайний случай).
       const buf = await this._decodeToPcm(blob);
+      await this.ensureLame();   // библиотека подгружается лениво, дождёмся её
       if (window.lamejs && lamejs.Mp3Encoder) {
         return { blob: this._encodeMp3(this._bufferToInt16Mono(buf), buf.sampleRate), ext: "mp3", mime: "audio/mp3" };
       }
@@ -1761,6 +1810,9 @@ createApp({
         this.mediaRecorder && this.mediaRecorder.stop();
         return;
       }
+      // Кодировщик тянем ПАРАЛЛЕЛЬНО с записью, а не ждём его здесь: пока
+      // пользователь говорит, библиотека успевает догрузиться незаметно.
+      this.ensureLame();
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         this.recChunks = [];
@@ -2018,10 +2070,11 @@ createApp({
       if (ui && ui.summary_every != null) this.summaryEvery = Number(ui.summary_every);
     },
     toggleAssistantMode() {
-      // Состояние видно по подсветке кнопки и полоске над полем ввода —
-      // отдельного механизма уведомлений в приложении нет.
       this.params.assistant_mode = !this.params.assistant_mode;
       this.saveUiPrefs();
+      this.showToast(this.params.assistant_mode
+        ? "🎓 Режим ассистента: персонаж не отыгрывает, а выполняет задачу"
+        : "🎭 Отыгрыш вернулся");
     },
     saveUiPrefs() {
       // Дебаунс, чтобы не дёргать сервер на каждое движение ползунка.

@@ -2,21 +2,38 @@
 <html lang="ru">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#12141a" />
     <title>TaleEngine</title>
+
+    <!-- Ранний коннект к CDN: на мобильном DNS + TLS до чужого хоста стоит сотни
+         миллисекунд, и начинать их в момент разбора <script> уже поздно. -->
+    <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin />
+    <link rel="dns-prefetch" href="https://cdn.jsdelivr.net" />
+
     <link rel="stylesheet" href="/styles.css" />
-    <!-- Без сборки: Vue, markdown-it и DOMPurify подключаются с CDN. -->
-    <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/markdown-it@14/dist/markdown-it.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
-    <!-- lamejs — кодирование голоса в MP3 в браузере (webm нейросеть не принимает). -->
-    <script src="https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js"></script>
-    <!-- KaTeX — рендер LaTeX-формул в ответах нейросети ($...$, $$...$$, \(...\), \[...\]). -->
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" />
-    <script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+
+    <!-- Без сборки: библиотеки подключаются с CDN.
+
+         defer — важнее всего остального: без него браузер останавливает разбор
+         страницы на КАЖДОМ скрипте и не рисует ничего, пока все не скачаются.
+         С defer они качаются параллельно, а выполняются по порядку перед
+         DOMContentLoaded — Vue гарантированно раньше app.js.
+
+         Все три — с ОДНОГО хоста (было два: unpkg + jsdelivr): лишний DNS + TLS
+         на мобильном стоит дороже, чем кажется. -->
+    <script defer src="https://cdn.jsdelivr.net/npm/vue@3/dist/vue.global.prod.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/markdown-it@14/dist/markdown-it.min.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+    <script defer src="/app.js"></script>
+
+    <!-- KaTeX (формулы) и lamejs (кодирование голоса в MP3) здесь НЕ подключены
+         намеренно: вдвоём они тяжелее всего остального вместе взятого, а нужны
+         редко — только если в ответе встретилась формула или нажата запись
+         голоса. Их подтягивает app.js по факту надобности (ensureKatex /
+         ensureLame), поэтому обычный чат за них больше не платит. -->
   </head>
   <body>
     <div id="app"></div>
-    <script src="/app.js"></script>
   </body>
 </html>
