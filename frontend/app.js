@@ -95,6 +95,7 @@ createApp({
         safety_overrides: {},     // точечные пороги по категориям (важнее пресета)
         send_avatars: false,
         web_access: false,
+        assistant_mode: false,  // весь чат без отыгрыша (разовый аналог — ((…)) или /ooc)
         reasoning_effort: "",   // "" авто | disable | low | medium | high
         file_reasoning: true,   // авто-включать рассуждения при файлах
       },
@@ -2016,6 +2017,12 @@ createApp({
       if (ui && ui.group_reply_delay != null) this.groupReplyDelay = Number(ui.group_reply_delay);
       if (ui && ui.summary_every != null) this.summaryEvery = Number(ui.summary_every);
     },
+    toggleAssistantMode() {
+      // Состояние видно по подсветке кнопки и полоске над полем ввода —
+      // отдельного механизма уведомлений в приложении нет.
+      this.params.assistant_mode = !this.params.assistant_mode;
+      this.saveUiPrefs();
+    },
     saveUiPrefs() {
       // Дебаунс, чтобы не дёргать сервер на каждое движение ползунка.
       clearTimeout(this._uiSaveTimer);
@@ -2848,6 +2855,12 @@ createApp({
       </div>
 
       <div class="composer" v-if="sessionId">
+        <!-- Режим ассистента включён — показываем явно: иначе легко забыть, что
+             персонаж сейчас не отыгрывает, и удивиться «сухому» ответу. -->
+        <div v-if="params.assistant_mode" class="director-bar">
+          <span class="dir-hint">🎓 <b>Режим ассистента</b> — персонаж не отыгрывает, а выполняет задачу.
+            <a href="#" @click.prevent="toggleAssistantMode">вернуть отыгрыш</a></span>
+        </div>
         <!-- Режиссёрская панель (группа): кнопки вызвать/исключить персонажей -->
         <div v-if="currentIsGroup && directorBar" class="director-bar">
           <span class="dir-hint">🎬 Режиссёр: клик по имени — вызвать (порядок кликов = порядок ответов), «−» — исключить. Можно писать вручную: <code>+Хорхе −Джеми</code></span>
@@ -2951,6 +2964,13 @@ createApp({
           <!-- Режиссёр (только в группе): панель кнопок «вызвать/исключить» -->
           <button v-if="currentIsGroup" class="btn-icon" :class="directorBar ? 'rec-active' : ''"
                   @click="directorBar = !directorBar" title="Режиссёр: кто отвечает и в каком порядке">🎬</button>
+          <!-- Режим ассистента: держим у поля ввода, а не только в настройках —
+               переключать его нужно ровно тогда, когда пишешь прикладную просьбу. -->
+          <button class="btn-icon" :class="params.assistant_mode ? 'rec-active' : ''"
+                  @click="toggleAssistantMode"
+                  :title="params.assistant_mode
+                    ? 'Режим ассистента ВКЛЮЧЁН: персонаж не отыгрывает, а выполняет задачу. Нажмите, чтобы вернуть отыгрыш'
+                    : 'Режим ассистента: выполнять задачи без отыгрыша. Для одного сообщения можно просто написать ((текст))'">🎓</button>
           <textarea ref="composer" v-model="input" rows="1" class="composer-input"
                     :placeholder="composerPlaceholder"
                     @input="autoGrow" @keydown="onComposerKeydown" @paste="onPaste"></textarea>
@@ -3150,6 +3170,8 @@ createApp({
           </details>
           <label class="check"><input type="checkbox" v-model="params.send_avatars" /> Показывать нейросети аватары (внешность персонажа и ролевика)</label>
           <label class="check"><input type="checkbox" v-model="params.web_access" /> 🌐 Доступ в интернет (веб-поиск на каждый запрос)</label>
+          <label class="check"><input type="checkbox" v-model="params.assistant_mode" /> 🎓 Режим ассистента — без отыгрыша</label>
+          <p class="muted" style="margin:2px 0 10px">Персонаж перестаёт «оставаться в образе» и просто выполняет задачу: написать пост, разобрать код, перевести текст. Нужно потому, что в обычном режиме прямо перед вашей репликой стоит напоминание держать роль — и прикладная просьба ему проигрывает, тем сильнее, чем длиннее чат. Для одного сообщения включать тумблер не нужно: напишите <code>((текст))</code> или <code>/ooc текст</code>.</p>
 
           <div class="hr"></div>
           <h3>Рассуждения (thinking) 💭</h3>

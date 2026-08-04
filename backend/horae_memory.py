@@ -20,6 +20,7 @@
                                 функцию выше.
 """
 from dataclasses import dataclass
+from functools import lru_cache
 
 
 def _is_image(src) -> bool:
@@ -50,13 +51,57 @@ def _avatar_messages(character: dict, character_avatar, persona_avatar) -> list[
     return msgs
 
 
+_ENCODER = None
+_ENCODER_TRIED = False
+
+
+def _encoder():
+    """Токенизатор tiktoken (приезжает зависимостью litellm). None, если недоступен."""
+    global _ENCODER, _ENCODER_TRIED
+    if not _ENCODER_TRIED:
+        _ENCODER_TRIED = True
+        try:
+            import tiktoken
+            _ENCODER = tiktoken.get_encoding("cl100k_base")
+        except Exception:  # noqa: BLE001 — без токенизатора просто считаем грубее
+            _ENCODER = None
+    return _ENCODER
+
+
+def _tokens_heuristic(text: str) -> int:
+    """
+    Запасная оценка, если tiktoken недоступен.
+
+    Правило «4 символа на токен» верно только для латиницы. Кириллица, греческий,
+    CJK и эмодзи в BPE-словарях режутся мелко — там ближе к 2 символам на токен.
+    Поэтому считаем «тяжёлые» символы отдельно от «лёгких».
+    """
+    heavy = sum(1 for ch in text if ord(ch) > 0x02FF)
+    return max(1, int(heavy / 2 + (len(text) - heavy) / 4))
+
+
+@lru_cache(maxsize=4096)
 def estimate_tokens(text: str) -> int:
     """
-    Грубая оценка количества токенов: ~4 символа на токен.
-    Для точного подсчёта можно подключить tiktoken, но для бюджетирования контекста
-    этой оценки достаточно, и она не тянет тяжёлых зависимостей.
+    Сколько токенов займёт текст.
+
+    ПОЧЕМУ НЕ len/4: прежняя оценка «4 символа на токен» — правило для английского.
+    На русском она занижает объём ПОЧТИ ВДВОЕ (замеры на реальных чатах: 47 706
+    против 93 912 и 22 016 против 42 511 — коэффициент 1.93–1.97). Последствия были
+    неприятные: окно контекста показывало не то, что уходит на самом деле, история
+    почти никогда не обрезалась (чат на 174 сообщения влезал «целиком»), а расход
+    оказывался вдвое больше ожидаемого. Длинный контекст ещё и топит инструкцию
+    пользователя — модель переставала слышать, чего от неё хотят.
+
+    Результат кэшируется: история пересчитывается на КАЖДОМ ходу, а сообщения в ней
+    не меняются, поэтому второй и последующие разы обходятся бесплатно.
     """
-    return max(1, len(text) // 4)
+    enc = _encoder()
+    if enc is None:
+        return _tokens_heuristic(text)
+    # disallowed_special=() — иначе tiktoken падает, если пользователь напишет
+    # в чате служебную последовательность вида <|endoftext|>.
+    return max(1, len(enc.encode(text, disallowed_special=())))
 
 
 def estimate_content_tokens(content) -> int:
@@ -481,6 +526,82 @@ STYLE_GUIDE = (
 )
 
 
+# ==================== РЕЖИМ БЕЗ ОТЫГРЫША (OOC / ассистент) ====================
+# Зачем: обычный BEHAVIOR_GUIDE требует «оставайся в образе и не давай мета-
+# комментариев», а якорь роли переинъектируется в САМУЮ сильную позицию — прямо
+# перед репликой пользователя. Из-за этого прикладная просьба («напиши пост»,
+# «разбери этот код») тонула: модель отвечала В ОБРАЗЕ вместо выполнения задачи,
+# и чем длиннее ролевая история, тем сильнее она перевешивала одну инструкцию.
+ASSISTANT_GUIDE = (
+    "[Как отвечать] ОТЫГРЫШ СЕЙЧАС ВЫКЛЮЧЕН. Пользователь обращается не к персонажу, "
+    "а к тебе напрямую, как к ассистенту, и ждёт выполнения конкретной задачи. "
+    "НЕ говори от лица персонажа, не описывай его действия и эмоции, не веди сцену. "
+    "Просто сделай то, о чём просят, и дай результат.\n"
+    "[Точность] Не придумывай факты. Если данных не хватает — спроси или скажи прямо, "
+    "чего не хватает, вместо того чтобы фантазировать.\n"
+    "[Контекст] Диалог выше — справочная информация: обращайся к нему, если задача "
+    "касается его содержимого, но отвечать в его стиле не нужно."
+)
+
+ASSISTANT_STYLE_GUIDE = (
+    "[Оформление ответа] Отвечай по существу, без ролевой прозы. Разметку используй "
+    "по делу: **жирный** для акцентов, `моноширинный` и блоки кода в тройных кавычках "
+    "для технического текста, «- » для списков. Не используй HTML-разметку."
+)
+
+# Пометки, которыми пользователь помечает реплику «вне роли». Скобки — конвенция
+# SillyTavern, косая черта — привычный вид команды.
+_OOC_PREFIXES = ("/ooc ", "/ooc\n", "//")
+
+
+def _replace_first_text(content, old: str, new: str):
+    """
+    Меняет текст в мультимодальном контенте (список блоков), не трогая вложения.
+
+    Нужно потому, что при сообщении с файлами текст лежит ПЕРВЫМ блоком списка, и
+    снять пометку «вне роли» только в user_message было бы мало — до модели она
+    доехала бы вторым путём, внутри блоков.
+    """
+    if not isinstance(content, list):
+        return content
+    out = []
+    done = False
+    for b in content:
+        if not done and isinstance(b, dict) and b.get("type") == "text" and b.get("text") == old:
+            out.append({**b, "text": new})
+            done = True
+        else:
+            out.append(b)
+    return out
+
+
+def detect_ooc(text: str) -> tuple[bool, str]:
+    """
+    Помечена ли реплика как «вне роли», и текст без пометки.
+
+    Понимаем два вида:
+        ((текст))     — обёрнуто ЦЕЛИКОМ (внутри сообщения такие скобки не трогаем,
+                        иначе сломали бы обычную ролевую ремарку в середине фразы);
+        /ooc текст    — команда в начале, а также сокращение //текст.
+
+    :return: (это_вне_роли, текст_без_пометки). Если пометки нет — (False, исходный).
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return False, text
+    if stripped.startswith("((") and stripped.endswith("))") and len(stripped) > 4:
+        inner = stripped[2:-2].strip()
+        if inner:
+            return True, inner
+    low = stripped.lower()
+    for pref in _OOC_PREFIXES:
+        if low.startswith(pref):
+            inner = stripped[len(pref):].strip()
+            if inner:
+                return True, inner
+    return False, text
+
+
 def _attachment_manifest(history: list[dict], current_content) -> str:
     """
     Манифест приложенных файлов: короткий список того, что физически есть в
@@ -538,6 +659,7 @@ def assemble_context(
     knowledge_text: str = "",
     knowledge_media: list | None = None,
     global_instructions: str = "",
+    ooc: bool = False,
 ) -> list[dict]:
     """
     ЧИСТАЯ функция сборки контекста. Возвращает messages для LiteLLM:
@@ -553,6 +675,9 @@ def assemble_context(
     :param history: предыдущие сообщения БЕЗ текущего (его добавим последним сами).
     :param user_attachments_content: если у текущего сообщения есть картинки/аудио —
         сюда передаётся уже собранный мультимодальный контент (см. build_user_content).
+    :param ooc: реплика «вне роли» — пользователь обращается к ассистенту, а не к
+        персонажу. Снимает требование держать образ и убирает якорь роли из конца,
+        иначе прикладная просьба проигрывает ролевой инструкции (см. ASSISTANT_GUIDE).
     """
     # 1. Текст, по которому ищем триггеры памяти: текущее сообщение + хвост истории.
     recent_text = user_message + "\n" + "\n".join(
@@ -569,8 +694,8 @@ def assemble_context(
         _render_character_block(character),
         _render_persona_block(persona),
         _render_horae_block(lore_recs),
-        BEHAVIOR_GUIDE,
-        STYLE_GUIDE,
+        ASSISTANT_GUIDE if ooc else BEHAVIOR_GUIDE,
+        ASSISTANT_STYLE_GUIDE if ooc else STYLE_GUIDE,
     ]
     system_prompt = "\n\n".join(p for p in system_parts if p)
 
@@ -646,8 +771,10 @@ def assemble_context(
     if author_note and author_note.strip():
         tail.append({"role": "system", "content": f"[Author's Note]\n{author_note.strip()}"})
 
-    # Якорь характера — чтобы личность не «плыла» в длинном окне.
-    tail.append({"role": "system", "content": _render_char_anchor(character)})
+    # Якорь характера — чтобы личность не «плыла» в длинном окне. В режиме «вне роли»
+    # его НЕ добавляем: он стоит в сильнейшей позиции и перебивал бы прямую задачу.
+    if not ooc:
+        tail.append({"role": "system", "content": _render_char_anchor(character)})
 
     # Post-History Instructions (jailbreak/UJB) — САМЫЙ конец: максимальное влияние.
     if post_history_instructions and post_history_instructions.strip():
@@ -667,7 +794,15 @@ def assemble_context(
         isinstance(b, dict) and b.get("type") in ("image_url", "input_audio")
         for b in user_attachments_content
     )
-    if has_current_media:
+    if ooc:
+        focus = (
+            "[Выполни эту задачу] Ниже — прямая просьба пользователя, обращённая к тебе "
+            "как к ассистенту, а НЕ реплика в ролевой сцене. Прочитай её целиком и сделай "
+            "ровно то, о чём просят. Не отвечай от лица персонажа и не переводи разговор "
+            "в отыгрыш. Если в просьбе уже есть нужный текст или данные — используй их "
+            "дословно, не подменяя выдумкой."
+        )
+    elif has_current_media:
         focus = (
             "[Отвечай на это сообщение] Ниже — АКТУАЛЬНАЯ реплика пользователя и "
             "ПРИЛОЖЕННЫЕ ИМЕННО К НЕЙ файлы. Анализируй их напрямую и целиком: смотри, "
@@ -814,10 +949,16 @@ async def build_context_from_db(
     history_files_turns: int | None = None,
     knowledge_chars: int | None = None,
     global_instructions: str = "",
+    assistant_mode: bool = False,
 ) -> list[dict]:
     """
     Достаёт из БД память Horae, персону, заметку автора и историю сообщений,
     после чего вызывает чистую assemble_context().
+
+    :param assistant_mode: постоянный тумблер «без отыгрыша» из интерфейса. Работает
+        вместе с разовой пометкой ((…)) / /ooc в самом сообщении — сработает любое
+        из двух. Разбор пометки живёт ЗДЕСЬ, а не в обработчике веб-запроса, чтобы
+        режим одинаково действовал во всех путях: чат, Telegram, регенерация, retry.
 
     :param session: ORM-объект ChatSession (нужны его id, persona_id, author_note).
     :param history: если None — берём всю историю сессии из БД. Можно передать свою
@@ -829,6 +970,17 @@ async def build_context_from_db(
     from sqlalchemy import select
 
     from backend.models import Message
+
+    # Пометка «вне роли» в самой реплике. Из текста её убираем: модели она ничего
+    # не говорит, а вот в сохранённом сообщении остаётся — пользователь видит в
+    # истории, что этот ход шёл без отыгрыша.
+    marked_ooc, clean_message = detect_ooc(user_message)
+    ooc = bool(assistant_mode or marked_ooc)
+    if marked_ooc and clean_message != user_message:
+        attachments_content = _replace_first_text(
+            attachments_content, user_message, clean_message
+        )
+        user_message = clean_message
 
     records = await _load_horae_records(
         session_db, session.id, getattr(character, "id", None)
@@ -887,4 +1039,5 @@ async def build_context_from_db(
         knowledge_text=knowledge_text,
         knowledge_media=knowledge_media,
         global_instructions=global_instructions,
+        ooc=ooc,
     )

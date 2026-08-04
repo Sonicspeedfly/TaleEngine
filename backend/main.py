@@ -1981,6 +1981,7 @@ async def canvas_generate(
         history_files_limit=_hist_files_limit(params),
         history_files_turns=_hist_files_turns(params),
         knowledge_chars=_kb_chars(params),
+        assistant_mode=bool(params and params.assistant_mode),
     )
     messages.append({"role": "system", "content": (
         "Сгенерируй по запросу пользователя ПОЛНЫЙ, законченный материал (документ, "
@@ -2389,6 +2390,7 @@ async def _start_user_turn(session_id, content, attachments, params, db, reply_t
         history_files_turns=_hist_files_turns(params),
         knowledge_chars=_kb_chars(params),
         web_access=bool(params and params.web_access),
+        assistant_mode=bool(params and params.assistant_mode),
     )
     msg = models.Message(
         session_id=session_id,
@@ -2463,6 +2465,7 @@ async def _start_regenerate(session_id, params, db) -> str:
         history=history,
         knowledge_chars=_kb_chars(params),
         web_access=bool(params and params.web_access),
+        assistant_mode=bool(params and params.assistant_mode),
     )
 
     job_id = uuid.uuid4().hex
@@ -2513,6 +2516,7 @@ async def _start_continue(session_id, params, db) -> str:
         db, sess, character, user_text, user_content, _ctx_budget(params),
         history=history, knowledge_chars=_kb_chars(params),
         web_access=bool(params and params.web_access),
+        assistant_mode=bool(params and params.assistant_mode),
     )
     # Уже написанный ответ + явная просьба продолжить именно его.
     messages.append({"role": "assistant", "content": target.content})
@@ -2574,6 +2578,7 @@ async def _start_retry(session_id, params, db) -> str:
         history=history, send_avatars=bool(params and params.send_avatars),
         knowledge_chars=_kb_chars(params),
         web_access=bool(params and params.web_access),
+        assistant_mode=bool(params and params.assistant_mode),
     )
     job_id = uuid.uuid4().hex
     await generation_manager.start(
