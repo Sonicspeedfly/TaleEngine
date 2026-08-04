@@ -101,17 +101,17 @@ def test_ooc_swaps_behavior_guide():
     assert BEHAVIOR_GUIDE not in system
 
 
-def test_ooc_drops_role_anchor_from_tail():
+def test_ooc_drops_character_reminder_from_tail():
     """
-    Якорь роли стоял в сильнейшей позиции — прямо перед репликой пользователя,
-    и прикладная просьба ему проигрывала. В режиме «вне роли» его быть не должно.
+    В обычном режиме персонажа освежаем в конце (в длинном окне личность «плывёт»),
+    а в режиме ассистента не напоминаем о нём вовсе — задача важнее.
     """
     normal = assemble_context(character=_char(), horae_records=[], history=[],
                               user_message="напиши пост")
     ooc = assemble_context(character=_char(), horae_records=[], history=[],
                            user_message="напиши пост", ooc=True)
-    assert "[Напоминание о роли]" in _system_text(normal)
-    assert "[Напоминание о роли]" not in _system_text(ooc)
+    assert "[Напоминание]" in _system_text(normal)
+    assert "[Напоминание]" not in _system_text(ooc)
 
 
 def test_ooc_focus_block_demands_the_task():
@@ -181,7 +181,7 @@ async def test_ooc_marker_works_through_db_builder(client):
         )
 
     system = "\n".join(m["content"] for m in messages if m["role"] == "system")
-    assert "[Напоминание о роли]" not in system      # якорь роли снят
+    assert "[Напоминание]" not in system             # о персонаже не напоминаем
     assert "[Выполни эту задачу]" in system          # фокус переключён на задачу
     assert messages[-1]["content"] == "напиши пост подруге"  # пометка снята с текста
 
@@ -203,5 +203,5 @@ async def test_assistant_mode_flag_works_without_marker(client):
         off = await build_context_from_db(
             db, sess, character, "напиши пост", None, 8000, assistant_mode=False)
 
-    assert "[Напоминание о роли]" not in "\n".join(m["content"] for m in on if m["role"] == "system")
-    assert "[Напоминание о роли]" in "\n".join(m["content"] for m in off if m["role"] == "system")
+    assert "[Напоминание]"not in "\n".join(m["content"] for m in on if m["role"] == "system")
+    assert "[Напоминание]"in "\n".join(m["content"] for m in off if m["role"] == "system")

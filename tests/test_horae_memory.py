@@ -18,10 +18,28 @@ from backend.horae_memory import (
 
 
 def test_behavior_guide_in_system_prompt():
-    """Базовые правила (характер / файлы / анти-выдумки) есть в системном промпте."""
+    """Базовые правила (файлы / анти-выдумки) есть в системном промпте."""
     messages = assemble_context(character=_char(), horae_records=[], history=[], user_message="hi")
     system = messages[0]["content"]
-    assert "в образе" in system and "изучи" in system.lower()
+    assert "изучи" in system.lower()      # смотреть в приложенные файлы
+    assert "Не придумывай" in system      # не выдумывать факты
+
+
+def test_app_does_not_lock_the_model_into_character():
+    """
+    Регрессия: приложение НЕ навязывает поведение роли.
+
+    Раньше в промпт зашивалось «оставайся полностью в образе, не давай мета-
+    комментариев», причём якорь роли стоял последним блоком перед репликой
+    пользователя. Это мешало вдвойне: нельзя было обсудить сцену со стороны или
+    попросить помочь с текстом, и приложение спорило с промптом самой карточки.
+    Как себя вести — решает карточка персонажа, здесь таких указаний быть не должно.
+    """
+    messages = assemble_context(character=_char(), horae_records=[], history=[],
+                                user_message="давай обсудим сцену со стороны")
+    system = " ".join(m["content"] for m in messages if m["role"] == "system")
+    for lock in ("оставайся", "в образе", "не ломай", "от его лица", "мета-коммент"):
+        assert lock not in system.lower(), f"вернулся замок роли: {lock!r}"
 
 
 def test_file_manifest_when_attachments_present():
@@ -301,8 +319,8 @@ def test_author_note_injected_near_end():
     sys_tail = " ".join(m["content"] for m in messages if m["role"] == "system")
     assert "Author's Note" in sys_tail and "Держи мрачный тон." in sys_tail
     assert messages[-1]["content"] == "что дальше?"
-    # Якорь характера тоже переинъектируется в конец.
-    assert any("Напоминание о роли" in m["content"] for m in messages if m["role"] == "system")
+    # Напоминание о персонаже тоже переинъектируется в конец (без указаний о роли).
+    assert any("[Напоминание]" in m["content"] for m in messages if m["role"] == "system")
 
 
 def test_post_history_instructions_near_end():
