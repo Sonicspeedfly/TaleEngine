@@ -545,6 +545,42 @@ input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
   .list-item:hover .row-time { display: none; }
 }
 
+/* ============================================================
+   Навигация по чату
+   ============================================================
+   Раньше добраться до начала длинного чата можно было только многократной
+   прокруткой вверх (история подгружается порциями), а кнопки «вниз» не было
+   вовсе. Панель висит над полем ввода и появляется, только когда от низа
+   отъехали — при чтении свежих реплик она не нужна. */
+.chat-nav {
+  /* Отступ снизу задаётся инлайном из composerH: поле ввода разной высоты —
+     на мобильном выше, чем на десктопе, и ещё растёт при наборе длинного
+     текста, — поэтому любое фиксированное значение его перекрывало. */
+  position: absolute; right: 16px; z-index: 12;
+  display: flex; flex-direction: column; gap: 4px;
+  padding: 4px; border-radius: 12px;
+  background: var(--bg2); border: 1px solid var(--border);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+  animation: nav-in 0.16s ease-out;
+}
+@keyframes nav-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+.chat-nav .btn-icon { width: 30px; height: 28px; display: grid; place-items: center; font-size: 14px; }
+.chat-nav .btn-icon.accent { color: var(--accent); }
+.chat-nav .btn-icon:disabled { opacity: 0.5; cursor: default; }
+
+/* Подсветка сообщения после прыжка — иначе непонятно, куда именно попал. */
+@keyframes jump-flash {
+  0%   { box-shadow: 0 0 0 2px var(--accent); }
+  100% { box-shadow: 0 0 0 2px transparent; }
+}
+.msg.jump-flash .bubble { animation: jump-flash 0.9s ease-out; border-radius: 14px; }
+
+@media (max-width: 760px) {
+  /* Ближе к краю и крупнее — под палец. Отступ снизу считается в JS. */
+  .chat-nav { right: 10px; }
+  .chat-nav .btn-icon { width: 40px; height: 36px; }
+}
+
 /* ----- Поиск по списку ----- */
 .list-search { display: flex; align-items: center; gap: 4px; padding: 4px 12px 6px; }
 .list-search input {

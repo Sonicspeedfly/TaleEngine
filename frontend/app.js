@@ -239,6 +239,9 @@ createApp({
       katexReady: false,    // KaTeX догрузился лениво -> перерисовать формулы
       chatFilter: "",       // строка поиска по чатам (появляется, когда их много)
       charFilter: "",       // то же по персонажам
+      awayFromBottom: false, // отъехали от низа -> показать навигацию по чату
+      jumpBusy: false,      // идёт дозагрузка истории для прыжка в начало
+      composerH: 90,        // высота поля ввода: над ним висит панель навигации
       dialog: null,         // модальный диалог (подтверждение/ввод) вместо браузерных alert/prompt/confirm
 
       // --- Отладочный лог LLM ---
@@ -1342,6 +1345,102 @@ createApp({
       if (e.target.scrollTop < 120 && !this.loadingOlder && !this.noMoreMessages) {
         this.loadOlder();
       }
+      // Показываем навигацию только когда от низа реально отъехали: у самого низа
+      // (обычное чтение свежих реплик) она была бы лишним элементом на экране.
+      const el = e.target;
+      this.awayFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight > 300;
+      this._syncComposerH();
+    },
+    // Высота поля ввода для отступа панели навигации. Обновляем при прокрутке и
+    // при росте textarea (autoGrow) — этого достаточно: панель видна только при
+    // прокрутке, а растёт композер только во время набора.
+    _syncComposerH() {
+      const c = document.querySelector(".composer");
+      if (c && c.offsetHeight && c.offsetHeight !== this.composerH) this.composerH = c.offsetHeight;
+    },
+
+    // ---------- Перемещение по чату ----------
+    // Список сообщений с их положением внутри прокручиваемого контейнера.
+    _msgTops() {
+      const box = this.$refs.messages;
+      if (!box) return [];
+      return [...box.querySelectorAll(".msg")].map((el) => ({
+        el,
+        top: el.offsetTop - box.offsetTop,
+      }));
+    },
+    scrollToBottom(smooth = true) {
+      const box = this.$refs.messages;
+      if (!box) return;
+      box.scrollTo({ top: box.scrollHeight, behavior: smooth ? "smooth" : "auto" });
+    },
+    // К самому началу чата. История подгружается порциями по мере прокрутки вверх,
+    // поэтому сначала дотягиваем недостающее, и только потом прыгаем — иначе
+    // «начало» оказалось бы началом загруженного куска, а не разговора.
+    async scrollToChatStart() {
+      const box = this.$refs.messages;
+      if (!box) return;
+      this.jumpBusy = true;
+      try {
+        let guard = 40;   // предохранитель от бесконечного цикла на огромном чате
+        while (!this.noMoreMessages && guard-- > 0) {
+          const before = this.messages.length;
+          await this.loadOlder();
+          if (this.messages.length === before) break;   // ничего не пришло — выходим
+        }
+        await this.$nextTick();
+        box.scrollTo({ top: 0, behavior: "smooth" });
+      } finally {
+        this.jumpBusy = false;
+      }
+    },
+    // Шаг по сообщениям. Ориентируемся на верхнюю кромку экрана: следующим
+    // считается ближайшее сообщение, начало которого ниже текущего положения.
+    jumpMessage(dir) {
+      const box = this.$refs.messages;
+      if (!box) return;
+      const tops = this._msgTops();
+      if (!tops.length) return;
+      const cur = box.scrollTop;
+      const eps = 8;   // допуск, иначе «вверх» упирается в текущее же сообщение
+      const target = dir > 0
+        ? tops.find((m) => m.top > cur + eps)
+        : [...tops].reverse().find((m) => m.top < cur - eps);
+      if (!target) {
+        if (dir > 0) this.scrollToBottom();
+        else if (!this.noMoreMessages) this.scrollToChatStart();
+        else box.scrollTo({ top: 0, behavior: "smooth" });
+        return;
+      }
+      box.scrollTo({ top: target.top, behavior: "smooth" });
+      this._flashMessage(target.el);
+    },
+    // К началу ЭТОГО сообщения: у длинного ответа его верх легко уехал за экран,
+    // и вернуться к нему прокруткой на глаз неудобно.
+    scrollMessageStart(id) {
+      const box = this.$refs.messages;
+      const el = box && box.querySelector('[data-mid="' + id + '"]');
+      if (!box || !el) return;
+      box.scrollTo({ top: el.offsetTop - box.offsetTop, behavior: "smooth" });
+      this._flashMessage(el);
+    },
+    // Короткая подсветка: после прыжка видно, куда именно попал.
+    _flashMessage(el) {
+      el.classList.remove("jump-flash");
+      void el.offsetWidth;              // перезапуск анимации
+      el.classList.add("jump-flash");
+      setTimeout(() => el.classList.remove("jump-flash"), 900);
+    },
+    // Клавиши работают, только когда не печатаешь: иначе Home/End в поле ввода
+    // прыгали бы по чату вместо перемещения курсора в тексте.
+    _onNavKey(ev) {
+      const t = ev.target;
+      const typing = t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
+      if (typing || !this.sessionId) return;
+      if (ev.altKey && ev.key === "ArrowUp") { ev.preventDefault(); this.jumpMessage(-1); }
+      else if (ev.altKey && ev.key === "ArrowDown") { ev.preventDefault(); this.jumpMessage(1); }
+      else if (ev.key === "Home" && !ev.ctrlKey) { ev.preventDefault(); this.scrollToChatStart(); }
+      else if (ev.key === "End" && !ev.ctrlKey) { ev.preventDefault(); this.scrollToBottom(); }
     },
 
     // ---------- WebSocket стриминг ----------
@@ -1469,6 +1568,7 @@ createApp({
       if (!el) return;
       el.style.height = "auto";
       el.style.height = Math.min(el.scrollHeight, 200) + "px";
+      this._syncComposerH();   // панель навигации висит над композером
     },
     resetComposerHeight() {
       this.$nextTick(() => { if (this.$refs.composer) this.$refs.composer.style.height = "auto"; });
@@ -2687,6 +2787,9 @@ createApp({
     // Копирование кода: один слушатель на документ (разметка сообщений приходит
     // из v-html и перерисовывается, вешать обработчики на каждый блок бессмысленно).
     document.addEventListener("click", this._onDocClick);
+    // Клавиши перемещения по чату: Home/End и Alt+↑/↓ (см. _onNavKey — в полях
+    // ввода они не перехватываются).
+    document.addEventListener("keydown", this._onNavKey);
     this.accessCode = localStorage.getItem("accessCode") || "";
     this.adminPassword = localStorage.getItem("adminPassword") || "";
     this.userToken = localStorage.getItem("userToken") || "";
@@ -2956,7 +3059,7 @@ createApp({
         <div v-if="sessionId && loadingOlder" class="load-older">⏳ Загружаю ранние сообщения…</div>
         <div v-else-if="sessionId && messages.length >= msgPageSize && noMoreMessages" class="load-older muted">— начало чата —</div>
 
-        <div v-for="m in messages" :key="m.id" :class="['msg', m.role]">
+        <div v-for="m in messages" :key="m.id" :class="['msg', m.role]" :data-mid="m.id">
           <!-- Аватарка: персонаж/участник группы у ответа, персона/профиль у пользователя -->
           <div v-if="m.role === 'user' || m.role === 'assistant'" class="msg-ava"
                :title="m.role === 'assistant' ? (m.speaker_name || (selectedCharacter && selectedCharacter.name) || '') : ''">
@@ -3022,6 +3125,10 @@ createApp({
             <!-- Время: у user — когда отправил, у assistant — когда пришёл ответ (в поясе чата) -->
             <span v-if="m.created_at" class="tag msg-time" :title="fmtWhenFull(m.created_at)">🕒 {{ fmtWhen(m.created_at) }}</span>
             <span v-if="m.model_used" class="tag">{{ m.model_used }}</span>
+            <!-- У длинного ответа верх уезжает за экран, и вернуться к нему
+                 прокруткой на глаз неудобно — даём точный прыжок. -->
+            <button v-if="(m.content || '').length > 800" class="btn-icon"
+                    @click="scrollMessageStart(m.id)" title="К началу этого сообщения">⇞</button>
             <button v-if="!m.canvas_id" class="btn-icon" @click="copyMessage(m)" title="Скопировать текст">📋</button>
             <template v-if="!m.canvas_id">
               <button class="btn-icon" @click="replyTo(m)" title="Ответить на это сообщение">↩</button>
@@ -3074,6 +3181,18 @@ createApp({
         <div v-if="canvasGenerating" class="msg assistant">
           <div class="bubble">📄 Генерирую документ для Canvas… <span class="typing">▌</span></div>
         </div>
+      </div>
+
+      <!-- Навигация по чату: появляется, когда отъехали от низа. У самого низа
+           (обычное чтение свежих реплик) она была бы лишним элементом. -->
+      <div class="chat-nav" v-if="sessionId && messages.length > 3 && awayFromBottom"
+           :style="{ bottom: (composerH + 12) + 'px' }">
+        <button class="btn-icon" @click="scrollToChatStart" :disabled="jumpBusy"
+                title="К началу чата (Home). Догрузит раннюю историю, если её ещё нет">
+          {{ jumpBusy ? '⏳' : '⤒' }}</button>
+        <button class="btn-icon" @click="jumpMessage(-1)" title="Предыдущее сообщение (Alt+↑)">⌃</button>
+        <button class="btn-icon" @click="jumpMessage(1)" title="Следующее сообщение (Alt+↓)">⌄</button>
+        <button class="btn-icon accent" @click="scrollToBottom()" title="К последнему сообщению (End)">⤓</button>
       </div>
 
       <div class="composer" v-if="sessionId">
