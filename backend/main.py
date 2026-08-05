@@ -23,6 +23,7 @@ import re
 import urllib.parse
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone as _tz
 from pathlib import Path
 
 from fastapi import (
@@ -620,6 +621,12 @@ def _make_persist_continue(message_id: int, model_used: str):
 @app.get("/api/characters", response_model=list[CharacterRead])
 async def list_characters(user=Depends(current_user), db: AsyncSession = Depends(get_session)):
     q = accounts.scope_query(select(models.Character), models.Character, user)
+    # Закреплённые наверх (см. list_sessions про порядок NULL в SQLite).
+    q = q.order_by(
+        models.Character.pinned_at.is_(None),
+        models.Character.pinned_at.desc(),
+        models.Character.id.asc(),
+    )
     return (await db.execute(q)).scalars().all()
 
 
@@ -645,7 +652,10 @@ async def update_character(
     char = await db.get(models.Character, character_id)
     if not char:
         raise HTTPException(404, "Персонаж не найден")
-    for key, value in payload.model_dump(exclude_none=True).items():
+    data = payload.model_dump(exclude_none=True)
+    if "pinned" in data:  # флаг снаружи -> дата внутри (см. update_session)
+        char.pinned_at = _utcnow() if data.pop("pinned") else None
+    for key, value in data.items():
         setattr(char, key, value)
     await db.commit()
     await db.refresh(char)
@@ -762,6 +772,42 @@ async def list_shared_sessions(user=Depends(current_user), db: AsyncSession = De
     return out
 
 
+async def _session_previews(db, ids: list[int]) -> dict[int, dict]:
+    """
+    Для каждого чата: последняя реплика (коротким куском), её время и число
+    сообщений — чтобы в списке было по чему узнать чат, а не только по заголовку
+    «Новый чат». Два запроса на весь список, а не по одному на чат.
+    """
+    if not ids:
+        return {}
+    agg = (await db.execute(
+        select(
+            models.Message.session_id,
+            func.count(models.Message.id),
+            func.max(models.Message.id),
+        )
+        .where(models.Message.session_id.in_(ids))
+        .group_by(models.Message.session_id)
+    )).all()
+    if not agg:
+        return {}
+    last_ids = [row[2] for row in agg]
+    last_rows = (await db.execute(
+        select(models.Message).where(models.Message.id.in_(last_ids))
+    )).scalars().all()
+    by_id = {m.id: m for m in last_rows}
+    out: dict[int, dict] = {}
+    for sid, count, last_id in agg:
+        msg = by_id.get(last_id)
+        text = re.sub(r"\s+", " ", (msg.content if msg else "") or "").strip()
+        out[sid] = {
+            "preview": text[:120],
+            "last_at": _iso_utc(msg.created_at) if msg else None,
+            "messages": count,
+        }
+    return out
+
+
 @app.get("/api/sessions")
 async def list_sessions(
     character_id: int | None = None,
@@ -771,12 +817,20 @@ async def list_sessions(
     q = (
         select(models.ChatSession)
         .where(models.ChatSession.is_group == False)  # noqa: E712 — группы отдельно
-        .order_by(models.ChatSession.id.desc())
+        # Закреплённые наверх (последний закреплённый первым), остальные — новые
+        # выше. pinned_at IS NULL идёт первым выражением, потому что в SQLite
+        # NULL при сортировке DESC оказался бы выше реальных дат.
+        .order_by(
+            models.ChatSession.pinned_at.is_(None),
+            models.ChatSession.pinned_at.desc(),
+            models.ChatSession.id.desc(),
+        )
     )
     if character_id is not None:
         q = q.where(models.ChatSession.character_id == character_id)
     q = accounts.scope_query(q, models.ChatSession, user)
     rows = (await db.execute(q)).scalars().all()
+    previews = await _session_previews(db, [s.id for s in rows])
     return [
         {
             "id": s.id,
@@ -788,6 +842,8 @@ async def list_sessions(
             "is_group": s.is_group,
             "director": s.director,
             "timezone": s.timezone or "",
+            "pinned": s.pinned_at is not None,
+            **previews.get(s.id, {"preview": "", "last_at": None, "messages": 0}),
         }
         for s in rows
     ]
@@ -829,10 +885,16 @@ async def update_session(
     sess = await db.get(models.ChatSession, session_id)
     if not sess:
         raise HTTPException(404, "Сессия не найдена")
-    for key, value in payload.model_dump(exclude_none=True).items():
+    data = payload.model_dump(exclude_none=True)
+    # pinned — флаг снаружи, дата внутри: при закреплении пишем «сейчас», чтобы
+    # закреплённые упорядочивались между собой, при снятии — NULL.
+    if "pinned" in data:
+        # Наивный UTC — та же форма, что пишет SQLite func.now() (см. _iso_utc).
+        sess.pinned_at = _utcnow() if data.pop("pinned") else None
+    for key, value in data.items():
         setattr(sess, key, value)
     await db.commit()
-    return {"ok": True}
+    return {"ok": True, "pinned": sess.pinned_at is not None}
 
 
 @app.delete("/api/sessions/{session_id}")
@@ -876,6 +938,12 @@ def _att_meta(a: dict) -> dict:
     data = a.get("data") or ""
     size = int(len(data) * 0.75) if data else int(a.get("size") or 0)  # ~сырой размер
     return {"type": a.get("type"), "mime": a.get("mime"), "name": a.get("name"), "size": size}
+
+
+def _utcnow():
+    """Текущее время в UTC БЕЗ tzinfo — ровно так его пишет SQLite func.now(),
+    и только так сортировка по дате не смешивает наивные значения со смещёнными."""
+    return datetime.now(_tz.utc).replace(tzinfo=None)
 
 
 def _iso_utc(dt) -> str | None:
@@ -994,10 +1062,15 @@ async def list_groups(user=Depends(current_user), db: AsyncSession = Depends(get
     q = (
         select(models.ChatSession)
         .where(models.ChatSession.is_group == True)  # noqa: E712
-        .order_by(models.ChatSession.id.desc())
+        .order_by(  # закреплённые наверх, как в личных чатах
+            models.ChatSession.pinned_at.is_(None),
+            models.ChatSession.pinned_at.desc(),
+            models.ChatSession.id.desc(),
+        )
     )
     q = accounts.scope_query(q, models.ChatSession, user)
     rows = (await db.execute(q)).scalars().all()
+    previews = await _session_previews(db, [s.id for s in rows])
     result = []
     for s in rows:
         members = await group_chat.load_members(db, s.id)
@@ -1008,6 +1081,8 @@ async def list_groups(user=Depends(current_user), db: AsyncSession = Depends(get
                 "director": s.director,
                 "scenario": s.scenario,
                 "timezone": s.timezone or "",
+                "pinned": s.pinned_at is not None,
+                **previews.get(s.id, {"preview": "", "last_at": None, "messages": 0}),
                 # avatar_path нужен для аватарок реплик в групповом чате.
                 "members": [
                     {"id": c.id, "name": c.name, "avatar_path": c.avatar_path}

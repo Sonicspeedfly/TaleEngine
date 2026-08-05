@@ -252,11 +252,33 @@ label span { color: var(--text); }
   .msg:last-child:hover .msg-meta .swipes { opacity: 1; }
 
   /* Строки списков (чаты, персонажи): экспорт/переименовать/удалить — редкие
-     операции, незачем держать их перед глазами в каждой строке. */
-  .list-item .btn-icon { opacity: 0; transition: opacity 0.16s ease; }
-  .list-item:hover .btn-icon,
-  .list-item .btn-icon:focus-visible { opacity: 1; }
+     операции, незачем держать их перед глазами в каждой строке.
+
+     ВАЖНО про opacity: сама по себе она НЕ освобождает место — невидимые кнопки
+     продолжали занимать ширину, и название чата обрезалось многоточием даже
+     короткое. Поэтому группа действий выводится из потока (position: absolute)
+     и всплывает поверх строки справа: пока курсор не на строке, вся ширина
+     достаётся названию и превью. */
+  .row-actions {
+    position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+    display: flex; align-items: center; gap: 2px;
+    opacity: 0; pointer-events: none;
+    transition: opacity 0.16s ease;
+    padding-left: 14px; border-radius: 8px;
+    /* Плавная подложка, чтобы кнопки читались поверх текста превью. */
+    background: linear-gradient(to right, transparent, var(--bg2) 14px);
+  }
+  .list-item:hover .row-actions,
+  .row-actions:focus-within { opacity: 1; pointer-events: auto; }
+  .list-item.active:hover .row-actions,
+  .list-item.active .row-actions:focus-within {
+    background: linear-gradient(to right, transparent, var(--bg3) 14px);
+  }
 }
+/* Позиционирование нужно всегда: на тач-устройствах группа остаётся в потоке,
+   но родителю всё равно полезно быть точкой отсчёта. */
+.list-item { position: relative; }
+.row-actions { display: flex; align-items: center; gap: 2px; }
 
 /* ============================================================
    Движение: отклик на действия
@@ -496,6 +518,41 @@ input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
 /* ----- Списки: мягче и отзывчивее ----- */
 .list-item { border-radius: 8px; margin: 1px 6px; transition: background 0.12s ease; }
 .list-item.active { background: var(--bg3); }
+
+/* ============================================================
+   Строка чата в две строки
+   ============================================================
+   Место под это освободилось, когда редкие кнопки перестали висеть постоянно.
+   Раньше строка была «Новый чат #7» — по такому названию вспомнить чат нечем,
+   отсюда и «легко потеряться». Теперь под названием видно последнюю реплику,
+   справа — когда она была. */
+.list-item.row2 { align-items: flex-start; padding-top: 6px; padding-bottom: 6px; }
+.row-text { min-width: 0; }                    /* иначе flex не даст тексту сжаться */
+.row-title { display: flex; align-items: center; gap: 5px; min-width: 0; }
+.row-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.row-sub {
+  font-size: 11px; color: var(--muted); margin-top: 2px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.row-time { font-size: 10px; color: var(--muted); flex: none; margin-top: 2px; white-space: nowrap; }
+.pin-mark { font-size: 10px; flex: none; opacity: 0.85; }
+/* Закреплённые отделены полоской слева — видно границу блока без заголовка. */
+.list-item.pinned { box-shadow: inset 2px 0 0 var(--accent); }
+
+/* Время и кнопки делят одно место: при наведении время уступает действиям.
+   Только для мыши — на тач-устройствах наведения нет и прятать нечего. */
+@media (hover: hover) and (pointer: fine) {
+  .list-item:hover .row-time { display: none; }
+}
+
+/* ----- Поиск по списку ----- */
+.list-search { display: flex; align-items: center; gap: 4px; padding: 4px 12px 6px; }
+.list-search input {
+  flex: 1; min-width: 0; font-size: 12px; padding: 5px 8px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 7px; color: var(--text);
+}
+.list-search input::placeholder { color: var(--muted); }
+.list-empty { padding: 8px 14px; font-size: 12px; color: var(--muted); }
 
 /* ----- Бейдж «пришёл ответ в другом чате» на элементе списка ----- */
 .reply-dot {

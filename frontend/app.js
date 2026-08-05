@@ -237,6 +237,8 @@ createApp({
       pendingChats: [],     // id чатов, куда пришёл ответ, пока вы были в другом чате
       toasts: [],           // всплывающие уведомления (тосты) в правом нижнем углу
       katexReady: false,    // KaTeX догрузился лениво -> перерисовать формулы
+      chatFilter: "",       // строка поиска по чатам (появляется, когда их много)
+      charFilter: "",       // то же по персонажам
       dialog: null,         // модальный диалог (подтверждение/ввод) вместо браузерных alert/prompt/confirm
 
       // --- Отладочный лог LLM ---
@@ -252,6 +254,20 @@ createApp({
   computed: {
     selectedCharacter() {
       return this.characters.find((c) => c.id === this.selectedCharacterId) || null;
+    },
+    // Поиск по списку: ищем и в названии, и в последней реплике — по чату
+    // «Новый чат #7» вспомнить нечего, а по обрывку разговора вспоминается сразу.
+    filteredSessions() {
+      const q = this.chatFilter.trim().toLowerCase();
+      if (!q) return this.sessions;
+      return this.sessions.filter((s) =>
+        (s.title || "").toLowerCase().includes(q) ||
+        (s.preview || "").toLowerCase().includes(q));
+    },
+    filteredCharacters() {
+      const q = this.charFilter.trim().toLowerCase();
+      if (!q) return this.characters;
+      return this.characters.filter((c) => (c.name || "").toLowerCase().includes(q));
     },
     // Ловушка, которую пользователь сам не свяжет: у Gemini режим размышлений
     // включает СВОЮ модерацию поверх safety_settings и душит контент даже при
@@ -2145,6 +2161,51 @@ createApp({
       if (ui && ui.group_reply_delay != null) this.groupReplyDelay = Number(ui.group_reply_delay);
       if (ui && ui.summary_every != null) this.summaryEvery = Number(ui.summary_every);
     },
+    // ---------- Закрепление чатов и персонажей ----------
+    // Порядок считает сервер (закреплённые сверху, последний закреплённый первым),
+    // поэтому после переключения просто перечитываем список — не пересортировываем
+    // на клиенте, иначе две реализации порядка неизбежно разъедутся.
+    async togglePinSession(s) {
+      const next = !s.pinned;
+      try {
+        await this.api("/sessions/" + s.id, {
+          method: "PATCH",
+          body: JSON.stringify({ pinned: next }),
+        });
+        if (s.is_group) await this.loadGroups();
+        else await this.loadSessions();
+        this.showToast(next ? "📌 Чат закреплён наверху" : "Чат откреплён");
+      } catch (e) {
+        this.showToast("Не удалось закрепить: " + e.message);
+      }
+    },
+    async togglePinCharacter(c) {
+      const next = !c.pinned;
+      try {
+        await this.api("/characters/" + c.id, {
+          method: "PATCH",
+          body: JSON.stringify({ pinned: next }),
+        });
+        await this.loadCharacters();
+        this.showToast(next ? "📌 Персонаж закреплён наверху" : "Персонаж откреплён");
+      } catch (e) {
+        this.showToast("Не удалось закрепить: " + e.message);
+      }
+    },
+    // Компактная отметка времени для списка: сегодня — часы, эта неделя — день,
+    // раньше — дата. Длинные строки в узком сайдбаре не помещаются.
+    shortWhen(iso) {
+      if (!iso) return "";
+      const d = new Date(iso);
+      if (isNaN(d)) return "";
+      const now = new Date();
+      const sameDay = d.toDateString() === now.toDateString();
+      if (sameDay) return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      const days = Math.floor((now - d) / 86400000);
+      if (days < 7) return d.toLocaleDateString([], { weekday: "short" });
+      return d.toLocaleDateString([], { day: "2-digit", month: "2-digit" });
+    },
+
     toggleAssistantMode() {
       this.params.assistant_mode = !this.params.assistant_mode;
       this.saveUiPrefs();
@@ -2701,14 +2762,26 @@ createApp({
               💬<input type="file" accept=".jsonl,.json" style="display:none" @change="importChat" />
             </label>
           </div>
-          <div v-for="c in characters" :key="c.id"
-               :class="['list-item', c.id === selectedCharacterId ? 'active' : '']"
+          <div class="list-search" v-if="characters.length > 5">
+            <input v-model="charFilter" placeholder="Поиск по персонажам…" @click.stop />
+            <button v-if="charFilter" class="btn-icon" @click.stop="charFilter=''" title="Очистить">✕</button>
+          </div>
+          <div v-for="c in filteredCharacters" :key="c.id"
+               :class="['list-item', c.id === selectedCharacterId ? 'active' : '', c.pinned ? 'pinned' : '']"
                @click="selectCharacter(c)">
             <div class="avatar"><img v-if="c.avatar_path" :src="c.avatar_path" class="avatar" />{{ c.avatar_path ? '' : c.name.charAt(0) }}</div>
-            <div class="grow">{{ c.name }}</div>
-            <button class="btn-icon" @click.stop="exportCharacter(c)" title="Экспорт (JSON + лор Horae)">⬇</button>
-            <button class="btn-icon" @click.stop="deleteCharacter(c)" title="Удалить">🗑</button>
+            <div class="grow row-title">
+              <span v-if="c.pinned" class="pin-mark" title="Закреплён наверху">📌</span>
+              <span class="row-name">{{ c.name }}</span>
+            </div>
+            <span class="row-actions">
+              <button class="btn-icon" @click.stop="togglePinCharacter(c)"
+                      :title="c.pinned ? 'Открепить' : 'Закрепить наверху'">{{ c.pinned ? '📍' : '📌' }}</button>
+              <button class="btn-icon" @click.stop="exportCharacter(c)" title="Экспорт (JSON + лор Horae)">⬇</button>
+              <button class="btn-icon" @click.stop="deleteCharacter(c)" title="Удалить">🗑</button>
+            </span>
           </div>
+          <div v-if="charFilter && !filteredCharacters.length" class="list-empty">Ничего не найдено</div>
         </div>
       </div>
 
@@ -2720,17 +2793,34 @@ createApp({
         </button>
         <div class="acc-body" :class="{ open: openSections.chats }">
           <div style="padding: 6px 12px"><button @click="newChat" style="width:100%">+ Новый чат</button></div>
-          <div v-for="s in sessions" :key="s.id"
-               :class="['list-item', s.id === sessionId ? 'active' : '']"
+          <div class="list-search" v-if="sessions.length > 5">
+            <input v-model="chatFilter" placeholder="Поиск по чатам…" @click.stop />
+            <button v-if="chatFilter" class="btn-icon" @click.stop="chatFilter=''" title="Очистить">✕</button>
+          </div>
+          <div v-for="s in filteredSessions" :key="s.id"
+               :class="['list-item', 'row2', s.id === sessionId ? 'active' : '', s.pinned ? 'pinned' : '']"
                :title="s.title + ' — чат #' + s.id"
                @click="openSession(s)">
             <span v-if="pendingChats.includes(s.id)" class="reply-dot" title="Пришёл новый ответ"></span>
-            <div class="grow">{{ s.title }} <span class="muted">#{{ s.id }}</span></div>
-            <button class="btn-icon" @click.stop="exportSession(s)" title="Экспорт чата (нативный формат AiChat)">💾</button>
-            <button v-if="authStatus.accounts_enabled" class="btn-icon" @click.stop="openInvite(s)" title="Пригласить друга">🔗</button>
-            <button class="btn-icon" @click.stop="renameSession(s)" title="Переименовать">✎</button>
-            <button class="btn-icon" @click.stop="deleteSession(s)" title="Удалить чат">🗑</button>
+            <div class="grow row-text">
+              <div class="row-title">
+                <span v-if="s.pinned" class="pin-mark" title="Закреплён наверху">📌</span>
+                <span class="row-name">{{ s.title }}</span>
+              </div>
+              <div class="row-sub" v-if="s.preview">{{ s.preview }}</div>
+              <div class="row-sub muted" v-else>пустой чат</div>
+            </div>
+            <span class="row-time" v-if="s.last_at">{{ shortWhen(s.last_at) }}</span>
+            <span class="row-actions">
+              <button class="btn-icon" @click.stop="togglePinSession(s)"
+                      :title="s.pinned ? 'Открепить' : 'Закрепить наверху'">{{ s.pinned ? '📍' : '📌' }}</button>
+              <button class="btn-icon" @click.stop="exportSession(s)" title="Экспорт чата (нативный формат AiChat)">💾</button>
+              <button v-if="authStatus.accounts_enabled" class="btn-icon" @click.stop="openInvite(s)" title="Пригласить друга">🔗</button>
+              <button class="btn-icon" @click.stop="renameSession(s)" title="Переименовать">✎</button>
+              <button class="btn-icon" @click.stop="deleteSession(s)" title="Удалить чат">🗑</button>
+            </span>
           </div>
+          <div v-if="chatFilter && !filteredSessions.length" class="list-empty">Ничего не найдено</div>
         </div>
       </div>
 

@@ -45,9 +45,16 @@ class Character(Base):
     # Персональные параметры генерации, переопределяющие дефолты из .env.
     generation_params: Mapped[dict] = mapped_column(JSON, default=dict)
     model: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # Закрепление персонажа наверху списка (см. ChatSession.pinned_at).
+    pinned_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     sessions = relationship("ChatSession", back_populates="character")
+
+    @property
+    def pinned(self) -> bool:
+        """Флаг для API: внутри храним дату закрепления, наружу отдаём да/нет."""
+        return self.pinned_at is not None
 
 
 class ChatSession(Base):
@@ -82,6 +89,10 @@ class ChatSession(Base):
     # Часовой пояс пользователя ДЛЯ ЭТОГО чата (IANA-имя или смещение "+03:00").
     # Нейросеть видит по нему текущее время собеседника; настраивается в UI на чат.
     timezone: Mapped[str] = mapped_column(String(64), default="")
+    # Закрепление чата наверху списка. Храним ВРЕМЯ, а не флаг: так закреплённые
+    # можно упорядочить между собой (последний закреплённый — сверху), а «не
+    # закреплён» это просто NULL.
+    pinned_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     character = relationship("Character", back_populates="sessions")

@@ -187,6 +187,7 @@ def _sqlite_add_missing_columns(sync_conn) -> None:
             "is_group": "BOOLEAN DEFAULT 0",
             "director": "BOOLEAN DEFAULT 0",
             "owner_id": "INTEGER",
+            "pinned_at": "DATETIME",
             "scenario": "TEXT DEFAULT ''",
             "timezone": "VARCHAR(64) DEFAULT ''",
         },
@@ -210,6 +211,7 @@ def _sqlite_add_missing_columns(sync_conn) -> None:
             "owner_id": "INTEGER",
             "mes_example": "TEXT DEFAULT ''",
             "post_history_instructions": "TEXT DEFAULT ''",
+            "pinned_at": "DATETIME",
         },
         "personas": {
             "owner_id": "INTEGER",

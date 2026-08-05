@@ -112,6 +112,9 @@ class CharacterRead(CharacterBase):
     # Аватар персонажа. Раньше поля здесь НЕ было, и API молча вырезал его из
     # ответов — аватарки «не были видны нигде», хотя в БД сохранялись.
     avatar_path: Optional[str] = None
+    # Закреплён ли наверху списка. В модели хранится дата, наружу отдаём флаг:
+    # схема читается из ORM (from_attributes), поэтому вычисляем его свойством.
+    pinned: bool = False
 
 
 class HoraeEntryBase(BaseModel):
@@ -138,6 +141,8 @@ class HoraeEntryRead(HoraeEntryBase):
 
 class CharacterUpdate(BaseModel):
     """Частичное обновление персонажа (все поля опциональны)."""
+    # Закрепить наверху списка. Внутри это дата (pinned_at), снаружи — флаг.
+    pinned: Optional[bool] = None
     name: Optional[str] = None
     description: Optional[str] = None
     personality: Optional[str] = None
@@ -204,6 +209,9 @@ class PresetRead(PresetBase):
 # ----- Обновление сессии / сообщения -----
 class SessionUpdate(BaseModel):
     title: Optional[str] = None
+    # Закрепить чат наверху списка. В модели это ВРЕМЯ (pinned_at), здесь —
+    # простой флаг: обработчик сам переводит True/False в дату/NULL.
+    pinned: Optional[bool] = None
     author_note: Optional[str] = None
     persona_id: Optional[int] = None
     background: Optional[str] = None
