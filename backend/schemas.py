@@ -222,6 +222,11 @@ class SessionUpdate(BaseModel):
     timezone: Optional[str] = None
 
 
+class SessionFork(BaseModel):
+    """Ветка чата: копия истории до указанной реплики включительно."""
+    message_id: int
+
+
 class GroupCreate(BaseModel):
     """Создание группового чата из нескольких персонажей."""
     name: str = "Групповой чат"

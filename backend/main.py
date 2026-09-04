@@ -102,6 +102,7 @@ from backend.schemas import (
     PersonaRead,
     PresetBase,
     PresetRead,
+    SessionFork,
     SessionUpdate,
     WSContinue,
     WSRegenerate,
@@ -869,11 +870,22 @@ async def list_sessions(
     rows = (await db.execute(q)).scalars().all()
     previews = await _session_previews(db, [s.id for s in rows])
     rows = _sort_by_activity(rows, previews)
+    # Имена персонажей одним запросом на весь список, а не по одному на строку.
+    # Единый список показывает чаты всех персонажей сразу, и без имени пять
+    # «Новых чатов» у разных персонажей в нём неразличимы.
+    char_ids = {s.character_id for s in rows if s.character_id}
+    names = {}
+    if char_ids:
+        names = dict((await db.execute(
+            select(models.Character.id, models.Character.name)
+            .where(models.Character.id.in_(char_ids))
+        )).all())
     return [
         {
             "id": s.id,
             "title": s.title,
             "character_id": s.character_id,
+            "character_name": names.get(s.character_id, ""),
             "author_note": s.author_note,
             "persona_id": s.persona_id,
             "background": s.background,
@@ -885,6 +897,163 @@ async def list_sessions(
         }
         for s in rows
     ]
+
+
+async def _accessible_session_ids(db, user) -> list[int]:
+    """
+    Все чаты, которые пользователю разрешено читать: свои плюс расшаренные.
+
+    Нужен поиску: искать по messages напрямую нельзя, иначе в выдачу попадут
+    реплики из чужих чатов. scope_query закрывает владение, SessionShare —
+    то, чем поделились явно.
+    """
+    q = accounts.scope_query(select(models.ChatSession.id), models.ChatSession, user)
+    ids = set((await db.execute(q)).scalars().all())
+    if user is not None:
+        shared = (await db.execute(
+            select(models.SessionShare.session_id)
+            .where(models.SessionShare.user_id == user.id)
+        )).scalars().all()
+        ids.update(shared)
+    return list(ids)
+
+
+@app.get("/api/search")
+async def search_messages(
+    q: str = "",
+    session_id: int | None = None,
+    limit: int = 40,
+    user=Depends(current_user),
+    db: AsyncSession = Depends(get_session),
+):
+    """
+    Поиск по тексту реплик.
+
+    До этого единственной опорой памяти в длинном чате была фраза из диалога, и
+    ровно её найти было нельзя: фильтр в сайдбаре искал по заголовку и по
+    последним 120 символам последней реплики, а браузерный Ctrl+F видит только
+    подгруженное окно истории и молчит о том, что искал не везде.
+    """
+    needle = (q or "").strip()
+    # Один символ дал бы выборку почти всей базы и ничего не сказал бы человеку.
+    if len(needle) < 2:
+        return {"query": needle, "results": []}
+    limit = max(1, min(limit, 200))
+
+    allowed = await _accessible_session_ids(db, user)
+    if not allowed:
+        return {"query": needle, "results": []}
+    if session_id is not None:
+        if session_id not in allowed:
+            raise HTTPException(403, "Нет доступа к этому чату")
+        allowed = [session_id]
+
+    stmt = (
+        select(models.Message, models.ChatSession.title)
+        .join(models.ChatSession, models.ChatSession.id == models.Message.session_id)
+        .where(
+            models.Message.session_id.in_(allowed),
+            models.Message.content.ilike("%" + needle.replace("%", r"\%") + "%"),
+        )
+        .order_by(models.Message.id.desc())
+        .limit(limit)
+    )
+    rows = (await db.execute(stmt)).all()
+
+    results = []
+    low = needle.lower()
+    for msg, title in rows:
+        text = re.sub(r"\s+", " ", msg.content or "").strip()
+        pos = text.lower().find(low)
+        # Фрагмент ВОКРУГ совпадения, а не начало сообщения: иначе в выдаче
+        # видно первые сто символов, а найденное слово где-то за кадром.
+        start = max(0, pos - 60)
+        snippet = text[start:start + 200]
+        if start > 0:
+            snippet = "…" + snippet
+        if start + 200 < len(text):
+            snippet = snippet + "…"
+        results.append({
+            "session_id": msg.session_id,
+            "session_title": title,
+            "message_id": msg.id,
+            "role": msg.role,
+            "created_at": _iso_utc(msg.created_at),
+            "snippet": snippet,
+            "match_at": pos - start + (1 if start > 0 else 0),
+            "match_len": len(needle),
+        })
+    return {"query": needle, "results": results}
+
+
+@app.post("/api/sessions/{session_id}/fork")
+async def fork_session(
+    session_id: int,
+    payload: SessionFork,
+    user=Depends(current_user),
+    db: AsyncSession = Depends(get_session),
+):
+    """
+    Ветка чата от выбранной реплики: копия истории ДО неё включительно.
+
+    Раньше развилку сюжета приходилось эмулировать откруткой свайпа в середине
+    чата, после чего вся дальнейшая переписка отвечала на вариант, которого
+    пользователь уже не видит, а модель получала несогласованную историю.
+    Исходный чат здесь не меняется вообще.
+    """
+    src = await db.get(models.ChatSession, session_id)
+    if not await _can_access_session(db, src, user):
+        raise HTTPException(403, "Нет доступа к этому чату")
+    pivot = await db.get(models.Message, payload.message_id)
+    if pivot is None or pivot.session_id != session_id:
+        raise HTTPException(404, "Сообщение не найдено в этом чате")
+
+    base = (src.title or "Чат").strip()
+    fork = models.ChatSession(
+        title=(base + " · ветка")[:200],
+        character_id=src.character_id,
+        user_key=src.user_key,
+        owner_id=src.owner_id,
+        author_note=src.author_note,
+        persona_id=src.persona_id,
+        background=src.background,
+        timezone=src.timezone,
+        is_group=src.is_group,
+        director=src.director,
+        scenario=src.scenario,
+    )
+    db.add(fork)
+    await db.flush()  # нужен id новой сессии до копирования сообщений
+
+    msgs = (await db.execute(
+        select(models.Message)
+        .where(models.Message.session_id == session_id, models.Message.id <= pivot.id)
+        .order_by(models.Message.id)
+    )).scalars().all()
+    for m in msgs:
+        db.add(models.Message(
+            session_id=fork.id,
+            role=m.role,
+            content=m.content,
+            attachments=list(m.attachments or []),
+            swipes=list(m.swipes or []),
+            active_swipe=m.active_swipe,
+            model_used=m.model_used,
+            speaker_name=m.speaker_name,
+            reply_to_id=None,   # ссылки на реплики исходного чата в ветке не имеют смысла
+            canvas_id=None,     # общий канвас связал бы ветку с исходным документом
+            created_at=m.created_at,
+        ))
+    # Группа без участников перестала бы быть группой.
+    if src.is_group:
+        members = (await db.execute(
+            select(models.GroupMember).where(models.GroupMember.session_id == session_id)
+        )).scalars().all()
+        for gm in members:
+            db.add(models.GroupMember(session_id=fork.id, character_id=gm.character_id))
+
+    await db.commit()
+    return {"session_id": fork.id, "title": fork.title, "messages": len(msgs)}
 
 
 @app.post("/api/sessions")

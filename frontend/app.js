@@ -51,8 +51,11 @@ createApp({
       canvasBusy: false,
       canvasSel: { start: 0, end: 0 },  // выделение в редакторе (для точечной правки)
       toolbarPos: null,                 // позиция плавающего тулбара ({top,left}) или null
-      canvasCmdMode: false,             // единый инпут пишет команду открытому Канвасу
-      canvasGenMode: false,             // триггер: следующий ответ ИИ уйдёт в Канвас-документ
+      // Режим композера. РОВНО ОДНО значение: text | art | canvasCmd | canvasGen.
+      // Раньше это были три независимых булевых флага, которые включались
+      // одновременно, показывали три одинаковые плашки и позволяли надписи на
+      // кнопке отправки разойтись с реальным действием.
+      composerMode: "text",
       canvasGenerating: false,          // идёт генерация документа в Канвас
       canvasView: "edit",               // 'edit' (редактор) | 'preview' (просмотр результата)
       copied: false,                    // флаг «код скопирован» для кнопки тулбара
@@ -178,7 +181,6 @@ createApp({
 
       // --- Меню генерации арта ---
       artMenu: false,
-      artMode: false, // режим «опиши арт в сообщении» (вместо алерта)
 
       // --- Доступ / администрирование ---
       accessCode: "",
@@ -223,6 +225,30 @@ createApp({
       // Недавние чаты для блока быстрого старта на первом экране. Список приходит
       // из /sessions без фильтра по персонажу и уже отсортирован по активности.
       recentChats: [],
+
+      // --- Единый список чатов ---
+      // Все чаты пользователя, а не только выбранного персонажа. Раньше раздел
+      // «Чаты» существовал лишь при выбранном персонаже, и чтобы найти чат, надо
+      // было сначала вспомнить персонажа — то есть вспомнить ответ до вопроса.
+      allSessions: [],
+      chatFilterChar: null,   // чип фильтра: id персонажа либо null («все»)
+
+      // --- Командная палитра ---
+      paletteOpen: false,
+      paletteQuery: "",
+      paletteIndex: 0,
+      searchResults: [],
+      searchBusy: false,
+      // Команды палитры. Статический список: хранить здесь функции нельзя,
+      // Vue обернул бы их в Proxy — диспетчеризация идёт по id в paletteRun.
+      paletteCommands: [
+        { id: "new", label: "Новый диалог", sub: "создать чат" },
+        { id: "model", label: "/model — сменить модель", sub: "настройки генерации" },
+        { id: "branch", label: "/branch — ветка от последней реплики", sub: "форк чата" },
+        { id: "export", label: "/export — выгрузить чат", sub: "нативный формат" },
+        { id: "settings", label: "/settings — настройки", sub: "панель параметров" },
+        { id: "clear", label: "/clear — очистить поле ввода", sub: "сбросить режим композера" },
+      ],
       groupDirector: false,
       liveBubbles: [], // живые пузыри разных персонажей при стриминге группы
 
@@ -418,20 +444,114 @@ createApp({
         + '<body>' + code + '</body></html>';
     },
     composerPlaceholder() {
-      if (this.canvasCmdMode) return "Что сделать с Canvas…";
-      if (this.canvasGenMode) return "Опишите документ или код для генерации…";
-      if (this.artMode) return "Опишите картинку для генерации…";
+      if (this.composerMode === "canvasCmd") return "Что сделать с Canvas… (Esc — обычное сообщение)";
+      if (this.composerMode === "canvasGen") return "Опишите документ или код… (Esc — обычное сообщение)";
+      if (this.composerMode === "art") return "Опишите картинку… (Esc — обычное сообщение)";
       if (this.currentIsGroup) return "Сообщение… Режиссура: +Имя вызвать, -Имя исключить (🎬)";
       return this.isTouch
         ? "Сообщение… (Enter — перенос строки)"
         : "Сообщение… (Enter — отправить, Shift+Enter — перенос)";
     },
-    // Открыт ли хоть какой-то модальный слой. Один признак на все десять окон:
+    // Открыт ли хоть какой-то модальный слой. Один признак на все окна:
     // по нему работают и удержание фокуса, и его возврат.
     overlayOpen() {
       return !!(this.dialog || this.lightbox || this.adminOpen || this.kbOpen
         || this.membersOpen || this.groupModal || this.inviteOpen || this.profileOpen
-        || this.debugOpen || this.usageOpen || this.drawerTab);
+        || this.debugOpen || this.usageOpen || this.drawerTab || this.paletteOpen);
+    },
+
+    // ---------- Шапка ----------
+    headerTitle() {
+      if (this.sharedView) return "🔗 " + this.sharedView.title;
+      if (!this.sessionId) return "TaleEngine";
+      return this.currentSessionTitle || "Чат";
+    },
+    // Вторая строка: кто в чате и его номер. Раньше это были три отдельные
+    // пилюли, две из которых повторяли заголовок.
+    headerSubtitle() {
+      if (!this.sessionId) return "";
+      const who = this.currentIsGroup
+        ? (this.currentGroup ? this.currentGroup.members.map((m) => m.name).join(", ") : "группа")
+        : (this.selectedCharacter ? this.selectedCharacter.name : "");
+      return (who ? who + " · " : "") + "#" + this.sessionId;
+    },
+
+    // ---------- Единый список чатов ----------
+    // Личные, групповые и расшаренные в одной ленте с признаком вида. Сортировка
+    // по последней активности: last_id монотонен и приходит с сервера для
+    // личных и групповых, у расшаренных его может не быть — они идут следом.
+    unifiedChats() {
+      const rows = [];
+      for (const s of this.allSessions) {
+        rows.push({ ...s, kind: "chat", sortKey: s.last_id || 0 });
+      }
+      for (const g of this.groups) {
+        rows.push({
+          ...g, kind: "group", sortKey: g.last_id || 0,
+          character_name: (g.members || []).map((m) => m.name).join(", "),
+        });
+      }
+      for (const s of this.sharedSessions) {
+        rows.push({ ...s, kind: "shared", sortKey: -1 });
+      }
+      return rows.sort((a, b) => b.sortKey - a.sortKey);
+    },
+    // Чипы фильтра: только персонажи, у которых чаты реально есть.
+    chatFilterChips() {
+      const seen = new Map();
+      for (const s of this.allSessions) {
+        if (!s.character_id) continue;
+        if (!seen.has(s.character_id)) {
+          seen.set(s.character_id, { id: s.character_id, name: s.character_name || "Без имени", n: 0 });
+        }
+        seen.get(s.character_id).n += 1;
+      }
+      return Array.from(seen.values()).sort((a, b) => b.n - a.n);
+    },
+    visibleChats() {
+      const q = (this.chatFilter || "").trim().toLowerCase();
+      return this.unifiedChats.filter((s) => {
+        if (this.chatFilterChar !== null && s.character_id !== this.chatFilterChar) return false;
+        if (!q) return true;
+        return (s.title || "").toLowerCase().includes(q)
+          || (s.preview || "").toLowerCase().includes(q)
+          || (s.character_name || "").toLowerCase().includes(q);
+      });
+    },
+
+    // ---------- Командная палитра ----------
+    paletteItems() {
+      const raw = this.paletteQuery.trim();
+      const q = raw.replace(/^\//, "");
+      const out = [];
+      const add = (kind, item, hay) => {
+        const score = this._fuzzy(hay, q);
+        if (score >= 0) out.push({ ...item, kind, score });
+      };
+      for (const c of this.paletteCommands) {
+        add("cmd", { id: c.id, label: c.label, sub: c.sub }, c.label + " " + c.id);
+      }
+      // Слэш означает «только команды»: иначе выдача тонет в чатах.
+      if (!raw.startsWith("/")) {
+        for (const s of this.unifiedChats.slice(0, 300)) {
+          add("chat", { id: s.id, label: s.title || "Чат", sub: s.character_name || "чат", row: s },
+            (s.title || "") + " " + (s.character_name || ""));
+        }
+        for (const c of this.characters) {
+          add("char", { id: c.id, label: c.name, sub: "персонаж" }, c.name);
+        }
+      }
+      out.sort((a, b) => a.score - b.score);
+      const head = out.slice(0, 10);
+      // Найденные реплики идут отдельным блоком после команд и чатов: они
+      // приходят с сервера асинхронно и не участвуют в нечётком ранжировании.
+      for (const r of this.searchResults.slice(0, 10)) {
+        head.push({
+          kind: "msg", id: r.message_id, sid: r.session_id,
+          label: r.session_title || "Чат", sub: r.snippet, score: 0,
+        });
+      }
+      return head;
     },
   },
 
@@ -715,13 +835,16 @@ createApp({
       if (!res.ok) { this.showToast("Не удалось импортировать персонажа (код " + res.status + ")"); return; }
       await this.loadCharacters();
     },
+    // Выбор персонажа теперь ТОЛЬКО меняет контекст: показывает карточку в
+    // редакторе и ставит фильтр списка чатов. Раньше он же открывал первый чат
+    // персонажа, а если чатов не было — создавал новый, то есть просмотр имел
+    // разрушительный побочный эффект и плодил пустые чаты. Открытие чата
+    // осталось за строкой списка, где ему и место.
     async selectCharacter(c) {
       this.selectedCharacterId = c.id;
       this.charEdit = { ...c, generation_params: c.generation_params || {} };
+      this.chatFilterChar = c.id;
       await this.loadSessions();
-      // Автоматически открываем последний чат или создаём новый.
-      if (this.sessions.length) this.openSession(this.sessions[0]);
-      else await this.newChat();
     },
     async saveCharacter() {
       const c = this.charEdit;
@@ -894,7 +1017,7 @@ createApp({
     // команды Канвасу (выделение сохраняется), фокус — на него.
     focusCanvasAi() {
       this.toolbarPos = null;
-      this.canvasCmdMode = true;
+      this.composerMode = "canvasCmd";
       this.mobilePane = "chat";  // на мобильном единый инпут живёт в панели чата
       this.$nextTick(() => { if (this.$refs.composer) this.$refs.composer.focus(); });
     },
@@ -947,7 +1070,11 @@ createApp({
       const name = (this.canvas.title || "document").replace(/[^\wа-яёА-ЯЁ\-. ]+/gi, "_").trim() || "document";
       this.downloadBlob(blob, name + "." + fmt);
     },
-    closeCanvas() { this.saveCanvas(); this.canvasOpen = false; this.mobilePane = "chat"; this.canvasCmdMode = false; },
+    closeCanvas() {
+      this.saveCanvas(); this.canvasOpen = false; this.mobilePane = "chat";
+      // Канваса больше нет — команда для него бессмысленна.
+      if (this.composerMode === "canvasCmd") this.composerMode = "text";
+    },
 
     // ---------- Сессии (чаты) ----------
     async loadSessions() {
@@ -986,6 +1113,143 @@ createApp({
         .filter((n) => n.getClientRects().length > 0 || n.classList.contains("file-input"));
     },
 
+    // ---------- Нечёткий поиск ----------
+    // Совпадение по подпоследовательности символов: «нвчт» находит «Новый чат».
+    // Возвращает РАНГ (меньше — лучше) или -1, если совпадения нет. Ранг растёт
+    // от позиции первого совпадения и от разрывов между буквами, поэтому точное
+    // начало слова всегда обходит совпадение в середине.
+    _fuzzy(hay, needle) {
+      if (!needle) return 0;
+      const h = (hay || "").toLowerCase();
+      const n = needle.toLowerCase();
+      let from = 0, first = -1, last = -1, gaps = 0;
+      for (const ch of n) {
+        const idx = h.indexOf(ch, from);
+        if (idx < 0) return -1;
+        if (first < 0) first = idx;
+        if (last >= 0) gaps += idx - last - 1;
+        last = idx;
+        from = idx + 1;
+      }
+      return first * 2 + gaps;
+    },
+
+    // ---------- Командная палитра ----------
+    openPalette(prefill) {
+      this.paletteQuery = prefill || "";
+      this.paletteIndex = 0;
+      this.searchResults = [];
+      this.paletteOpen = true;
+      this.$nextTick(() => { if (this.$refs.paletteInput) this.$refs.paletteInput.focus(); });
+    },
+    closePalette() {
+      this.paletteOpen = false;
+      this.paletteQuery = "";
+      this.searchResults = [];
+    },
+    paletteMove(step) {
+      const n = this.paletteItems.length;
+      if (!n) return;
+      this.paletteIndex = (this.paletteIndex + step + n) % n;
+    },
+    async paletteRun(item) {
+      const it = item || this.paletteItems[this.paletteIndex];
+      if (!it) return;
+      this.closePalette();
+      if (it.kind === "chat") return this.openRecent(it.row);
+      if (it.kind === "char") {
+        const c = this.characters.find((x) => x.id === it.id);
+        if (c) { this.selectCharacter(c); this.sidebarOpen = true; }
+        return;
+      }
+      if (it.kind === "msg") return this.jumpToMessage(it.sid, it.id);
+      // Команды.
+      if (it.id === "new") return this.startNewChat();
+      if (it.id === "model" || it.id === "settings") { this.drawerTab = "generation"; return; }
+      if (it.id === "export") {
+        const s = this._sessionCard(this.sessionId);
+        if (s) this.exportSession(s);
+        return;
+      }
+      if (it.id === "branch") {
+        const last = this.messages[this.messages.length - 1];
+        if (last) return this.forkFrom(last);
+        this.showToast("Ветвить нечего: в чате нет сообщений");
+        return;
+      }
+      if (it.id === "clear") {
+        this.input = "";
+        this.composerMode = "text";
+        this.resetComposerHeight();
+      }
+    },
+
+    // ---------- Поиск по репликам ----------
+    // Дебаунс держим в обычном поле с префиксом _, а не в data: Vue обернул бы
+    // дескриптор таймера в Proxy (см. заметку про _bgJobs).
+    scheduleSearch() {
+      clearTimeout(this._searchTimer);
+      const q = this.paletteQuery.trim();
+      if (q.startsWith("/") || q.length < 2) { this.searchResults = []; return; }
+      this._searchTimer = setTimeout(() => this.runSearch(q), 220);
+    },
+    async runSearch(q) {
+      this.searchBusy = true;
+      try {
+        const r = await this.api("/search?q=" + encodeURIComponent(q));
+        // Пока ждали ответ, запрос мог смениться — старую выдачу не показываем.
+        if (this.paletteQuery.trim() === q) this.searchResults = r.results || [];
+      } catch (e) {
+        this.searchResults = [];
+      } finally {
+        this.searchBusy = false;
+      }
+    },
+    // Открыть чат и доехать до конкретной реплики. История грузится окнами,
+    // поэтому нужное сообщение может быть ещё не загружено: догружаем порциями,
+    // как это делает scrollToChatStart, с тем же предохранителем.
+    async jumpToMessage(sessionId, messageId) {
+      if (sessionId !== this.sessionId) {
+        await this.openSession(this._sessionCard(sessionId) || { id: sessionId });
+      }
+      this.jumpBusy = true;
+      try {
+        let guard = 40;
+        while (guard-- > 0) {
+          if (this.messages.some((m) => m.id === messageId)) break;
+          if (this.noMoreMessages) break;
+          const before = this.messages.length;
+          await this.loadOlder();
+          if (this.messages.length === before) break;  // ничего не пришло
+        }
+        await this.$nextTick();
+        this.scrollMessageStart(messageId);
+      } finally {
+        this.jumpBusy = false;
+      }
+    },
+
+    // ---------- Ветвление ----------
+    async forkFrom(m) {
+      if (!this.sessionId || !m) return;
+      const ok = await this.askConfirm(
+        "Создать ветку от этой реплики? В новый чат скопируется вся история до неё включительно, исходный чат не изменится.",
+        { title: "Ветка чата", okText: "Создать ветку", danger: false }
+      );
+      if (!ok) return;
+      try {
+        const r = await this.api("/sessions/" + this.sessionId + "/fork", {
+          method: "POST",
+          body: JSON.stringify({ message_id: m.id }),
+        });
+        await Promise.all([this.loadSessions(), this.loadAllSessions(), this.loadGroups()]);
+        await this.openSession(this._sessionCard(r.session_id) || { id: r.session_id });
+        this.showToast("Ветка создана: " + r.messages + " реплик");
+      } catch (e) {
+        this.showToast("Не удалось создать ветку: " + (e && e.message ? e.message : e));
+      }
+    },
+
     // ---------- Первый экран ----------
     // Все чаты без фильтра по персонажу: бэкенд отдаёт их отсортированными по
     // последней активности, поэтому «недавние» здесь означает именно недавние.
@@ -993,14 +1257,33 @@ createApp({
       try { this.recentChats = (await this.api("/sessions")).slice(0, 5); }
       catch (e) { this.recentChats = []; }
     },
+    // Все чаты пользователя одним списком. Это основной источник сайдбара;
+    // loadSessions (чаты одного персонажа) остаётся для мест, где нужен
+    // именно контекст персонажа.
+    async loadAllSessions() {
+      try {
+        this.allSessions = await this.api("/sessions");
+        this.recentChats = this.allSessions.slice(0, 5);
+      } catch (e) { this.allSessions = []; }
+    },
     async startNewChat() {
       if (this.selectedCharacter) { await this.newChat(); return; }
-      if (this.characters.length) { await this.selectCharacter(this.characters[0]); return; }
+      if (this.characters.length) {
+        await this.selectCharacter(this.characters[0]);
+        await this.newChat();
+        return;
+      }
       await this.createCharacter();
     },
-    // Открыть чат из блока быстрого старта. selectCharacter здесь звать НЕЛЬЗЯ:
-    // он сам открывает первый чат персонажа, а если чатов нет — создаёт новый,
-    // то есть просмотр имел бы побочный эффект. Переключаем контекст вручную.
+    // Открыть чат из блока быстрого старта или из палитры: подтягиваем контекст
+    // персонажа (карточка, список его чатов) и открываем именно тот чат, по
+    // которому кликнули, а не первый попавшийся.
+    // Строка единого списка: личный чат, группа и общий чат открываются
+    // по-разному, но для пользователя это одна и та же строка.
+    async openChatRow(s) {
+      if (s.kind === "shared") return this.openSharedSession(s);
+      return this.openRecent(s);
+    },
     async openRecent(s) {
       if (s.character_id && s.character_id !== this.selectedCharacterId) {
         const c = this.characters.find((x) => x.id === s.character_id);
@@ -1645,9 +1928,24 @@ createApp({
       if (e.key !== "Enter" || e.isComposing) return;  // не мешаем IME
       if (e.shiftKey || this.isTouch) return;          // перенос строки
       e.preventDefault();
-      if (this.canvasCmdMode) this.applyCanvasCmd();
-      else if (this.artMode) this.sendArt();
-      else this.send();
+      this.submitComposer();
+    },
+    // Единственная точка отправки: и кнопка, и Enter зовут её. Пока действие
+    // выбиралось в двух местах (цепочка v-else-if в шаблоне и if-цепочка в
+    // обработчике Enter), они могли разойтись между собой.
+    submitComposer() {
+      if (this.streaming) return;
+      if (this.composerMode === "canvasCmd") return this.applyCanvasCmd();
+      if (this.composerMode === "art") return this.sendArt();
+      return this.send();
+    },
+    // Надпись на кнопке отправки берётся из того же режима, что и действие.
+    submitLabel() {
+      if (this.waitingFiles) return "⏳ файлы…";
+      if (this.composerMode === "canvasCmd") return "✨ Применить";
+      if (this.composerMode === "canvasGen") return this.canvasGenerating ? "⏳…" : "📄 Создать";
+      if (this.composerMode === "art") return "🎨 Сгенерировать";
+      return "Отправить";
     },
     // Единый инпут в режиме команды Канвасу: применяем введённое как инструкцию ИИ
     // (к выделенному фрагменту, если он есть, иначе ко всему документу).
@@ -1656,7 +1954,7 @@ createApp({
       if (!cmd || !this.canvas) return;
       this.input = "";
       this.resetComposerHeight();
-      this.canvasCmdMode = false;
+      this.composerMode = "text";
       await this.reviseCanvas(cmd);
     },
     async send() {
@@ -1674,9 +1972,9 @@ createApp({
       if (!content && this.pendingAttachments.length === 0) return; // всё отвалилось
       // ===== Умная маршрутизация интентов для Canvas =====
       // Явный триггер «📄 Документ»: новый файл, ИЛИ правка открытого (если не «с нуля»).
-      if (this.canvasGenMode) {
+      if (this.composerMode === "canvasGen") {
         const atts = this._cleanAtts(this.pendingAttachments);
-        this.input = ""; this.pendingAttachments = []; this.canvasGenMode = false; this.resetComposerHeight();
+        this.input = ""; this.pendingAttachments = []; this.composerMode = "text"; this.resetComposerHeight();
         if (this.canvasOpen && this.canvas && !this._isNewCanvasIntent(content)) this.editOpenCanvas(content);
         else this.canvasGenerate(content, atts);
         return;
@@ -2127,7 +2425,7 @@ createApp({
       if (!this.sessionId) return;
       // «По описанию» — не алерт, а режим: вы пишете описание (+ фото) сообщением.
       if (mode === "prompt") {
-        this.artMode = true;
+        this.composerMode = "art";
         this.chatError = "";
         return;
       }
@@ -2157,7 +2455,7 @@ createApp({
       const attachments = this._cleanAtts(this.pendingAttachments);
       this.input = "";
       this.pendingAttachments = [];
-      this.artMode = false;
+      this.composerMode = "text";
       this.resetComposerHeight();
       try {
         // Фото-референсы могут быть тяжёлыми — грузим с прогрессом.
@@ -2811,7 +3109,7 @@ createApp({
       if (def) { this.applyPreset(def); await this.loadUiPrefs(false); }
       else await this.loadUiPrefs();
       await Promise.all([this.loadCharacters(), this.loadPersonas(), this.loadHorae(),
-        this.loadGroups(), this.loadFriends(), this.loadRecent()]);
+        this.loadGroups(), this.loadFriends(), this.loadAllSessions()]);
       // Восстанавливаем последний открытый чат (после F5 сразу можно писать);
       // если не вышло — показываем блок быстрого старта, а не открываем первого
       // персонажа молча: раньше это создавало чат как побочный эффект запуска.
@@ -2853,8 +3151,18 @@ createApp({
           if (e.shiftKey && cur === first) { e.preventDefault(); last.focus(); }
           else if (!e.shiftKey && cur === last) { e.preventDefault(); first.focus(); }
         });
+        // Палитра: Ctrl+K на Windows и Linux, Cmd+K на маке. Перехватываем до
+        // браузера, иначе Ctrl+K уедет в его строку поиска.
+        window.addEventListener("keydown", (e) => {
+          if (e.key !== "k" && e.key !== "K" && e.key !== "л" && e.key !== "Л") return;
+          if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+          e.preventDefault();
+          if (this.paletteOpen) this.closePalette();
+          else this.openPalette();
+        });
         window.addEventListener("keydown", (e) => {
           if (e.key !== "Escape" || e.defaultPrevented) return;
+          if (this.paletteOpen) { this.closePalette(); return; }
           if (this.dialog) { this.dialogCancel(); return; }
           if (this.lightbox) { this.lightbox = null; return; }
           if (this.headerMenu) { this.headerMenu = false; return; }
@@ -2868,7 +3176,13 @@ createApp({
           if (this.debugOpen) { this.debugOpen = false; return; }
           if (this.usageOpen) { this.usageOpen = false; return; }
           if (this.adminOpen) { this.adminOpen = false; return; }
-          if (this.drawerTab) { this.drawerTab = null; }
+          if (this.drawerTab) { this.drawerTab = null; return; }
+          // Режим композера — тоже слой, и выходить из него надо той же клавишей.
+          // Раньше из режима арта можно было выйти только маленькой ссылкой
+          // «отмена» внутри плашки, и обычное сообщение легко уходило в
+          // генератор картинок.
+          if (this.composerMode !== "text") { this.composerMode = "text"; return; }
+          if (this.sidebarOpen && this.isTouch) { this.sidebarOpen = false; }
         });
       }
     },
@@ -2904,6 +3218,12 @@ createApp({
     // Объявляем этапы хода, а не токены.
     streaming(on) {
       this.liveStatus = on ? "Генерация ответа началась" : "Ответ получен";
+    },
+    // Ввод в палитре: поиск по репликам идёт на сервер с дебаунсом, чтобы не
+    // слать запрос на каждую букву.
+    paletteQuery() {
+      this.paletteIndex = 0;
+      this.scheduleSearch();
     },
     chatError(text) {
       if (text) this.liveStatus = "Ошибка генерации: " + text;
@@ -3025,37 +3345,61 @@ createApp({
         </div>
       </div>
 
-      <!-- Раздел: Чаты выбранного персонажа -->
-      <div class="acc" v-if="selectedCharacter">
+      <!-- Раздел: ВСЕ чаты. Раньше он существовал только при выбранном
+           персонаже, и чтобы найти чат, надо было сначала вспомнить персонажа,
+           то есть вспомнить ответ до того, как задал вопрос. Теперь это одна
+           лента личных, групповых и общих чатов, а персонаж — фильтр поверх. -->
+      <div class="acc">
         <button class="acc-head" @click="toggleSection('chats')"
                 :aria-expanded="openSections.chats ? 'true' : 'false'">
-          <span class="acc-icon">💬</span><span class="acc-title">Чаты — {{ selectedCharacter.name }}</span>
+          <span class="acc-icon">💬</span>
+          <span class="acc-title">Чаты<template v-if="chatFilterChar !== null && selectedCharacter"> — {{ selectedCharacter.name }}</template></span>
           <span class="acc-chevron" :class="{ open: openSections.chats }">▸</span>
         </button>
         <div class="acc-body" :class="{ open: openSections.chats }">
-          <div style="padding: 6px 12px"><button @click="newChat" style="width:100%">+ Новый чат</button></div>
-          <div class="list-search" v-if="sessions.length > 5">
-            <input v-model="chatFilter" placeholder="Поиск по чатам…" @click.stop />
+          <div class="row" style="padding: 6px 12px; gap:6px">
+            <button @click="newChat" style="flex:1" :disabled="!selectedCharacter"
+                    :title="selectedCharacter ? 'Новый чат с ' + selectedCharacter.name : 'Сначала выберите персонажа'">+ Новый чат</button>
+            <button class="btn-icon" @click="openGroupModal" title="Собрать группу персонажей"
+                    aria-label="Собрать группу персонажей">👥</button>
+            <button class="btn-icon" @click="openPalette()" title="Поиск по сообщениям (Ctrl+K)"
+                    aria-label="Поиск по сообщениям, Ctrl+K">🔍</button>
+          </div>
+          <!-- Чипы фильтра. Клик по чипу меняет ТОЛЬКО фильтр: он не открывает
+               чат и не закрывает сайдбар, поэтому по спискам можно ходить. -->
+          <div class="chip-row" v-if="chatFilterChips.length > 1">
+            <button class="filter-chip" :class="{ on: chatFilterChar === null }"
+                    @click="chatFilterChar = null"
+                    :aria-pressed="chatFilterChar === null ? 'true' : 'false'">Все · {{ unifiedChats.length }}</button>
+            <button v-for="ch in chatFilterChips" :key="'fc'+ch.id" class="filter-chip"
+                    :class="{ on: chatFilterChar === ch.id }"
+                    @click="chatFilterChar = (chatFilterChar === ch.id ? null : ch.id)"
+                    :aria-pressed="chatFilterChar === ch.id ? 'true' : 'false'">{{ ch.name }} · {{ ch.n }}</button>
+          </div>
+          <div class="list-search" v-if="unifiedChats.length > 5">
+            <input v-model="chatFilter" placeholder="Поиск по названиям…" @click.stop />
             <button v-if="chatFilter" class="btn-icon" @click.stop="chatFilter=''" title="Очистить" aria-label="Очистить">✕</button>
           </div>
-          <div v-for="s in filteredSessions" :key="s.id"
+          <div v-for="s in visibleChats" :key="s.kind + s.id"
                :class="['list-item', 'row2', s.id === sessionId ? 'active' : '', s.pinned ? 'pinned' : '']">
-            <button type="button" class="row-main" @click="openSession(s)"
+            <button type="button" class="row-main" @click="openChatRow(s)"
                     :title="s.title + ' — чат #' + s.id"
                     :aria-current="s.id === sessionId ? 'true' : null"
-                    :aria-label="'Чат ' + s.title + (s.pinned ? ', закреплён' : '') + (pendingChats.includes(s.id) ? ', пришёл новый ответ' : '') + (s.last_at ? ', ' + shortWhen(s.last_at) : '')">
+                    :aria-label="(s.kind === 'group' ? 'Группа ' : s.kind === 'shared' ? 'Общий чат ' : 'Чат ') + s.title + (s.character_name ? ', ' + s.character_name : '') + (s.pinned ? ', закреплён' : '') + (pendingChats.includes(s.id) ? ', пришёл новый ответ' : '') + (s.last_at ? ', ' + shortWhen(s.last_at) : '')">
               <span v-if="pendingChats.includes(s.id)" class="reply-dot" aria-hidden="true"></span>
               <span class="grow row-text">
                 <span class="row-title">
                   <span v-if="s.pinned" class="pin-mark" aria-hidden="true">📌</span>
+                  <span v-if="s.kind !== 'chat'" class="kind-mark" aria-hidden="true">{{ s.kind === 'group' ? '👥' : '🔗' }}</span>
                   <span class="row-name">{{ s.title }}</span>
                 </span>
                 <span class="row-sub" v-if="s.preview">{{ s.preview }}</span>
+                <span class="row-sub muted" v-else-if="s.character_name">{{ s.character_name }}</span>
                 <span class="row-sub muted" v-else>пустой чат</span>
               </span>
               <span class="row-time" v-if="s.last_at" aria-hidden="true">{{ shortWhen(s.last_at) }}</span>
             </button>
-            <span class="row-actions">
+            <span class="row-actions" v-if="s.kind !== 'shared'">
               <button class="btn-icon" @click.stop="togglePinSession(s)"
                       :title="s.pinned ? 'Открепить' : 'Закрепить наверху'" :aria-label="s.pinned ? 'Открепить' : 'Закрепить наверху'">{{ s.pinned ? '📍' : '📌' }}</button>
               <button class="btn-icon" @click.stop="exportSession(s)" title="Экспорт чата (нативный формат AiChat)" aria-label="Экспорт чата (нативный формат AiChat)">💾</button>
@@ -3064,65 +3408,17 @@ createApp({
               <button class="btn-icon" @click.stop="deleteSession(s)" title="Удалить чат" aria-label="Удалить чат">🗑</button>
             </span>
           </div>
-          <div v-if="chatFilter && !filteredSessions.length" class="list-empty">Ничего не найдено</div>
-        </div>
-      </div>
-
-      <!-- Раздел: Группы -->
-      <div class="acc">
-        <button class="acc-head" @click="toggleSection('groups')"
-                :aria-expanded="openSections.groups ? 'true' : 'false'">
-          <span class="acc-icon">👥</span><span class="acc-title">Группы</span>
-          <span class="acc-chevron" :class="{ open: openSections.groups }">▸</span>
-        </button>
-        <div class="acc-body" :class="{ open: openSections.groups }">
-          <div style="padding: 6px 12px"><button @click="openGroupModal" style="width:100%">+ Группа</button></div>
-          <!-- Действия группы завёрнуты в .row-actions, как у чатов. Раньше четыре
-               кнопки стояли прямыми детьми строки и были видны всегда, съедая
-               ширину названия: два соседних списка вели себя по-разному. -->
-          <div v-for="g in groups" :key="g.id"
-               :class="['list-item', g.id === sessionId ? 'active' : '']">
-            <button type="button" class="row-main" @click="openSession(g)"
-                    :title="g.title + ' — чат #' + g.id"
-                    :aria-current="g.id === sessionId ? 'true' : null"
-                    :aria-label="'Группа ' + g.title + ', участники: ' + g.members.map(m => m.name).join(', ') + (pendingChats.includes(g.id) ? ', пришёл новый ответ' : '')">
-              <span v-if="pendingChats.includes(g.id)" class="reply-dot" aria-hidden="true"></span>
-              <span class="grow row-text">
-                <span class="row-name">{{ g.title }}</span>
-                <span class="row-sub muted">{{ g.members.map(m => m.name).join(', ') }}</span>
-              </span>
-            </button>
-            <span class="row-actions">
-              <button class="btn-icon" @click.stop="exportSession(g)" title="Экспорт чата (нативный формат AiChat)" aria-label="Экспорт чата (нативный формат AiChat)">💾</button>
-              <button v-if="authStatus.accounts_enabled" class="btn-icon" @click.stop="openInvite(g)" title="Пригласить друга в группу" aria-label="Пригласить друга в группу">🔗</button>
-              <button class="btn-icon" @click.stop="renameSession(g)" title="Переименовать" aria-label="Переименовать">✎</button>
-              <button class="btn-icon" @click.stop="deleteSession(g)" title="Удалить группу" aria-label="Удалить группу">🗑</button>
-            </span>
+          <div v-if="!visibleChats.length" class="list-empty">
+            {{ chatFilter || chatFilterChar !== null ? 'Ничего не найдено' : 'Чатов пока нет' }}
           </div>
         </div>
       </div>
 
-      <!-- Раздел: Доступные мне (расшаренные чаты) -->
-      <div class="acc" v-if="authStatus.accounts_enabled && sharedSessions.length">
-        <button class="acc-head" @click="toggleSection('shared')"
-                :aria-expanded="openSections.shared ? 'true' : 'false'">
-          <span class="acc-icon">👁</span><span class="acc-title">Доступные мне</span>
-          <span class="acc-chevron" :class="{ open: openSections.shared }">▸</span>
-        </button>
-        <div class="acc-body" :class="{ open: openSections.shared }">
-          <div v-for="s in sharedSessions" :key="'sh'+s.id"
-               :class="['list-item', s.id === sessionId ? 'active' : '']">
-            <button type="button" class="row-main" @click="openSharedSession(s)"
-                    :aria-current="s.id === sessionId ? 'true' : null"
-                    :aria-label="'Общий чат ' + s.title + ', персонаж ' + s.character_name + ', от ' + s.owner">
-              <span class="grow row-text">
-                <span class="row-name">{{ s.title }}</span>
-                <span class="row-sub muted">{{ s.character_name }} · от {{ s.owner }}</span>
-              </span>
-            </button>
-          </div>
-        </div>
-      </div>
+      <!-- Разделы «Группы» и «Доступные мне» слились с общим списком чатов выше:
+           три списка одной сущности с тремя разными правилами строки были ровно
+           тем, из-за чего пользователь не мог опереться ни на одно из них.
+           Кнопка создания группы переехала к кнопке нового чата. -->
+
     </div>
 
     <!-- ===== Центр: чат ===== -->
@@ -3136,21 +3432,21 @@ createApp({
           <img v-if="headerAvatar" :src="headerAvatar" />
           <span v-else>{{ currentIsGroup ? '👥' : (currentSessionTitle || 'T').charAt(0).toUpperCase() }}</span>
         </span>
-        <span class="title" :title="sessionId ? (currentSessionTitle + ' — чат #' + sessionId) : ''">{{ sharedView ? ('🔗 ' + sharedView.title) : (currentIsGroup ? currentGroup.title : (selectedCharacter ? selectedCharacter.name : 'TaleEngine')) }}</span>
-        <!-- Полное имя чата и его номер: по нему удобно ссылаться на конкретный чат -->
-        <span v-if="sessionId" class="pill chat-id-pill" :title="currentSessionTitle + ' — чат #' + sessionId">💬 {{ currentSessionTitle || 'чат' }} · #{{ sessionId }}</span>
-        <span v-if="currentIsGroup" class="pill hide-mobile" title="Участники группы">👥 {{ currentGroup.members.map(m => m.name).join(', ') }}</span>
-        <span :class="['pill', connected ? 'status-ok' : 'status-err']"
-              :title="connected ? 'Соединение с сервером активно' : 'Переподключение…'">{{ connected ? 'online' : '⟳ реконнект' }}</span>
-        <span class="pill hide-mobile">{{ params.model || connection.default_model }}</span>
-        <span v-if="connection.use_proxy" class="pill hide-mobile" title="Запросы идут в LiteLLM-прокси">proxy {{ connection.base_url }}</span>
-        <div style="flex:1"></div>
-        <button v-if="sessionId" class="btn-icon hide-mobile" @click="openKnowledge"
-                title="База знаний чата: файлы, которые персонажи всегда учитывают" aria-label="База знаний чата: файлы, которые персонажи всегда учитывают">📚</button>
-        <button v-if="sessionId && !sharedView" class="btn-icon hide-mobile" @click="openMembers"
-                :title="currentIsGroup ? 'Участники группы (добавить/убрать)' : 'Добавить персонажа (сделать групповым)'" :aria-label="currentIsGroup ? 'Участники группы (добавить/убрать)' : 'Добавить персонажа (сделать групповым)'">👥➕</button>
-        <button v-if="currentIsGroup" class="btn-icon hide-mobile" :class="currentGroup.director ? 'rec-active' : ''"
-                @click="toggleDirector" title="ИИ-режиссёр: решает, кто ответит" aria-label="ИИ-режиссёр: решает, кто ответит">🎬</button>
+        <!-- Идентичность чата: одна строка вместо заголовка и дублирующей его
+             пилюли. Номер чата остаётся, по нему удобно ссылаться. -->
+        <span class="header-id">
+          <span class="title" :title="headerSubtitle">{{ headerTitle }}</span>
+          <span v-if="headerSubtitle" class="header-sub">{{ headerSubtitle }}</span>
+        </span>
+        <!-- Статус связи виден ТОЛЬКО когда связи нет. Вечно зелёный «online»
+             занимал место в самой дорогой по вниманию полосе и не читался. -->
+        <!-- Распорника здесь нет намеренно: .header-id уже растягивается, и второй
+             flex:1 делил бы полосу пополам, подвешивая плашку обрыва связи ровно
+             посередине шапки, вдали и от заголовка, и от кнопок. -->
+        <span v-if="!connected" class="pill status-err" title="Связь с сервером потеряна, идёт переподключение">⟳ реконнект</span>
+        <button class="btn-icon" @click="openPalette()"
+                title="Поиск по сообщениям и команды (Ctrl+K)"
+                aria-label="Поиск по сообщениям и команды, Ctrl+K">🔍</button>
         <!-- Колокольчик уведомлений: входящие заявки в друзья -->
         <div v-if="currentUserObj" class="notif-wrap">
           <button class="btn-icon" @click="notifOpen=!notifOpen" title="Уведомления" aria-label="Уведомления">
@@ -3169,15 +3465,11 @@ createApp({
             </div>
           </div>
         </div>
-        <button class="btn-icon hide-mobile" @click="soundOn=!soundOn" :title="soundOn ? 'Звук вкл' : 'Звук выкл'" :aria-label="soundOn ? 'Звук вкл' : 'Звук выкл'">{{ soundOn ? '🔊' : '🔇' }}</button>
-        <button v-if="currentUserObj" class="btn-icon hide-mobile" @click="openProfile" title="Профиль / привязка Telegram" aria-label="Профиль / привязка Telegram">👤<span class="hide-mobile"> {{ currentUserObj.username }}</span></button>
-        <button v-if="sessionId && authStatus.accounts_enabled && !sharedView" class="btn-icon hide-mobile" @click="openInvite({ id: sessionId })" title="Пригласить друга в этот чат" aria-label="Пригласить друга в этот чат">👥</button>
-        <button v-if="sessionId" class="btn-icon hide-mobile" @click="bgPicker=!bgPicker" title="Фон чата" aria-label="Фон чата">🖼</button>
-        <button class="btn-icon hide-mobile" @click="openDebug" title="Отладка LLM (что уходит в прокси)" aria-label="Отладка LLM (что уходит в прокси)">🐞</button>
-        <button v-if="isAdmin" class="btn-icon hide-mobile" @click="openAdmin" title="Администрирование" aria-label="Администрирование">🛡</button>
         <button class="btn-icon" @click="drawerTab = drawerTab ? null : 'generation'" title="Настройки" aria-label="Настройки">⚙</button>
-        <!-- На мобильном вторичные действия шапки прячем в это меню (⋯) -->
-        <div class="header-menu-wrap only-mobile">
+        <!-- Редкие действия живут здесь на ВСЕХ экранах, а не только на телефоне.
+             Механизм был написан ещё для мобильной шапки, но к десктопу его тогда
+             не применили, и девять кнопок продолжали висеть в полосе. -->
+        <div class="header-menu-wrap">
           <button class="btn-icon" @click="headerMenu=!headerMenu" title="Ещё" aria-label="Ещё">⋯</button>
           <div v-if="headerMenu" class="plus-backdrop" @click="headerMenu=false"></div>
           <div v-if="headerMenu" class="plus-menu header-menu">
@@ -3321,6 +3613,12 @@ createApp({
               <button v-if="m.role === 'assistant' && m.id === lastAssistantId" class="btn-icon" @click="regenerate" title="Перегенерировать" aria-label="Перегенерировать">↻</button>
               <button v-if="m.role === 'assistant' && m.id === lastAssistantId" class="btn-icon" @click="continueReply" title="Продолжить" aria-label="Продолжить">⏩</button>
               <button class="btn-icon" @click="artFromMessage(m)" title="Нарисовать по этому сообщению" aria-label="Нарисовать по этому сообщению">🎨</button>
+              <!-- Ветка от реплики: развилка сюжета перестаёт эмулироваться
+                   откруткой свайпа в середине чата, после которой вся дальнейшая
+                   переписка отвечала на вариант, которого уже не видно. -->
+              <button class="btn-icon" @click="forkFrom(m)"
+                      title="Форкнуть отсюда: новый чат с историей до этой реплики"
+                      aria-label="Форкнуть отсюда: новый чат с историей до этой реплики">⑂</button>
             </template>
             <button class="btn-icon" @click="deleteMessage(m)" title="Удалить" aria-label="Удалить">🗑</button>
           </div>
@@ -3417,25 +3715,10 @@ createApp({
           ↪ Ответ на: {{ (replyToMsg.content || '').slice(0, 90) }}
           <a href="#" @click.prevent="cancelReply">✕</a>
         </div>
-        <!-- Индикатор режима арта (вместо алерта): пишите описание сообщением -->
-        <div v-if="artMode" class="art-indicator">
-          🎨 Опишите картинку сообщением (можно прикрепить фото 📎), затем «Сгенерировать».
-          <a href="#" @click.prevent="artMode=false">отмена</a>
-        </div>
-        <!-- Индикатор: команда уходит в открытый Канвас (а не сообщением в чат) -->
-        <div v-if="canvasCmdMode" class="art-indicator">
-          ✨ Команда для Canvas {{ canvasSelText ? '(выделенный фрагмент)' : '(весь документ)' }}
-          <a href="#" @click.prevent="canvasCmdMode=false">отмена</a>
-        </div>
-        <!-- Индикатор: триггер «Документ» — ответ ИИ откроется в Canvas -->
-        <div v-if="canvasGenMode" class="art-indicator">
-          📄 Опишите документ/код — ответ придёт плашкой и откроется в Canvas.
-          <a href="#" @click.prevent="canvasGenMode=false">отмена</a>
-        </div>
-        <!-- Подсказка о маршрутизации, когда Канвас открыт (умный редактор, а не генератор файлов) -->
-        <div v-if="canvasOpen && canvas && !canvasGenMode && !canvasCmdMode && !artMode" class="art-indicator route-hint">
-          📝 Открыт «{{ canvas.title || 'без названия' }}»: правки («исправь…», «сделай длиннее») меняют его; «напиши новый…» создаст отдельный.
-        </div>
+        <!-- Плашек режима здесь больше нет: режим виден на кнопке отправки и в
+             плейсхолдере, а Esc возвращает обычное сообщение. Раньше три режима
+             давали три одинаковые синие полосы над полем ввода, и на телефоне
+             при нескольких полосах на саму переписку оставалось полторы строки. -->
         <div class="chips" v-if="pendingAttachments.length">
           <span class="chip att-chip" :class="{ 'att-loading': a.loading, 'att-error': a.error }"
                 v-for="(a, i) in pendingAttachments" :key="a.id">
@@ -3472,10 +3755,11 @@ createApp({
         <div class="row">
           <!-- [+] второстепенные действия: документ, арт -->
           <div class="plus-wrap">
-            <button class="btn-icon" :class="(artMode || canvasGenMode) ? 'rec-active' : ''" @click="plusMenu=!plusMenu" title="Ещё: документ, арт" aria-label="Ещё: документ, арт">➕</button>
+            <button class="btn-icon" :class="composerMode !== 'text' ? 'rec-active' : ''"
+                    @click="plusMenu=!plusMenu" title="Ещё: документ, арт" aria-label="Ещё: документ, арт">➕</button>
             <div v-if="plusMenu" class="plus-backdrop" @click="plusMenu=false"></div>
             <div v-if="plusMenu" class="plus-menu">
-              <button @click="canvasGenMode=true; artMode=false; plusMenu=false">📄 Создать документ/код (Canvas)</button>
+              <button @click="composerMode='canvasGen'; plusMenu=false">📄 Создать документ/код (Canvas)</button>
               <button @click="generateArt('prompt'); plusMenu=false">🖼 Сгенерировать фото (арт)</button>
               <button @click="generateArt('scene'); plusMenu=false">🎬 Арт по последней сцене</button>
               <button @click="generateArt('overview'); plusMenu=false">🌅 Арт по общей картине</button>
@@ -3505,10 +3789,12 @@ createApp({
                     :placeholder="composerPlaceholder"
                     @input="autoGrow" @keydown="onComposerKeydown" @paste="onPaste"></textarea>
           <button v-if="streaming" class="btn-danger" @click="stop">■ Стоп</button>
-          <button v-else-if="canvasCmdMode" class="btn-primary" @click="applyCanvasCmd" :disabled="canvasBusy">✨ Применить</button>
-          <button v-else-if="canvasGenMode" class="btn-primary" @click="send" :disabled="!connected || canvasGenerating">{{ canvasGenerating ? '⏳…' : '📄 Создать' }}</button>
-          <button v-else-if="artMode" class="btn-primary" @click="sendArt" :disabled="!connected">🎨 Сгенерировать</button>
-          <button v-else class="btn-primary" @click="send" :disabled="!connected || waitingFiles">{{ waitingFiles ? '⏳ файлы…' : 'Отправить' }}</button>
+          <!-- ОДНА кнопка на все режимы. Раньше их было четыре в цепочке
+               v-else-if, и порядок цепочки решал, что произойдёт: надпись могла
+               обещать одно, а нажатие делало другое. Теперь и надпись, и
+               действие читают одно и то же поле composerMode. -->
+          <button v-else class="btn-primary" @click="submitComposer"
+                  :disabled="!connected || waitingFiles || (composerMode === 'canvasCmd' && canvasBusy) || (composerMode === 'canvasGen' && canvasGenerating)">{{ submitLabel() }}</button>
         </div>
       </div>
     </div>
@@ -4295,6 +4581,39 @@ createApp({
       <div class="dialog-actions">
         <button class="btn-ghost" @click="dialogCancel">{{ dialog.cancelText }}</button>
         <button :class="dialog.danger ? 'btn-danger' : 'btn-primary'" @click="dialogOk">{{ dialog.okText }}</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Командная палитра (Ctrl+K) =====
+       Один вход к чатам, персонажам, командам и поиску по репликам. Класс .modal
+       нужен не для вида, а чтобы палитра попала в ловушку фокуса из волны 2 без
+       отдельного кода: _topOverlay ищет именно .drawer, .modal и .lightbox. -->
+  <div v-if="paletteOpen" class="modal-backdrop palette-backdrop" @click.self="closePalette">
+    <div class="modal palette" role="dialog" aria-modal="true" aria-label="Поиск и команды">
+      <input ref="paletteInput" v-model="paletteQuery" class="palette-input"
+             placeholder="Чат, персонаж, команда со /, или фраза из переписки…"
+             aria-label="Поиск по чатам, персонажам, командам и репликам"
+             @keydown.down.prevent="paletteMove(1)"
+             @keydown.up.prevent="paletteMove(-1)"
+             @keydown.enter.prevent="paletteRun()" />
+      <div class="palette-hint">
+        <span>↑↓ — выбор · Enter — открыть · Esc — закрыть</span>
+        <span v-if="searchBusy">ищу по репликам…</span>
+      </div>
+      <div class="palette-list" v-if="paletteItems.length">
+        <button v-for="(it, i) in paletteItems" :key="it.kind + '-' + it.id + '-' + i"
+                class="palette-item" :class="{ on: i === paletteIndex }"
+                @click="paletteRun(it)" @mousemove="paletteIndex = i">
+          <span class="palette-kind" aria-hidden="true">{{ it.kind === 'cmd' ? '⌘' : it.kind === 'char' ? '🎭' : it.kind === 'msg' ? '🔍' : '💬' }}</span>
+          <span class="palette-text">
+            <span class="palette-label">{{ it.label }}</span>
+            <span class="palette-sub">{{ it.sub }}</span>
+          </span>
+        </button>
+      </div>
+      <div class="palette-empty" v-else>
+        {{ paletteQuery.trim().length < 2 ? 'Введите хотя бы два символа' : 'Ничего не найдено' }}
       </div>
     </div>
   </div>
