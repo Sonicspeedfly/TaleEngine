@@ -387,7 +387,7 @@ label.btn-primary { color: var(--text-on-accent); }
 /* Внутри блока у <pre> своя рамка и отступы уже не нужны — их даёт .code-block. */
 .code-block pre { margin: 0; border: none; border-radius: 0; background: transparent; }
 /* На узком экране кнопка всё равно должна быть нажимаемой пальцем. */
-@media (max-width: 760px) { .code-copy { min-height: 32px; padding: 4px 12px; } }
+@media (max-width: 767.98px) { .code-copy { min-height: 32px; padding: 4px 12px; } }
 .bubble pre code { background: transparent; padding: 0; }
 /* Разметка в духе Telegram: цитаты, ссылки, списки, заголовки. */
 .bubble strong, .bubble b { font-weight: 700; }
@@ -539,6 +539,134 @@ label.btn:focus-within, label.btn-primary:focus-within, label.btn-icon:focus-wit
 }
 
 /* ============================================================
+   Приборы: телеметрия у композера
+   ============================================================
+   Полоса заполнения окна, скорость и задержка первого токена. На узком экране
+   схлопывается в одну строку-бейдж: отнимать высоту у переписки прибор не вправе. */
+.telemetry {
+  display: flex; align-items: center; gap: var(--sp-3);
+  margin-top: 6px; font-size: var(--fs-100); color: var(--text-secondary);
+}
+.telemetry-main {
+  display: flex; align-items: center; gap: var(--sp-2);
+  padding: 4px 8px; background: transparent; border: 1px solid transparent;
+  border-radius: var(--r-md); color: inherit; font: inherit; min-width: 0;
+}
+.telemetry-main:hover { background: var(--surface-hover); border-color: var(--border-subtle); }
+.telemetry-main:active { transform: none; }
+.tele-gauge {
+  width: 84px; height: 6px; flex: none; border-radius: var(--r-pill);
+  background: var(--surface-3); overflow: hidden;
+}
+.tele-gauge i { display: block; height: 100%; background: var(--ok); transition: width 0.3s ease; }
+.tele-gauge.warn i { background: var(--warn); }
+.tele-gauge.crit i { background: var(--danger); }
+.tele-num { font-variant-numeric: tabular-nums; color: var(--text-primary); }
+.tele-sub { white-space: nowrap; }
+.tele-warn { color: var(--warn); }
+.tele-live { margin-left: auto; display: flex; gap: 6px; font-variant-numeric: tabular-nums; }
+
+/* ============================================================
+   Инспектор хода
+   ============================================================
+   На десктопе правая панель, на узком экране нижняя шторка (см. адаптив ниже).
+   Сжимать чат сбоку на телефоне нельзя: от переписки не осталось бы ничего. */
+.inspector {
+  width: 480px; max-width: 100%; height: 100%; max-height: 100%;
+  margin-left: auto; margin-right: 0; border-radius: 0;
+  display: flex; flex-direction: column; padding: 0;
+}
+.sheet-backdrop { align-items: stretch; justify-content: flex-end; padding: 0; }
+.sheet-grip { display: none; }
+.inspector-head {
+  display: flex; align-items: center; gap: var(--sp-2);
+  padding: var(--sp-3) var(--sp-4); border-bottom: 1px solid var(--border-subtle);
+}
+.inspector-head h3 { flex: 1; margin: 0; font-size: var(--fs-400); }
+.inspector-body { flex: 1; overflow-y: auto; padding: var(--sp-4); }
+.ins-total { font-size: var(--fs-300); margin-bottom: var(--sp-3); }
+/* Полоса весов: что занимает контекст, видно до чтения списка. */
+.ins-bar {
+  display: flex; height: 10px; border-radius: var(--r-pill); overflow: hidden;
+  background: var(--surface-3); margin-bottom: var(--sp-4);
+}
+.ins-bar i { display: block; height: 100%; }
+.seg-character { background: #8aa3ff; }
+.seg-persona   { background: #5ccf8d; }
+.seg-horae     { background: #deb35b; }
+.seg-guides    { background: #a2a9b4; }
+.seg-history   { background: #6f7a8e; }
+.seg-tail      { background: #e08b5c; }
+.ins-dot { width: 10px; height: 10px; border-radius: 50%; flex: none; background: var(--text-tertiary); }
+.ins-block, .ins-horae {
+  display: flex; align-items: center; gap: var(--sp-2);
+  padding: 8px 0; border-bottom: 1px solid var(--border-subtle);
+  font-size: var(--fs-200);
+}
+.ins-block summary {
+  display: flex; align-items: center; gap: var(--sp-2);
+  cursor: pointer; list-style: none;
+}
+.ins-block summary::-webkit-details-marker { display: none; }
+details.ins-block { display: block; }
+details.ins-block > summary { padding: 8px 0; }
+.ins-w { font-variant-numeric: tabular-nums; color: var(--text-secondary); flex: none; }
+.ins-cut { color: var(--warn); }
+.ins-cut .ins-dot { background: var(--warn); }
+.ins-text {
+  margin: 4px 0 10px; padding: 10px 12px; max-height: 260px; overflow: auto;
+  background: var(--surface-0); border: 1px solid var(--border-subtle);
+  border-radius: var(--r-md); font-size: var(--fs-100); white-space: pre-wrap;
+  font-family: "Cascadia Code", Consolas, monospace;
+}
+.ins-sub { margin: var(--sp-4) 0 var(--sp-2); font-size: var(--fs-200); }
+.menu-label {
+  display: block; padding: 8px 12px 4px; font-size: var(--fs-100);
+  color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 0.5px;
+}
+.menu-sep { display: block; height: 1px; background: var(--border-subtle); margin: 4px 0; }
+.plus-menu button.on { background: var(--surface-selected); color: var(--text-primary); }
+
+/* ============================================================
+   Режим «Сцена»
+   ============================================================
+   Фон чата задаёт пользователь, и раньше имя говорящего ложилось прямо на него:
+   на светлом фото контраст падал примерно до 1.55:1, а починить это было нечем.
+   Теперь реплика живёт на СОБСТВЕННОЙ подложке. Непрозрачность 0.88 выбрана
+   расчётом по худшему случаю (белое фото): текст получает 12.16:1, именная
+   реплика 7.51:1. Ниже 0.88 имя перестаёт держать 7:1 при любом оттенке. */
+.view-scene .bubble {
+  background: rgba(14, 12, 15, 0.88);
+  border: 1px solid rgba(240, 235, 230, 0.10);
+  backdrop-filter: blur(2px);
+}
+.view-scene .msg.user .bubble { background: rgba(20, 16, 28, 0.88); }
+/* Именная реплика: янтарь светлее уголька именно ради порога 7:1 — исходный
+   #e0763c давал на белом фоне только 4.68:1. */
+.view-scene .speaker {
+  color: #f0ad78; font-size: var(--fs-100); letter-spacing: 0.14em;
+  text-transform: uppercase; margin-bottom: 4px;
+}
+.view-scene .msg.user .speaker { color: #cfd6e6; }
+/* Ремарки: то, что модель пишет курсивом, читается как сценическая ремарка. */
+.view-scene .bubble em {
+  color: #d9cfc6; font-style: italic;
+}
+.view-scene .messages { padding-top: 26px; padding-bottom: 26px; }
+.view-scene .msg { max-width: 720px; }
+.view-scene .msg-meta, .view-scene .msg-ava { opacity: 0.85; }
+/* Метаданные тоже на подложке: они лежали на пользовательском фоне так же, как имя. */
+.view-scene .msg-meta {
+  background: rgba(14, 12, 15, 0.88); border-radius: var(--r-sm);
+  padding: 2px 6px; width: fit-content;
+}
+.view-scene .msg.user .msg-meta { margin-left: auto; }
+
+/* Режим «Работа с документом»: лента уступает место Канвасу. */
+.view-work.with-canvas .chat { flex: 0 1 42%; }
+.view-work.with-canvas .canvas-pane { flex: 1 1 58%; }
+
+/* ============================================================
    Командная палитра (Ctrl+K)
    ============================================================
    Один вход к чатам, персонажам, командам и поиску по репликам. Садится сверху,
@@ -577,7 +705,7 @@ label.btn:focus-within, label.btn-primary:focus-within, label.btn-icon:focus-wit
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .palette-empty { padding: 22px 18px; color: var(--text-secondary); font-size: var(--fs-100); }
-@media (max-width: 760px) {
+@media (max-width: 767.98px) {
   .palette-backdrop { padding-top: 6vh; }
   .palette { max-height: 82vh; }
 }
@@ -780,7 +908,7 @@ input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
 .backdrop { display: none; }
 
 /* ----- Адаптивность ----- */
-@media (max-width: 760px) {
+@media (max-width: 767.98px) {
   /* На мобильном сайдбар — выезжающий оверлей по ☰ (а не колонка). */
   .hide-mobile { display: none; }
   .sidebar {
@@ -807,12 +935,74 @@ input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
   input, textarea, select { font-size: var(--fs-300); }
 
   /* --- Размер зоны нажатия ---
-     Кнопки высотой 24-32px трудно попасть пальцем (рекомендация — от 44px).
-     Задаём минимум высоты, не трогая ширину, чтобы плотные ряды не разъезжались. */
-  button, .btn-icon, .tab-btn { min-height: 40px; }
-  .btn-icon { min-width: 40px; display: inline-flex; align-items: center; justify-content: center; }
+     Было 40px — компромисс, который так и не дотянул до нормы. Рекомендация
+     Apple и WCAG 2.5.5 — 44×44, и меньше уже требует прицеливаться. Правило
+     задано от РОЛИ элемента, а не от перечня классов: иначе каждый новый тип
+     контрола снова выпадал бы из него, как выпали ссылки-кнопки. */
+  button, .btn, .btn-icon, .tab-btn, label.btn, label.btn-primary, label.btn-icon,
+  .filter-chip, .palette-item, .start-chat, [role="button"] {
+    min-height: 44px;
+  }
+  .btn-icon, label.btn-icon { min-width: 44px; display: inline-flex; align-items: center; justify-content: center; }
+  /* Ссылки внутри плашек ведут себя как кнопки — им та же зона. */
+  .error-banner a, .art-indicator a, .reply-bar a, .att-x, .att-dl {
+    display: inline-flex; align-items: center; min-height: 44px; padding: 0 6px;
+  }
   /* Строки списков (чаты, персонажи) — тоже под палец. */
   .list-item { min-height: 42px; }
+
+  /* ---- Строка действий под сообщением переносится ----
+     Она была плоским flex без переноса, и на узком экране уже не помещалась.
+     У сообщений пользователя justify-content: flex-end выталкивал переполнение
+     за НАЧАЛЬНЫЙ край, до которого прокруткой не добраться ни в одном браузере.
+     Увеличение целей до 44px сделало бы это заметно хуже, поэтому перенос
+     обязателен именно здесь, а не «когда-нибудь потом». */
+  .msg-meta { flex-wrap: wrap; row-gap: 4px; }
+
+  /* ---- Нижние шторки вместо боковых панелей ----
+     Панель шириной 480px на экране 375px это не панель, а закрытый чат. Всё,
+     что на десктопе выезжает сбоку, здесь поднимается снизу: так остаётся видна
+     верхняя часть переписки, и жест закрытия совпадает с направлением открытия. */
+  /* Подложка модалок имеет отступ 16px — шторке он не нужен, иначе она висит
+     в воздухе, а не выезжает из нижнего края. */
+  .sheet-backdrop { align-items: flex-end; justify-content: center; padding: 0; }
+  .inspector, .drawer {
+    width: 100%; max-width: 100%; height: auto; max-height: 85vh;
+    margin: 0; border-radius: var(--r-lg) var(--r-lg) 0 0;
+    border-left: none; border-top: 1px solid var(--border-subtle);
+    box-shadow: var(--shadow-2);
+  }
+  .drawer { position: fixed; left: 0; right: 0; bottom: 0; top: auto; }
+  /* Ручка: без неё шторка читается как «экран приехал», а не «панель поднялась». */
+  .sheet-grip {
+    display: block; width: 36px; height: 4px; margin: 8px auto 2px;
+    border-radius: var(--r-pill); background: var(--border-strong); flex: none;
+  }
+  .inspector-body { padding: var(--sp-3); }
+
+  /* ---- Телеметрия: микро-бейдж ----
+     На узком экране прибор не имеет права отнимать высоту у переписки. */
+  .telemetry { margin-top: 4px; font-size: var(--fs-100); }
+  /* Бейдж остаётся визуально в одну строку (24px), но зона нажатия растянута
+     невидимым слоем до 44px. Требование «прибор не отнимает высоту переписки» и
+     требование «палец попадает» иначе противоречат друг другу: min-height здесь
+     вернул бы те самые 44px высоты, ради экономии которых бейдж и сделан. */
+  .telemetry-main { padding: 2px 6px; min-height: 0; gap: 6px; position: relative; }
+  .telemetry-main::after {
+    content: ""; position: absolute; left: 0; right: 0; top: 50%;
+    height: 44px; transform: translateY(-50%);
+  }
+  .tele-gauge { width: 48px; height: 5px; }
+  .hide-narrow { display: none; }
+  .tele-live { gap: 4px; }
+
+  /* ---- Канвас во весь экран ----
+     Вкладки «чат / канвас» уже прячут неактивную панель, но канвас оставался в
+     общем потоке и делил экран с шапкой чата. Здесь он занимает его целиком. */
+  .app-grid.with-canvas.pane-canvas .canvas-pane {
+    position: fixed; inset: 0; z-index: 45; width: 100%; border-left: none;
+  }
+  .canvas-back { min-height: 44px; padding: 0 12px; flex: none; }
 
   /* --- Вырезы и жесты (iPhone) ---
      viewport-fit=cover в index.html пускает контент под скруглённые углы и полосу
@@ -902,7 +1092,7 @@ input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
 }
 .msg.jump-flash .bubble { animation: jump-flash 0.9s ease-out; border-radius: var(--r-lg); }
 
-@media (max-width: 760px) {
+@media (max-width: 767.98px) {
   /* Ближе к краю и крупнее — под палец. Отступ снизу считается в JS. */
   .chat-nav { right: 10px; }
   .chat-nav .btn-icon { width: 40px; height: 36px; }
@@ -1069,7 +1259,7 @@ input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
 .canvas-ai input { flex: 1; }
 /* Мобильные вкладки: на экране либо Чат, либо Canvas — без сплющивания. */
 .only-mobile { display: none; }
-@media (max-width: 760px) {
+@media (max-width: 767.98px) {
   .only-mobile { display: inline-flex; }
   /* Вкладки: на экране либо чат, либо канвас (через display:none неактивной). */
   .app-grid.with-canvas.pane-chat > .canvas-pane { display: none; }

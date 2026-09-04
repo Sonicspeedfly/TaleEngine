@@ -226,6 +226,24 @@ createApp({
       // из /sessions без фильтра по персонажу и уже отсортирован по активности.
       recentChats: [],
 
+      // --- Приборы: телеметрия хода ---
+      // Замеры делаются на КЛИЕНТЕ: токенизатор провайдера браузеру недоступен,
+      // поэтому скорость считается по приросту символов и честно подписана оценкой.
+      ctxStats: null,          // отчёт инспектора: веса блоков, обрезка, память
+      ctxBusy: false,
+      inspectorOpen: false,
+      genStartAt: 0,           // момент отправки
+      genFirstAt: 0,           // момент первого токена
+      genElapsed: 0,           // секунд идёт ход
+      genTps: 0,               // символов в секунду -> оценка токенов
+      // Цена за миллион входных токенов. Ноль означает «не показывать»: выдумывать
+      // тарифы за пользователя нельзя, у каждого прокси они свои.
+      pricePerMTok: Number(localStorage.getItem("pricePerMTok") || 0),
+
+      // --- Режим ленты ---
+      // Одно поле, как composerMode: normal | scene | work.
+      viewMode: localStorage.getItem("viewMode") || "normal",
+
       // --- Единый список чатов ---
       // Все чаты пользователя, а не только выбранного персонажа. Раньше раздел
       // «Чаты» существовал лишь при выбранном персонаже, и чтобы найти чат, надо
@@ -457,7 +475,8 @@ createApp({
     overlayOpen() {
       return !!(this.dialog || this.lightbox || this.adminOpen || this.kbOpen
         || this.membersOpen || this.groupModal || this.inviteOpen || this.profileOpen
-        || this.debugOpen || this.usageOpen || this.drawerTab || this.paletteOpen);
+        || this.debugOpen || this.usageOpen || this.drawerTab || this.paletteOpen
+        || this.inspectorOpen);
     },
 
     // ---------- Шапка ----------
@@ -517,6 +536,30 @@ createApp({
           || (s.preview || "").toLowerCase().includes(q)
           || (s.character_name || "").toLowerCase().includes(q);
       });
+    },
+
+    // ---------- Приборы ----------
+    // Доля занятого окна контекста. Считается по отчёту инспектора, то есть по
+    // тем же числам, что уйдут в модель, а не по отдельной оценке рядом.
+    ctxFill() {
+      if (!this.ctxStats || !this.ctxStats.budget) return 0;
+      return Math.min(100, Math.round((this.ctxStats.total_tokens / this.ctxStats.budget) * 100));
+    },
+    ctxLevel() {
+      const p = this.ctxFill;
+      return p >= 90 ? "crit" : p >= 70 ? "warn" : "ok";
+    },
+    // Стоимость показываем ТОЛЬКО если пользователь задал свой тариф: у каждого
+    // прокси он свой, и выдуманное число здесь хуже отсутствующего.
+    ctxCost() {
+      if (!this.pricePerMTok || !this.ctxStats) return "";
+      const usd = (this.ctxStats.total_tokens / 1e6) * this.pricePerMTok;
+      return usd < 0.01 ? "<0.01" : usd.toFixed(2);
+    },
+    fmtCtx() {
+      if (!this.ctxStats) return "";
+      const t = this.ctxStats.total_tokens;
+      return t >= 1000 ? Math.round(t / 1000) + "к" : String(t);
     },
 
     // ---------- Командная палитра ----------
@@ -1111,6 +1154,64 @@ createApp({
         + "select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])";
       return Array.from(el.querySelectorAll(sel))
         .filter((n) => n.getClientRects().length > 0 || n.classList.contains("file-input"));
+    },
+
+    // ---------- Приборы и инспектор хода ----------
+    async loadCtxStats() {
+      if (!this.sessionId) { this.ctxStats = null; return; }
+      this.ctxBusy = true;
+      try {
+        this.ctxStats = await this.api("/sessions/" + this.sessionId + "/context");
+      } catch (e) {
+        this.ctxStats = null;   // у группы без участников контекст не собирается
+      } finally {
+        this.ctxBusy = false;
+      }
+    },
+    openInspector() {
+      this.inspectorOpen = true;
+      this.loadCtxStats();
+    },
+    closeInspector() { this.inspectorOpen = false; },
+
+    // Телеметрия хода. Тикер живёт в обычном поле с префиксом _: реактивный
+    // дескриптор таймера Vue обернул бы в Proxy (см. заметку про _bgJobs).
+    _startTelemetry() {
+      this.genStartAt = performance.now();
+      this.genFirstAt = 0;
+      this.genElapsed = 0;
+      this.genTps = 0;
+      clearInterval(this._genTimer);
+      this._genTimer = setInterval(() => {
+        this.genElapsed = (performance.now() - this.genStartAt) / 1000;
+        const chars = (this.currentReply || "").length
+          + this.liveBubbles.reduce((n, b) => n + (b.content || "").length, 0);
+        if (chars > 0 && !this.genFirstAt) this.genFirstAt = performance.now();
+        if (this.genFirstAt) {
+          const sec = (performance.now() - this.genFirstAt) / 1000;
+          // Делим на 4: грубый перевод символов в токены. Точнее браузер не может,
+          // токенизатор провайдера ему недоступен, поэтому подпись говорит «≈».
+          if (sec > 0.4) this.genTps = Math.round(chars / 4 / sec);
+        }
+      }, 250);
+    },
+    _stopTelemetry() {
+      clearInterval(this._genTimer);
+      this._genTimer = null;
+      // Контекст после хода вырос — пересчитываем полосу заполнения.
+      this.loadCtxStats();
+    },
+    // Задержка до первого токена: главный признак «модель думает или зависла».
+    // Обычный метод, а не геттер: Vue перебирает methods и ждёт там функции,
+    // геттер вычислился бы один раз при инициализации.
+    ttft() { return this.genFirstAt ? (this.genFirstAt - this.genStartAt) / 1000 : 0; },
+
+    // ---------- Режим ленты ----------
+    setViewMode(m) {
+      this.viewMode = m;
+      localStorage.setItem("viewMode", m);
+      // «Работа с документом» без открытого Канваса бессмысленна — открываем его.
+      if (m === "work" && !this.canvasOpen && this.canvas) this.canvasOpen = true;
     },
 
     // ---------- Нечёткий поиск ----------
@@ -3163,6 +3264,7 @@ createApp({
         window.addEventListener("keydown", (e) => {
           if (e.key !== "Escape" || e.defaultPrevented) return;
           if (this.paletteOpen) { this.closePalette(); return; }
+          if (this.inspectorOpen) { this.closeInspector(); return; }
           if (this.dialog) { this.dialogCancel(); return; }
           if (this.lightbox) { this.lightbox = null; return; }
           if (this.headerMenu) { this.headerMenu = false; return; }
@@ -3218,6 +3320,14 @@ createApp({
     // Объявляем этапы хода, а не токены.
     streaming(on) {
       this.liveStatus = on ? "Генерация ответа началась" : "Ответ получен";
+      if (on) this._startTelemetry();
+      else this._stopTelemetry();
+    },
+    // Полоса заполнения окна должна относиться к ОТКРЫТОМУ чату, иначе она
+    // показывала бы вес предыдущего.
+    sessionId() {
+      this.ctxStats = null;
+      this.loadCtxStats();
     },
     // Ввод в палитре: поиск по репликам идёт на сервер с дебаунсом, чтобы не
     // слать запрос на каждую букву.
@@ -3288,7 +3398,7 @@ createApp({
   </div>
 
   <template v-else>
-  <div :class="['app-grid', !sidebarOpen ? 'sb-hidden' : '', canvasOpen ? 'with-canvas' : '', 'pane-' + mobilePane]">
+  <div :class="['app-grid', !sidebarOpen ? 'sb-hidden' : '', canvasOpen ? 'with-canvas' : '', 'pane-' + mobilePane, 'view-' + viewMode]">
 
     <!-- Затемнение под мобильным сайдбаром -->
     <div v-if="sidebarOpen" class="backdrop" @click="sidebarOpen=false"></div>
@@ -3473,6 +3583,16 @@ createApp({
           <button class="btn-icon" @click="headerMenu=!headerMenu" title="Ещё" aria-label="Ещё">⋯</button>
           <div v-if="headerMenu" class="plus-backdrop" @click="headerMenu=false"></div>
           <div v-if="headerMenu" class="plus-menu header-menu">
+            <!-- Режим ленты: одно поле viewMode, три взаимоисключающих значения.
+                 Как и с composerMode, состояние ровно одно, поэтому «сцена» и
+                 «работа с документом» не могут оказаться включены одновременно. -->
+            <span class="menu-label">Режим ленты</span>
+            <button v-for="m in [['normal','💬 Обычный'],['scene','🎭 Сцена'],['work','📄 Работа с документом']]"
+                    :key="'vm'+m[0]" :class="viewMode === m[0] ? 'on' : ''"
+                    :aria-pressed="viewMode === m[0] ? 'true' : 'false'"
+                    @click="setViewMode(m[0]); headerMenu=false">{{ m[1] }}</button>
+            <span class="menu-sep" role="separator"></span>
+            <button v-if="sessionId" @click="openInspector(); headerMenu=false">🔬 Инспектор хода</button>
             <button v-if="sessionId" @click="openKnowledge(); headerMenu=false">📚 База знаний</button>
             <button v-if="sessionId && !sharedView" @click="openMembers(); headerMenu=false">👥➕ {{ currentIsGroup ? 'Участники группы' : 'Добавить персонажа' }}</button>
             <button v-if="currentIsGroup" @click="toggleDirector(); headerMenu=false">🎬 ИИ-режиссёр: {{ currentGroup.director ? 'вкл' : 'выкл' }}</button>
@@ -3543,6 +3663,11 @@ createApp({
           </div>
           <div class="msg-body">
           <div v-if="m.speaker_name" class="speaker">{{ m.speaker_name }}</div>
+          <!-- В режиме сцены реплику подписывает КАЖДЫЙ говорящий, а не только
+               участник группы: это театральная ремарка, по которой читают, кто
+               сейчас на сцене. В обычном режиме подпись осталась как была. -->
+          <div v-else-if="viewMode === 'scene' && (m.role === 'user' || m.role === 'assistant')"
+               class="speaker">{{ m.role === 'user' ? 'Вы' : (selectedCharacter ? selectedCharacter.name : 'Персонаж') }}</div>
           <div v-if="m.reply_to_id" class="reply-quote">↪ {{ quoteOf(m.reply_to_id) }}</div>
           <div class="bubble">
             <!-- режим редактирования: авто-фокус, авто-высота, Ctrl+Enter / Esc -->
@@ -3796,13 +3921,51 @@ createApp({
           <button v-else class="btn-primary" @click="submitComposer"
                   :disabled="!connected || waitingFiles || (composerMode === 'canvasCmd' && canvasBusy) || (composerMode === 'canvasGen' && canvasGenerating)">{{ submitLabel() }}</button>
         </div>
+
+        <!-- ПРИБОРЫ. Раньше пользователь платил за вход на каждом ходу и не видел
+             стоимости следующего, а о переполнении окна узнавал постфактум, когда
+             персонаж «забыл» события: история молча обрезалась на сервере.
+             На узком экране полоса схлопывается в строку-бейдж (см. CSS), чтобы
+             не отнимать высоту у переписки. -->
+        <div class="telemetry" v-if="sessionId && ctxStats">
+          <button class="telemetry-main" @click="openInspector"
+                  :title="'Окно контекста: ' + ctxStats.total_tokens + ' из ' + ctxStats.budget + ' токенов. Открыть инспектор хода'"
+                  :aria-label="'Окно контекста заполнено на ' + ctxFill + ' процентов. Открыть инспектор хода'">
+            <span class="tele-gauge" :class="ctxLevel" aria-hidden="true">
+              <i :style="{ width: ctxFill + '%' }"></i>
+            </span>
+            <span class="tele-num">{{ fmtCtx }} / {{ Math.round(ctxStats.budget / 1000) }}к</span>
+            <span class="tele-sub hide-narrow">{{ ctxFill }}% окна</span>
+            <!-- Знак доллара собираем ВНУТРИ выражения. Шаблон живёт в JS-литерале
+                 с обратными кавычками, и последовательность «$» плюс «{» начала бы
+                 подстановку самого JavaScript ещё до того, как строку увидит Vue. -->
+            <span v-if="ctxCost" class="tele-sub">{{ '≈ $' + ctxCost }}</span>
+            <span v-if="ctxStats.history && ctxStats.history.trimmed" class="tele-sub tele-warn">
+              обрезано {{ ctxStats.history.trimmed }}</span>
+          </button>
+          <!-- Скорость и задержка: экран перестаёт выглядеть одинаково на второй
+               секунде и на девяностой. Знак «≈» не декоративный: браузеру
+               токенизатор провайдера недоступен, считаем по приросту символов. -->
+          <span v-if="streaming" class="tele-live" aria-hidden="true">
+            <span v-if="!genFirstAt">думает {{ genElapsed.toFixed(1) }}с</span>
+            <template v-else>
+              <span>{{ genElapsed.toFixed(1) }}с</span>
+              <span v-if="genTps">· ≈{{ genTps }} т/с</span>
+              <span v-if="ttft()">· первый токен {{ ttft().toFixed(1) }}с</span>
+            </template>
+          </span>
+        </div>
       </div>
     </div>
 
     <!-- ===== Канвас: документ/код рядом с чатом (side-by-side, как в Gemini) ===== -->
     <div class="canvas-pane" v-if="canvasOpen && canvas">
       <div class="canvas-head">
-        <button class="btn-icon only-mobile" @click="mobilePane='chat'" title="К чату" aria-label="К чату">💬</button>
+        <!-- На узком экране Канвас занимает весь экран, поэтому возврат должен быть
+             явной подписанной кнопкой, а не иконкой: иконка «💬» рядом с полем
+             названия читалась как «обсудить документ», а не «выйти отсюда». -->
+        <button class="btn canvas-back only-mobile" @click="mobilePane='chat'"
+                aria-label="Назад к чату">← К чату</button>
         <input v-model="canvas.title" class="canvas-title" @blur="saveCanvas" placeholder="Без названия" />
         <select v-model="canvas.kind" @change="saveCanvas" class="canvas-kind" title="Тип канваса">
           <option value="document">📄 документ</option>
@@ -4581,6 +4744,74 @@ createApp({
       <div class="dialog-actions">
         <button class="btn-ghost" @click="dialogCancel">{{ dialog.cancelText }}</button>
         <button :class="dialog.danger ? 'btn-danger' : 'btn-primary'" @click="dialogOk">{{ dialog.okText }}</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Инспектор хода =====
+       На вопрос «почему персонаж сказал именно это, дошёл ли лорбук, сработала ли
+       заметка автора, что срезал бюджет» панель отладки отвечала длинами:
+       «system весил 4210 символов». Здесь видно сам ход: блоки, их вес и обрезка.
+       Разбор собирает сама сборка контекста, поэтому числа те же, что уйдут в модель.
+       На десктопе это правая панель, на узком экране — нижняя шторка. -->
+  <div v-if="inspectorOpen" class="modal-backdrop sheet-backdrop" @click.self="closeInspector">
+    <div class="modal inspector" role="dialog" aria-modal="true" aria-label="Инспектор хода">
+      <span class="sheet-grip" aria-hidden="true"></span>
+      <div class="inspector-head">
+        <h3>Инспектор хода</h3>
+        <button class="btn-icon" @click="loadCtxStats" title="Пересчитать" aria-label="Пересчитать">↻</button>
+        <button class="btn-icon" @click="closeInspector" aria-label="Закрыть инспектор хода">✕</button>
+      </div>
+      <div class="inspector-body">
+        <p v-if="ctxBusy" class="muted">Собираю контекст…</p>
+        <p v-else-if="!ctxStats" class="muted">Контекст не собирается: у чата нет персонажа.</p>
+        <template v-else>
+          <div class="ins-total">
+            <b>{{ ctxStats.total_tokens.toLocaleString('ru') }}</b> токенов из
+            {{ ctxStats.budget.toLocaleString('ru') }} · {{ ctxFill }}% окна
+            <span v-if="ctxStats.model" class="tag">{{ ctxStats.model }}</span>
+          </div>
+          <!-- Полоса весов: видно, что именно занимает контекст, до чтения списка. -->
+          <div class="ins-bar" aria-hidden="true">
+            <i v-for="b in ctxStats.blocks" :key="'bar'+b.key" :class="'seg-' + b.key"
+               :style="{ width: (b.tokens / ctxStats.total_tokens * 100) + '%' }"></i>
+            <i class="seg-history" :style="{ width: (ctxStats.history.tokens / ctxStats.total_tokens * 100) + '%' }"></i>
+            <i class="seg-tail" :style="{ width: (ctxStats.tail_tokens / ctxStats.total_tokens * 100) + '%' }"></i>
+          </div>
+
+          <details v-for="b in ctxStats.blocks" :key="b.key" class="ins-block">
+            <summary>
+              <span class="ins-dot" :class="'seg-' + b.key" aria-hidden="true"></span>
+              <span class="grow">{{ b.label }}</span>
+              <span class="ins-w">{{ b.tokens }}</span>
+            </summary>
+            <pre class="ins-text">{{ b.text || '— пусто —' }}</pre>
+          </details>
+
+          <div class="ins-block ins-static">
+            <span class="ins-dot seg-history" aria-hidden="true"></span>
+            <span class="grow">История · {{ ctxStats.history.included }} из {{ ctxStats.history.total }}</span>
+            <span class="ins-w">{{ ctxStats.history.tokens }}</span>
+          </div>
+          <div v-if="ctxStats.history.trimmed" class="ins-block ins-cut">
+            <span class="ins-dot" aria-hidden="true"></span>
+            <span class="grow">Обрезано бюджетом · {{ ctxStats.history.trimmed }} реплик</span>
+            <span class="ins-w">−{{ ctxStats.history.tokens_trimmed }}</span>
+          </div>
+          <div class="ins-block ins-static">
+            <span class="ins-dot seg-tail" aria-hidden="true"></span>
+            <span class="grow">Хвост: сводка, заметка автора, якорь характера</span>
+            <span class="ins-w">{{ ctxStats.tail_tokens }}</span>
+          </div>
+
+          <h4 class="ins-sub">Память Horae: сработало {{ ctxStats.horae.length }} из {{ ctxStats.horae_total }}</h4>
+          <p v-if="!ctxStats.horae.length" class="muted">Ни одна запись не сработала на этом ходу.</p>
+          <div v-for="(h, i) in ctxStats.horae" :key="'h'+i" class="ins-horae">
+            <span class="grow">{{ h.title }}</span>
+            <span class="tag">{{ h.always_on ? 'always' : (h.keywords.join(', ') || h.category) }}</span>
+            <span class="ins-w">{{ h.tokens }}</span>
+          </div>
+        </template>
       </div>
     </div>
   </div>

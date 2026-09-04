@@ -986,6 +986,61 @@ async def search_messages(
     return {"query": needle, "results": results}
 
 
+@app.get("/api/sessions/{session_id}/context")
+async def inspect_context(
+    session_id: int,
+    user=Depends(current_user),
+    db: AsyncSession = Depends(get_session),
+):
+    """
+    Инспектор хода: что РЕАЛЬНО уйдёт в модель на следующем ходу и сколько это весит.
+
+    Раньше на этот вопрос отвечала панель отладки, и отвечала длинами:
+    «system весил 4210 символов». Понять по ней, дошёл ли лорбук, сработала ли
+    Author's Note и что срезал бюджет, было нельзя.
+
+    Отчёт собирает сама assemble_context (параметр report), поэтому здесь нет
+    второй реализации той же логики, которая рано или поздно разошлась бы с
+    оригиналом. Ход не выполняется: ни записи в базу, ни запроса к модели.
+    """
+    sess = await db.get(models.ChatSession, session_id)
+    if not await _can_access_session(db, sess, user):
+        raise HTTPException(403, "Нет доступа к этому чату")
+    character = await db.get(models.Character, sess.character_id) if sess.character_id else None
+    if character is None:
+        # Группа: паспорт берём у первого участника — контекст собирается на него.
+        members = await group_chat.load_members(db, session_id)
+        character = members[0] if members else None
+    if character is None:
+        raise HTTPException(400, "У чата нет персонажа, контекст не собирается")
+
+    # Параметры генерации живут там же, где их сохраняет интерфейс: настройки «ui».
+    # Берём именно их, а не умолчания, иначе инспектор считал бы бюджет по одним
+    # числам, а настоящий ход шёл бы по другим.
+    ui_row = await db.get(models.AppSetting, "ui")
+    ui = (ui_row.value if ui_row else {}) or {}
+    try:
+        params = GenerationParams(**(ui.get("params") or ui or {}))
+    except Exception:  # noqa: BLE001 — чужие поля в настройках не должны ронять инспектор
+        params = GenerationParams()
+
+    report: dict = {}
+    await build_context_from_db(
+        db, sess, character,
+        "",            # следующий ход ещё не написан
+        None,
+        _ctx_budget(params),
+        history_files_limit=_hist_files_limit(params),
+        history_files_turns=_hist_files_turns(params),
+        knowledge_chars=_kb_chars(params),
+        assistant_mode=bool(params and params.assistant_mode),
+        report=report,
+    )
+    report["character"] = character.name
+    report["model"] = (params.model if params else "") or ""
+    return report
+
+
 @app.post("/api/sessions/{session_id}/fork")
 async def fork_session(
     session_id: int,
