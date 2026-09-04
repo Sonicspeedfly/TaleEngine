@@ -3018,6 +3018,14 @@ async def ws_chat(websocket: WebSocket, session_id: int):
             raw = await websocket.receive_json()
             mtype = raw.get("type")
 
+            # Пульс от клиента. Браузерный JS не умеет слать протокольный ping,
+            # поэтому держим канал прикладным. Отвечать надо ДО разбора схем ниже:
+            # иначе ping провалился бы в ветку обычного сообщения и упал на
+            # валидации WSUserMessage.
+            if mtype == "ping":
+                await websocket.send_json({"type": "pong"})
+                continue
+
             if mtype == "stop":
                 if current_job_id:
                     generation_manager.cancel(current_job_id)

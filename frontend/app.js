@@ -1895,12 +1895,16 @@ createApp({
 
     // ---------- WebSocket стриминг ----------
     connectWs() {
+      // Поколение сокета. Обработчики старого сокета могут сработать уже ПОСЛЕ
+      // того, как открыт новый (закрытие приходит асинхронно), и без этой метки
+      // они бы гасили connected у живого соединения.
+      const gen = (this._wsGen = (this._wsGen || 0) + 1);
       if (this.ws) {
         // Мы сами закрываем сокет (смена чата) — это не обрыв сети, не надо
         // дослушивать старую генерацию в активный (уже другой) чат.
-        this._intentionalClose = true;
         try { this.ws.close(); } catch (e) {}
       }
+      this._stopHeartbeat();
       if (this._wsReconnectTimer) { clearTimeout(this._wsReconnectTimer); this._wsReconnectTimer = null; }
       const sid = this.sessionId; // для реконнекта: переподключаемся только к ЭТОМУ чату
       const proto = location.protocol === "https:" ? "wss" : "ws";
@@ -1909,22 +1913,93 @@ createApp({
       if (this.userToken) qs.push("token=" + encodeURIComponent(this.userToken));
       const q = qs.length ? "?" + qs.join("&") : "";
       this.ws = new WebSocket(proto + "://" + location.host + "/ws/chat/" + this.sessionId + q);
-      this.ws.onopen = () => { this.connected = true; this._wsRetry = 0; };
+      this.ws.onopen = () => {
+        if (gen !== this._wsGen) return;  // открылся уже неактуальный сокет
+        this.connected = true;
+        this._wsRetry = 0;
+        this._startHeartbeat();
+      };
       this.ws.onclose = () => {
+        // Закрылся СТАРЫЙ сокет, пока новый уже работает — не наше дело.
+        //
+        // Раньше здесь стоял общий флаг _intentionalClose, и он давал баг,
+        // из-за которого связь не восстанавливалась без перезагрузки страницы:
+        // при вызове connectWs на УЖЕ закрытом сокете close() не порождает
+        // события, флаг оставался true, и следующий НАСТОЯЩИЙ обрыв считался
+        // намеренным — реконнект не планировался вообще никогда.
+        if (gen !== this._wsGen) return;
         this.connected = false;
-        if (this._intentionalClose) { this._intentionalClose = false; return; }
+        this._stopHeartbeat();
         // Непреднамеренный обрыв: дослушиваем активную генерацию через SSE.
         if (this.streaming && this.currentJobId) this.resumeSSE(this.currentJobId);
         // Автопереподключение с бэкоффом: сеть моргнула или сервер перезапустился.
-        // Без этого после обрыва connected=false навсегда и отправка блокируется.
-        const delay = Math.min(15000, 1500 * Math.pow(2, this._wsRetry || 0));
+        // Потолок 8 с, а не 15: дольше человек воспринимает как «зависло».
+        const delay = Math.min(8000, 1000 * Math.pow(2, this._wsRetry || 0));
         this._wsRetry = (this._wsRetry || 0) + 1;
         this._wsReconnectTimer = setTimeout(() => {
           this._wsReconnectTimer = null;
           if (this.sessionId === sid) this.connectWs();
         }, delay);
       };
-      this.ws.onmessage = (e) => this.onWsEvent(JSON.parse(e.data));
+      // Без этого неудачная попытка подключения иногда висит без onclose, и
+      // реконнект не планируется: закрываем сами, дальше отработает onclose.
+      this.ws.onerror = () => { try { this.ws && this.ws.close(); } catch (e) {} };
+      this.ws.onmessage = (e) => {
+        this._hbPending = false;   // любое сообщение — признак живого соединения
+        const data = JSON.parse(e.data);
+        if (data && data.type === "pong") return;  // служебный ответ, в ленту не идёт
+        this.onWsEvent(data);
+      };
+    },
+
+    // ---------- Живучесть соединения ----------
+    // Пауза в переписке — норма: люди читают ответ по несколько минут. Но
+    // молчащий сокет закрывают промежуточные прокси, мобильные операторы и
+    // энергосбережение телефона через 30-60 секунд тишины, и выглядело это как
+    // «постоянный реконнект на ровном месте». Пинг раз в 25 секунд держит канал.
+    _startHeartbeat() {
+      this._stopHeartbeat();
+      this._hbPending = false;
+      this._hbTimer = setInterval(() => {
+        const ws = this.ws;
+        if (!ws || ws.readyState !== 1) return;
+        // На прошлый пинг не ответили — канал мёртв, хотя браузер этого ещё не
+        // заметил (полуоткрытый TCP). Закрываем сами, чтобы сработал реконнект.
+        if (this._hbPending) {
+          this._hbPending = false;
+          try { ws.close(); } catch (e) {}
+          return;
+        }
+        this._hbPending = true;
+        try { ws.send(JSON.stringify({ type: "ping" })); } catch (e) {}
+      }, 25000);
+    },
+    _stopHeartbeat() {
+      if (this._hbTimer) { clearInterval(this._hbTimer); this._hbTimer = null; }
+      this._hbPending = false;
+    },
+    // Возвращение к вкладке, восстановление сети, фокус окна — это момент, когда
+    // человек СМОТРИТ на приложение и ждёт, что оно работает. Ждать бэкофф здесь
+    // нельзя: на телефоне таймеры в фоне заморожены, поэтому запланированный
+    // реконнект мог не сработать вовсе, и связь не поднималась до перезагрузки.
+    _bindWake() {
+      if (this._wakeBound) return;
+      this._wakeBound = true;
+      const wake = () => {
+        if (document.visibilityState !== "visible") return;
+        if (!this.sessionId) return;
+        if (this.ws && this.ws.readyState === 1) return;   // уже живы
+        if (this.ws && this.ws.readyState === 0) return;   // подключаемся прямо сейчас
+        this._wsRetry = 0;                                  // человек вернулся — не томим
+        if (this._wsReconnectTimer) {
+          clearTimeout(this._wsReconnectTimer);
+          this._wsReconnectTimer = null;
+        }
+        this.connectWs();
+      };
+      document.addEventListener("visibilitychange", wake);
+      window.addEventListener("online", wake);
+      window.addEventListener("focus", wake);
     },
     onWsEvent(ev) {
       this._lastEvtAt = Date.now(); // метка для сторожа зависшего стриминга
@@ -3234,6 +3309,7 @@ createApp({
         else this.finishStream();
       }, 15000);
       // Esc закрывает верхний оверлей — как ожидают от десктопного приложения.
+      this._bindWake();
       if (!this._escBound) {
         this._escBound = true;
         // Удержание фокуса внутри верхнего оверлея. Без него Tab уходил гулять
