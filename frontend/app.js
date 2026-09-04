@@ -51,8 +51,11 @@ createApp({
       canvasBusy: false,
       canvasSel: { start: 0, end: 0 },  // выделение в редакторе (для точечной правки)
       toolbarPos: null,                 // позиция плавающего тулбара ({top,left}) или null
-      canvasCmdMode: false,             // единый инпут пишет команду открытому Канвасу
-      canvasGenMode: false,             // триггер: следующий ответ ИИ уйдёт в Канвас-документ
+      // Режим композера. РОВНО ОДНО значение: text | art | canvasCmd | canvasGen.
+      // Раньше это были три независимых булевых флага, которые включались
+      // одновременно, показывали три одинаковые плашки и позволяли надписи на
+      // кнопке отправки разойтись с реальным действием.
+      composerMode: "text",
       canvasGenerating: false,          // идёт генерация документа в Канвас
       canvasView: "edit",               // 'edit' (редактор) | 'preview' (просмотр результата)
       copied: false,                    // флаг «код скопирован» для кнопки тулбара
@@ -178,7 +181,6 @@ createApp({
 
       // --- Меню генерации арта ---
       artMenu: false,
-      artMode: false, // режим «опиши арт в сообщении» (вместо алерта)
 
       // --- Доступ / администрирование ---
       accessCode: "",
@@ -216,6 +218,55 @@ createApp({
       directorBar: false,       // показывать режиссёрскую панель (группа)
       // Аккордеон сайдбара: какие разделы раскрыты (по умолчанию — персонажи и чаты).
       openSections: { characters: true, chats: true, groups: false, shared: false },
+      // Вежливый регион объявлений: скринридер узнаёт о ходе генерации. Объявляем
+      // ЗАВЕРШЁННЫЙ ответ, а не каждый токен, иначе речь перезапускается десятки
+      // раз в секунду и слушать её невозможно.
+      liveStatus: "",
+      // Недавние чаты для блока быстрого старта на первом экране. Список приходит
+      // из /sessions без фильтра по персонажу и уже отсортирован по активности.
+      recentChats: [],
+
+      // --- Приборы: телеметрия хода ---
+      // Замеры делаются на КЛИЕНТЕ: токенизатор провайдера браузеру недоступен,
+      // поэтому скорость считается по приросту символов и честно подписана оценкой.
+      ctxStats: null,          // отчёт инспектора: веса блоков, обрезка, память
+      ctxBusy: false,
+      inspectorOpen: false,
+      genStartAt: 0,           // момент отправки
+      genFirstAt: 0,           // момент первого токена
+      genElapsed: 0,           // секунд идёт ход
+      genTps: 0,               // символов в секунду -> оценка токенов
+      // Цена за миллион входных токенов. Ноль означает «не показывать»: выдумывать
+      // тарифы за пользователя нельзя, у каждого прокси они свои.
+      pricePerMTok: Number(localStorage.getItem("pricePerMTok") || 0),
+
+      // --- Режим ленты ---
+      // Одно поле, как composerMode: normal | scene | work.
+      viewMode: localStorage.getItem("viewMode") || "normal",
+
+      // --- Единый список чатов ---
+      // Все чаты пользователя, а не только выбранного персонажа. Раньше раздел
+      // «Чаты» существовал лишь при выбранном персонаже, и чтобы найти чат, надо
+      // было сначала вспомнить персонажа — то есть вспомнить ответ до вопроса.
+      allSessions: [],
+      chatFilterChar: null,   // чип фильтра: id персонажа либо null («все»)
+
+      // --- Командная палитра ---
+      paletteOpen: false,
+      paletteQuery: "",
+      paletteIndex: 0,
+      searchResults: [],
+      searchBusy: false,
+      // Команды палитры. Статический список: хранить здесь функции нельзя,
+      // Vue обернул бы их в Proxy — диспетчеризация идёт по id в paletteRun.
+      paletteCommands: [
+        { id: "new", label: "Новый диалог", sub: "создать чат" },
+        { id: "model", label: "/model — сменить модель", sub: "настройки генерации" },
+        { id: "branch", label: "/branch — ветка от последней реплики", sub: "форк чата" },
+        { id: "export", label: "/export — выгрузить чат", sub: "нативный формат" },
+        { id: "settings", label: "/settings — настройки", sub: "панель параметров" },
+        { id: "clear", label: "/clear — очистить поле ввода", sub: "сбросить режим композера" },
+      ],
       groupDirector: false,
       liveBubbles: [], // живые пузыри разных персонажей при стриминге группы
 
@@ -411,13 +462,139 @@ createApp({
         + '<body>' + code + '</body></html>';
     },
     composerPlaceholder() {
-      if (this.canvasCmdMode) return "Что сделать с Canvas…";
-      if (this.canvasGenMode) return "Опишите документ или код для генерации…";
-      if (this.artMode) return "Опишите картинку для генерации…";
+      if (this.composerMode === "canvasCmd") return "Что сделать с Canvas… (Esc — обычное сообщение)";
+      if (this.composerMode === "canvasGen") return "Опишите документ или код… (Esc — обычное сообщение)";
+      if (this.composerMode === "art") return "Опишите картинку… (Esc — обычное сообщение)";
       if (this.currentIsGroup) return "Сообщение… Режиссура: +Имя вызвать, -Имя исключить (🎬)";
       return this.isTouch
         ? "Сообщение… (Enter — перенос строки)"
         : "Сообщение… (Enter — отправить, Shift+Enter — перенос)";
+    },
+    // Открыт ли хоть какой-то модальный слой. Один признак на все окна:
+    // по нему работают и удержание фокуса, и его возврат.
+    overlayOpen() {
+      return !!(this.dialog || this.lightbox || this.adminOpen || this.kbOpen
+        || this.membersOpen || this.groupModal || this.inviteOpen || this.profileOpen
+        || this.debugOpen || this.usageOpen || this.drawerTab || this.paletteOpen
+        || this.inspectorOpen);
+    },
+
+    // ---------- Шапка ----------
+    headerTitle() {
+      if (this.sharedView) return "🔗 " + this.sharedView.title;
+      if (!this.sessionId) return "TaleEngine";
+      return this.currentSessionTitle || "Чат";
+    },
+    // Вторая строка: кто в чате и его номер. Раньше это были три отдельные
+    // пилюли, две из которых повторяли заголовок.
+    headerSubtitle() {
+      if (!this.sessionId) return "";
+      const who = this.currentIsGroup
+        ? (this.currentGroup ? this.currentGroup.members.map((m) => m.name).join(", ") : "группа")
+        : (this.selectedCharacter ? this.selectedCharacter.name : "");
+      return (who ? who + " · " : "") + "#" + this.sessionId;
+    },
+
+    // ---------- Единый список чатов ----------
+    // Личные, групповые и расшаренные в одной ленте с признаком вида. Сортировка
+    // по последней активности: last_id монотонен и приходит с сервера для
+    // личных и групповых, у расшаренных его может не быть — они идут следом.
+    unifiedChats() {
+      const rows = [];
+      for (const s of this.allSessions) {
+        rows.push({ ...s, kind: "chat", sortKey: s.last_id || 0 });
+      }
+      for (const g of this.groups) {
+        rows.push({
+          ...g, kind: "group", sortKey: g.last_id || 0,
+          character_name: (g.members || []).map((m) => m.name).join(", "),
+        });
+      }
+      for (const s of this.sharedSessions) {
+        rows.push({ ...s, kind: "shared", sortKey: -1 });
+      }
+      return rows.sort((a, b) => b.sortKey - a.sortKey);
+    },
+    // Чипы фильтра: только персонажи, у которых чаты реально есть.
+    chatFilterChips() {
+      const seen = new Map();
+      for (const s of this.allSessions) {
+        if (!s.character_id) continue;
+        if (!seen.has(s.character_id)) {
+          seen.set(s.character_id, { id: s.character_id, name: s.character_name || "Без имени", n: 0 });
+        }
+        seen.get(s.character_id).n += 1;
+      }
+      return Array.from(seen.values()).sort((a, b) => b.n - a.n);
+    },
+    visibleChats() {
+      const q = (this.chatFilter || "").trim().toLowerCase();
+      return this.unifiedChats.filter((s) => {
+        if (this.chatFilterChar !== null && s.character_id !== this.chatFilterChar) return false;
+        if (!q) return true;
+        return (s.title || "").toLowerCase().includes(q)
+          || (s.preview || "").toLowerCase().includes(q)
+          || (s.character_name || "").toLowerCase().includes(q);
+      });
+    },
+
+    // ---------- Приборы ----------
+    // Доля занятого окна контекста. Считается по отчёту инспектора, то есть по
+    // тем же числам, что уйдут в модель, а не по отдельной оценке рядом.
+    ctxFill() {
+      if (!this.ctxStats || !this.ctxStats.budget) return 0;
+      return Math.min(100, Math.round((this.ctxStats.total_tokens / this.ctxStats.budget) * 100));
+    },
+    ctxLevel() {
+      const p = this.ctxFill;
+      return p >= 90 ? "crit" : p >= 70 ? "warn" : "ok";
+    },
+    // Стоимость показываем ТОЛЬКО если пользователь задал свой тариф: у каждого
+    // прокси он свой, и выдуманное число здесь хуже отсутствующего.
+    ctxCost() {
+      if (!this.pricePerMTok || !this.ctxStats) return "";
+      const usd = (this.ctxStats.total_tokens / 1e6) * this.pricePerMTok;
+      return usd < 0.01 ? "<0.01" : usd.toFixed(2);
+    },
+    fmtCtx() {
+      if (!this.ctxStats) return "";
+      const t = this.ctxStats.total_tokens;
+      return t >= 1000 ? Math.round(t / 1000) + "к" : String(t);
+    },
+
+    // ---------- Командная палитра ----------
+    paletteItems() {
+      const raw = this.paletteQuery.trim();
+      const q = raw.replace(/^\//, "");
+      const out = [];
+      const add = (kind, item, hay) => {
+        const score = this._fuzzy(hay, q);
+        if (score >= 0) out.push({ ...item, kind, score });
+      };
+      for (const c of this.paletteCommands) {
+        add("cmd", { id: c.id, label: c.label, sub: c.sub }, c.label + " " + c.id);
+      }
+      // Слэш означает «только команды»: иначе выдача тонет в чатах.
+      if (!raw.startsWith("/")) {
+        for (const s of this.unifiedChats.slice(0, 300)) {
+          add("chat", { id: s.id, label: s.title || "Чат", sub: s.character_name || "чат", row: s },
+            (s.title || "") + " " + (s.character_name || ""));
+        }
+        for (const c of this.characters) {
+          add("char", { id: c.id, label: c.name, sub: "персонаж" }, c.name);
+        }
+      }
+      out.sort((a, b) => a.score - b.score);
+      const head = out.slice(0, 10);
+      // Найденные реплики идут отдельным блоком после команд и чатов: они
+      // приходят с сервера асинхронно и не участвуют в нечётком ранжировании.
+      for (const r of this.searchResults.slice(0, 10)) {
+        head.push({
+          kind: "msg", id: r.message_id, sid: r.session_id,
+          label: r.session_title || "Чат", sub: r.snippet, score: 0,
+        });
+      }
+      return head;
     },
   },
 
@@ -701,13 +878,16 @@ createApp({
       if (!res.ok) { this.showToast("Не удалось импортировать персонажа (код " + res.status + ")"); return; }
       await this.loadCharacters();
     },
+    // Выбор персонажа теперь ТОЛЬКО меняет контекст: показывает карточку в
+    // редакторе и ставит фильтр списка чатов. Раньше он же открывал первый чат
+    // персонажа, а если чатов не было — создавал новый, то есть просмотр имел
+    // разрушительный побочный эффект и плодил пустые чаты. Открытие чата
+    // осталось за строкой списка, где ему и место.
     async selectCharacter(c) {
       this.selectedCharacterId = c.id;
       this.charEdit = { ...c, generation_params: c.generation_params || {} };
+      this.chatFilterChar = c.id;
       await this.loadSessions();
-      // Автоматически открываем последний чат или создаём новый.
-      if (this.sessions.length) this.openSession(this.sessions[0]);
-      else await this.newChat();
     },
     async saveCharacter() {
       const c = this.charEdit;
@@ -880,7 +1060,7 @@ createApp({
     // команды Канвасу (выделение сохраняется), фокус — на него.
     focusCanvasAi() {
       this.toolbarPos = null;
-      this.canvasCmdMode = true;
+      this.composerMode = "canvasCmd";
       this.mobilePane = "chat";  // на мобильном единый инпут живёт в панели чата
       this.$nextTick(() => { if (this.$refs.composer) this.$refs.composer.focus(); });
     },
@@ -933,7 +1113,11 @@ createApp({
       const name = (this.canvas.title || "document").replace(/[^\wа-яёА-ЯЁ\-. ]+/gi, "_").trim() || "document";
       this.downloadBlob(blob, name + "." + fmt);
     },
-    closeCanvas() { this.saveCanvas(); this.canvasOpen = false; this.mobilePane = "chat"; this.canvasCmdMode = false; },
+    closeCanvas() {
+      this.saveCanvas(); this.canvasOpen = false; this.mobilePane = "chat";
+      // Канваса больше нет — команда для него бессмысленна.
+      if (this.composerMode === "canvasCmd") this.composerMode = "text";
+    },
 
     // ---------- Сессии (чаты) ----------
     async loadSessions() {
@@ -944,21 +1128,287 @@ createApp({
       await this.loadSessions();
       this.openSession({ id: r.session_id });
     },
+    // Найти полную карточку чата по id в уже загруженных списках.
+    // openSession зовут из восьми мест, и половина передаёт голый {id}
+    // (импорт, шаринг, превращение чата в группу, восстановление после F5).
+    // Без этого дровер показывал бы пустые метаданные вместо настоящих.
+    _sessionCard(id) {
+      return this.sessions.find((x) => x.id === id)
+        || this.groups.find((x) => x.id === id)
+        || this.sharedSessions.find((x) => x.id === id)
+        || null;
+    },
+
+    // ---------- Доступность: удержание и возврат фокуса ----------
+    // Верхний открытый слой. Порядок слоёв уже задан порядком в шаблоне
+    // (дровер -> модалки -> диалог -> лайтбокс), поэтому последний найденный
+    // узел и есть верхний. Так не нужен ref на каждом из десяти оверлеев.
+    _topOverlay() {
+      const nodes = document.querySelectorAll(".drawer, .modal, .lightbox");
+      return nodes.length ? nodes[nodes.length - 1] : null;
+    },
+    // Фокусируемое внутри оверлея. Поля выбора файла скрыты визуально, но
+    // остаются в табуляции намеренно (см. .file-input), поэтому их пропускать нельзя.
+    _focusables(el) {
+      const sel = "a[href], button:not([disabled]), input:not([disabled]), "
+        + "select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])";
+      return Array.from(el.querySelectorAll(sel))
+        .filter((n) => n.getClientRects().length > 0 || n.classList.contains("file-input"));
+    },
+
+    // ---------- Приборы и инспектор хода ----------
+    async loadCtxStats() {
+      if (!this.sessionId) { this.ctxStats = null; return; }
+      this.ctxBusy = true;
+      try {
+        this.ctxStats = await this.api("/sessions/" + this.sessionId + "/context");
+      } catch (e) {
+        this.ctxStats = null;   // у группы без участников контекст не собирается
+      } finally {
+        this.ctxBusy = false;
+      }
+    },
+    openInspector() {
+      this.inspectorOpen = true;
+      this.loadCtxStats();
+    },
+    closeInspector() { this.inspectorOpen = false; },
+
+    // Телеметрия хода. Тикер живёт в обычном поле с префиксом _: реактивный
+    // дескриптор таймера Vue обернул бы в Proxy (см. заметку про _bgJobs).
+    _startTelemetry() {
+      this.genStartAt = performance.now();
+      this.genFirstAt = 0;
+      this.genElapsed = 0;
+      this.genTps = 0;
+      clearInterval(this._genTimer);
+      this._genTimer = setInterval(() => {
+        this.genElapsed = (performance.now() - this.genStartAt) / 1000;
+        const chars = (this.currentReply || "").length
+          + this.liveBubbles.reduce((n, b) => n + (b.content || "").length, 0);
+        if (chars > 0 && !this.genFirstAt) this.genFirstAt = performance.now();
+        if (this.genFirstAt) {
+          const sec = (performance.now() - this.genFirstAt) / 1000;
+          // Делим на 4: грубый перевод символов в токены. Точнее браузер не может,
+          // токенизатор провайдера ему недоступен, поэтому подпись говорит «≈».
+          if (sec > 0.4) this.genTps = Math.round(chars / 4 / sec);
+        }
+      }, 250);
+    },
+    _stopTelemetry() {
+      clearInterval(this._genTimer);
+      this._genTimer = null;
+      // Контекст после хода вырос — пересчитываем полосу заполнения.
+      this.loadCtxStats();
+    },
+    // Задержка до первого токена: главный признак «модель думает или зависла».
+    // Обычный метод, а не геттер: Vue перебирает methods и ждёт там функции,
+    // геттер вычислился бы один раз при инициализации.
+    ttft() { return this.genFirstAt ? (this.genFirstAt - this.genStartAt) / 1000 : 0; },
+
+    // ---------- Режим ленты ----------
+    setViewMode(m) {
+      this.viewMode = m;
+      localStorage.setItem("viewMode", m);
+      // «Работа с документом» без открытого Канваса бессмысленна — открываем его.
+      if (m === "work" && !this.canvasOpen && this.canvas) this.canvasOpen = true;
+    },
+
+    // ---------- Нечёткий поиск ----------
+    // Совпадение по подпоследовательности символов: «нвчт» находит «Новый чат».
+    // Возвращает РАНГ (меньше — лучше) или -1, если совпадения нет. Ранг растёт
+    // от позиции первого совпадения и от разрывов между буквами, поэтому точное
+    // начало слова всегда обходит совпадение в середине.
+    _fuzzy(hay, needle) {
+      if (!needle) return 0;
+      const h = (hay || "").toLowerCase();
+      const n = needle.toLowerCase();
+      let from = 0, first = -1, last = -1, gaps = 0;
+      for (const ch of n) {
+        const idx = h.indexOf(ch, from);
+        if (idx < 0) return -1;
+        if (first < 0) first = idx;
+        if (last >= 0) gaps += idx - last - 1;
+        last = idx;
+        from = idx + 1;
+      }
+      return first * 2 + gaps;
+    },
+
+    // ---------- Командная палитра ----------
+    openPalette(prefill) {
+      this.paletteQuery = prefill || "";
+      this.paletteIndex = 0;
+      this.searchResults = [];
+      this.paletteOpen = true;
+      this.$nextTick(() => { if (this.$refs.paletteInput) this.$refs.paletteInput.focus(); });
+    },
+    closePalette() {
+      this.paletteOpen = false;
+      this.paletteQuery = "";
+      this.searchResults = [];
+    },
+    paletteMove(step) {
+      const n = this.paletteItems.length;
+      if (!n) return;
+      this.paletteIndex = (this.paletteIndex + step + n) % n;
+    },
+    async paletteRun(item) {
+      const it = item || this.paletteItems[this.paletteIndex];
+      if (!it) return;
+      this.closePalette();
+      if (it.kind === "chat") return this.openRecent(it.row);
+      if (it.kind === "char") {
+        const c = this.characters.find((x) => x.id === it.id);
+        if (c) { this.selectCharacter(c); this.sidebarOpen = true; }
+        return;
+      }
+      if (it.kind === "msg") return this.jumpToMessage(it.sid, it.id);
+      // Команды.
+      if (it.id === "new") return this.startNewChat();
+      if (it.id === "model" || it.id === "settings") { this.drawerTab = "generation"; return; }
+      if (it.id === "export") {
+        const s = this._sessionCard(this.sessionId);
+        if (s) this.exportSession(s);
+        return;
+      }
+      if (it.id === "branch") {
+        const last = this.messages[this.messages.length - 1];
+        if (last) return this.forkFrom(last);
+        this.showToast("Ветвить нечего: в чате нет сообщений");
+        return;
+      }
+      if (it.id === "clear") {
+        this.input = "";
+        this.composerMode = "text";
+        this.resetComposerHeight();
+      }
+    },
+
+    // ---------- Поиск по репликам ----------
+    // Дебаунс держим в обычном поле с префиксом _, а не в data: Vue обернул бы
+    // дескриптор таймера в Proxy (см. заметку про _bgJobs).
+    scheduleSearch() {
+      clearTimeout(this._searchTimer);
+      const q = this.paletteQuery.trim();
+      if (q.startsWith("/") || q.length < 2) { this.searchResults = []; return; }
+      this._searchTimer = setTimeout(() => this.runSearch(q), 220);
+    },
+    async runSearch(q) {
+      this.searchBusy = true;
+      try {
+        const r = await this.api("/search?q=" + encodeURIComponent(q));
+        // Пока ждали ответ, запрос мог смениться — старую выдачу не показываем.
+        if (this.paletteQuery.trim() === q) this.searchResults = r.results || [];
+      } catch (e) {
+        this.searchResults = [];
+      } finally {
+        this.searchBusy = false;
+      }
+    },
+    // Открыть чат и доехать до конкретной реплики. История грузится окнами,
+    // поэтому нужное сообщение может быть ещё не загружено: догружаем порциями,
+    // как это делает scrollToChatStart, с тем же предохранителем.
+    async jumpToMessage(sessionId, messageId) {
+      if (sessionId !== this.sessionId) {
+        await this.openSession(this._sessionCard(sessionId) || { id: sessionId });
+      }
+      this.jumpBusy = true;
+      try {
+        let guard = 40;
+        while (guard-- > 0) {
+          if (this.messages.some((m) => m.id === messageId)) break;
+          if (this.noMoreMessages) break;
+          const before = this.messages.length;
+          await this.loadOlder();
+          if (this.messages.length === before) break;  // ничего не пришло
+        }
+        await this.$nextTick();
+        this.scrollMessageStart(messageId);
+      } finally {
+        this.jumpBusy = false;
+      }
+    },
+
+    // ---------- Ветвление ----------
+    async forkFrom(m) {
+      if (!this.sessionId || !m) return;
+      const ok = await this.askConfirm(
+        "Создать ветку от этой реплики? В новый чат скопируется вся история до неё включительно, исходный чат не изменится.",
+        { title: "Ветка чата", okText: "Создать ветку", danger: false }
+      );
+      if (!ok) return;
+      try {
+        const r = await this.api("/sessions/" + this.sessionId + "/fork", {
+          method: "POST",
+          body: JSON.stringify({ message_id: m.id }),
+        });
+        await Promise.all([this.loadSessions(), this.loadAllSessions(), this.loadGroups()]);
+        await this.openSession(this._sessionCard(r.session_id) || { id: r.session_id });
+        this.showToast("Ветка создана: " + r.messages + " реплик");
+      } catch (e) {
+        this.showToast("Не удалось создать ветку: " + (e && e.message ? e.message : e));
+      }
+    },
+
+    // ---------- Первый экран ----------
+    // Все чаты без фильтра по персонажу: бэкенд отдаёт их отсортированными по
+    // последней активности, поэтому «недавние» здесь означает именно недавние.
+    async loadRecent() {
+      try { this.recentChats = (await this.api("/sessions")).slice(0, 5); }
+      catch (e) { this.recentChats = []; }
+    },
+    // Все чаты пользователя одним списком. Это основной источник сайдбара;
+    // loadSessions (чаты одного персонажа) остаётся для мест, где нужен
+    // именно контекст персонажа.
+    async loadAllSessions() {
+      try {
+        this.allSessions = await this.api("/sessions");
+        this.recentChats = this.allSessions.slice(0, 5);
+      } catch (e) { this.allSessions = []; }
+    },
+    async startNewChat() {
+      if (this.selectedCharacter) { await this.newChat(); return; }
+      if (this.characters.length) {
+        await this.selectCharacter(this.characters[0]);
+        await this.newChat();
+        return;
+      }
+      await this.createCharacter();
+    },
+    // Открыть чат из блока быстрого старта или из палитры: подтягиваем контекст
+    // персонажа (карточка, список его чатов) и открываем именно тот чат, по
+    // которому кликнули, а не первый попавшийся.
+    // Строка единого списка: личный чат, группа и общий чат открываются
+    // по-разному, но для пользователя это одна и та же строка.
+    async openChatRow(s) {
+      if (s.kind === "shared") return this.openSharedSession(s);
+      return this.openRecent(s);
+    },
+    async openRecent(s) {
+      if (s.character_id && s.character_id !== this.selectedCharacterId) {
+        const c = this.characters.find((x) => x.id === s.character_id);
+        if (c) {
+          this.selectedCharacterId = c.id;
+          this.charEdit = { ...c, generation_params: c.generation_params || {} };
+          await this.loadSessions();
+        }
+      }
+      await this.openSession(s);
+    },
     async openSession(s) {
       if (s.id === this.sessionId && !this.sharedView) return; // уже открыт
       this._handoffStreaming();  // текущую генерацию (если есть) доигрываем в фоне
       this.sharedView = null;   // это мой собственный чат, а не «чужой»
       this.sessionId = s.id;
       this._clearPending(s.id); // открыли чат — снимаем метку «пришёл ответ»
-      this.authorNote = s.author_note || "";
-      this.sessionPersonaId = s.persona_id || null;
-      this.sessionBg = s.background || "";
-      // Часовой пояс чата: из сессии; для групп (открываются как {id}) — из списка групп.
-      this.sessionTimezone = s.timezone || "";
-      if (!this.sessionTimezone) {
-        const g = this.groups.find((x) => x.id === s.id);
-        this.sessionTimezone = (g && g.timezone) || "";
-      }
+      // Метаданные берём из переданного объекта, а недостающее дотягиваем из
+      // списков: переданный {id} не должен выглядеть как «у чата всё пусто».
+      const card = ("author_note" in s) ? s : (this._sessionCard(s.id) || s);
+      this.authorNote = card.author_note || "";
+      this.sessionPersonaId = card.persona_id || null;
+      this.sessionBg = card.background || "";
+      this.sessionTimezone = card.timezone || "";
       // Пояс ещё не задан — определяем по браузеру и сохраняем за этим чатом.
       // Пользователь может сменить его во вкладке «Персона» (настройка на чат).
       if (!this.sessionTimezone) this._autoTimezone();
@@ -985,7 +1435,7 @@ createApp({
       // Группа: открываем по id из списка групп.
       if (saved.isGroup) {
         const g = this.groups.find((x) => x.id === saved.sessionId);
-        if (g) { await this.openSession({ id: g.id }); return true; }
+        if (g) { await this.openSession(g); return true; }
       }
       // Обычный чат: выбираем персонажа и открываем именно этот чат.
       if (saved.characterId) {
@@ -1066,7 +1516,7 @@ createApp({
       const s = this.sessions.find((x) => x.id === sid);
       if (s) return this.openSession(s);
       const g = this.groups.find((x) => x.id === sid);
-      if (g) return this.openSession({ id: g.id });
+      if (g) return this.openSession(g);
       const sh = this.sharedSessions.find((x) => x.id === sid);
       if (sh) return this.openSharedSession(sh);
       return this.openSession({ id: sid }); // запасной вариант: хотя бы покажем сообщения
@@ -1445,12 +1895,16 @@ createApp({
 
     // ---------- WebSocket стриминг ----------
     connectWs() {
+      // Поколение сокета. Обработчики старого сокета могут сработать уже ПОСЛЕ
+      // того, как открыт новый (закрытие приходит асинхронно), и без этой метки
+      // они бы гасили connected у живого соединения.
+      const gen = (this._wsGen = (this._wsGen || 0) + 1);
       if (this.ws) {
         // Мы сами закрываем сокет (смена чата) — это не обрыв сети, не надо
         // дослушивать старую генерацию в активный (уже другой) чат.
-        this._intentionalClose = true;
         try { this.ws.close(); } catch (e) {}
       }
+      this._stopHeartbeat();
       if (this._wsReconnectTimer) { clearTimeout(this._wsReconnectTimer); this._wsReconnectTimer = null; }
       const sid = this.sessionId; // для реконнекта: переподключаемся только к ЭТОМУ чату
       const proto = location.protocol === "https:" ? "wss" : "ws";
@@ -1459,22 +1913,93 @@ createApp({
       if (this.userToken) qs.push("token=" + encodeURIComponent(this.userToken));
       const q = qs.length ? "?" + qs.join("&") : "";
       this.ws = new WebSocket(proto + "://" + location.host + "/ws/chat/" + this.sessionId + q);
-      this.ws.onopen = () => { this.connected = true; this._wsRetry = 0; };
+      this.ws.onopen = () => {
+        if (gen !== this._wsGen) return;  // открылся уже неактуальный сокет
+        this.connected = true;
+        this._wsRetry = 0;
+        this._startHeartbeat();
+      };
       this.ws.onclose = () => {
+        // Закрылся СТАРЫЙ сокет, пока новый уже работает — не наше дело.
+        //
+        // Раньше здесь стоял общий флаг _intentionalClose, и он давал баг,
+        // из-за которого связь не восстанавливалась без перезагрузки страницы:
+        // при вызове connectWs на УЖЕ закрытом сокете close() не порождает
+        // события, флаг оставался true, и следующий НАСТОЯЩИЙ обрыв считался
+        // намеренным — реконнект не планировался вообще никогда.
+        if (gen !== this._wsGen) return;
         this.connected = false;
-        if (this._intentionalClose) { this._intentionalClose = false; return; }
+        this._stopHeartbeat();
         // Непреднамеренный обрыв: дослушиваем активную генерацию через SSE.
         if (this.streaming && this.currentJobId) this.resumeSSE(this.currentJobId);
         // Автопереподключение с бэкоффом: сеть моргнула или сервер перезапустился.
-        // Без этого после обрыва connected=false навсегда и отправка блокируется.
-        const delay = Math.min(15000, 1500 * Math.pow(2, this._wsRetry || 0));
+        // Потолок 8 с, а не 15: дольше человек воспринимает как «зависло».
+        const delay = Math.min(8000, 1000 * Math.pow(2, this._wsRetry || 0));
         this._wsRetry = (this._wsRetry || 0) + 1;
         this._wsReconnectTimer = setTimeout(() => {
           this._wsReconnectTimer = null;
           if (this.sessionId === sid) this.connectWs();
         }, delay);
       };
-      this.ws.onmessage = (e) => this.onWsEvent(JSON.parse(e.data));
+      // Без этого неудачная попытка подключения иногда висит без onclose, и
+      // реконнект не планируется: закрываем сами, дальше отработает onclose.
+      this.ws.onerror = () => { try { this.ws && this.ws.close(); } catch (e) {} };
+      this.ws.onmessage = (e) => {
+        this._hbPending = false;   // любое сообщение — признак живого соединения
+        const data = JSON.parse(e.data);
+        if (data && data.type === "pong") return;  // служебный ответ, в ленту не идёт
+        this.onWsEvent(data);
+      };
+    },
+
+    // ---------- Живучесть соединения ----------
+    // Пауза в переписке — норма: люди читают ответ по несколько минут. Но
+    // молчащий сокет закрывают промежуточные прокси, мобильные операторы и
+    // энергосбережение телефона через 30-60 секунд тишины, и выглядело это как
+    // «постоянный реконнект на ровном месте». Пинг раз в 25 секунд держит канал.
+    _startHeartbeat() {
+      this._stopHeartbeat();
+      this._hbPending = false;
+      this._hbTimer = setInterval(() => {
+        const ws = this.ws;
+        if (!ws || ws.readyState !== 1) return;
+        // На прошлый пинг не ответили — канал мёртв, хотя браузер этого ещё не
+        // заметил (полуоткрытый TCP). Закрываем сами, чтобы сработал реконнект.
+        if (this._hbPending) {
+          this._hbPending = false;
+          try { ws.close(); } catch (e) {}
+          return;
+        }
+        this._hbPending = true;
+        try { ws.send(JSON.stringify({ type: "ping" })); } catch (e) {}
+      }, 25000);
+    },
+    _stopHeartbeat() {
+      if (this._hbTimer) { clearInterval(this._hbTimer); this._hbTimer = null; }
+      this._hbPending = false;
+    },
+    // Возвращение к вкладке, восстановление сети, фокус окна — это момент, когда
+    // человек СМОТРИТ на приложение и ждёт, что оно работает. Ждать бэкофф здесь
+    // нельзя: на телефоне таймеры в фоне заморожены, поэтому запланированный
+    // реконнект мог не сработать вовсе, и связь не поднималась до перезагрузки.
+    _bindWake() {
+      if (this._wakeBound) return;
+      this._wakeBound = true;
+      const wake = () => {
+        if (document.visibilityState !== "visible") return;
+        if (!this.sessionId) return;
+        if (this.ws && this.ws.readyState === 1) return;   // уже живы
+        if (this.ws && this.ws.readyState === 0) return;   // подключаемся прямо сейчас
+        this._wsRetry = 0;                                  // человек вернулся — не томим
+        if (this._wsReconnectTimer) {
+          clearTimeout(this._wsReconnectTimer);
+          this._wsReconnectTimer = null;
+        }
+        this.connectWs();
+      };
+      document.addEventListener("visibilitychange", wake);
+      window.addEventListener("online", wake);
+      window.addEventListener("focus", wake);
     },
     onWsEvent(ev) {
       this._lastEvtAt = Date.now(); // метка для сторожа зависшего стриминга
@@ -1579,9 +2104,24 @@ createApp({
       if (e.key !== "Enter" || e.isComposing) return;  // не мешаем IME
       if (e.shiftKey || this.isTouch) return;          // перенос строки
       e.preventDefault();
-      if (this.canvasCmdMode) this.applyCanvasCmd();
-      else if (this.artMode) this.sendArt();
-      else this.send();
+      this.submitComposer();
+    },
+    // Единственная точка отправки: и кнопка, и Enter зовут её. Пока действие
+    // выбиралось в двух местах (цепочка v-else-if в шаблоне и if-цепочка в
+    // обработчике Enter), они могли разойтись между собой.
+    submitComposer() {
+      if (this.streaming) return;
+      if (this.composerMode === "canvasCmd") return this.applyCanvasCmd();
+      if (this.composerMode === "art") return this.sendArt();
+      return this.send();
+    },
+    // Надпись на кнопке отправки берётся из того же режима, что и действие.
+    submitLabel() {
+      if (this.waitingFiles) return "⏳ файлы…";
+      if (this.composerMode === "canvasCmd") return "✨ Применить";
+      if (this.composerMode === "canvasGen") return this.canvasGenerating ? "⏳…" : "📄 Создать";
+      if (this.composerMode === "art") return "🎨 Сгенерировать";
+      return "Отправить";
     },
     // Единый инпут в режиме команды Канвасу: применяем введённое как инструкцию ИИ
     // (к выделенному фрагменту, если он есть, иначе ко всему документу).
@@ -1590,7 +2130,7 @@ createApp({
       if (!cmd || !this.canvas) return;
       this.input = "";
       this.resetComposerHeight();
-      this.canvasCmdMode = false;
+      this.composerMode = "text";
       await this.reviseCanvas(cmd);
     },
     async send() {
@@ -1608,9 +2148,9 @@ createApp({
       if (!content && this.pendingAttachments.length === 0) return; // всё отвалилось
       // ===== Умная маршрутизация интентов для Canvas =====
       // Явный триггер «📄 Документ»: новый файл, ИЛИ правка открытого (если не «с нуля»).
-      if (this.canvasGenMode) {
+      if (this.composerMode === "canvasGen") {
         const atts = this._cleanAtts(this.pendingAttachments);
-        this.input = ""; this.pendingAttachments = []; this.canvasGenMode = false; this.resetComposerHeight();
+        this.input = ""; this.pendingAttachments = []; this.composerMode = "text"; this.resetComposerHeight();
         if (this.canvasOpen && this.canvas && !this._isNewCanvasIntent(content)) this.editOpenCanvas(content);
         else this.canvasGenerate(content, atts);
         return;
@@ -2061,7 +2601,7 @@ createApp({
       if (!this.sessionId) return;
       // «По описанию» — не алерт, а режим: вы пишете описание (+ фото) сообщением.
       if (mode === "prompt") {
-        this.artMode = true;
+        this.composerMode = "art";
         this.chatError = "";
         return;
       }
@@ -2091,7 +2631,7 @@ createApp({
       const attachments = this._cleanAtts(this.pendingAttachments);
       this.input = "";
       this.pendingAttachments = [];
-      this.artMode = false;
+      this.composerMode = "text";
       this.resetComposerHeight();
       try {
         // Фото-референсы могут быть тяжёлыми — грузим с прогрессом.
@@ -2420,15 +2960,29 @@ createApp({
       e.target.value = "";
     },
     async deletePersona(p) { await this.api("/personas/" + p.id, { method: "DELETE" }); await this.loadPersonas(); },
-    async applySessionMeta() {
+    // Сохранить метаданные чата — ТОЛЬКО те поля, которые пользователь трогал.
+    //
+    // Раньше метод слал все три поля разом, и это молча стирало данные: группа
+    // открывается как {id}, метаданных в объекте нет, поэтому authorNote получал
+    // пустую строку, и первое же изменение часового пояса записывало эту пустоту
+    // в базу. Сервер делает model_dump(exclude_none=True), то есть null он
+    // отбрасывает, а пустую СТРОКУ записывает — страдали author_note и timezone.
+    //
+    // fields приходит из шаблона как объектный литерал. Явная проверка нужна
+    // потому, что @change="applySessionMeta" передал бы сюда Event, и его поля
+    // ушли бы в PATCH.
+    async applySessionMeta(fields) {
       if (!this.sessionId) return;
+      const ok = fields && typeof fields === "object" && !(fields instanceof Event);
+      if (!ok) return;
+      const payload = {};
+      for (const [k, v] of Object.entries(fields)) {
+        if (v !== undefined) payload[k] = v;
+      }
+      if (!Object.keys(payload).length) return;
       await this.api("/sessions/" + this.sessionId, {
         method: "PATCH",
-        body: JSON.stringify({
-          author_note: this.authorNote,
-          persona_id: this.sessionPersonaId,
-          timezone: this.sessionTimezone || "",
-        }),
+        body: JSON.stringify(payload),
       });
     },
 
@@ -2730,11 +3284,12 @@ createApp({
       // Дефолт-пресет задаёт params; message_preload подтягиваем в любом случае.
       if (def) { this.applyPreset(def); await this.loadUiPrefs(false); }
       else await this.loadUiPrefs();
-      await Promise.all([this.loadCharacters(), this.loadPersonas(), this.loadHorae(), this.loadGroups(), this.loadFriends()]);
+      await Promise.all([this.loadCharacters(), this.loadPersonas(), this.loadHorae(),
+        this.loadGroups(), this.loadFriends(), this.loadAllSessions()]);
       // Восстанавливаем последний открытый чат (после F5 сразу можно писать);
-      // если не вышло — открываем первого персонажа, как раньше.
-      const restored = await this._restoreLastChat();
-      if (!restored && this.characters.length) this.selectCharacter(this.characters[0]);
+      // если не вышло — показываем блок быстрого старта, а не открываем первого
+      // персонажа молча: раньше это создавало чат как побочный эффект запуска.
+      await this._restoreLastChat();
       // Периодически подтягиваем заявки в друзья/общие чаты — чтобы уведомления
       // в колокольчике появлялись без перезагрузки страницы.
       clearInterval(this._friendsTimer);
@@ -2754,10 +3309,38 @@ createApp({
         else this.finishStream();
       }, 15000);
       // Esc закрывает верхний оверлей — как ожидают от десктопного приложения.
+      this._bindWake();
       if (!this._escBound) {
         this._escBound = true;
+        // Удержание фокуса внутри верхнего оверлея. Без него Tab уходил гулять
+        // по интерфейсу под затемнением: при окне в 40 сообщений и 8-11 кнопках
+        // под каждым это больше 300 остановок на невидимых элементах.
+        window.addEventListener("keydown", (e) => {
+          if (e.key !== "Tab" || e.defaultPrevented) return;
+          const el = this._topOverlay();
+          if (!el) return;
+          const items = this._focusables(el);
+          if (!items.length) return;
+          const first = items[0];
+          const last = items[items.length - 1];
+          const cur = document.activeElement;
+          if (!el.contains(cur)) { e.preventDefault(); first.focus(); return; }
+          if (e.shiftKey && cur === first) { e.preventDefault(); last.focus(); }
+          else if (!e.shiftKey && cur === last) { e.preventDefault(); first.focus(); }
+        });
+        // Палитра: Ctrl+K на Windows и Linux, Cmd+K на маке. Перехватываем до
+        // браузера, иначе Ctrl+K уедет в его строку поиска.
+        window.addEventListener("keydown", (e) => {
+          if (e.key !== "k" && e.key !== "K" && e.key !== "л" && e.key !== "Л") return;
+          if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+          e.preventDefault();
+          if (this.paletteOpen) this.closePalette();
+          else this.openPalette();
+        });
         window.addEventListener("keydown", (e) => {
           if (e.key !== "Escape" || e.defaultPrevented) return;
+          if (this.paletteOpen) { this.closePalette(); return; }
+          if (this.inspectorOpen) { this.closeInspector(); return; }
           if (this.dialog) { this.dialogCancel(); return; }
           if (this.lightbox) { this.lightbox = null; return; }
           if (this.headerMenu) { this.headerMenu = false; return; }
@@ -2771,7 +3354,13 @@ createApp({
           if (this.debugOpen) { this.debugOpen = false; return; }
           if (this.usageOpen) { this.usageOpen = false; return; }
           if (this.adminOpen) { this.adminOpen = false; return; }
-          if (this.drawerTab) { this.drawerTab = null; }
+          if (this.drawerTab) { this.drawerTab = null; return; }
+          // Режим композера — тоже слой, и выходить из него надо той же клавишей.
+          // Раньше из режима арта можно было выйти только маленькой ссылкой
+          // «отмена» внутри плашки, и обычное сообщение легко уходило в
+          // генератор картинок.
+          if (this.composerMode !== "text") { this.composerMode = "text"; return; }
+          if (this.sidebarOpen && this.isTouch) { this.sidebarOpen = false; }
         });
       }
     },
@@ -2781,6 +3370,50 @@ createApp({
     // Любое изменение параметров генерации сохраняем в системе (с дебаунсом).
     params: { handler() { this.saveUiPrefs(); }, deep: true },
     soundOn(v) { localStorage.setItem("soundOn", v ? "1" : "0"); },
+
+    // Фокус при открытии оверлея уходит внутрь, при закрытии ВОЗВРАЩАЕТСЯ на
+    // вызвавший элемент. Раньше клавиатурный путь после каждого закрытия
+    // начинался заново с начала страницы, а до дровера, стоящего в шаблоне
+    // после ленты, надо было протабать весь чат.
+    overlayOpen(open) {
+      if (open) {
+        this._focusReturn = document.activeElement;
+        this.$nextTick(() => {
+          const el = this._topOverlay();
+          if (!el) return;
+          const first = this._focusables(el)[0];
+          if (first) first.focus();
+          else { el.setAttribute("tabindex", "-1"); el.focus(); }
+        });
+        return;
+      }
+      const back = this._focusReturn;
+      this._focusReturn = null;
+      // Элемент мог исчезнуть вместе с закрытым окном — тогда возвращать некуда.
+      if (back && document.contains(back)) back.focus();
+    },
+
+    // Объявляем этапы хода, а не токены.
+    streaming(on) {
+      this.liveStatus = on ? "Генерация ответа началась" : "Ответ получен";
+      if (on) this._startTelemetry();
+      else this._stopTelemetry();
+    },
+    // Полоса заполнения окна должна относиться к ОТКРЫТОМУ чату, иначе она
+    // показывала бы вес предыдущего.
+    sessionId() {
+      this.ctxStats = null;
+      this.loadCtxStats();
+    },
+    // Ввод в палитре: поиск по репликам идёт на сервер с дебаунсом, чтобы не
+    // слать запрос на каждую букву.
+    paletteQuery() {
+      this.paletteIndex = 0;
+      this.scheduleSearch();
+    },
+    chatError(text) {
+      if (text) this.liveStatus = "Ошибка генерации: " + text;
+    },
   },
 
   async mounted() {
@@ -2841,7 +3474,7 @@ createApp({
   </div>
 
   <template v-else>
-  <div :class="['app-grid', !sidebarOpen ? 'sb-hidden' : '', canvasOpen ? 'with-canvas' : '', 'pane-' + mobilePane]">
+  <div :class="['app-grid', !sidebarOpen ? 'sb-hidden' : '', canvasOpen ? 'with-canvas' : '', 'pane-' + mobilePane, 'view-' + viewMode]">
 
     <!-- Затемнение под мобильным сайдбаром -->
     <div v-if="sidebarOpen" class="backdrop" @click="sidebarOpen=false"></div>
@@ -2851,7 +3484,8 @@ createApp({
 
       <!-- Раздел: Персонажи -->
       <div class="acc">
-        <button class="acc-head" @click="toggleSection('characters')">
+        <button class="acc-head" @click="toggleSection('characters')"
+                :aria-expanded="openSections.characters ? 'true' : 'false'">
           <span class="acc-icon">🎭</span><span class="acc-title">Персонажи</span>
           <span class="acc-chevron" :class="{ open: openSections.characters }">▸</span>
         </button>
@@ -2859,145 +3493,149 @@ createApp({
           <div class="row" style="padding: 6px 12px; gap:6px">
             <button class="btn-primary" style="flex:1" @click="createCharacter">+ Новый</button>
             <label class="btn-icon" style="margin:0; cursor:pointer" title="Импорт персонажа PNG/JSON">
-              📥<input type="file" accept=".png,.json" style="display:none" @change="importCharacter" />
+              📥<input type="file" accept=".png,.json" class="file-input" @change="importCharacter"
+                     aria-label="Импорт персонажа из файла PNG или JSON" />
             </label>
             <label class="btn-icon" style="margin:0; cursor:pointer" title="Импорт чата: нативный AiChat (.aichat.json) или SillyTavern (.jsonl)">
-              💬<input type="file" accept=".jsonl,.json" style="display:none" @change="importChat" />
+              💬<input type="file" accept=".jsonl,.json" class="file-input" @change="importChat"
+                     aria-label="Импорт чата из файла AiChat или SillyTavern" />
             </label>
           </div>
           <div class="list-search" v-if="characters.length > 5">
             <input v-model="charFilter" placeholder="Поиск по персонажам…" @click.stop />
-            <button v-if="charFilter" class="btn-icon" @click.stop="charFilter=''" title="Очистить">✕</button>
+            <button v-if="charFilter" class="btn-icon" @click.stop="charFilter=''" title="Очистить" aria-label="Очистить">✕</button>
           </div>
+          <!-- Строка списка это КНОПКА, а не div с обработчиком: иначе с клавиатуры
+               можно удалить чат, но нельзя его открыть. Действия лежат СОСЕДЯМИ
+               кнопки, а не внутри неё: интерактивный элемент внутри кнопки
+               недопустим и ломает и клавиатуру, и скринридер. -->
           <div v-for="c in filteredCharacters" :key="c.id"
-               :class="['list-item', c.id === selectedCharacterId ? 'active' : '', c.pinned ? 'pinned' : '']"
-               @click="selectCharacter(c)">
-            <div class="avatar"><img v-if="c.avatar_path" :src="c.avatar_path" class="avatar" />{{ c.avatar_path ? '' : c.name.charAt(0) }}</div>
-            <div class="grow row-title">
-              <span v-if="c.pinned" class="pin-mark" title="Закреплён наверху">📌</span>
-              <span class="row-name">{{ c.name }}</span>
-            </div>
+               :class="['list-item', c.id === selectedCharacterId ? 'active' : '', c.pinned ? 'pinned' : '']">
+            <button type="button" class="row-main" @click="selectCharacter(c)"
+                    :aria-current="c.id === selectedCharacterId ? 'true' : null"
+                    :aria-label="'Персонаж ' + c.name + (c.pinned ? ', закреплён' : '')">
+              <span class="avatar" aria-hidden="true"><img v-if="c.avatar_path" :src="c.avatar_path" class="avatar" alt="" />{{ c.avatar_path ? '' : c.name.charAt(0) }}</span>
+              <span class="grow row-title">
+                <span v-if="c.pinned" class="pin-mark" aria-hidden="true">📌</span>
+                <span class="row-name">{{ c.name }}</span>
+              </span>
+            </button>
             <span class="row-actions">
               <button class="btn-icon" @click.stop="togglePinCharacter(c)"
-                      :title="c.pinned ? 'Открепить' : 'Закрепить наверху'">{{ c.pinned ? '📍' : '📌' }}</button>
-              <button class="btn-icon" @click.stop="exportCharacter(c)" title="Экспорт (JSON + лор Horae)">⬇</button>
-              <button class="btn-icon" @click.stop="deleteCharacter(c)" title="Удалить">🗑</button>
+                      :title="c.pinned ? 'Открепить' : 'Закрепить наверху'" :aria-label="c.pinned ? 'Открепить' : 'Закрепить наверху'">{{ c.pinned ? '📍' : '📌' }}</button>
+              <button class="btn-icon" @click.stop="exportCharacter(c)" title="Экспорт (JSON + лор Horae)" aria-label="Экспорт (JSON + лор Horae)">⬇</button>
+              <button class="btn-icon" @click.stop="deleteCharacter(c)" title="Удалить" aria-label="Удалить">🗑</button>
             </span>
           </div>
           <div v-if="charFilter && !filteredCharacters.length" class="list-empty">Ничего не найдено</div>
         </div>
       </div>
 
-      <!-- Раздел: Чаты выбранного персонажа -->
-      <div class="acc" v-if="selectedCharacter">
-        <button class="acc-head" @click="toggleSection('chats')">
-          <span class="acc-icon">💬</span><span class="acc-title">Чаты — {{ selectedCharacter.name }}</span>
+      <!-- Раздел: ВСЕ чаты. Раньше он существовал только при выбранном
+           персонаже, и чтобы найти чат, надо было сначала вспомнить персонажа,
+           то есть вспомнить ответ до того, как задал вопрос. Теперь это одна
+           лента личных, групповых и общих чатов, а персонаж — фильтр поверх. -->
+      <div class="acc">
+        <button class="acc-head" @click="toggleSection('chats')"
+                :aria-expanded="openSections.chats ? 'true' : 'false'">
+          <span class="acc-icon">💬</span>
+          <span class="acc-title">Чаты<template v-if="chatFilterChar !== null && selectedCharacter"> — {{ selectedCharacter.name }}</template></span>
           <span class="acc-chevron" :class="{ open: openSections.chats }">▸</span>
         </button>
         <div class="acc-body" :class="{ open: openSections.chats }">
-          <div style="padding: 6px 12px"><button @click="newChat" style="width:100%">+ Новый чат</button></div>
-          <div class="list-search" v-if="sessions.length > 5">
-            <input v-model="chatFilter" placeholder="Поиск по чатам…" @click.stop />
-            <button v-if="chatFilter" class="btn-icon" @click.stop="chatFilter=''" title="Очистить">✕</button>
+          <div class="row" style="padding: 6px 12px; gap:6px">
+            <button @click="newChat" style="flex:1" :disabled="!selectedCharacter"
+                    :title="selectedCharacter ? 'Новый чат с ' + selectedCharacter.name : 'Сначала выберите персонажа'">+ Новый чат</button>
+            <button class="btn-icon" @click="openGroupModal" title="Собрать группу персонажей"
+                    aria-label="Собрать группу персонажей">👥</button>
+            <button class="btn-icon" @click="openPalette()" title="Поиск по сообщениям (Ctrl+K)"
+                    aria-label="Поиск по сообщениям, Ctrl+K">🔍</button>
           </div>
-          <div v-for="s in filteredSessions" :key="s.id"
-               :class="['list-item', 'row2', s.id === sessionId ? 'active' : '', s.pinned ? 'pinned' : '']"
-               :title="s.title + ' — чат #' + s.id"
-               @click="openSession(s)">
-            <span v-if="pendingChats.includes(s.id)" class="reply-dot" title="Пришёл новый ответ"></span>
-            <div class="grow row-text">
-              <div class="row-title">
-                <span v-if="s.pinned" class="pin-mark" title="Закреплён наверху">📌</span>
-                <span class="row-name">{{ s.title }}</span>
-              </div>
-              <div class="row-sub" v-if="s.preview">{{ s.preview }}</div>
-              <div class="row-sub muted" v-else>пустой чат</div>
-            </div>
-            <span class="row-time" v-if="s.last_at">{{ shortWhen(s.last_at) }}</span>
-            <span class="row-actions">
+          <!-- Чипы фильтра. Клик по чипу меняет ТОЛЬКО фильтр: он не открывает
+               чат и не закрывает сайдбар, поэтому по спискам можно ходить. -->
+          <div class="chip-row" v-if="chatFilterChips.length > 1">
+            <button class="filter-chip" :class="{ on: chatFilterChar === null }"
+                    @click="chatFilterChar = null"
+                    :aria-pressed="chatFilterChar === null ? 'true' : 'false'">Все · {{ unifiedChats.length }}</button>
+            <button v-for="ch in chatFilterChips" :key="'fc'+ch.id" class="filter-chip"
+                    :class="{ on: chatFilterChar === ch.id }"
+                    @click="chatFilterChar = (chatFilterChar === ch.id ? null : ch.id)"
+                    :aria-pressed="chatFilterChar === ch.id ? 'true' : 'false'">{{ ch.name }} · {{ ch.n }}</button>
+          </div>
+          <div class="list-search" v-if="unifiedChats.length > 5">
+            <input v-model="chatFilter" placeholder="Поиск по названиям…" @click.stop />
+            <button v-if="chatFilter" class="btn-icon" @click.stop="chatFilter=''" title="Очистить" aria-label="Очистить">✕</button>
+          </div>
+          <div v-for="s in visibleChats" :key="s.kind + s.id"
+               :class="['list-item', 'row2', s.id === sessionId ? 'active' : '', s.pinned ? 'pinned' : '']">
+            <button type="button" class="row-main" @click="openChatRow(s)"
+                    :title="s.title + ' — чат #' + s.id"
+                    :aria-current="s.id === sessionId ? 'true' : null"
+                    :aria-label="(s.kind === 'group' ? 'Группа ' : s.kind === 'shared' ? 'Общий чат ' : 'Чат ') + s.title + (s.character_name ? ', ' + s.character_name : '') + (s.pinned ? ', закреплён' : '') + (pendingChats.includes(s.id) ? ', пришёл новый ответ' : '') + (s.last_at ? ', ' + shortWhen(s.last_at) : '')">
+              <span v-if="pendingChats.includes(s.id)" class="reply-dot" aria-hidden="true"></span>
+              <span class="grow row-text">
+                <span class="row-title">
+                  <span v-if="s.pinned" class="pin-mark" aria-hidden="true">📌</span>
+                  <span v-if="s.kind !== 'chat'" class="kind-mark" aria-hidden="true">{{ s.kind === 'group' ? '👥' : '🔗' }}</span>
+                  <span class="row-name">{{ s.title }}</span>
+                </span>
+                <span class="row-sub" v-if="s.preview">{{ s.preview }}</span>
+                <span class="row-sub muted" v-else-if="s.character_name">{{ s.character_name }}</span>
+                <span class="row-sub muted" v-else>пустой чат</span>
+              </span>
+              <span class="row-time" v-if="s.last_at" aria-hidden="true">{{ shortWhen(s.last_at) }}</span>
+            </button>
+            <span class="row-actions" v-if="s.kind !== 'shared'">
               <button class="btn-icon" @click.stop="togglePinSession(s)"
-                      :title="s.pinned ? 'Открепить' : 'Закрепить наверху'">{{ s.pinned ? '📍' : '📌' }}</button>
-              <button class="btn-icon" @click.stop="exportSession(s)" title="Экспорт чата (нативный формат AiChat)">💾</button>
-              <button v-if="authStatus.accounts_enabled" class="btn-icon" @click.stop="openInvite(s)" title="Пригласить друга">🔗</button>
-              <button class="btn-icon" @click.stop="renameSession(s)" title="Переименовать">✎</button>
-              <button class="btn-icon" @click.stop="deleteSession(s)" title="Удалить чат">🗑</button>
+                      :title="s.pinned ? 'Открепить' : 'Закрепить наверху'" :aria-label="s.pinned ? 'Открепить' : 'Закрепить наверху'">{{ s.pinned ? '📍' : '📌' }}</button>
+              <button class="btn-icon" @click.stop="exportSession(s)" title="Экспорт чата (нативный формат AiChat)" aria-label="Экспорт чата (нативный формат AiChat)">💾</button>
+              <button v-if="authStatus.accounts_enabled" class="btn-icon" @click.stop="openInvite(s)" title="Пригласить друга" aria-label="Пригласить друга">🔗</button>
+              <button class="btn-icon" @click.stop="renameSession(s)" title="Переименовать" aria-label="Переименовать">✎</button>
+              <button class="btn-icon" @click.stop="deleteSession(s)" title="Удалить чат" aria-label="Удалить чат">🗑</button>
             </span>
           </div>
-          <div v-if="chatFilter && !filteredSessions.length" class="list-empty">Ничего не найдено</div>
-        </div>
-      </div>
-
-      <!-- Раздел: Группы -->
-      <div class="acc">
-        <button class="acc-head" @click="toggleSection('groups')">
-          <span class="acc-icon">👥</span><span class="acc-title">Группы</span>
-          <span class="acc-chevron" :class="{ open: openSections.groups }">▸</span>
-        </button>
-        <div class="acc-body" :class="{ open: openSections.groups }">
-          <div style="padding: 6px 12px"><button @click="openGroupModal" style="width:100%">+ Группа</button></div>
-          <div v-for="g in groups" :key="g.id"
-               :class="['list-item', g.id === sessionId ? 'active' : '']"
-               :title="g.title + ' — чат #' + g.id"
-               @click="openSession({ id: g.id })">
-            <span v-if="pendingChats.includes(g.id)" class="reply-dot" title="Пришёл новый ответ"></span>
-            <div class="grow">{{ g.title }}
-              <span class="muted">{{ g.members.map(m => m.name).join(', ') }}</span>
-            </div>
-            <button class="btn-icon" @click.stop="exportSession(g)" title="Экспорт чата (нативный формат AiChat)">💾</button>
-            <button v-if="authStatus.accounts_enabled" class="btn-icon" @click.stop="openInvite(g)" title="Пригласить друга в группу">🔗</button>
-            <button class="btn-icon" @click.stop="renameSession(g)" title="Переименовать">✎</button>
-            <button class="btn-icon" @click.stop="deleteSession(g)" title="Удалить группу">🗑</button>
+          <div v-if="!visibleChats.length" class="list-empty">
+            {{ chatFilter || chatFilterChar !== null ? 'Ничего не найдено' : 'Чатов пока нет' }}
           </div>
         </div>
       </div>
 
-      <!-- Раздел: Доступные мне (расшаренные чаты) -->
-      <div class="acc" v-if="authStatus.accounts_enabled && sharedSessions.length">
-        <button class="acc-head" @click="toggleSection('shared')">
-          <span class="acc-icon">👁</span><span class="acc-title">Доступные мне</span>
-          <span class="acc-chevron" :class="{ open: openSections.shared }">▸</span>
-        </button>
-        <div class="acc-body" :class="{ open: openSections.shared }">
-          <div v-for="s in sharedSessions" :key="'sh'+s.id"
-               :class="['list-item', s.id === sessionId ? 'active' : '']"
-               @click="openSharedSession(s)">
-            <div class="grow">{{ s.title }}
-              <span class="muted">{{ s.character_name }} · от {{ s.owner }}</span>
-            </div>
-          </div>
-        </div>
-      </div>
+      <!-- Разделы «Группы» и «Доступные мне» слились с общим списком чатов выше:
+           три списка одной сущности с тремя разными правилами строки были ровно
+           тем, из-за чего пользователь не мог опереться ни на одно из них.
+           Кнопка создания группы переехала к кнопке нового чата. -->
+
     </div>
 
     <!-- ===== Центр: чат ===== -->
     <div class="chat" @dragover.prevent="dragOver = !!sessionId" @dragleave.prevent="dragOver=false" @drop.prevent="onDrop">
       <div v-if="dragOver" class="drop-overlay">📎 Отпустите файл — он прикрепится к сообщению</div>
       <div class="chat-header">
-        <button class="btn-icon hamburger" @click="sidebarOpen=!sidebarOpen" title="Меню">☰</button>
-        <button v-if="canvasOpen" class="btn-icon only-mobile" @click="mobilePane='canvas'" title="Открыть Canvas">📋</button>
+        <button class="btn-icon hamburger" @click="sidebarOpen=!sidebarOpen" title="Меню" aria-label="Меню">☰</button>
+        <button v-if="canvasOpen" class="btn-icon only-mobile" @click="mobilePane='canvas'" title="Открыть Canvas" aria-label="Открыть Canvas">📋</button>
         <!-- Аватарка персонажа (для группы — первого участника с аватаркой) -->
         <span v-if="sessionId" class="header-ava">
           <img v-if="headerAvatar" :src="headerAvatar" />
           <span v-else>{{ currentIsGroup ? '👥' : (currentSessionTitle || 'T').charAt(0).toUpperCase() }}</span>
         </span>
-        <span class="title" :title="sessionId ? (currentSessionTitle + ' — чат #' + sessionId) : ''">{{ sharedView ? ('🔗 ' + sharedView.title) : (currentIsGroup ? currentGroup.title : (selectedCharacter ? selectedCharacter.name : 'TaleEngine')) }}</span>
-        <!-- Полное имя чата и его номер: по нему удобно ссылаться на конкретный чат -->
-        <span v-if="sessionId" class="pill chat-id-pill" :title="currentSessionTitle + ' — чат #' + sessionId">💬 {{ currentSessionTitle || 'чат' }} · #{{ sessionId }}</span>
-        <span v-if="currentIsGroup" class="pill hide-mobile" title="Участники группы">👥 {{ currentGroup.members.map(m => m.name).join(', ') }}</span>
-        <span :class="['pill', connected ? 'status-ok' : 'status-err']"
-              :title="connected ? 'Соединение с сервером активно' : 'Переподключение…'">{{ connected ? 'online' : '⟳ реконнект' }}</span>
-        <span class="pill hide-mobile">{{ params.model || connection.default_model }}</span>
-        <span v-if="connection.use_proxy" class="pill hide-mobile" title="Запросы идут в LiteLLM-прокси">proxy {{ connection.base_url }}</span>
-        <div style="flex:1"></div>
-        <button v-if="sessionId" class="btn-icon hide-mobile" @click="openKnowledge"
-                title="База знаний чата: файлы, которые персонажи всегда учитывают">📚</button>
-        <button v-if="sessionId && !sharedView" class="btn-icon hide-mobile" @click="openMembers"
-                :title="currentIsGroup ? 'Участники группы (добавить/убрать)' : 'Добавить персонажа (сделать групповым)'">👥➕</button>
-        <button v-if="currentIsGroup" class="btn-icon hide-mobile" :class="currentGroup.director ? 'rec-active' : ''"
-                @click="toggleDirector" title="ИИ-режиссёр: решает, кто ответит">🎬</button>
+        <!-- Идентичность чата: одна строка вместо заголовка и дублирующей его
+             пилюли. Номер чата остаётся, по нему удобно ссылаться. -->
+        <span class="header-id">
+          <span class="title" :title="headerSubtitle">{{ headerTitle }}</span>
+          <span v-if="headerSubtitle" class="header-sub">{{ headerSubtitle }}</span>
+        </span>
+        <!-- Статус связи виден ТОЛЬКО когда связи нет. Вечно зелёный «online»
+             занимал место в самой дорогой по вниманию полосе и не читался. -->
+        <!-- Распорника здесь нет намеренно: .header-id уже растягивается, и второй
+             flex:1 делил бы полосу пополам, подвешивая плашку обрыва связи ровно
+             посередине шапки, вдали и от заголовка, и от кнопок. -->
+        <span v-if="!connected" class="pill status-err" title="Связь с сервером потеряна, идёт переподключение">⟳ реконнект</span>
+        <button class="btn-icon" @click="openPalette()"
+                title="Поиск по сообщениям и команды (Ctrl+K)"
+                aria-label="Поиск по сообщениям и команды, Ctrl+K">🔍</button>
         <!-- Колокольчик уведомлений: входящие заявки в друзья -->
         <div v-if="currentUserObj" class="notif-wrap">
-          <button class="btn-icon" @click="notifOpen=!notifOpen" title="Уведомления">
+          <button class="btn-icon" @click="notifOpen=!notifOpen" title="Уведомления" aria-label="Уведомления">
             🔔<span v-if="friendsIncoming.length" class="notif-badge">{{ friendsIncoming.length }}</span>
           </button>
           <div v-if="notifOpen" class="notif-backdrop" @click="notifOpen=false"></div>
@@ -3013,18 +3651,24 @@ createApp({
             </div>
           </div>
         </div>
-        <button class="btn-icon hide-mobile" @click="soundOn=!soundOn" :title="soundOn ? 'Звук вкл' : 'Звук выкл'">{{ soundOn ? '🔊' : '🔇' }}</button>
-        <button v-if="currentUserObj" class="btn-icon hide-mobile" @click="openProfile" title="Профиль / привязка Telegram">👤<span class="hide-mobile"> {{ currentUserObj.username }}</span></button>
-        <button v-if="sessionId && authStatus.accounts_enabled && !sharedView" class="btn-icon hide-mobile" @click="openInvite({ id: sessionId })" title="Пригласить друга в этот чат">👥</button>
-        <button v-if="sessionId" class="btn-icon hide-mobile" @click="bgPicker=!bgPicker" title="Фон чата">🖼</button>
-        <button class="btn-icon hide-mobile" @click="openDebug" title="Отладка LLM (что уходит в прокси)">🐞</button>
-        <button v-if="isAdmin" class="btn-icon hide-mobile" @click="openAdmin" title="Администрирование">🛡</button>
-        <button class="btn-icon" @click="drawerTab = drawerTab ? null : 'generation'" title="Настройки">⚙</button>
-        <!-- На мобильном вторичные действия шапки прячем в это меню (⋯) -->
-        <div class="header-menu-wrap only-mobile">
-          <button class="btn-icon" @click="headerMenu=!headerMenu" title="Ещё">⋯</button>
+        <button class="btn-icon" @click="drawerTab = drawerTab ? null : 'generation'" title="Настройки" aria-label="Настройки">⚙</button>
+        <!-- Редкие действия живут здесь на ВСЕХ экранах, а не только на телефоне.
+             Механизм был написан ещё для мобильной шапки, но к десктопу его тогда
+             не применили, и девять кнопок продолжали висеть в полосе. -->
+        <div class="header-menu-wrap">
+          <button class="btn-icon" @click="headerMenu=!headerMenu" title="Ещё" aria-label="Ещё">⋯</button>
           <div v-if="headerMenu" class="plus-backdrop" @click="headerMenu=false"></div>
           <div v-if="headerMenu" class="plus-menu header-menu">
+            <!-- Режим ленты: одно поле viewMode, три взаимоисключающих значения.
+                 Как и с composerMode, состояние ровно одно, поэтому «сцена» и
+                 «работа с документом» не могут оказаться включены одновременно. -->
+            <span class="menu-label">Режим ленты</span>
+            <button v-for="m in [['normal','💬 Обычный'],['scene','🎭 Сцена'],['work','📄 Работа с документом']]"
+                    :key="'vm'+m[0]" :class="viewMode === m[0] ? 'on' : ''"
+                    :aria-pressed="viewMode === m[0] ? 'true' : 'false'"
+                    @click="setViewMode(m[0]); headerMenu=false">{{ m[1] }}</button>
+            <span class="menu-sep" role="separator"></span>
+            <button v-if="sessionId" @click="openInspector(); headerMenu=false">🔬 Инспектор хода</button>
             <button v-if="sessionId" @click="openKnowledge(); headerMenu=false">📚 База знаний</button>
             <button v-if="sessionId && !sharedView" @click="openMembers(); headerMenu=false">👥➕ {{ currentIsGroup ? 'Участники группы' : 'Добавить персонажа' }}</button>
             <button v-if="currentIsGroup" @click="toggleDirector(); headerMenu=false">🎬 ИИ-режиссёр: {{ currentGroup.director ? 'вкл' : 'выкл' }}</button>
@@ -3042,9 +3686,10 @@ createApp({
       <div v-if="bgPicker" class="bg-picker">
         <div class="bg-row">
           <button v-for="b in bgPresets" :key="b.name" class="bg-swatch" :style="b.value ? {background:b.value} : {}"
-                  @click="setBackground(b.value)" :title="b.name">{{ b.value ? '' : '∅' }}</button>
+                  @click="setBackground(b.value)" :title="b.name" :aria-label="b.name">{{ b.value ? '' : '∅' }}</button>
           <label class="btn" style="margin:0;cursor:pointer">Загрузить фото
-            <input type="file" accept="image/*" style="display:none" @change="uploadBackground" />
+            <input type="file" accept="image/*" class="file-input" @change="uploadBackground"
+                   aria-label="Загрузить фотографию как фон чата" />
           </label>
         </div>
         <div v-if="chatImages.length" class="bg-row">
@@ -3053,8 +3698,34 @@ createApp({
         </div>
       </div>
 
-      <div class="messages" ref="messages" :style="chatBgStyle" @scroll="onMessagesScroll">
-        <div v-if="!sessionId" class="empty">Выберите или создайте персонажа и чат слева.</div>
+      <!-- Вежливый регион: скринридер узнаёт, что ход начался, закончился или упал.
+           Раньше незрячий пользователь отправлял сообщение и не получал НИКАКОГО
+           сигнала о том, что вообще происходит. -->
+      <div class="sr-only" role="status" aria-live="polite">{{ liveStatus }}</div>
+
+      <div class="messages" ref="messages" :style="chatBgStyle" @scroll="onMessagesScroll"
+           role="log" aria-label="Переписка">
+        <!-- Первый экран. Раньше здесь была одна бледная строка «выберите слева»,
+             которая на телефоне указывала туда, где ничего нет: сайдбар за ☰. -->
+        <div v-if="!sessionId" class="start">
+          <h2 class="start-title">С чего начнём?</h2>
+          <p class="start-lead">Диалог с персонажем, разговор нескольких персонажей сразу
+            или помощник без отыгрыша — всё это один и тот же чат.</p>
+          <div class="start-actions">
+            <button class="btn-primary" @click="startNewChat">Новый диалог</button>
+            <button @click="createCharacter">Создать персонажа</button>
+            <button v-if="characters.length > 1" @click="openGroupModal">Собрать группу</button>
+          </div>
+          <div class="start-recent" v-if="recentChats.length">
+            <span class="start-recent-head">Недавние диалоги</span>
+            <button v-for="s in recentChats" :key="'rc'+s.id" class="start-chat"
+                    @click="openRecent(s)" :aria-label="'Открыть чат ' + s.title">
+              <span class="grow">{{ s.title }}</span>
+              <span class="when" v-if="s.last_at">{{ shortWhen(s.last_at) }}</span>
+            </button>
+          </div>
+          <p class="start-hint only-mobile">Персонажи и все чаты — в меню ☰ вверху.</p>
+        </div>
         <!-- Индикатор подгрузки истории при скролле вверх -->
         <div v-if="sessionId && loadingOlder" class="load-older">⏳ Загружаю ранние сообщения…</div>
         <div v-else-if="sessionId && messages.length >= msgPageSize && noMoreMessages" class="load-older muted">— начало чата —</div>
@@ -3068,6 +3739,11 @@ createApp({
           </div>
           <div class="msg-body">
           <div v-if="m.speaker_name" class="speaker">{{ m.speaker_name }}</div>
+          <!-- В режиме сцены реплику подписывает КАЖДЫЙ говорящий, а не только
+               участник группы: это театральная ремарка, по которой читают, кто
+               сейчас на сцене. В обычном режиме подпись осталась как была. -->
+          <div v-else-if="viewMode === 'scene' && (m.role === 'user' || m.role === 'assistant')"
+               class="speaker">{{ m.role === 'user' ? 'Вы' : (selectedCharacter ? selectedCharacter.name : 'Персонаж') }}</div>
           <div v-if="m.reply_to_id" class="reply-quote">↪ {{ quoteOf(m.reply_to_id) }}</div>
           <div class="bubble">
             <!-- режим редактирования: авто-фокус, авто-высота, Ctrl+Enter / Esc -->
@@ -3118,9 +3794,11 @@ createApp({
           <div class="msg-meta">
             <!-- свайпы только у ассистента и если их больше одного / это последний ответ -->
             <span v-if="m.role === 'assistant' && !m.canvas_id" class="swipes">
-              <button class="btn-icon" @click="swipe(m, -1)" :disabled="m.active_swipe === 0">◀</button>
+              <button class="btn-icon" @click="swipe(m, -1)" :disabled="m.active_swipe === 0"
+                      aria-label="Предыдущий вариант ответа">◀</button>
               {{ m.active_swipe + 1 }}/{{ (m.swipes || [m.content]).length }}
-              <button class="btn-icon" @click="swipe(m, 1)" :title="m.id === lastAssistantId ? 'Ещё вариант' : ''">▶</button>
+              <button class="btn-icon" @click="swipe(m, 1)" :title="m.id === lastAssistantId ? 'Ещё вариант' : ''"
+                      :aria-label="m.id === lastAssistantId ? 'Сгенерировать ещё вариант ответа' : 'Следующий вариант ответа'">▶</button>
             </span>
             <!-- Время: у user — когда отправил, у assistant — когда пришёл ответ (в поясе чата) -->
             <span v-if="m.created_at" class="tag msg-time" :title="fmtWhenFull(m.created_at)">🕒 {{ fmtWhen(m.created_at) }}</span>
@@ -3129,15 +3807,21 @@ createApp({
                  прокруткой на глаз неудобно — даём точный прыжок. -->
             <button v-if="(m.content || '').length > 800" class="btn-icon"
                     @click="scrollMessageStart(m.id)" title="К началу этого сообщения">⇞</button>
-            <button v-if="!m.canvas_id" class="btn-icon" @click="copyMessage(m)" title="Скопировать текст">📋</button>
+            <button v-if="!m.canvas_id" class="btn-icon" @click="copyMessage(m)" title="Скопировать текст" aria-label="Скопировать текст">📋</button>
             <template v-if="!m.canvas_id">
-              <button class="btn-icon" @click="replyTo(m)" title="Ответить на это сообщение">↩</button>
-              <button class="btn-icon" @click="startEdit(m)" title="Редактировать">✎</button>
-              <button v-if="m.role === 'assistant' && m.id === lastAssistantId" class="btn-icon" @click="regenerate" title="Перегенерировать">↻</button>
-              <button v-if="m.role === 'assistant' && m.id === lastAssistantId" class="btn-icon" @click="continueReply" title="Продолжить">⏩</button>
-              <button class="btn-icon" @click="artFromMessage(m)" title="Нарисовать по этому сообщению">🎨</button>
+              <button class="btn-icon" @click="replyTo(m)" title="Ответить на это сообщение" aria-label="Ответить на это сообщение">↩</button>
+              <button class="btn-icon" @click="startEdit(m)" title="Редактировать" aria-label="Редактировать">✎</button>
+              <button v-if="m.role === 'assistant' && m.id === lastAssistantId" class="btn-icon" @click="regenerate" title="Перегенерировать" aria-label="Перегенерировать">↻</button>
+              <button v-if="m.role === 'assistant' && m.id === lastAssistantId" class="btn-icon" @click="continueReply" title="Продолжить" aria-label="Продолжить">⏩</button>
+              <button class="btn-icon" @click="artFromMessage(m)" title="Нарисовать по этому сообщению" aria-label="Нарисовать по этому сообщению">🎨</button>
+              <!-- Ветка от реплики: развилка сюжета перестаёт эмулироваться
+                   откруткой свайпа в середине чата, после которой вся дальнейшая
+                   переписка отвечала на вариант, которого уже не видно. -->
+              <button class="btn-icon" @click="forkFrom(m)"
+                      title="Форкнуть отсюда: новый чат с историей до этой реплики"
+                      aria-label="Форкнуть отсюда: новый чат с историей до этой реплики">⑂</button>
             </template>
-            <button class="btn-icon" @click="deleteMessage(m)" title="Удалить">🗑</button>
+            <button class="btn-icon" @click="deleteMessage(m)" title="Удалить" aria-label="Удалить">🗑</button>
           </div>
           </div><!-- /.msg-body -->
         </div>
@@ -3188,11 +3872,11 @@ createApp({
       <div class="chat-nav" v-if="sessionId && messages.length > 3 && awayFromBottom"
            :style="{ bottom: (composerH + 12) + 'px' }">
         <button class="btn-icon" @click="scrollToChatStart" :disabled="jumpBusy"
-                title="К началу чата (Home). Догрузит раннюю историю, если её ещё нет">
+                title="К началу чата (Home). Догрузит раннюю историю, если её ещё нет" aria-label="К началу чата (Home). Догрузит раннюю историю, если её ещё нет">
           {{ jumpBusy ? '⏳' : '⤒' }}</button>
-        <button class="btn-icon" @click="jumpMessage(-1)" title="Предыдущее сообщение (Alt+↑)">⌃</button>
-        <button class="btn-icon" @click="jumpMessage(1)" title="Следующее сообщение (Alt+↓)">⌄</button>
-        <button class="btn-icon accent" @click="scrollToBottom()" title="К последнему сообщению (End)">⤓</button>
+        <button class="btn-icon" @click="jumpMessage(-1)" title="Предыдущее сообщение (Alt+↑)" aria-label="Предыдущее сообщение (Alt+↑)">⌃</button>
+        <button class="btn-icon" @click="jumpMessage(1)" title="Следующее сообщение (Alt+↓)" aria-label="Следующее сообщение (Alt+↓)">⌄</button>
+        <button class="btn-icon accent" @click="scrollToBottom()" title="К последнему сообщению (End)" aria-label="К последнему сообщению (End)">⤓</button>
       </div>
 
       <div class="composer" v-if="sessionId">
@@ -3207,8 +3891,8 @@ createApp({
           <span class="dir-hint">🎬 Режиссёр: клик по имени — вызвать (порядок кликов = порядок ответов), «−» — исключить. Можно писать вручную: <code>+Хорхе −Джеми</code></span>
           <div class="dir-chips">
             <span v-for="m in currentGroup.members" :key="'d'+m.id" class="dir-chip">
-              <button class="dir-add" @click="dirInsert('+', m.name)" :title="'Вызвать ' + m.name">+ {{ m.name }}</button>
-              <button class="dir-ex" @click="dirInsert('-', m.name)" :title="'Исключить ' + m.name">−</button>
+              <button class="dir-add" @click="dirInsert('+', m.name)" :title="'Вызвать ' + m.name" :aria-label="'Вызвать ' + m.name">+ {{ m.name }}</button>
+              <button class="dir-ex" @click="dirInsert('-', m.name)" :title="'Исключить ' + m.name" :aria-label="'Исключить ' + m.name">−</button>
             </span>
           </div>
         </div>
@@ -3232,25 +3916,10 @@ createApp({
           ↪ Ответ на: {{ (replyToMsg.content || '').slice(0, 90) }}
           <a href="#" @click.prevent="cancelReply">✕</a>
         </div>
-        <!-- Индикатор режима арта (вместо алерта): пишите описание сообщением -->
-        <div v-if="artMode" class="art-indicator">
-          🎨 Опишите картинку сообщением (можно прикрепить фото 📎), затем «Сгенерировать».
-          <a href="#" @click.prevent="artMode=false">отмена</a>
-        </div>
-        <!-- Индикатор: команда уходит в открытый Канвас (а не сообщением в чат) -->
-        <div v-if="canvasCmdMode" class="art-indicator">
-          ✨ Команда для Canvas {{ canvasSelText ? '(выделенный фрагмент)' : '(весь документ)' }}
-          <a href="#" @click.prevent="canvasCmdMode=false">отмена</a>
-        </div>
-        <!-- Индикатор: триггер «Документ» — ответ ИИ откроется в Canvas -->
-        <div v-if="canvasGenMode" class="art-indicator">
-          📄 Опишите документ/код — ответ придёт плашкой и откроется в Canvas.
-          <a href="#" @click.prevent="canvasGenMode=false">отмена</a>
-        </div>
-        <!-- Подсказка о маршрутизации, когда Канвас открыт (умный редактор, а не генератор файлов) -->
-        <div v-if="canvasOpen && canvas && !canvasGenMode && !canvasCmdMode && !artMode" class="art-indicator route-hint">
-          📝 Открыт «{{ canvas.title || 'без названия' }}»: правки («исправь…», «сделай длиннее») меняют его; «напиши новый…» создаст отдельный.
-        </div>
+        <!-- Плашек режима здесь больше нет: режим виден на кнопке отправки и в
+             плейсхолдере, а Esc возвращает обычное сообщение. Раньше три режима
+             давали три одинаковые синие полосы над полем ввода, и на телефоне
+             при нескольких полосах на саму переписку оставалось полторы строки. -->
         <div class="chips" v-if="pendingAttachments.length">
           <span class="chip att-chip" :class="{ 'att-loading': a.loading, 'att-error': a.error }"
                 v-for="(a, i) in pendingAttachments" :key="a.id">
@@ -3287,39 +3956,80 @@ createApp({
         <div class="row">
           <!-- [+] второстепенные действия: документ, арт -->
           <div class="plus-wrap">
-            <button class="btn-icon" :class="(artMode || canvasGenMode) ? 'rec-active' : ''" @click="plusMenu=!plusMenu" title="Ещё: документ, арт">➕</button>
+            <button class="btn-icon" :class="composerMode !== 'text' ? 'rec-active' : ''"
+                    @click="plusMenu=!plusMenu" title="Ещё: документ, арт" aria-label="Ещё: документ, арт">➕</button>
             <div v-if="plusMenu" class="plus-backdrop" @click="plusMenu=false"></div>
             <div v-if="plusMenu" class="plus-menu">
-              <button @click="canvasGenMode=true; artMode=false; plusMenu=false">📄 Создать документ/код (Canvas)</button>
+              <button @click="composerMode='canvasGen'; plusMenu=false">📄 Создать документ/код (Canvas)</button>
               <button @click="generateArt('prompt'); plusMenu=false">🖼 Сгенерировать фото (арт)</button>
               <button @click="generateArt('scene'); plusMenu=false">🎬 Арт по последней сцене</button>
               <button @click="generateArt('overview'); plusMenu=false">🌅 Арт по общей картине</button>
             </div>
           </div>
           <label class="btn-icon" style="margin:0; cursor:pointer" title="Прикрепить файл: фото, аудио, видео или документ (Word/PDF/текст)">
-            📎<input type="file" multiple accept="image/*,audio/*,video/*,.pdf,.doc,.docx,.odt,.rtf,.txt,.md,.csv" style="display:none" @change="onAttach" />
+            📎<input type="file" multiple accept="image/*,audio/*,video/*,.pdf,.doc,.docx,.odt,.rtf,.txt,.md,.csv"
+                   class="file-input" @change="onAttach"
+                   aria-label="Прикрепить файл к сообщению: фото, аудио, видео или документ" />
           </label>
           <!-- Голос — отдельной кнопкой: запись/стоп в один клик -->
           <button class="btn-icon" :class="recording ? 'rec-active' : ''" @click="toggleRecord"
-                  :title="recording ? 'Остановить запись' : 'Записать голос'">{{ recording ? '⏺ стоп' : '🎤' }}</button>
+                  :title="recording ? 'Остановить запись' : 'Записать голос'" :aria-label="recording ? 'Остановить запись' : 'Записать голос'">{{ recording ? '⏺ стоп' : '🎤' }}</button>
           <!-- Режиссёр (только в группе): панель кнопок «вызвать/исключить» -->
           <button v-if="currentIsGroup" class="btn-icon" :class="directorBar ? 'rec-active' : ''"
-                  @click="directorBar = !directorBar" title="Режиссёр: кто отвечает и в каком порядке">🎬</button>
+                  @click="directorBar = !directorBar" title="Режиссёр: кто отвечает и в каком порядке" aria-label="Режиссёр: кто отвечает и в каком порядке">🎬</button>
           <!-- Режим ассистента: держим у поля ввода, а не только в настройках —
                переключать его нужно ровно тогда, когда пишешь прикладную просьбу. -->
           <button class="btn-icon" :class="params.assistant_mode ? 'rec-active' : ''"
                   @click="toggleAssistantMode"
                   :title="params.assistant_mode
                     ? 'Режим ассистента ВКЛЮЧЁН: персонаж не отыгрывает, а выполняет задачу. Нажмите, чтобы вернуть отыгрыш'
+                    : 'Режим ассистента: выполнять задачи без отыгрыша. Для одного сообщения можно просто написать ((текст))'" :aria-label="params.assistant_mode
+                    ? 'Режим ассистента ВКЛЮЧЁН: персонаж не отыгрывает, а выполняет задачу. Нажмите, чтобы вернуть отыгрыш'
                     : 'Режим ассистента: выполнять задачи без отыгрыша. Для одного сообщения можно просто написать ((текст))'">🎓</button>
           <textarea ref="composer" v-model="input" rows="1" class="composer-input"
                     :placeholder="composerPlaceholder"
                     @input="autoGrow" @keydown="onComposerKeydown" @paste="onPaste"></textarea>
           <button v-if="streaming" class="btn-danger" @click="stop">■ Стоп</button>
-          <button v-else-if="canvasCmdMode" class="btn-primary" @click="applyCanvasCmd" :disabled="canvasBusy">✨ Применить</button>
-          <button v-else-if="canvasGenMode" class="btn-primary" @click="send" :disabled="!connected || canvasGenerating">{{ canvasGenerating ? '⏳…' : '📄 Создать' }}</button>
-          <button v-else-if="artMode" class="btn-primary" @click="sendArt" :disabled="!connected">🎨 Сгенерировать</button>
-          <button v-else class="btn-primary" @click="send" :disabled="!connected || waitingFiles">{{ waitingFiles ? '⏳ файлы…' : 'Отправить' }}</button>
+          <!-- ОДНА кнопка на все режимы. Раньше их было четыре в цепочке
+               v-else-if, и порядок цепочки решал, что произойдёт: надпись могла
+               обещать одно, а нажатие делало другое. Теперь и надпись, и
+               действие читают одно и то же поле composerMode. -->
+          <button v-else class="btn-primary" @click="submitComposer"
+                  :disabled="!connected || waitingFiles || (composerMode === 'canvasCmd' && canvasBusy) || (composerMode === 'canvasGen' && canvasGenerating)">{{ submitLabel() }}</button>
+        </div>
+
+        <!-- ПРИБОРЫ. Раньше пользователь платил за вход на каждом ходу и не видел
+             стоимости следующего, а о переполнении окна узнавал постфактум, когда
+             персонаж «забыл» события: история молча обрезалась на сервере.
+             На узком экране полоса схлопывается в строку-бейдж (см. CSS), чтобы
+             не отнимать высоту у переписки. -->
+        <div class="telemetry" v-if="sessionId && ctxStats">
+          <button class="telemetry-main" @click="openInspector"
+                  :title="'Окно контекста: ' + ctxStats.total_tokens + ' из ' + ctxStats.budget + ' токенов. Открыть инспектор хода'"
+                  :aria-label="'Окно контекста заполнено на ' + ctxFill + ' процентов. Открыть инспектор хода'">
+            <span class="tele-gauge" :class="ctxLevel" aria-hidden="true">
+              <i :style="{ width: ctxFill + '%' }"></i>
+            </span>
+            <span class="tele-num">{{ fmtCtx }} / {{ Math.round(ctxStats.budget / 1000) }}к</span>
+            <span class="tele-sub hide-narrow">{{ ctxFill }}% окна</span>
+            <!-- Знак доллара собираем ВНУТРИ выражения. Шаблон живёт в JS-литерале
+                 с обратными кавычками, и последовательность «$» плюс «{» начала бы
+                 подстановку самого JavaScript ещё до того, как строку увидит Vue. -->
+            <span v-if="ctxCost" class="tele-sub">{{ '≈ $' + ctxCost }}</span>
+            <span v-if="ctxStats.history && ctxStats.history.trimmed" class="tele-sub tele-warn">
+              обрезано {{ ctxStats.history.trimmed }}</span>
+          </button>
+          <!-- Скорость и задержка: экран перестаёт выглядеть одинаково на второй
+               секунде и на девяностой. Знак «≈» не декоративный: браузеру
+               токенизатор провайдера недоступен, считаем по приросту символов. -->
+          <span v-if="streaming" class="tele-live" aria-hidden="true">
+            <span v-if="!genFirstAt">думает {{ genElapsed.toFixed(1) }}с</span>
+            <template v-else>
+              <span>{{ genElapsed.toFixed(1) }}с</span>
+              <span v-if="genTps">· ≈{{ genTps }} т/с</span>
+              <span v-if="ttft()">· первый токен {{ ttft().toFixed(1) }}с</span>
+            </template>
+          </span>
         </div>
       </div>
     </div>
@@ -3327,28 +4037,32 @@ createApp({
     <!-- ===== Канвас: документ/код рядом с чатом (side-by-side, как в Gemini) ===== -->
     <div class="canvas-pane" v-if="canvasOpen && canvas">
       <div class="canvas-head">
-        <button class="btn-icon only-mobile" @click="mobilePane='chat'" title="К чату">💬</button>
+        <!-- На узком экране Канвас занимает весь экран, поэтому возврат должен быть
+             явной подписанной кнопкой, а не иконкой: иконка «💬» рядом с полем
+             названия читалась как «обсудить документ», а не «выйти отсюда». -->
+        <button class="btn canvas-back only-mobile" @click="mobilePane='chat'"
+                aria-label="Назад к чату">← К чату</button>
         <input v-model="canvas.title" class="canvas-title" @blur="saveCanvas" placeholder="Без названия" />
         <select v-model="canvas.kind" @change="saveCanvas" class="canvas-kind" title="Тип канваса">
           <option value="document">📄 документ</option>
           <option value="code">💻 код</option>
         </select>
-        <button class="btn-icon" @click="undoCanvas" :disabled="!canvas.can_undo || canvasBusy" title="Откатить к предыдущей версии">↩</button>
-        <button class="btn-icon" @click="exportCanvas('docx')" title="Экспорт в Word">📄</button>
-        <button class="btn-icon" @click="exportCanvas('pdf')" title="Экспорт в PDF">📑</button>
-        <button class="btn-icon" @click="closeCanvas" title="Закрыть канвас">✕</button>
+        <button class="btn-icon" @click="undoCanvas" :disabled="!canvas.can_undo || canvasBusy" title="Откатить к предыдущей версии" aria-label="Откатить к предыдущей версии">↩</button>
+        <button class="btn-icon" @click="exportCanvas('docx')" title="Экспорт в Word" aria-label="Экспорт в Word">📄</button>
+        <button class="btn-icon" @click="exportCanvas('pdf')" title="Экспорт в PDF" aria-label="Экспорт в PDF">📑</button>
+        <button class="btn-icon" @click="closeCanvas" title="Закрыть канвас" aria-label="Закрыть канвас">✕</button>
       </div>
 
       <!-- Единый тулбар: слева — контекстные действия (форматирование / копировать код),
            справа — переключатель «Редактор / Просмотр» (для веб-кода — live-результат). -->
       <div class="canvas-tabs">
         <template v-if="canvas.kind==='document' && canvasView==='edit'">
-          <button class="canvas-fmt" @click="wrapSelection('**','**')" title="Жирный"><b>B</b></button>
-          <button class="canvas-fmt" @click="wrapSelection('*','*')" title="Курсив"><i>I</i></button>
-          <button class="canvas-fmt" @click="wrapSelection('## ','')" title="Заголовок">H</button>
-          <button class="canvas-fmt" @click="wrapSelection('\`','\`')" title="Моноширинный">&lt;/&gt;</button>
+          <button class="canvas-fmt" @click="wrapSelection('**','**')" title="Жирный" aria-label="Жирный"><b>B</b></button>
+          <button class="canvas-fmt" @click="wrapSelection('*','*')" title="Курсив" aria-label="Курсив"><i>I</i></button>
+          <button class="canvas-fmt" @click="wrapSelection('## ','')" title="Заголовок" aria-label="Заголовок">H</button>
+          <button class="canvas-fmt" @click="wrapSelection('\`','\`')" title="Моноширинный" aria-label="Моноширинный">&lt;/&gt;</button>
         </template>
-        <button v-if="canvas.kind==='code'" class="canvas-fmt" @click="copyCanvas" :title="copied ? 'Скопировано' : 'Скопировать код'">{{ copied ? '✓ Скопировано' : '⧉ Скопировать код' }}</button>
+        <button v-if="canvas.kind==='code'" class="canvas-fmt" @click="copyCanvas" :title="copied ? 'Скопировано' : 'Скопировать код'" :aria-label="copied ? 'Скопировано' : 'Скопировать код'">{{ copied ? '✓ Скопировано' : '⧉ Скопировать код' }}</button>
         <div style="flex:1"></div>
         <button :class="{ active: canvasView==='edit' }" @click="canvasView='edit'">✎ {{ canvas.kind==='code' ? 'Код' : 'Редактор' }}</button>
         <button :class="{ active: canvasView==='preview' }" @click="canvasView='preview'">{{ canvasIsWeb ? '▶ Превью' : '👁 Просмотр' }}</button>
@@ -3377,7 +4091,7 @@ createApp({
 
     <!-- ===== Правый drawer: настройки (выезжающий оверлей) ===== -->
     <div v-if="drawerTab" class="drawer-backdrop" @click="drawerTab=null"></div>
-    <div class="drawer" v-if="drawerTab">
+    <div class="drawer" v-if="drawerTab" role="dialog" aria-modal="true" aria-label="Настройки">
       <div class="tabs">
         <button :class="['tab-btn', drawerTab==='generation'?'active':'']" @click="drawerTab='generation'">Генерация</button>
         <button v-if="isAdmin" :class="['tab-btn', drawerTab==='connection'?'active':'']" @click="drawerTab='connection'">Подключение</button>
@@ -3385,7 +4099,7 @@ createApp({
         <button :class="['tab-btn', drawerTab==='memory'?'active':'']" @click="drawerTab='memory'">Память</button>
         <button :class="['tab-btn', drawerTab==='persona'?'active':'']" @click="drawerTab='persona'">Персона</button>
         <div style="flex:1"></div>
-        <button class="tab-btn" @click="drawerTab=null" title="Закрыть">✕</button>
+        <button class="tab-btn" @click="drawerTab=null" title="Закрыть" aria-label="Закрыть">✕</button>
       </div>
       <div class="body">
 
@@ -3410,8 +4124,8 @@ createApp({
           <div class="row" style="gap:6px; margin:0 0 6px; flex-wrap:wrap">
             <button v-for="m in economyModes" :key="m.id"
                     :class="isEconomyMode(m) ? 'btn-primary' : ''"
-                    :title="m.hint" @click="applyEconomyMode(m)">{{ m.label }}</button>
-            <button @click="usageOpen = true; loadUsage()" title="Сколько токенов реально потрачено">📊 Расход</button>
+                    :title="m.hint" @click="applyEconomyMode(m)" :aria-label="m.hint">{{ m.label }}</button>
+            <button @click="usageOpen = true; loadUsage()" title="Сколько токенов реально потрачено" aria-label="Сколько токенов реально потрачено">📊 Расход</button>
           </div>
 
           <label>🧠 Окно контекста — память диалога (токенов) <span class="range-val">{{ params.context_tokens >= 1000000 ? '1 млн (максимум)' : params.context_tokens }}</span>
@@ -3546,8 +4260,8 @@ createApp({
             <div class="row-between"><b>{{ p.is_default ? '⭐ ' : '' }}{{ p.name }}</b>
               <span>
                 <button @click="applyPreset(p)">Применить</button>
-                <button @click="setDefaultPreset(p)" :title="'Сделать по умолчанию'">⭐</button>
-                <button class="btn-danger" @click="deletePreset(p)">🗑</button>
+                <button @click="setDefaultPreset(p)" :title="'Сделать по умолчанию'" :aria-label="'Сделать по умолчанию'">⭐</button>
+                <button class="btn-danger" @click="deletePreset(p)" :aria-label="'Удалить пресет ' + p.name">🗑</button>
               </span></div>
           </div>
         </div>
@@ -3592,7 +4306,8 @@ createApp({
             <div class="row" style="margin-bottom:10px">
               <img v-if="charEdit.avatar_path" :src="charEdit.avatar_path" class="avatar" style="width:48px;height:48px" />
               <label class="btn" style="margin:0; cursor:pointer">Загрузить файл
-                <input type="file" accept="image/*" style="display:none" @change="onAvatarFile" />
+                <input type="file" accept="image/*" class="file-input" @change="onAvatarFile"
+                       aria-label="Загрузить аватар персонажа" />
               </label>
               <button v-if="charEdit.avatar_path" class="btn-danger" @click="charEdit.avatar_path=''; saveCharacter()">убрать</button>
             </div>
@@ -3669,8 +4384,8 @@ createApp({
               <span style="display:inline-flex; align-items:center; gap:4px">
                 <span class="scope-tag" :class="h.session_id ? 'session' : (h.character_id ? 'character' : 'global')">{{ h.session_id ? '💬 чат' : (h.character_id ? '🎭 перс.' : '🌐 глоб.') }}</span>
                 <span class="tag">{{ h.always_on ? 'always' : ((h.keywords || []).join(',') || h.category) }}</span>
-                <button class="btn-icon" @click="editHorae(h)">✎</button>
-                <button class="btn-danger" @click="deleteHorae(h)">🗑</button>
+                <button class="btn-icon" @click="editHorae(h)" :aria-label="'Изменить запись памяти: ' + (h.title || h.category)">✎</button>
+                <button class="btn-danger" @click="deleteHorae(h)" :aria-label="'Удалить запись памяти: ' + (h.title || h.category)">🗑</button>
               </span>
             </div>
             <div class="muted">{{ h.content }}</div>
@@ -3681,7 +4396,7 @@ createApp({
         <div v-if="drawerTab==='persona'">
           <h3>Персона пользователя</h3>
           <label>Активная персона в этом чате
-            <select v-model="sessionPersonaId" @change="applySessionMeta">
+            <select v-model="sessionPersonaId" @change="applySessionMeta({ persona_id: sessionPersonaId })">
               <option :value="null">— нет —</option>
               <option v-for="p in personas" :key="p.id" :value="p.id">{{ p.name }}</option>
             </select>
@@ -3692,7 +4407,8 @@ createApp({
             <div class="row" style="margin-top:6px">
               <img v-if="personaNew.avatar_path" :src="personaNew.avatar_path" class="avatar" style="width:40px;height:40px" />
               <label class="btn" style="margin:0;cursor:pointer">Внешность (фото)
-                <input type="file" accept="image/*" style="display:none" @change="onPersonaAvatar" />
+                <input type="file" accept="image/*" class="file-input" @change="onPersonaAvatar"
+                       aria-label="Загрузить фотографию персоны" />
               </label>
             </div>
             <button class="btn-primary" @click="createPersona" style="margin-top:6px">Создать персону</button>
@@ -3700,7 +4416,7 @@ createApp({
           <div class="card" v-for="p in personas" :key="p.id">
             <div class="row-between">
               <span class="row" style="gap:8px"><img v-if="p.avatar_path" :src="p.avatar_path" class="avatar" /><b>{{ p.name }}</b></span>
-              <button class="btn-danger" @click="deletePersona(p)">🗑</button>
+              <button class="btn-danger" @click="deletePersona(p)" :aria-label="'Удалить персону ' + p.name">🗑</button>
             </div>
             <div class="muted">{{ p.description }}</div>
           </div>
@@ -3727,7 +4443,7 @@ createApp({
             <div class="card" v-for="f in friends" :key="'fr'+f.id">
               <div class="row-between">
                 <b>👥 {{ f.username }}</b>
-                <button class="btn-danger" @click="removeFriend(f)" title="Удалить из друзей">Удалить</button>
+                <button class="btn-danger" @click="removeFriend(f)" title="Удалить из друзей" aria-label="Удалить из друзей">Удалить</button>
               </div>
             </div>
             <p class="muted" style="margin-top:8px">Делиться чатом: откройте чат в списке слева и нажмите 🔗 — друг увидит его в разделе «Доступные мне». Так же делятся и групповые чаты.</p>
@@ -3737,17 +4453,17 @@ createApp({
           <h3>Часовой пояс этого чата 🕒</h3>
           <p class="muted">Нейросеть видит ваше текущее время (утро/ночь, день недели) и метки времени сообщений показываются в этом поясе. Настройка сохраняется для каждого чата отдельно; по умолчанию берётся из браузера.</p>
           <label>Часовой пояс
-            <input v-model="sessionTimezone" list="tz-list" placeholder="например Europe/Moscow" @change="applySessionMeta" />
+            <input v-model="sessionTimezone" list="tz-list" placeholder="например Europe/Moscow" @change="applySessionMeta({ timezone: sessionTimezone })" />
             <datalist id="tz-list"><option v-for="tz in tzOptions" :key="tz" :value="tz"></option></datalist>
           </label>
           <div class="row">
-            <button @click="_autoTimezone(); applySessionMeta()">📍 Определить по браузеру</button>
+            <button @click="_autoTimezone(); applySessionMeta({ timezone: sessionTimezone })">📍 Определить по браузеру</button>
           </div>
 
           <div class="hr"></div>
           <h3>Заметка автора (Author's Note)</h3>
           <p class="muted">Подмешивается у самого конца контекста — сильно влияет на ответ.</p>
-          <textarea v-model="authorNote" rows="3" @blur="applySessionMeta" placeholder="например: Пиши от третьего лица, держи мрачный тон."></textarea>
+          <textarea v-model="authorNote" rows="3" @blur="applySessionMeta({ author_note: authorNote })" placeholder="например: Пиши от третьего лица, держи мрачный тон."></textarea>
         </div>
 
       </div>
@@ -3756,10 +4472,10 @@ createApp({
 
   <!-- ===== Админ-модалка ===== -->
   <div v-if="adminOpen" class="modal-backdrop" @click.self="adminOpen=false">
-    <div class="modal">
+    <div class="modal" role="dialog" aria-modal="true" aria-label="Администрирование">
       <div class="row-between" style="margin-bottom:10px">
         <h3 style="margin:0">Администрирование</h3>
-        <button class="btn-icon" @click="adminOpen=false">✕</button>
+        <button class="btn-icon" @click="adminOpen=false" aria-label="Закрыть администрирование">✕</button>
       </div>
 
       <!-- Запрос пароля администратора -->
@@ -3847,9 +4563,9 @@ createApp({
               <span>{{ u.username }} <span class="tag">{{ u.role }}</span>
                 <span v-if="u.telegram_id" class="muted">tg:{{ u.telegram_id }}</span></span>
               <span>
-                <button v-if="u.role!=='admin'" @click="setUserRole(u,'admin')" title="Сделать админом">⬆ админ</button>
-                <button v-else @click="setUserRole(u,'user')" title="Снять админа">⬇ юзер</button>
-                <button class="btn-danger" @click="deleteUser(u)">🗑</button>
+                <button v-if="u.role!=='admin'" @click="setUserRole(u,'admin')" title="Сделать админом" aria-label="Сделать админом">⬆ админ</button>
+                <button v-else @click="setUserRole(u,'user')" title="Снять админа" aria-label="Снять админа">⬇ юзер</button>
+                <button class="btn-danger" @click="deleteUser(u)" :aria-label="'Удалить пользователя ' + u.username">🗑</button>
               </span>
             </div>
           </div>
@@ -3860,16 +4576,17 @@ createApp({
 
   <!-- ===== Модалка «База знаний чата» ===== -->
   <div v-if="kbOpen" class="modal-backdrop" @click.self="kbOpen=false">
-    <div class="modal" style="width:460px">
+    <div class="modal" style="width:460px" role="dialog" aria-modal="true" aria-label="База знаний чата">
       <div class="row-between" style="margin-bottom:10px">
         <h3 style="margin:0">📚 База знаний чата</h3>
-        <button class="btn-icon" @click="kbOpen=false">✕</button>
+        <button class="btn-icon" @click="kbOpen=false" aria-label="Закрыть базу знаний">✕</button>
       </div>
       <p class="muted" style="margin-top:0">Файлы, которые персонажи учитывают в КАЖДОМ ответе (в личном и групповом чате). Документы (PDF, Word, txt) читаются как текст; картинки/аудио/видео прикладываются целиком. Добавляйте при создании чата и в любой момент.</p>
       <div class="row" style="margin:8px 0">
         <label class="btn-primary" style="margin:0; cursor:pointer">
           {{ kbUploading ? '⏳ Загрузка…' : '➕ Добавить файлы' }}
-          <input type="file" multiple style="display:none" :disabled="kbUploading"
+          <input type="file" multiple class="file-input" :disabled="kbUploading"
+                 aria-label="Добавить файлы в базу знаний чата"
                  accept="image/*,audio/*,video/*,.pdf,.doc,.docx,.odt,.rtf,.txt,.md,.csv" @change="onKnowledgeFiles" />
         </label>
       </div>
@@ -3881,7 +4598,7 @@ createApp({
             <span class="grow" style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap" :title="f.name">{{ f.name }}</span>
             <span v-if="f.has_text" class="tag" title="Документ прочитан как текст">текст</span>
           </span>
-          <button class="btn-danger" @click="deleteKnowledge(f)" title="Удалить из базы знаний">🗑</button>
+          <button class="btn-danger" @click="deleteKnowledge(f)" title="Удалить из базы знаний" aria-label="Удалить из базы знаний">🗑</button>
         </div>
       </div>
     </div>
@@ -3889,10 +4606,10 @@ createApp({
 
   <!-- ===== Модалка участников (добавить/убрать, чат→группа) ===== -->
   <div v-if="membersOpen" class="modal-backdrop" @click.self="membersOpen=false">
-    <div class="modal" style="width:440px">
+    <div class="modal" style="width:440px" role="dialog" aria-modal="true" aria-label="Участники группы">
       <div class="row-between" style="margin-bottom:10px">
         <h3 style="margin:0">{{ currentIsGroup ? 'Участники группы' : 'Добавить персонажа' }}</h3>
-        <button class="btn-icon" @click="membersOpen=false">✕</button>
+        <button class="btn-icon" @click="membersOpen=false" aria-label="Закрыть участников">✕</button>
       </div>
       <p v-if="!currentIsGroup" class="muted" style="margin-top:0">Добавив персонажа, вы превратите этот чат в групповой. Ведущий персонаж останется в группе.</p>
 
@@ -3905,7 +4622,7 @@ createApp({
               <span class="member-ava"><img v-if="m.avatar_path" :src="m.avatar_path" /><span v-else>{{ (m.name||'?').charAt(0) }}</span></span>
               <b>{{ m.name }}</b>
             </span>
-            <button class="btn-danger" :disabled="currentGroup.members.length <= 1" @click="removeMember(m)" title="Убрать из группы">Убрать</button>
+            <button class="btn-danger" :disabled="currentGroup.members.length <= 1" @click="removeMember(m)" title="Убрать из группы" aria-label="Убрать из группы">Убрать</button>
           </div>
         </div>
         <div class="hr"></div>
@@ -3927,10 +4644,10 @@ createApp({
 
   <!-- ===== Модалка создания группового чата ===== -->
   <div v-if="groupModal" class="modal-backdrop" @click.self="groupModal=false">
-    <div class="modal">
+    <div class="modal" role="dialog" aria-modal="true" aria-label="Создание группы">
       <div class="row-between" style="margin-bottom:10px">
         <h3 style="margin:0">Новый групповой чат</h3>
-        <button class="btn-icon" @click="groupModal=false">✕</button>
+        <button class="btn-icon" @click="groupModal=false" aria-label="Закрыть создание группы">✕</button>
       </div>
       <label>Название<input v-model="groupName" /></label>
       <label>Сцена / сеттинг (детально влияет на ролевую — общая обстановка для всех)
@@ -3963,10 +4680,10 @@ createApp({
   <!-- ===== Профиль / привязка Telegram ===== -->
   <!-- ===== Модалка приглашения друзей в чат ===== -->
   <div v-if="inviteOpen" class="modal-backdrop" @click.self="inviteOpen=false">
-    <div class="modal" style="width:420px">
+    <div class="modal" style="width:420px" role="dialog" aria-modal="true" aria-label="Приглашение в чат">
       <div class="row-between" style="margin-bottom:12px">
         <h3 style="margin:0">Пригласить в чат</h3>
-        <button class="btn-icon" @click="inviteOpen=false">✕</button>
+        <button class="btn-icon" @click="inviteOpen=false" aria-label="Закрыть приглашение">✕</button>
       </div>
       <div v-if="!friends.length" class="empty-state">
         <div class="empty-icon">🫂</div>
@@ -3991,10 +4708,10 @@ createApp({
   </div>
 
   <div v-if="profileOpen" class="modal-backdrop" @click.self="profileOpen=false">
-    <div class="modal">
+    <div class="modal" role="dialog" aria-modal="true" aria-label="Профиль">
       <div class="row-between" style="margin-bottom:10px">
         <h3 style="margin:0">Профиль</h3>
-        <button class="btn-icon" @click="profileOpen=false">✕</button>
+        <button class="btn-icon" @click="profileOpen=false" aria-label="Закрыть профиль">✕</button>
       </div>
       <p>Аккаунт: <b>{{ currentUserObj && currentUserObj.username }}</b>
         <span class="tag">{{ currentUserObj && currentUserObj.role }}</span></p>
@@ -4015,10 +4732,10 @@ createApp({
 
   <!-- ===== Отладочный лог LLM ===== -->
   <div v-if="debugOpen" class="modal-backdrop" @click.self="closeDebug">
-    <div class="modal" style="width:640px">
+    <div class="modal" style="width:640px" role="dialog" aria-modal="true" aria-label="Отладка LLM">
       <div class="row-between" style="margin-bottom:8px">
         <h3 style="margin:0">🐞 Отладка LLM</h3>
-        <span><button @click="clearDebug">Очистить</button> <button class="btn-icon" @click="closeDebug">✕</button></span>
+        <span><button @click="clearDebug">Очистить</button> <button class="btn-icon" @click="closeDebug" aria-label="Закрыть отладку">✕</button></span>
       </div>
       <p class="muted">Последние запросы к прокси: модель, что отправлено и что вернулось. Обновляется автоматически.</p>
       <p v-if="!debugEntries.length" class="muted">Пока пусто — отправьте сообщение или сгенерируйте арт.</p>
@@ -4046,10 +4763,10 @@ createApp({
 
   <!-- ===== Расход токенов ===== -->
   <div v-if="usageOpen" class="modal-backdrop" @click.self="usageOpen=false">
-    <div class="modal" style="width:640px">
+    <div class="modal" style="width:640px" role="dialog" aria-modal="true" aria-label="Расход токенов">
       <div class="row-between" style="margin-bottom:8px">
         <h3 style="margin:0">📊 Расход токенов</h3>
-        <span><button @click="loadUsage">Обновить</button> <button class="btn-icon" @click="usageOpen=false">✕</button></span>
+        <span><button @click="loadUsage">Обновить</button> <button class="btn-icon" @click="usageOpen=false" aria-label="Закрыть отчёт о расходе">✕</button></span>
       </div>
       <p class="muted">Сколько токенов реально ушло провайдеру за последние 7 дней. <b>Вход</b> — весь контекст, который мы отправили; <b>из кэша</b> — та его часть, что стоила в разы дешевле; <b>ответ</b> и <b>размышления</b> — вывод, самый дорогой вид токенов.</p>
       <p v-if="!usage" class="muted">Загрузка…</p>
@@ -4094,7 +4811,7 @@ createApp({
 
   <!-- ===== Диалог (подтверждение/ввод) вместо браузерных confirm/prompt ===== -->
   <div v-if="dialog" class="modal-backdrop" @click.self="dialogCancel" @keydown.esc="dialogCancel">
-    <div class="modal dialog-modal">
+    <div class="modal dialog-modal" role="dialog" aria-modal="true">
       <h3>{{ dialog.title }}</h3>
       <p v-if="dialog.message" class="dialog-msg">{{ dialog.message }}</p>
       <input v-if="dialog.mode==='prompt'" ref="dialogInput" v-model="dialog.value"
@@ -4107,6 +4824,107 @@ createApp({
     </div>
   </div>
 
+  <!-- ===== Инспектор хода =====
+       На вопрос «почему персонаж сказал именно это, дошёл ли лорбук, сработала ли
+       заметка автора, что срезал бюджет» панель отладки отвечала длинами:
+       «system весил 4210 символов». Здесь видно сам ход: блоки, их вес и обрезка.
+       Разбор собирает сама сборка контекста, поэтому числа те же, что уйдут в модель.
+       На десктопе это правая панель, на узком экране — нижняя шторка. -->
+  <div v-if="inspectorOpen" class="modal-backdrop sheet-backdrop" @click.self="closeInspector">
+    <div class="modal inspector" role="dialog" aria-modal="true" aria-label="Инспектор хода">
+      <span class="sheet-grip" aria-hidden="true"></span>
+      <div class="inspector-head">
+        <h3>Инспектор хода</h3>
+        <button class="btn-icon" @click="loadCtxStats" title="Пересчитать" aria-label="Пересчитать">↻</button>
+        <button class="btn-icon" @click="closeInspector" aria-label="Закрыть инспектор хода">✕</button>
+      </div>
+      <div class="inspector-body">
+        <p v-if="ctxBusy" class="muted">Собираю контекст…</p>
+        <p v-else-if="!ctxStats" class="muted">Контекст не собирается: у чата нет персонажа.</p>
+        <template v-else>
+          <div class="ins-total">
+            <b>{{ ctxStats.total_tokens.toLocaleString('ru') }}</b> токенов из
+            {{ ctxStats.budget.toLocaleString('ru') }} · {{ ctxFill }}% окна
+            <span v-if="ctxStats.model" class="tag">{{ ctxStats.model }}</span>
+          </div>
+          <!-- Полоса весов: видно, что именно занимает контекст, до чтения списка. -->
+          <div class="ins-bar" aria-hidden="true">
+            <i v-for="b in ctxStats.blocks" :key="'bar'+b.key" :class="'seg-' + b.key"
+               :style="{ width: (b.tokens / ctxStats.total_tokens * 100) + '%' }"></i>
+            <i class="seg-history" :style="{ width: (ctxStats.history.tokens / ctxStats.total_tokens * 100) + '%' }"></i>
+            <i class="seg-tail" :style="{ width: (ctxStats.tail_tokens / ctxStats.total_tokens * 100) + '%' }"></i>
+          </div>
+
+          <details v-for="b in ctxStats.blocks" :key="b.key" class="ins-block">
+            <summary>
+              <span class="ins-dot" :class="'seg-' + b.key" aria-hidden="true"></span>
+              <span class="grow">{{ b.label }}</span>
+              <span class="ins-w">{{ b.tokens }}</span>
+            </summary>
+            <pre class="ins-text">{{ b.text || '— пусто —' }}</pre>
+          </details>
+
+          <div class="ins-block ins-static">
+            <span class="ins-dot seg-history" aria-hidden="true"></span>
+            <span class="grow">История · {{ ctxStats.history.included }} из {{ ctxStats.history.total }}</span>
+            <span class="ins-w">{{ ctxStats.history.tokens }}</span>
+          </div>
+          <div v-if="ctxStats.history.trimmed" class="ins-block ins-cut">
+            <span class="ins-dot" aria-hidden="true"></span>
+            <span class="grow">Обрезано бюджетом · {{ ctxStats.history.trimmed }} реплик</span>
+            <span class="ins-w">−{{ ctxStats.history.tokens_trimmed }}</span>
+          </div>
+          <div class="ins-block ins-static">
+            <span class="ins-dot seg-tail" aria-hidden="true"></span>
+            <span class="grow">Хвост: сводка, заметка автора, якорь характера</span>
+            <span class="ins-w">{{ ctxStats.tail_tokens }}</span>
+          </div>
+
+          <h4 class="ins-sub">Память Horae: сработало {{ ctxStats.horae.length }} из {{ ctxStats.horae_total }}</h4>
+          <p v-if="!ctxStats.horae.length" class="muted">Ни одна запись не сработала на этом ходу.</p>
+          <div v-for="(h, i) in ctxStats.horae" :key="'h'+i" class="ins-horae">
+            <span class="grow">{{ h.title }}</span>
+            <span class="tag">{{ h.always_on ? 'always' : (h.keywords.join(', ') || h.category) }}</span>
+            <span class="ins-w">{{ h.tokens }}</span>
+          </div>
+        </template>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Командная палитра (Ctrl+K) =====
+       Один вход к чатам, персонажам, командам и поиску по репликам. Класс .modal
+       нужен не для вида, а чтобы палитра попала в ловушку фокуса из волны 2 без
+       отдельного кода: _topOverlay ищет именно .drawer, .modal и .lightbox. -->
+  <div v-if="paletteOpen" class="modal-backdrop palette-backdrop" @click.self="closePalette">
+    <div class="modal palette" role="dialog" aria-modal="true" aria-label="Поиск и команды">
+      <input ref="paletteInput" v-model="paletteQuery" class="palette-input"
+             placeholder="Чат, персонаж, команда со /, или фраза из переписки…"
+             aria-label="Поиск по чатам, персонажам, командам и репликам"
+             @keydown.down.prevent="paletteMove(1)"
+             @keydown.up.prevent="paletteMove(-1)"
+             @keydown.enter.prevent="paletteRun()" />
+      <div class="palette-hint">
+        <span>↑↓ — выбор · Enter — открыть · Esc — закрыть</span>
+        <span v-if="searchBusy">ищу по репликам…</span>
+      </div>
+      <div class="palette-list" v-if="paletteItems.length">
+        <button v-for="(it, i) in paletteItems" :key="it.kind + '-' + it.id + '-' + i"
+                class="palette-item" :class="{ on: i === paletteIndex }"
+                @click="paletteRun(it)" @mousemove="paletteIndex = i">
+          <span class="palette-kind" aria-hidden="true">{{ it.kind === 'cmd' ? '⌘' : it.kind === 'char' ? '🎭' : it.kind === 'msg' ? '🔍' : '💬' }}</span>
+          <span class="palette-text">
+            <span class="palette-label">{{ it.label }}</span>
+            <span class="palette-sub">{{ it.sub }}</span>
+          </span>
+        </button>
+      </div>
+      <div class="palette-empty" v-else>
+        {{ paletteQuery.trim().length < 2 ? 'Введите хотя бы два символа' : 'Ничего не найдено' }}
+      </div>
+    </div>
+  </div>
+
   <!-- ===== Лайтбокс: полноэкранный предпросмотр картинки ===== -->
   <div v-if="lightbox" class="lightbox" @click="lightbox=null"><img :src="lightbox" /></div>
 
@@ -4114,20 +4932,20 @@ createApp({
   <div v-if="canvasOpen && canvas && canvasSelText && toolbarPos" class="canvas-toolbar"
        :style="{ top: toolbarPos.top + 'px', left: toolbarPos.left + 'px' }" @mousedown.prevent>
     <template v-if="canvas.kind==='code'">
-      <button @click="quickAction('Добавь подробные комментарии, объясняющие, что делает код.')" :disabled="canvasBusy" title="Комментарии">💬</button>
-      <button @click="quickAction('Найди и исправь баги в этом фрагменте.')" :disabled="canvasBusy" title="Найти баги">🐞</button>
-      <button @click="quickAction('Сделай ревью: улучши читаемость и структуру, не меняя поведение.')" :disabled="canvasBusy" title="Ревью">🔍</button>
-      <button @click="translateCode" :disabled="canvasBusy" title="Перевести на другой язык">🔁</button>
+      <button @click="quickAction('Добавь подробные комментарии, объясняющие, что делает код.')" :disabled="canvasBusy" title="Комментарии" aria-label="Комментарии">💬</button>
+      <button @click="quickAction('Найди и исправь баги в этом фрагменте.')" :disabled="canvasBusy" title="Найти баги" aria-label="Найти баги">🐞</button>
+      <button @click="quickAction('Сделай ревью: улучши читаемость и структуру, не меняя поведение.')" :disabled="canvasBusy" title="Ревью" aria-label="Ревью">🔍</button>
+      <button @click="translateCode" :disabled="canvasBusy" title="Перевести на другой язык" aria-label="Перевести на другой язык">🔁</button>
     </template>
     <template v-else>
-      <button @click="quickAction('Сократи примерно вдвое, сохранив суть.')" :disabled="canvasBusy" title="Короче">↧</button>
-      <button @click="quickAction('Расширь, добавь деталей и примеров.')" :disabled="canvasBusy" title="Подробнее">↥</button>
-      <button @click="quickAction('Перепиши в строгом профессиональном тоне.')" :disabled="canvasBusy" title="Строже">🎩</button>
-      <button @click="quickAction('Перепиши простым языком, понятно для новичка.')" :disabled="canvasBusy" title="Проще">🙂</button>
-      <button @click="quickAction('Исправь грамматику, орфографию и пунктуацию, не меняя стиль.')" :disabled="canvasBusy" title="Грамматика">✓</button>
+      <button @click="quickAction('Сократи примерно вдвое, сохранив суть.')" :disabled="canvasBusy" title="Короче" aria-label="Короче">↧</button>
+      <button @click="quickAction('Расширь, добавь деталей и примеров.')" :disabled="canvasBusy" title="Подробнее" aria-label="Подробнее">↥</button>
+      <button @click="quickAction('Перепиши в строгом профессиональном тоне.')" :disabled="canvasBusy" title="Строже" aria-label="Строже">🎩</button>
+      <button @click="quickAction('Перепиши простым языком, понятно для новичка.')" :disabled="canvasBusy" title="Проще" aria-label="Проще">🙂</button>
+      <button @click="quickAction('Исправь грамматику, орфографию и пунктуацию, не меняя стиль.')" :disabled="canvasBusy" title="Грамматика" aria-label="Грамматика">✓</button>
     </template>
     <span class="ct-sep"></span>
-    <button @click="focusCanvasAi" :disabled="canvasBusy" title="Своя команда для выделенного">✨</button>
+    <button @click="focusCanvasAi" :disabled="canvasBusy" title="Своя команда для выделенного" aria-label="Своя команда для выделенного">✨</button>
   </div>
   </template>
   `,

@@ -14,5 +14,6 @@
       "runtimeArgs": ["run", "dev", "--prefix", "sonic-hd-green-hill"],
       "port": 5173
     }
-  ]
+  ],
+  "autoVerify": true
 }

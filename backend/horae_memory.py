@@ -671,6 +671,7 @@ def assemble_context(
     knowledge_media: list | None = None,
     global_instructions: str = "",
     ooc: bool = False,
+    report: dict | None = None,
 ) -> list[dict]:
     """
     ЧИСТАЯ функция сборки контекста. Возвращает messages для LiteLLM:
@@ -689,6 +690,11 @@ def assemble_context(
     :param ooc: реплика «вне роли» — пользователь обращается к ассистенту, а не к
         персонажу. Снимает требование держать образ и убирает якорь роли из конца,
         иначе прикладная просьба проигрывает ролевой инструкции (см. ASSISTANT_GUIDE).
+
+    :param report: если передан словарь, функция складывает в него разбор хода:
+        вес каждого блока, сработавшие записи памяти и что срезал бюджет. Заполняется
+        ПО ХОДУ сборки теми же значениями, что уходят в модель, поэтому инспектор
+        показывает реальный ход, а не его реконструкцию. На результат не влияет.
     """
     # 1. Текст, по которому ищем триггеры памяти: текущее сообщение + хвост истории.
     recent_text = user_message + "\n" + "\n".join(
@@ -701,14 +707,44 @@ def assemble_context(
     lore_recs = [r for r in activated if r.category != "summary"]
 
     # 2. Системный промпт = паспорт персонажа + персона + лор Horae + правила поведения.
-    system_parts = [
-        _render_character_block(character),
-        _render_persona_block(persona),
-        _render_horae_block(lore_recs),
-        ASSISTANT_GUIDE if ooc else BEHAVIOR_GUIDE,
-        ASSISTANT_STYLE_GUIDE if ooc else STYLE_GUIDE,
-    ]
+    part_character = _render_character_block(character)
+    part_persona = _render_persona_block(persona)
+    part_horae = _render_horae_block(lore_recs)
+    part_behaviour = ASSISTANT_GUIDE if ooc else BEHAVIOR_GUIDE
+    part_style = ASSISTANT_STYLE_GUIDE if ooc else STYLE_GUIDE
+    system_parts = [part_character, part_persona, part_horae, part_behaviour, part_style]
     system_prompt = "\n\n".join(p for p in system_parts if p)
+
+    if report is not None:
+        # estimate_tokens возвращает max(1, ...), поэтому пустой блок отчитался бы
+        # одним токеном. В инспекторе это была бы ложь: «Персона: 1 токен» там, где
+        # персоны нет вовсе. Пустое весит ноль.
+        def _w(t):
+            return estimate_tokens(t) if (t or "").strip() else 0
+
+        report["blocks"] = [
+            {"key": "character", "label": "Паспорт персонажа",
+             "tokens": _w(part_character), "text": part_character},
+            {"key": "persona", "label": "Персона пользователя",
+             "tokens": _w(part_persona), "text": part_persona},
+            {"key": "horae", "label": "Память Horae (лор)",
+             "tokens": _w(part_horae), "text": part_horae},
+            {"key": "guides", "label": "Инструкции поведения и стиля",
+             "tokens": _w(part_behaviour) + _w(part_style),
+             "text": part_behaviour + "\n\n" + part_style},
+        ]
+        report["system_prompt"] = system_prompt
+        report["system_tokens"] = estimate_tokens(system_prompt) if system_prompt.strip() else 0
+        report["ooc"] = bool(ooc)
+        # Сработавшие записи памяти: по каким словам вызваны и что это было.
+        report["horae"] = [
+            {"title": r.title or r.category, "category": r.category,
+             "always_on": bool(r.always_on), "priority": r.priority,
+             "keywords": list(r.keywords or []),
+             "tokens": _w(r.content)}
+            for r in activated
+        ]
+        report["horae_total"] = len(horae_records)
 
     # 3. «Несжимаемый» бюджет: системный промпт + текущее сообщение пользователя.
     used = estimate_tokens(system_prompt) + estimate_tokens(user_message)
@@ -724,6 +760,18 @@ def assemble_context(
         {"role": m["role"], "content": m["content"]} for m in history[start:]
     ]
     used += sum(costs[start:])
+
+    if report is not None:
+        report["history"] = {
+            "total": len(history),
+            "included": len(trimmed_history),
+            "trimmed": start,
+            "tokens": sum(costs[start:]),
+            "tokens_trimmed": sum(costs[:start]),
+        }
+        report["user_message_tokens"] = estimate_tokens(user_message) if (user_message or "").strip() else 0
+        report["budget"] = token_budget
+        report["knowledge_tokens"] = estimate_tokens(knowledge_text) if (knowledge_text or "").strip() else 0
 
     # 5. Финальная сборка messages.
     messages: list[dict] = []
@@ -830,6 +878,21 @@ def assemble_context(
     tail.append({"role": "system", "content": focus})
 
     messages.extend(tail)
+
+    if report is not None:
+        # Хвост — то, что переинъектируется в конец: сводка сюжета, заметка автора,
+        # якорь характера, post-history. Именно он сильнее всего влияет на ответ,
+        # поэтому в инспекторе он показан отдельно, а не растворён в системном блоке.
+        report["tail"] = [
+            {"tokens": estimate_content_tokens(m.get("content")),
+             "text": m.get("content") if isinstance(m.get("content"), str) else ""}
+            for m in tail
+        ]
+        report["tail_tokens"] = sum(b["tokens"] for b in report["tail"])
+        report["total_tokens"] = sum(
+            estimate_content_tokens(m.get("content")) for m in messages
+        )
+        report["messages"] = len(messages)
 
     # Текущее сообщение: либо мультимодальный контент, либо просто текст.
     messages.append(
@@ -961,6 +1024,7 @@ async def build_context_from_db(
     knowledge_chars: int | None = None,
     global_instructions: str = "",
     assistant_mode: bool = False,
+    report: dict | None = None,
 ) -> list[dict]:
     """
     Достаёт из БД память Horae, персону, заметку автора и историю сообщений,
@@ -1051,4 +1115,5 @@ async def build_context_from_db(
         knowledge_media=knowledge_media,
         global_instructions=global_instructions,
         ooc=ooc,
+        report=report,
     )
