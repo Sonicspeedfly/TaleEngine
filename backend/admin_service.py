@@ -66,6 +66,31 @@ async def _load(db, key: str, default: dict) -> dict:
     return data
 
 
+# Какие секреты заданы в окружении. Значение оттуда ПЕРЕКРЫВАЕТ базу: секреты
+# уже лежат в app_settings открытым текстом, и «запасной вариант» проиграл бы
+# сохранённому значению — перенос оказался бы бессмысленным.
+def env_secrets() -> dict:
+    return {
+        "admin_password": (cfg.ADMIN_PASSWORD or "").strip(),
+        "access_code": (cfg.ACCESS_CODE or "").strip(),
+        "telegram_token": (cfg.TELEGRAM_BOT_TOKEN or "").strip(),
+    }
+
+
+def env_locked() -> dict:
+    """Что задано снаружи. Интерфейс по этому списку блокирует поля."""
+    e = env_secrets()
+    return {k: bool(v) for k, v in e.items()}
+
+
+def _apply_env(data: dict, mapping: dict) -> dict:
+    for env_key, data_key in mapping.items():
+        val = env_secrets().get(env_key) or ""
+        if val:
+            data[data_key] = val
+    return data
+
+
 async def _save(db, key: str, data: dict) -> None:
     row = await db.get(AppSetting, key)
     if row is None:
@@ -92,13 +117,20 @@ def telegram_cache() -> dict:
 
 # ---------- Безопасность ----------
 async def get_security(db) -> dict:
-    return await _load(db, SECURITY_KEY, default_security())
+    data = await _load(db, SECURITY_KEY, default_security())
+    return _apply_env(data, {"admin_password": "admin_password", "access_code": "access_code"})
 
 
 async def set_security(db, data: dict) -> dict:
     global _security_cache
     cur = await get_security(db)
+    locked = env_locked()
     for k in ("access_code", "admin_password"):
+        # Заданное окружением из интерфейса не переписывается: иначе поле
+        # выглядело бы редактируемым, сохранение «проходило» бы, а работало бы
+        # всё равно значение из .env — худший вид молчаливого расхождения.
+        if locked.get(k):
+            continue
         if k in data and data[k] is not None:
             cur[k] = str(data[k])
     if "accounts_enabled" in data and data["accounts_enabled"] is not None:
@@ -119,13 +151,19 @@ async def set_security(db, data: dict) -> dict:
 
 # ---------- Telegram ----------
 async def get_telegram(db) -> dict:
-    return await _load(db, TELEGRAM_KEY, default_telegram())
+    data = await _load(db, TELEGRAM_KEY, default_telegram())
+    return _apply_env(data, {"telegram_token": "token"})
 
 
 async def set_telegram(db, data: dict) -> dict:
     global _telegram_cache
     cur = await get_telegram(db)
+    token_locked = env_locked().get("telegram_token")
     for k in ("token", "enabled", "default_character_id", "model", "open_to_all"):
+        # Токен, заданный окружением, из интерфейса не переписывается — иначе
+        # сохранение «проходило» бы, а работал бы всё равно .env.
+        if k == "token" and token_locked:
+            continue
         if k in data:
             cur[k] = data[k]
     await _save(db, TELEGRAM_KEY, cur)

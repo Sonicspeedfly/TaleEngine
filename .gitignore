@@ -4,6 +4,7 @@
 # База данных и данные среды выполнения
 data/*.db
 data/*.db-*
+*.sqlite3
 
 # Python
 __pycache__/

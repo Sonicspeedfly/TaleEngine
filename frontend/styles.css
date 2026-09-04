@@ -710,6 +710,25 @@ details.ins-block > summary { padding: 8px 0; }
   .palette { max-height: 82vh; }
 }
 
+/* ----- Бейдж режима фильтрации -----
+   Состояние читается с одного взгляда. Раньше о нём говорил только цвет подписи
+   у галочки, причём красный стоял на состоянии ПО УМОЛЧАНИЮ. */
+.safety-badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 10px; border-radius: var(--r-pill);
+  font-size: var(--fs-100); border: 1px solid transparent;
+}
+.safety-badge.on { background: var(--ok-subtle); border-color: var(--ok); color: var(--ok); }
+.safety-badge.off { background: var(--warn-subtle); border-color: var(--warn); color: var(--warn); }
+
+/* ----- Метка «секрет задан в окружении» ----- */
+.env-locked {
+  display: inline-flex; align-items: center; gap: 6px; margin-left: 6px;
+  padding: 2px 8px; border-radius: var(--r-pill); font-size: var(--fs-100);
+  background: var(--accent-subtle); border: 1px solid var(--accent-border);
+  color: var(--accent);
+}
+
 /* ----- Чипы фильтра списка чатов ----- */
 .chip-row {
   display: flex; flex-wrap: wrap; gap: 4px; padding: 2px 12px 6px;
