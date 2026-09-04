@@ -257,8 +257,15 @@ async def current_user(
 ):
     """Текущий пользователь (или None, если режим аккаунтов выключен / не вошёл)."""
     if not admin_service.security_cache().get("accounts_enabled"):
+        debug_log.set_owner(None)
         return None
-    return await accounts.user_from_token(db, x_user_token)
+    u = await accounts.user_from_token(db, x_user_token)
+    # Помечаем контекст владельцем ЗДЕСЬ: это единственное место, через которое
+    # проходит опознание на всех HTTP-путях. Фоновые задачи генерации создаются
+    # уже внутри запроса и наследуют пометку вместе с контекстом, поэтому
+    # протаскивать owner_id через llm_gateway не нужно (см. debug_log).
+    debug_log.set_owner(getattr(u, "id", None))
+    return u
 
 
 class StaticCacheMiddleware(BaseHTTPMiddleware):
@@ -2986,6 +2993,9 @@ async def ws_chat(websocket: WebSocket, session_id: int):
             if not await _can_access_session(db, wsess, ws_user):
                 await websocket.close(code=4403)
                 return
+            # Владелец хода для панели отладки. Фоновая задача генерации
+            # создаётся из этого контекста и наследует пометку.
+            debug_log.set_owner(getattr(ws_user, "id", None))
     else:
         code = sec.get("access_code") or ""
         if code:
@@ -2994,6 +3004,7 @@ async def ws_chat(websocket: WebSocket, session_id: int):
             if q != code and not (ap and q == ap):
                 await websocket.close(code=4401)
                 return
+        debug_log.set_owner(None)  # режим без аккаунтов: владелец один
 
     await websocket.accept()
     current_job_id: str | None = None
@@ -3460,7 +3471,11 @@ async def auth_admin(payload: dict):
 # ============================ АДМИНКА (требует X-Admin-Password) ============================
 @app.get("/api/admin/security")
 async def admin_get_security(db: AsyncSession = Depends(get_session)):
-    return await admin_service.get_security(db)
+    data = await admin_service.get_security(db)
+    # Какие секреты заданы окружением: интерфейс по этому списку блокирует поля,
+    # чтобы не предлагать править то, что правится не там.
+    data["env_locked"] = admin_service.env_locked()
+    return data
 
 
 @app.put("/api/admin/security")
@@ -3472,6 +3487,7 @@ async def admin_set_security(payload: dict, db: AsyncSession = Depends(get_sessi
 async def admin_get_telegram(db: AsyncSession = Depends(get_session)):
     data = await admin_service.get_telegram(db)
     data["bot_state"] = telegram_runtime.status()
+    data["env_locked"] = admin_service.env_locked()
     return data
 
 
@@ -3552,16 +3568,36 @@ async def admin_delete_user(user_id: int, db: AsyncSession = Depends(get_session
     return {"ok": True}
 
 
+def _debug_scope(user, want_all: bool) -> tuple:
+    """
+    Кому какие записи отладки видны.
+
+    Раньше эндпоинты вообще не спрашивали, кто пришёл, а буфер был общим: в
+    режиме аккаунтов любой залогиненный видел сводку чужих сообщений. Право
+    смотреть всё есть только у администратора, и решается это ЗДЕСЬ, а не в
+    модуле лога: роль знает слой доступа.
+    """
+    is_admin = user is None or getattr(user, "role", "") == "admin"
+    owner = getattr(user, "id", None)
+    return owner, bool(want_all and is_admin), is_admin
+
+
 @app.get("/api/debug/log")
-async def debug_log_get():
-    """Последние обращения к LLM (что отправлено и что вернулось)."""
-    return debug_log.entries()
+async def debug_log_get(all: bool = False, user=Depends(current_user)):
+    """Последние обращения к LLM ТЕКУЩЕГО пользователя (или все — для админа)."""
+    owner, include_all, is_admin = _debug_scope(user, all)
+    return {
+        "entries": debug_log.entries(owner, include_all),
+        "scope": "all" if include_all else "own",
+        "can_see_all": is_admin,
+    }
 
 
 @app.delete("/api/debug/log")
-async def debug_log_clear():
-    debug_log.clear()
-    return {"ok": True}
+async def debug_log_clear(all: bool = False, user=Depends(current_user)):
+    owner, include_all, _ = _debug_scope(user, all)
+    removed = debug_log.clear(owner, include_all)
+    return {"ok": True, "removed": removed}
 
 
 @app.get("/api/usage")

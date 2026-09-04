@@ -130,6 +130,16 @@ class Settings(BaseSettings):
     VERTEX_PROJECT: Optional[str] = None
     VERTEX_LOCATION: Optional[str] = "us-central1"
 
+    # ----- Секреты доступа -----
+    # Пароль администратора и код доступа к приложению. Заданные ЗДЕСЬ значения
+    # ПЕРЕКРЫВАЮТ то, что лежит в базе, и не редактируются из интерфейса.
+    #
+    # Почему перекрывают, а не дополняют: значения уже сохранены в app_settings
+    # открытым текстом, и «запасной вариант» проиграл бы базе — перенос вышел бы
+    # бессмысленным. Пусто — работает прежний путь через базу.
+    ADMIN_PASSWORD: Optional[str] = None
+    ACCESS_CODE: Optional[str] = None
+
     # ----- Telegram -----
     TELEGRAM_BOT_TOKEN: Optional[str] = None
     # С каким персонажем начинать чат в Telegram, если у пользователя ещё нет сессии.

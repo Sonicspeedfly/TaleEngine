@@ -8,8 +8,28 @@
 """
 import time
 from collections import deque
+from contextvars import ContextVar
 
-_entries: deque = deque(maxlen=100)
+_entries: deque = deque(maxlen=400)
+
+# Владелец текущего хода. Заполняется там, где ход НАЧИНАЕТСЯ (веб-сокет, REST),
+# и читается здесь, в момент записи.
+#
+# Почему контекстная переменная, а не параметр: log_request зовут из llm_gateway,
+# который про пользователя ничего не знает и знать не должен. Протаскивать
+# owner_id через stream_completion, complete и три функции картинок значило бы
+# менять их сигнатуры ради служебного поля. ContextVar копируется в задачу при
+# asyncio.create_task, поэтому фоновая генерация наследует владельца сама.
+_owner: ContextVar = ContextVar("debug_owner", default=None)
+
+
+def set_owner(user_id) -> None:
+    """Пометить текущий контекст владельцем. None — режим без аккаунтов."""
+    _owner.set(user_id)
+
+
+def current_owner():
+    return _owner.get()
 
 
 def summarize_messages(messages: list[dict]) -> list[dict]:
@@ -55,6 +75,9 @@ def log_request(kind: str, model: str, api_base, detail: dict) -> dict:
         "model": model,
         "api_base": api_base or "",
         "status": "...",  # ... | ok | error
+        # Владелец хода. Наружу это поле не отдаётся (см. _public), оно нужно
+        # только для фильтрации: сводка сообщений — это чужая переписка.
+        "owner_id": _owner.get(),
         **detail,
     }
     _entries.appendleft(entry)  # новые сверху
@@ -69,9 +92,34 @@ def finish(entry: dict, status: str, error: str = "", preview: str = "") -> None
         entry["preview"] = preview
 
 
-def entries() -> list:
-    return list(_entries)
+def _public(entry: dict) -> dict:
+    """Запись без служебных полей: владелец наружу не уходит."""
+    return {k: v for k, v in entry.items() if k != "owner_id"}
 
 
-def clear() -> None:
+def entries(owner_id, include_all: bool = False) -> list:
+    """
+    Записи ОДНОГО владельца.
+
+    Раньше буфер был общим, а эндпоинт не спрашивал, кто пришёл: в режиме
+    аккаунтов любой залогиненный видел сводку чужих сообщений, то есть чужую
+    переписку. Право на include_all проверяет ВЫЗЫВАЮЩИЙ (эндпоинт знает роль),
+    здесь мы только исполняем: модуль лога не должен решать вопросы доступа.
+    """
+    if include_all:
+        return [_public(e) for e in _entries]
+    return [_public(e) for e in _entries if e.get("owner_id") == owner_id]
+
+
+def clear(owner_id, include_all: bool = False) -> int:
+    """Очистить свои записи (или все, если разрешено). Возвращает число удалённых."""
+    global _entries
+    if include_all:
+        n = len(_entries)
+        _entries.clear()
+        return n
+    keep = [e for e in _entries if e.get("owner_id") != owner_id]
+    n = len(_entries) - len(keep)
     _entries.clear()
+    _entries.extend(keep)   # deque сохраняет maxlen, порядок «новые сверху» цел
+    return n

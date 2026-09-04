@@ -93,8 +93,10 @@ createApp({
         history_files_mb: 8,       // файлы истории: сколько МБ вложений уходит модели за ход
         history_files_turns: 12,   // и из скольких ПОСЛЕДНИХ сообщений (0 = без ограничения)
         knowledge_chars: 60000,    // потолок текста базы знаний в контексте (0 = без лимита)
-        disable_safety: true,
-        safety_preset: "off",     // общий порог настраиваемых фильтров провайдера
+        // Стандартная фильтрация по умолчанию. Существующие профили не
+        // затрагиваются: loadUiPrefs кладёт сохранённые параметры поверх.
+        disable_safety: false,
+        safety_preset: null,      // общий порог настраиваемых фильтров провайдера
         safety_overrides: {},     // точечные пороги по категориям (важнее пресета)
         send_avatars: false,
         web_access: false,
@@ -298,6 +300,11 @@ createApp({
       // --- Отладочный лог LLM ---
       debugOpen: false,
       debugEntries: [],
+      envLocked: {},          // какие секреты приходят из переменных окружения
+      // Панель отладки показывает ТОЛЬКО свои ходы. Раньше буфер был общим на
+      // всё приложение, и в режиме аккаунтов туда попадала чужая переписка.
+      debugAll: false,        // админ может посмотреть общий системный лог
+      debugCanSeeAll: false,  // роль приходит с сервера, клиент её не решает
 
       // --- Профиль (привязка Telegram) ---
       profileOpen: false,
@@ -1154,6 +1161,21 @@ createApp({
         + "select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])";
       return Array.from(el.querySelectorAll(sel))
         .filter((n) => n.getClientRects().length > 0 || n.classList.contains("file-input"));
+    },
+
+    // Одноразовая подсказка про режим фильтрации. Показывается ровно один раз:
+    // навязчивое напоминание о настройке, которую человек уже видел, раздражает
+    // сильнее, чем отсутствие подсказки.
+    _safetyHint() {
+      try {
+        if (localStorage.getItem("safetyHintSeen")) return;
+        localStorage.setItem("safetyHintSeen", "1");
+      } catch (e) { return; }
+      if (this.params.disable_safety) return;   // человек уже снял фильтры сам
+      this.showToast(
+        "Включён стандартный режим фильтрации. Zero-Censorship переключается в настройках, вкладка «Генерация»",
+        () => { this.drawerTab = "generation"; }
+      );
     },
 
     // ---------- Приборы и инспектор хода ----------
@@ -2785,8 +2807,12 @@ createApp({
         // Новые настройки экономии могли не сохраниться в старых профилях.
         if (this.params.history_files_turns == null) this.params.history_files_turns = 12;
         if (this.params.knowledge_chars == null) this.params.knowledge_chars = 60000;
-        // Настройки обхода цензуры (появились в 1.13.0).
-        if (!this.params.safety_preset) this.params.safety_preset = "off";
+        // Настройки обхода цензуры (появились в 1.13.0). Порог доставляем только
+        // тем, у кого Zero-Censorship РЕАЛЬНО включён: иначе эта строка молча
+        // возвращала бы «off» и новым профилям, у которых фильтры стандартные.
+        if (this.params.disable_safety && !this.params.safety_preset) {
+          this.params.safety_preset = "off";
+        }
         if (!this.params.safety_overrides) this.params.safety_overrides = {};
       }
       if (ui && ui.jailbreak) {
@@ -3104,9 +3130,17 @@ createApp({
     },
     closeDebug() { this.debugOpen = false; clearInterval(this._debugTimer); },
     async loadDebug() {
-      try { this.debugEntries = await this.api("/debug/log"); } catch (e) {}
+      try {
+        const r = await this.api("/debug/log" + (this.debugAll ? "?all=true" : ""));
+        this.debugEntries = r.entries || [];
+        this.debugCanSeeAll = !!r.can_see_all;
+      } catch (e) {}
     },
-    async clearDebug() { await this.api("/debug/log", { method: "DELETE" }); this.debugEntries = []; },
+    async clearDebug() {
+      await this.api("/debug/log" + (this.debugAll ? "?all=true" : ""), { method: "DELETE" });
+      this.debugEntries = [];
+    },
+    async toggleDebugScope() { this.debugAll = !this.debugAll; await this.loadDebug(); },
 
     // ---------- Расход токенов ----------
     async loadUsage() {
@@ -3205,6 +3239,8 @@ createApp({
     async loadAdmin() {
       this.adminSec = await this.api("/admin/security");
       if (!this.adminSec.basic_auth) this.adminSec.basic_auth = { enabled: false, username: "", password: "" };
+      // Что задано снаружи — решает сервер, клиент только показывает.
+      this.envLocked = this.adminSec.env_locked || {};
       this.adminTg = await this.api("/admin/telegram");
       try { this.adminUsers = await this.api("/admin/users"); } catch (e) { this.adminUsers = []; }
     },
@@ -3286,6 +3322,7 @@ createApp({
       else await this.loadUiPrefs();
       await Promise.all([this.loadCharacters(), this.loadPersonas(), this.loadHorae(),
         this.loadGroups(), this.loadFriends(), this.loadAllSessions()]);
+      this._safetyHint();
       // Восстанавливаем последний открытый чат (после F5 сразу можно писать);
       // если не вышло — показываем блок быстрого старта, а не открываем первого
       // персонажа молча: раньше это создавало чат как побочный эффект запуска.
@@ -4171,7 +4208,12 @@ createApp({
             <input type="range" min="0.8" max="2" step="0.05" v-model.number="params.repetition_penalty" /></label>
           <div class="hr"></div>
           <h3>🛡 Обход цензуры</h3>
-          <label class="check danger-text"><input type="checkbox" v-model="params.disable_safety" /> Zero-Censorship — снять настраиваемые фильтры провайдера</label>
+          <div class="row" style="gap:8px; margin-bottom:6px">
+            <span class="safety-badge" :class="params.disable_safety ? 'off' : 'on'">
+              {{ params.disable_safety ? '⚠ Фильтры сняты' : '🛡 Стандартная фильтрация' }}
+            </span>
+          </div>
+          <label class="check" :class="params.disable_safety ? 'danger-text' : ''"><input type="checkbox" v-model="params.disable_safety" /> Zero-Censorship — снять настраиваемые фильтры провайдера</label>
           <template v-if="params.disable_safety">
             <label>Порог для всех категорий
               <select v-model="params.safety_preset">
@@ -4489,11 +4531,20 @@ createApp({
 
       <div v-else>
         <h4>Безопасность</h4>
+        <!-- Секрет, заданный переменной окружения, ПЕРЕКРЫВАЕТ базу и не
+             редактируется отсюда: иначе сохранение «проходило» бы, а работало
+             всё равно значение из .env. -->
         <label>Код доступа к приложению (пусто = открыто всем)
-          <input v-model="adminSec.access_code" placeholder="код для входа" />
+          <span v-if="envLocked.access_code" class="env-locked">🔒 задан в .env</span>
+          <input v-model="adminSec.access_code" placeholder="код для входа"
+                 :disabled="envLocked.access_code"
+                 :title="envLocked.access_code ? 'Значение приходит из переменной ACCESS_CODE' : ''" />
         </label>
         <label>Пароль администратора (пусто = без пароля)
-          <input v-model="adminSec.admin_password" type="password" placeholder="пароль админа" />
+          <span v-if="envLocked.admin_password" class="env-locked">🔒 задан в .env</span>
+          <input v-model="adminSec.admin_password" type="password" placeholder="пароль админа"
+                 :disabled="envLocked.admin_password"
+                 :title="envLocked.admin_password ? 'Значение приходит из переменной ADMIN_PASSWORD' : ''" />
         </label>
         <label class="check"><input type="checkbox" v-model="adminSec.accounts_enabled" /> Режим аккаунтов (вход по логину/паролю, у каждого свои приватные данные)</label>
         <p class="muted">В режиме аккаунтов первый зарегистрированный — администратор. Код доступа не используется.</p>
@@ -4512,7 +4563,10 @@ createApp({
         <div class="hr"></div>
         <h4>Telegram-бот</h4>
         <label>Токен бота (от @BotFather)
-          <input v-model="adminTg.token" type="password" placeholder="123456:ABC..." />
+          <span v-if="envLocked.telegram_token" class="env-locked">🔒 задан в .env</span>
+          <input v-model="adminTg.token" type="password" placeholder="123456:ABC..."
+                 :disabled="envLocked.telegram_token"
+                 :title="envLocked.telegram_token ? 'Значение приходит из переменной TELEGRAM_BOT_TOKEN' : ''" />
         </label>
         <label>Персонаж по умолчанию
           <select v-model="adminTg.default_character_id">
@@ -4735,7 +4789,16 @@ createApp({
     <div class="modal" style="width:640px" role="dialog" aria-modal="true" aria-label="Отладка LLM">
       <div class="row-between" style="margin-bottom:8px">
         <h3 style="margin:0">🐞 Отладка LLM</h3>
-        <span><button @click="clearDebug">Очистить</button> <button class="btn-icon" @click="closeDebug" aria-label="Закрыть отладку">✕</button></span>
+        <span>
+          <!-- Общий системный лог доступен только администратору, и решает это
+               сервер: клиент лишь показывает то, что ему разрешено. -->
+          <button v-if="debugCanSeeAll" @click="toggleDebugScope"
+                  :class="debugAll ? 'btn-primary' : ''"
+                  :title="debugAll ? 'Показаны ходы ВСЕХ пользователей' : 'Показаны только ваши ходы'"
+                  :aria-pressed="debugAll ? 'true' : 'false'">{{ debugAll ? '🌐 Все' : '👤 Мои' }}</button>
+          <button @click="clearDebug">Очистить</button>
+          <button class="btn-icon" @click="closeDebug" aria-label="Закрыть отладку">✕</button>
+        </span>
       </div>
       <p class="muted">Последние запросы к прокси: модель, что отправлено и что вернулось. Обновляется автоматически.</p>
       <p v-if="!debugEntries.length" class="muted">Пока пусто — отправьте сообщение или сгенерируйте арт.</p>
