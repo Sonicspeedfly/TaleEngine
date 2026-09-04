@@ -236,12 +236,42 @@ label.btn-primary { color: var(--text-on-accent); }
 .acc-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .acc-chevron { transition: transform 0.2s ease; color: var(--text-secondary); }
 .acc-chevron.open { transform: rotate(90deg); }
-.acc-body { max-height: 0; overflow: hidden; transition: max-height 0.25s ease; }
-.acc-body.open { max-height: 60vh; overflow-y: auto; }
+/* Свёрнутый раздел уходит и из табуляции, и из дерева доступности.
+   Одной max-height: 0 мало: содержимое остаётся фокусируемым, и человек,
+   свернувший раздел, получал десятки остановок фокуса в пустоте, а сайдбар
+   при этом дёргался, прокручивая невидимое. После превращения строк списка
+   в кнопки таких остановок стало бы ещё больше.
+   visibility выключается БЕЗ задержки при открытии и С задержкой при закрытии,
+   иначе анимация схлопывания пропадала бы. */
+.acc-body {
+  max-height: 0; overflow: hidden; visibility: hidden;
+  transition: max-height 0.25s ease, visibility 0s linear 0.25s;
+}
+.acc-body.open {
+  max-height: 60vh; overflow-y: auto; visibility: visible;
+  transition: max-height 0.25s ease, visibility 0s linear 0s;
+}
 .list-item {
   display: flex; align-items: center; gap: 8px;
-  padding: 8px 12px; cursor: pointer; border-left: 3px solid transparent;
+  /* Отступы переехали в .row-main: зона нажатия должна совпадать с кнопкой,
+     а не быть меньше строки. Сама строка теперь только контейнер. */
+  padding: 0; cursor: default; border-left: 3px solid transparent;
 }
+/* Кнопка-содержимое строки. Ей нужно погасить весь скин обычной кнопки: фон,
+   рамку, скругление, кегль, и особенно button:active { transform: scale(.94) },
+   от которого вся строка проседала бы при клике. */
+.row-main {
+  flex: 1; min-width: 0; width: 100%;
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 12px;
+  background: transparent; border: none; border-radius: inherit;
+  color: inherit; font: inherit; text-align: left; cursor: pointer;
+}
+.row-main:hover { background: transparent; border-color: transparent; }
+.row-main:active { transform: none; }
+/* Кольцо рисуется ВНУТРЬ: снаружи его срезал бы overflow сайдбара. */
+.row-main:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.list-item.row2 .row-main { align-items: flex-start; padding-top: 6px; padding-bottom: 6px; }
 .list-item:hover { background: var(--surface-hover); }
 /* Выбор кодируется тремя сигналами разом (заливка + акцентная полоса +
    основной цвет текста), а наведение - только слабой нейтральной заливкой.
@@ -439,7 +469,9 @@ label.btn-primary { color: var(--text-on-accent); }
 /* Позиционирование нужно всегда: на тач-устройствах группа остаётся в потоке,
    но родителю всё равно полезно быть точкой отсчёта. */
 .list-item { position: relative; }
-.row-actions { display: flex; align-items: center; gap: 2px; }
+/* Отступ строки переехал в .row-main, поэтому действиям нужен свой: на тач-
+   устройствах они остаются в потоке и иначе прижались бы к самому краю. */
+.row-actions { display: flex; align-items: center; gap: 2px; padding-right: 6px; }
 
 /* ============================================================
    Движение: отклик на действия
@@ -480,6 +512,61 @@ textarea:focus-visible, select:focus-visible {
 .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
 .chip { font-size: var(--fs-100); background: var(--surface-3); border: 1px solid var(--border-subtle); border-radius: var(--r-md); padding: 3px 8px; }
 .empty { margin: auto; color: var(--text-secondary); text-align: center; }
+
+/* ============================================================
+   Доступность: служебные утилиты
+   ============================================================ */
+
+/* Текст только для скринридера. Нужен региону объявлений: сообщать о ходе
+   генерации надо, показывать эту строку глазами - нет. */
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%);
+  white-space: nowrap; border: 0;
+}
+
+/* Поле выбора файла. Раньше пряталось через display: none, что ВЫКЛЮЧАЕТ
+   элемент: он выпадал из табуляции и из дерева доступности, и семь сценариев
+   загрузки были невыполнимы без мыши. Теперь поле живо, просто не видно. */
+.file-input {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: 0;
+  overflow: hidden; clip: rect(0 0 0 0); clip-path: inset(50%);
+  white-space: nowrap; border: 0; opacity: 0;
+}
+/* Кольцо фокуса рисуется на видимой подписи-кнопке, а не на скрытом поле. */
+label.btn:focus-within, label.btn-primary:focus-within, label.btn-icon:focus-within {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
+
+/* ============================================================
+   Первый экран: блок быстрого старта
+   ============================================================
+   Раньше здесь стояла одна бледная строка «Выберите или создайте персонажа и
+   чат слева» самым низким уровнем эмфазы в системе, причём на телефоне она
+   указывала туда, где ничего нет: сайдбар скрыт за кнопкой меню. */
+.start {
+  margin: auto; padding: var(--sp-5); max-width: 460px; width: 100%;
+  display: flex; flex-direction: column; gap: var(--sp-4); text-align: left;
+}
+.start-title { font-size: var(--fs-500); font-weight: 700; margin: 0; }
+.start-lead { color: var(--text-secondary); margin: 0; }
+.start-actions { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+.start-actions > button { padding: 9px 14px; }
+.start-recent { display: flex; flex-direction: column; gap: 2px; }
+.start-recent-head {
+  font-size: var(--fs-100); color: var(--text-tertiary);
+  text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: var(--sp-1);
+}
+.start-chat {
+  display: flex; align-items: baseline; gap: var(--sp-2); width: 100%;
+  padding: 8px 10px; text-align: left;
+  background: transparent; border: 1px solid transparent; border-radius: var(--r-md);
+  color: var(--text-primary); font: inherit;
+}
+.start-chat:hover { background: var(--surface-hover); border-color: var(--border-subtle); }
+.start-chat .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.start-chat .when { font-size: var(--fs-100); color: var(--text-tertiary); flex: none; }
+.start-hint { font-size: var(--fs-100); color: var(--text-tertiary); margin: 0; }
 /* Индикатор ленивой подгрузки истории (вверху ленты сообщений). */
 .load-older { text-align: center; font-size: var(--fs-100); color: var(--accent); padding: 2px 0; flex: none; }
 .load-older.muted { color: var(--text-secondary); }
@@ -694,8 +781,11 @@ input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
    Раньше строка была «Новый чат #7» — по такому названию вспомнить чат нечем,
    отсюда и «легко потеряться». Теперь под названием видно последнюю реплику,
    справа — когда она была. */
-.list-item.row2 { align-items: flex-start; padding-top: 6px; padding-bottom: 6px; }
-.row-text { min-width: 0; }                    /* иначе flex не даст тексту сжаться */
+.list-item.row2 { align-items: flex-start; }
+/* Две строки текста внутри кнопки: раньше это были div, теперь span, поэтому
+   колонку задаём явно, а не полагаемся на блочность тегов. */
+.row-text { min-width: 0; display: flex; flex-direction: column; }
+.row-sub { display: block; }
 .row-title { display: flex; align-items: center; gap: 5px; min-width: 0; }
 .row-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .row-sub {

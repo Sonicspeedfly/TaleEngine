@@ -216,6 +216,13 @@ createApp({
       directorBar: false,       // показывать режиссёрскую панель (группа)
       // Аккордеон сайдбара: какие разделы раскрыты (по умолчанию — персонажи и чаты).
       openSections: { characters: true, chats: true, groups: false, shared: false },
+      // Вежливый регион объявлений: скринридер узнаёт о ходе генерации. Объявляем
+      // ЗАВЕРШЁННЫЙ ответ, а не каждый токен, иначе речь перезапускается десятки
+      // раз в секунду и слушать её невозможно.
+      liveStatus: "",
+      // Недавние чаты для блока быстрого старта на первом экране. Список приходит
+      // из /sessions без фильтра по персонажу и уже отсортирован по активности.
+      recentChats: [],
       groupDirector: false,
       liveBubbles: [], // живые пузыри разных персонажей при стриминге группы
 
@@ -418,6 +425,13 @@ createApp({
       return this.isTouch
         ? "Сообщение… (Enter — перенос строки)"
         : "Сообщение… (Enter — отправить, Shift+Enter — перенос)";
+    },
+    // Открыт ли хоть какой-то модальный слой. Один признак на все десять окон:
+    // по нему работают и удержание фокуса, и его возврат.
+    overlayOpen() {
+      return !!(this.dialog || this.lightbox || this.adminOpen || this.kbOpen
+        || this.membersOpen || this.groupModal || this.inviteOpen || this.profileOpen
+        || this.debugOpen || this.usageOpen || this.drawerTab);
     },
   },
 
@@ -953,6 +967,50 @@ createApp({
         || this.groups.find((x) => x.id === id)
         || this.sharedSessions.find((x) => x.id === id)
         || null;
+    },
+
+    // ---------- Доступность: удержание и возврат фокуса ----------
+    // Верхний открытый слой. Порядок слоёв уже задан порядком в шаблоне
+    // (дровер -> модалки -> диалог -> лайтбокс), поэтому последний найденный
+    // узел и есть верхний. Так не нужен ref на каждом из десяти оверлеев.
+    _topOverlay() {
+      const nodes = document.querySelectorAll(".drawer, .modal, .lightbox");
+      return nodes.length ? nodes[nodes.length - 1] : null;
+    },
+    // Фокусируемое внутри оверлея. Поля выбора файла скрыты визуально, но
+    // остаются в табуляции намеренно (см. .file-input), поэтому их пропускать нельзя.
+    _focusables(el) {
+      const sel = "a[href], button:not([disabled]), input:not([disabled]), "
+        + "select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])";
+      return Array.from(el.querySelectorAll(sel))
+        .filter((n) => n.getClientRects().length > 0 || n.classList.contains("file-input"));
+    },
+
+    // ---------- Первый экран ----------
+    // Все чаты без фильтра по персонажу: бэкенд отдаёт их отсортированными по
+    // последней активности, поэтому «недавние» здесь означает именно недавние.
+    async loadRecent() {
+      try { this.recentChats = (await this.api("/sessions")).slice(0, 5); }
+      catch (e) { this.recentChats = []; }
+    },
+    async startNewChat() {
+      if (this.selectedCharacter) { await this.newChat(); return; }
+      if (this.characters.length) { await this.selectCharacter(this.characters[0]); return; }
+      await this.createCharacter();
+    },
+    // Открыть чат из блока быстрого старта. selectCharacter здесь звать НЕЛЬЗЯ:
+    // он сам открывает первый чат персонажа, а если чатов нет — создаёт новый,
+    // то есть просмотр имел бы побочный эффект. Переключаем контекст вручную.
+    async openRecent(s) {
+      if (s.character_id && s.character_id !== this.selectedCharacterId) {
+        const c = this.characters.find((x) => x.id === s.character_id);
+        if (c) {
+          this.selectedCharacterId = c.id;
+          this.charEdit = { ...c, generation_params: c.generation_params || {} };
+          await this.loadSessions();
+        }
+      }
+      await this.openSession(s);
     },
     async openSession(s) {
       if (s.id === this.sessionId && !this.sharedView) return; // уже открыт
@@ -2752,11 +2810,12 @@ createApp({
       // Дефолт-пресет задаёт params; message_preload подтягиваем в любом случае.
       if (def) { this.applyPreset(def); await this.loadUiPrefs(false); }
       else await this.loadUiPrefs();
-      await Promise.all([this.loadCharacters(), this.loadPersonas(), this.loadHorae(), this.loadGroups(), this.loadFriends()]);
+      await Promise.all([this.loadCharacters(), this.loadPersonas(), this.loadHorae(),
+        this.loadGroups(), this.loadFriends(), this.loadRecent()]);
       // Восстанавливаем последний открытый чат (после F5 сразу можно писать);
-      // если не вышло — открываем первого персонажа, как раньше.
-      const restored = await this._restoreLastChat();
-      if (!restored && this.characters.length) this.selectCharacter(this.characters[0]);
+      // если не вышло — показываем блок быстрого старта, а не открываем первого
+      // персонажа молча: раньше это создавало чат как побочный эффект запуска.
+      await this._restoreLastChat();
       // Периодически подтягиваем заявки в друзья/общие чаты — чтобы уведомления
       // в колокольчике появлялись без перезагрузки страницы.
       clearInterval(this._friendsTimer);
@@ -2778,6 +2837,22 @@ createApp({
       // Esc закрывает верхний оверлей — как ожидают от десктопного приложения.
       if (!this._escBound) {
         this._escBound = true;
+        // Удержание фокуса внутри верхнего оверлея. Без него Tab уходил гулять
+        // по интерфейсу под затемнением: при окне в 40 сообщений и 8-11 кнопках
+        // под каждым это больше 300 остановок на невидимых элементах.
+        window.addEventListener("keydown", (e) => {
+          if (e.key !== "Tab" || e.defaultPrevented) return;
+          const el = this._topOverlay();
+          if (!el) return;
+          const items = this._focusables(el);
+          if (!items.length) return;
+          const first = items[0];
+          const last = items[items.length - 1];
+          const cur = document.activeElement;
+          if (!el.contains(cur)) { e.preventDefault(); first.focus(); return; }
+          if (e.shiftKey && cur === first) { e.preventDefault(); last.focus(); }
+          else if (!e.shiftKey && cur === last) { e.preventDefault(); first.focus(); }
+        });
         window.addEventListener("keydown", (e) => {
           if (e.key !== "Escape" || e.defaultPrevented) return;
           if (this.dialog) { this.dialogCancel(); return; }
@@ -2803,6 +2878,36 @@ createApp({
     // Любое изменение параметров генерации сохраняем в системе (с дебаунсом).
     params: { handler() { this.saveUiPrefs(); }, deep: true },
     soundOn(v) { localStorage.setItem("soundOn", v ? "1" : "0"); },
+
+    // Фокус при открытии оверлея уходит внутрь, при закрытии ВОЗВРАЩАЕТСЯ на
+    // вызвавший элемент. Раньше клавиатурный путь после каждого закрытия
+    // начинался заново с начала страницы, а до дровера, стоящего в шаблоне
+    // после ленты, надо было протабать весь чат.
+    overlayOpen(open) {
+      if (open) {
+        this._focusReturn = document.activeElement;
+        this.$nextTick(() => {
+          const el = this._topOverlay();
+          if (!el) return;
+          const first = this._focusables(el)[0];
+          if (first) first.focus();
+          else { el.setAttribute("tabindex", "-1"); el.focus(); }
+        });
+        return;
+      }
+      const back = this._focusReturn;
+      this._focusReturn = null;
+      // Элемент мог исчезнуть вместе с закрытым окном — тогда возвращать некуда.
+      if (back && document.contains(back)) back.focus();
+    },
+
+    // Объявляем этапы хода, а не токены.
+    streaming(on) {
+      this.liveStatus = on ? "Генерация ответа началась" : "Ответ получен";
+    },
+    chatError(text) {
+      if (text) this.liveStatus = "Ошибка генерации: " + text;
+    },
   },
 
   async mounted() {
@@ -2873,7 +2978,8 @@ createApp({
 
       <!-- Раздел: Персонажи -->
       <div class="acc">
-        <button class="acc-head" @click="toggleSection('characters')">
+        <button class="acc-head" @click="toggleSection('characters')"
+                :aria-expanded="openSections.characters ? 'true' : 'false'">
           <span class="acc-icon">🎭</span><span class="acc-title">Персонажи</span>
           <span class="acc-chevron" :class="{ open: openSections.characters }">▸</span>
         </button>
@@ -2881,29 +2987,38 @@ createApp({
           <div class="row" style="padding: 6px 12px; gap:6px">
             <button class="btn-primary" style="flex:1" @click="createCharacter">+ Новый</button>
             <label class="btn-icon" style="margin:0; cursor:pointer" title="Импорт персонажа PNG/JSON">
-              📥<input type="file" accept=".png,.json" style="display:none" @change="importCharacter" />
+              📥<input type="file" accept=".png,.json" class="file-input" @change="importCharacter"
+                     aria-label="Импорт персонажа из файла PNG или JSON" />
             </label>
             <label class="btn-icon" style="margin:0; cursor:pointer" title="Импорт чата: нативный AiChat (.aichat.json) или SillyTavern (.jsonl)">
-              💬<input type="file" accept=".jsonl,.json" style="display:none" @change="importChat" />
+              💬<input type="file" accept=".jsonl,.json" class="file-input" @change="importChat"
+                     aria-label="Импорт чата из файла AiChat или SillyTavern" />
             </label>
           </div>
           <div class="list-search" v-if="characters.length > 5">
             <input v-model="charFilter" placeholder="Поиск по персонажам…" @click.stop />
-            <button v-if="charFilter" class="btn-icon" @click.stop="charFilter=''" title="Очистить">✕</button>
+            <button v-if="charFilter" class="btn-icon" @click.stop="charFilter=''" title="Очистить" aria-label="Очистить">✕</button>
           </div>
+          <!-- Строка списка это КНОПКА, а не div с обработчиком: иначе с клавиатуры
+               можно удалить чат, но нельзя его открыть. Действия лежат СОСЕДЯМИ
+               кнопки, а не внутри неё: интерактивный элемент внутри кнопки
+               недопустим и ломает и клавиатуру, и скринридер. -->
           <div v-for="c in filteredCharacters" :key="c.id"
-               :class="['list-item', c.id === selectedCharacterId ? 'active' : '', c.pinned ? 'pinned' : '']"
-               @click="selectCharacter(c)">
-            <div class="avatar"><img v-if="c.avatar_path" :src="c.avatar_path" class="avatar" />{{ c.avatar_path ? '' : c.name.charAt(0) }}</div>
-            <div class="grow row-title">
-              <span v-if="c.pinned" class="pin-mark" title="Закреплён наверху">📌</span>
-              <span class="row-name">{{ c.name }}</span>
-            </div>
+               :class="['list-item', c.id === selectedCharacterId ? 'active' : '', c.pinned ? 'pinned' : '']">
+            <button type="button" class="row-main" @click="selectCharacter(c)"
+                    :aria-current="c.id === selectedCharacterId ? 'true' : null"
+                    :aria-label="'Персонаж ' + c.name + (c.pinned ? ', закреплён' : '')">
+              <span class="avatar" aria-hidden="true"><img v-if="c.avatar_path" :src="c.avatar_path" class="avatar" alt="" />{{ c.avatar_path ? '' : c.name.charAt(0) }}</span>
+              <span class="grow row-title">
+                <span v-if="c.pinned" class="pin-mark" aria-hidden="true">📌</span>
+                <span class="row-name">{{ c.name }}</span>
+              </span>
+            </button>
             <span class="row-actions">
               <button class="btn-icon" @click.stop="togglePinCharacter(c)"
-                      :title="c.pinned ? 'Открепить' : 'Закрепить наверху'">{{ c.pinned ? '📍' : '📌' }}</button>
-              <button class="btn-icon" @click.stop="exportCharacter(c)" title="Экспорт (JSON + лор Horae)">⬇</button>
-              <button class="btn-icon" @click.stop="deleteCharacter(c)" title="Удалить">🗑</button>
+                      :title="c.pinned ? 'Открепить' : 'Закрепить наверху'" :aria-label="c.pinned ? 'Открепить' : 'Закрепить наверху'">{{ c.pinned ? '📍' : '📌' }}</button>
+              <button class="btn-icon" @click.stop="exportCharacter(c)" title="Экспорт (JSON + лор Horae)" aria-label="Экспорт (JSON + лор Horae)">⬇</button>
+              <button class="btn-icon" @click.stop="deleteCharacter(c)" title="Удалить" aria-label="Удалить">🗑</button>
             </span>
           </div>
           <div v-if="charFilter && !filteredCharacters.length" class="list-empty">Ничего не найдено</div>
@@ -2912,7 +3027,8 @@ createApp({
 
       <!-- Раздел: Чаты выбранного персонажа -->
       <div class="acc" v-if="selectedCharacter">
-        <button class="acc-head" @click="toggleSection('chats')">
+        <button class="acc-head" @click="toggleSection('chats')"
+                :aria-expanded="openSections.chats ? 'true' : 'false'">
           <span class="acc-icon">💬</span><span class="acc-title">Чаты — {{ selectedCharacter.name }}</span>
           <span class="acc-chevron" :class="{ open: openSections.chats }">▸</span>
         </button>
@@ -2920,29 +3036,32 @@ createApp({
           <div style="padding: 6px 12px"><button @click="newChat" style="width:100%">+ Новый чат</button></div>
           <div class="list-search" v-if="sessions.length > 5">
             <input v-model="chatFilter" placeholder="Поиск по чатам…" @click.stop />
-            <button v-if="chatFilter" class="btn-icon" @click.stop="chatFilter=''" title="Очистить">✕</button>
+            <button v-if="chatFilter" class="btn-icon" @click.stop="chatFilter=''" title="Очистить" aria-label="Очистить">✕</button>
           </div>
           <div v-for="s in filteredSessions" :key="s.id"
-               :class="['list-item', 'row2', s.id === sessionId ? 'active' : '', s.pinned ? 'pinned' : '']"
-               :title="s.title + ' — чат #' + s.id"
-               @click="openSession(s)">
-            <span v-if="pendingChats.includes(s.id)" class="reply-dot" title="Пришёл новый ответ"></span>
-            <div class="grow row-text">
-              <div class="row-title">
-                <span v-if="s.pinned" class="pin-mark" title="Закреплён наверху">📌</span>
-                <span class="row-name">{{ s.title }}</span>
-              </div>
-              <div class="row-sub" v-if="s.preview">{{ s.preview }}</div>
-              <div class="row-sub muted" v-else>пустой чат</div>
-            </div>
-            <span class="row-time" v-if="s.last_at">{{ shortWhen(s.last_at) }}</span>
+               :class="['list-item', 'row2', s.id === sessionId ? 'active' : '', s.pinned ? 'pinned' : '']">
+            <button type="button" class="row-main" @click="openSession(s)"
+                    :title="s.title + ' — чат #' + s.id"
+                    :aria-current="s.id === sessionId ? 'true' : null"
+                    :aria-label="'Чат ' + s.title + (s.pinned ? ', закреплён' : '') + (pendingChats.includes(s.id) ? ', пришёл новый ответ' : '') + (s.last_at ? ', ' + shortWhen(s.last_at) : '')">
+              <span v-if="pendingChats.includes(s.id)" class="reply-dot" aria-hidden="true"></span>
+              <span class="grow row-text">
+                <span class="row-title">
+                  <span v-if="s.pinned" class="pin-mark" aria-hidden="true">📌</span>
+                  <span class="row-name">{{ s.title }}</span>
+                </span>
+                <span class="row-sub" v-if="s.preview">{{ s.preview }}</span>
+                <span class="row-sub muted" v-else>пустой чат</span>
+              </span>
+              <span class="row-time" v-if="s.last_at" aria-hidden="true">{{ shortWhen(s.last_at) }}</span>
+            </button>
             <span class="row-actions">
               <button class="btn-icon" @click.stop="togglePinSession(s)"
-                      :title="s.pinned ? 'Открепить' : 'Закрепить наверху'">{{ s.pinned ? '📍' : '📌' }}</button>
-              <button class="btn-icon" @click.stop="exportSession(s)" title="Экспорт чата (нативный формат AiChat)">💾</button>
-              <button v-if="authStatus.accounts_enabled" class="btn-icon" @click.stop="openInvite(s)" title="Пригласить друга">🔗</button>
-              <button class="btn-icon" @click.stop="renameSession(s)" title="Переименовать">✎</button>
-              <button class="btn-icon" @click.stop="deleteSession(s)" title="Удалить чат">🗑</button>
+                      :title="s.pinned ? 'Открепить' : 'Закрепить наверху'" :aria-label="s.pinned ? 'Открепить' : 'Закрепить наверху'">{{ s.pinned ? '📍' : '📌' }}</button>
+              <button class="btn-icon" @click.stop="exportSession(s)" title="Экспорт чата (нативный формат AiChat)" aria-label="Экспорт чата (нативный формат AiChat)">💾</button>
+              <button v-if="authStatus.accounts_enabled" class="btn-icon" @click.stop="openInvite(s)" title="Пригласить друга" aria-label="Пригласить друга">🔗</button>
+              <button class="btn-icon" @click.stop="renameSession(s)" title="Переименовать" aria-label="Переименовать">✎</button>
+              <button class="btn-icon" @click.stop="deleteSession(s)" title="Удалить чат" aria-label="Удалить чат">🗑</button>
             </span>
           </div>
           <div v-if="chatFilter && !filteredSessions.length" class="list-empty">Ничего не найдено</div>
@@ -2951,41 +3070,56 @@ createApp({
 
       <!-- Раздел: Группы -->
       <div class="acc">
-        <button class="acc-head" @click="toggleSection('groups')">
+        <button class="acc-head" @click="toggleSection('groups')"
+                :aria-expanded="openSections.groups ? 'true' : 'false'">
           <span class="acc-icon">👥</span><span class="acc-title">Группы</span>
           <span class="acc-chevron" :class="{ open: openSections.groups }">▸</span>
         </button>
         <div class="acc-body" :class="{ open: openSections.groups }">
           <div style="padding: 6px 12px"><button @click="openGroupModal" style="width:100%">+ Группа</button></div>
+          <!-- Действия группы завёрнуты в .row-actions, как у чатов. Раньше четыре
+               кнопки стояли прямыми детьми строки и были видны всегда, съедая
+               ширину названия: два соседних списка вели себя по-разному. -->
           <div v-for="g in groups" :key="g.id"
-               :class="['list-item', g.id === sessionId ? 'active' : '']"
-               :title="g.title + ' — чат #' + g.id"
-               @click="openSession(g)">
-            <span v-if="pendingChats.includes(g.id)" class="reply-dot" title="Пришёл новый ответ"></span>
-            <div class="grow">{{ g.title }}
-              <span class="muted">{{ g.members.map(m => m.name).join(', ') }}</span>
-            </div>
-            <button class="btn-icon" @click.stop="exportSession(g)" title="Экспорт чата (нативный формат AiChat)">💾</button>
-            <button v-if="authStatus.accounts_enabled" class="btn-icon" @click.stop="openInvite(g)" title="Пригласить друга в группу">🔗</button>
-            <button class="btn-icon" @click.stop="renameSession(g)" title="Переименовать">✎</button>
-            <button class="btn-icon" @click.stop="deleteSession(g)" title="Удалить группу">🗑</button>
+               :class="['list-item', g.id === sessionId ? 'active' : '']">
+            <button type="button" class="row-main" @click="openSession(g)"
+                    :title="g.title + ' — чат #' + g.id"
+                    :aria-current="g.id === sessionId ? 'true' : null"
+                    :aria-label="'Группа ' + g.title + ', участники: ' + g.members.map(m => m.name).join(', ') + (pendingChats.includes(g.id) ? ', пришёл новый ответ' : '')">
+              <span v-if="pendingChats.includes(g.id)" class="reply-dot" aria-hidden="true"></span>
+              <span class="grow row-text">
+                <span class="row-name">{{ g.title }}</span>
+                <span class="row-sub muted">{{ g.members.map(m => m.name).join(', ') }}</span>
+              </span>
+            </button>
+            <span class="row-actions">
+              <button class="btn-icon" @click.stop="exportSession(g)" title="Экспорт чата (нативный формат AiChat)" aria-label="Экспорт чата (нативный формат AiChat)">💾</button>
+              <button v-if="authStatus.accounts_enabled" class="btn-icon" @click.stop="openInvite(g)" title="Пригласить друга в группу" aria-label="Пригласить друга в группу">🔗</button>
+              <button class="btn-icon" @click.stop="renameSession(g)" title="Переименовать" aria-label="Переименовать">✎</button>
+              <button class="btn-icon" @click.stop="deleteSession(g)" title="Удалить группу" aria-label="Удалить группу">🗑</button>
+            </span>
           </div>
         </div>
       </div>
 
       <!-- Раздел: Доступные мне (расшаренные чаты) -->
       <div class="acc" v-if="authStatus.accounts_enabled && sharedSessions.length">
-        <button class="acc-head" @click="toggleSection('shared')">
+        <button class="acc-head" @click="toggleSection('shared')"
+                :aria-expanded="openSections.shared ? 'true' : 'false'">
           <span class="acc-icon">👁</span><span class="acc-title">Доступные мне</span>
           <span class="acc-chevron" :class="{ open: openSections.shared }">▸</span>
         </button>
         <div class="acc-body" :class="{ open: openSections.shared }">
           <div v-for="s in sharedSessions" :key="'sh'+s.id"
-               :class="['list-item', s.id === sessionId ? 'active' : '']"
-               @click="openSharedSession(s)">
-            <div class="grow">{{ s.title }}
-              <span class="muted">{{ s.character_name }} · от {{ s.owner }}</span>
-            </div>
+               :class="['list-item', s.id === sessionId ? 'active' : '']">
+            <button type="button" class="row-main" @click="openSharedSession(s)"
+                    :aria-current="s.id === sessionId ? 'true' : null"
+                    :aria-label="'Общий чат ' + s.title + ', персонаж ' + s.character_name + ', от ' + s.owner">
+              <span class="grow row-text">
+                <span class="row-name">{{ s.title }}</span>
+                <span class="row-sub muted">{{ s.character_name }} · от {{ s.owner }}</span>
+              </span>
+            </button>
           </div>
         </div>
       </div>
@@ -2995,8 +3129,8 @@ createApp({
     <div class="chat" @dragover.prevent="dragOver = !!sessionId" @dragleave.prevent="dragOver=false" @drop.prevent="onDrop">
       <div v-if="dragOver" class="drop-overlay">📎 Отпустите файл — он прикрепится к сообщению</div>
       <div class="chat-header">
-        <button class="btn-icon hamburger" @click="sidebarOpen=!sidebarOpen" title="Меню">☰</button>
-        <button v-if="canvasOpen" class="btn-icon only-mobile" @click="mobilePane='canvas'" title="Открыть Canvas">📋</button>
+        <button class="btn-icon hamburger" @click="sidebarOpen=!sidebarOpen" title="Меню" aria-label="Меню">☰</button>
+        <button v-if="canvasOpen" class="btn-icon only-mobile" @click="mobilePane='canvas'" title="Открыть Canvas" aria-label="Открыть Canvas">📋</button>
         <!-- Аватарка персонажа (для группы — первого участника с аватаркой) -->
         <span v-if="sessionId" class="header-ava">
           <img v-if="headerAvatar" :src="headerAvatar" />
@@ -3012,14 +3146,14 @@ createApp({
         <span v-if="connection.use_proxy" class="pill hide-mobile" title="Запросы идут в LiteLLM-прокси">proxy {{ connection.base_url }}</span>
         <div style="flex:1"></div>
         <button v-if="sessionId" class="btn-icon hide-mobile" @click="openKnowledge"
-                title="База знаний чата: файлы, которые персонажи всегда учитывают">📚</button>
+                title="База знаний чата: файлы, которые персонажи всегда учитывают" aria-label="База знаний чата: файлы, которые персонажи всегда учитывают">📚</button>
         <button v-if="sessionId && !sharedView" class="btn-icon hide-mobile" @click="openMembers"
-                :title="currentIsGroup ? 'Участники группы (добавить/убрать)' : 'Добавить персонажа (сделать групповым)'">👥➕</button>
+                :title="currentIsGroup ? 'Участники группы (добавить/убрать)' : 'Добавить персонажа (сделать групповым)'" :aria-label="currentIsGroup ? 'Участники группы (добавить/убрать)' : 'Добавить персонажа (сделать групповым)'">👥➕</button>
         <button v-if="currentIsGroup" class="btn-icon hide-mobile" :class="currentGroup.director ? 'rec-active' : ''"
-                @click="toggleDirector" title="ИИ-режиссёр: решает, кто ответит">🎬</button>
+                @click="toggleDirector" title="ИИ-режиссёр: решает, кто ответит" aria-label="ИИ-режиссёр: решает, кто ответит">🎬</button>
         <!-- Колокольчик уведомлений: входящие заявки в друзья -->
         <div v-if="currentUserObj" class="notif-wrap">
-          <button class="btn-icon" @click="notifOpen=!notifOpen" title="Уведомления">
+          <button class="btn-icon" @click="notifOpen=!notifOpen" title="Уведомления" aria-label="Уведомления">
             🔔<span v-if="friendsIncoming.length" class="notif-badge">{{ friendsIncoming.length }}</span>
           </button>
           <div v-if="notifOpen" class="notif-backdrop" @click="notifOpen=false"></div>
@@ -3035,16 +3169,16 @@ createApp({
             </div>
           </div>
         </div>
-        <button class="btn-icon hide-mobile" @click="soundOn=!soundOn" :title="soundOn ? 'Звук вкл' : 'Звук выкл'">{{ soundOn ? '🔊' : '🔇' }}</button>
-        <button v-if="currentUserObj" class="btn-icon hide-mobile" @click="openProfile" title="Профиль / привязка Telegram">👤<span class="hide-mobile"> {{ currentUserObj.username }}</span></button>
-        <button v-if="sessionId && authStatus.accounts_enabled && !sharedView" class="btn-icon hide-mobile" @click="openInvite({ id: sessionId })" title="Пригласить друга в этот чат">👥</button>
-        <button v-if="sessionId" class="btn-icon hide-mobile" @click="bgPicker=!bgPicker" title="Фон чата">🖼</button>
-        <button class="btn-icon hide-mobile" @click="openDebug" title="Отладка LLM (что уходит в прокси)">🐞</button>
-        <button v-if="isAdmin" class="btn-icon hide-mobile" @click="openAdmin" title="Администрирование">🛡</button>
-        <button class="btn-icon" @click="drawerTab = drawerTab ? null : 'generation'" title="Настройки">⚙</button>
+        <button class="btn-icon hide-mobile" @click="soundOn=!soundOn" :title="soundOn ? 'Звук вкл' : 'Звук выкл'" :aria-label="soundOn ? 'Звук вкл' : 'Звук выкл'">{{ soundOn ? '🔊' : '🔇' }}</button>
+        <button v-if="currentUserObj" class="btn-icon hide-mobile" @click="openProfile" title="Профиль / привязка Telegram" aria-label="Профиль / привязка Telegram">👤<span class="hide-mobile"> {{ currentUserObj.username }}</span></button>
+        <button v-if="sessionId && authStatus.accounts_enabled && !sharedView" class="btn-icon hide-mobile" @click="openInvite({ id: sessionId })" title="Пригласить друга в этот чат" aria-label="Пригласить друга в этот чат">👥</button>
+        <button v-if="sessionId" class="btn-icon hide-mobile" @click="bgPicker=!bgPicker" title="Фон чата" aria-label="Фон чата">🖼</button>
+        <button class="btn-icon hide-mobile" @click="openDebug" title="Отладка LLM (что уходит в прокси)" aria-label="Отладка LLM (что уходит в прокси)">🐞</button>
+        <button v-if="isAdmin" class="btn-icon hide-mobile" @click="openAdmin" title="Администрирование" aria-label="Администрирование">🛡</button>
+        <button class="btn-icon" @click="drawerTab = drawerTab ? null : 'generation'" title="Настройки" aria-label="Настройки">⚙</button>
         <!-- На мобильном вторичные действия шапки прячем в это меню (⋯) -->
         <div class="header-menu-wrap only-mobile">
-          <button class="btn-icon" @click="headerMenu=!headerMenu" title="Ещё">⋯</button>
+          <button class="btn-icon" @click="headerMenu=!headerMenu" title="Ещё" aria-label="Ещё">⋯</button>
           <div v-if="headerMenu" class="plus-backdrop" @click="headerMenu=false"></div>
           <div v-if="headerMenu" class="plus-menu header-menu">
             <button v-if="sessionId" @click="openKnowledge(); headerMenu=false">📚 База знаний</button>
@@ -3064,9 +3198,10 @@ createApp({
       <div v-if="bgPicker" class="bg-picker">
         <div class="bg-row">
           <button v-for="b in bgPresets" :key="b.name" class="bg-swatch" :style="b.value ? {background:b.value} : {}"
-                  @click="setBackground(b.value)" :title="b.name">{{ b.value ? '' : '∅' }}</button>
+                  @click="setBackground(b.value)" :title="b.name" :aria-label="b.name">{{ b.value ? '' : '∅' }}</button>
           <label class="btn" style="margin:0;cursor:pointer">Загрузить фото
-            <input type="file" accept="image/*" style="display:none" @change="uploadBackground" />
+            <input type="file" accept="image/*" class="file-input" @change="uploadBackground"
+                   aria-label="Загрузить фотографию как фон чата" />
           </label>
         </div>
         <div v-if="chatImages.length" class="bg-row">
@@ -3075,8 +3210,34 @@ createApp({
         </div>
       </div>
 
-      <div class="messages" ref="messages" :style="chatBgStyle" @scroll="onMessagesScroll">
-        <div v-if="!sessionId" class="empty">Выберите или создайте персонажа и чат слева.</div>
+      <!-- Вежливый регион: скринридер узнаёт, что ход начался, закончился или упал.
+           Раньше незрячий пользователь отправлял сообщение и не получал НИКАКОГО
+           сигнала о том, что вообще происходит. -->
+      <div class="sr-only" role="status" aria-live="polite">{{ liveStatus }}</div>
+
+      <div class="messages" ref="messages" :style="chatBgStyle" @scroll="onMessagesScroll"
+           role="log" aria-label="Переписка">
+        <!-- Первый экран. Раньше здесь была одна бледная строка «выберите слева»,
+             которая на телефоне указывала туда, где ничего нет: сайдбар за ☰. -->
+        <div v-if="!sessionId" class="start">
+          <h2 class="start-title">С чего начнём?</h2>
+          <p class="start-lead">Диалог с персонажем, разговор нескольких персонажей сразу
+            или помощник без отыгрыша — всё это один и тот же чат.</p>
+          <div class="start-actions">
+            <button class="btn-primary" @click="startNewChat">Новый диалог</button>
+            <button @click="createCharacter">Создать персонажа</button>
+            <button v-if="characters.length > 1" @click="openGroupModal">Собрать группу</button>
+          </div>
+          <div class="start-recent" v-if="recentChats.length">
+            <span class="start-recent-head">Недавние диалоги</span>
+            <button v-for="s in recentChats" :key="'rc'+s.id" class="start-chat"
+                    @click="openRecent(s)" :aria-label="'Открыть чат ' + s.title">
+              <span class="grow">{{ s.title }}</span>
+              <span class="when" v-if="s.last_at">{{ shortWhen(s.last_at) }}</span>
+            </button>
+          </div>
+          <p class="start-hint only-mobile">Персонажи и все чаты — в меню ☰ вверху.</p>
+        </div>
         <!-- Индикатор подгрузки истории при скролле вверх -->
         <div v-if="sessionId && loadingOlder" class="load-older">⏳ Загружаю ранние сообщения…</div>
         <div v-else-if="sessionId && messages.length >= msgPageSize && noMoreMessages" class="load-older muted">— начало чата —</div>
@@ -3140,9 +3301,11 @@ createApp({
           <div class="msg-meta">
             <!-- свайпы только у ассистента и если их больше одного / это последний ответ -->
             <span v-if="m.role === 'assistant' && !m.canvas_id" class="swipes">
-              <button class="btn-icon" @click="swipe(m, -1)" :disabled="m.active_swipe === 0">◀</button>
+              <button class="btn-icon" @click="swipe(m, -1)" :disabled="m.active_swipe === 0"
+                      aria-label="Предыдущий вариант ответа">◀</button>
               {{ m.active_swipe + 1 }}/{{ (m.swipes || [m.content]).length }}
-              <button class="btn-icon" @click="swipe(m, 1)" :title="m.id === lastAssistantId ? 'Ещё вариант' : ''">▶</button>
+              <button class="btn-icon" @click="swipe(m, 1)" :title="m.id === lastAssistantId ? 'Ещё вариант' : ''"
+                      :aria-label="m.id === lastAssistantId ? 'Сгенерировать ещё вариант ответа' : 'Следующий вариант ответа'">▶</button>
             </span>
             <!-- Время: у user — когда отправил, у assistant — когда пришёл ответ (в поясе чата) -->
             <span v-if="m.created_at" class="tag msg-time" :title="fmtWhenFull(m.created_at)">🕒 {{ fmtWhen(m.created_at) }}</span>
@@ -3151,15 +3314,15 @@ createApp({
                  прокруткой на глаз неудобно — даём точный прыжок. -->
             <button v-if="(m.content || '').length > 800" class="btn-icon"
                     @click="scrollMessageStart(m.id)" title="К началу этого сообщения">⇞</button>
-            <button v-if="!m.canvas_id" class="btn-icon" @click="copyMessage(m)" title="Скопировать текст">📋</button>
+            <button v-if="!m.canvas_id" class="btn-icon" @click="copyMessage(m)" title="Скопировать текст" aria-label="Скопировать текст">📋</button>
             <template v-if="!m.canvas_id">
-              <button class="btn-icon" @click="replyTo(m)" title="Ответить на это сообщение">↩</button>
-              <button class="btn-icon" @click="startEdit(m)" title="Редактировать">✎</button>
-              <button v-if="m.role === 'assistant' && m.id === lastAssistantId" class="btn-icon" @click="regenerate" title="Перегенерировать">↻</button>
-              <button v-if="m.role === 'assistant' && m.id === lastAssistantId" class="btn-icon" @click="continueReply" title="Продолжить">⏩</button>
-              <button class="btn-icon" @click="artFromMessage(m)" title="Нарисовать по этому сообщению">🎨</button>
+              <button class="btn-icon" @click="replyTo(m)" title="Ответить на это сообщение" aria-label="Ответить на это сообщение">↩</button>
+              <button class="btn-icon" @click="startEdit(m)" title="Редактировать" aria-label="Редактировать">✎</button>
+              <button v-if="m.role === 'assistant' && m.id === lastAssistantId" class="btn-icon" @click="regenerate" title="Перегенерировать" aria-label="Перегенерировать">↻</button>
+              <button v-if="m.role === 'assistant' && m.id === lastAssistantId" class="btn-icon" @click="continueReply" title="Продолжить" aria-label="Продолжить">⏩</button>
+              <button class="btn-icon" @click="artFromMessage(m)" title="Нарисовать по этому сообщению" aria-label="Нарисовать по этому сообщению">🎨</button>
             </template>
-            <button class="btn-icon" @click="deleteMessage(m)" title="Удалить">🗑</button>
+            <button class="btn-icon" @click="deleteMessage(m)" title="Удалить" aria-label="Удалить">🗑</button>
           </div>
           </div><!-- /.msg-body -->
         </div>
@@ -3210,11 +3373,11 @@ createApp({
       <div class="chat-nav" v-if="sessionId && messages.length > 3 && awayFromBottom"
            :style="{ bottom: (composerH + 12) + 'px' }">
         <button class="btn-icon" @click="scrollToChatStart" :disabled="jumpBusy"
-                title="К началу чата (Home). Догрузит раннюю историю, если её ещё нет">
+                title="К началу чата (Home). Догрузит раннюю историю, если её ещё нет" aria-label="К началу чата (Home). Догрузит раннюю историю, если её ещё нет">
           {{ jumpBusy ? '⏳' : '⤒' }}</button>
-        <button class="btn-icon" @click="jumpMessage(-1)" title="Предыдущее сообщение (Alt+↑)">⌃</button>
-        <button class="btn-icon" @click="jumpMessage(1)" title="Следующее сообщение (Alt+↓)">⌄</button>
-        <button class="btn-icon accent" @click="scrollToBottom()" title="К последнему сообщению (End)">⤓</button>
+        <button class="btn-icon" @click="jumpMessage(-1)" title="Предыдущее сообщение (Alt+↑)" aria-label="Предыдущее сообщение (Alt+↑)">⌃</button>
+        <button class="btn-icon" @click="jumpMessage(1)" title="Следующее сообщение (Alt+↓)" aria-label="Следующее сообщение (Alt+↓)">⌄</button>
+        <button class="btn-icon accent" @click="scrollToBottom()" title="К последнему сообщению (End)" aria-label="К последнему сообщению (End)">⤓</button>
       </div>
 
       <div class="composer" v-if="sessionId">
@@ -3229,8 +3392,8 @@ createApp({
           <span class="dir-hint">🎬 Режиссёр: клик по имени — вызвать (порядок кликов = порядок ответов), «−» — исключить. Можно писать вручную: <code>+Хорхе −Джеми</code></span>
           <div class="dir-chips">
             <span v-for="m in currentGroup.members" :key="'d'+m.id" class="dir-chip">
-              <button class="dir-add" @click="dirInsert('+', m.name)" :title="'Вызвать ' + m.name">+ {{ m.name }}</button>
-              <button class="dir-ex" @click="dirInsert('-', m.name)" :title="'Исключить ' + m.name">−</button>
+              <button class="dir-add" @click="dirInsert('+', m.name)" :title="'Вызвать ' + m.name" :aria-label="'Вызвать ' + m.name">+ {{ m.name }}</button>
+              <button class="dir-ex" @click="dirInsert('-', m.name)" :title="'Исключить ' + m.name" :aria-label="'Исключить ' + m.name">−</button>
             </span>
           </div>
         </div>
@@ -3309,7 +3472,7 @@ createApp({
         <div class="row">
           <!-- [+] второстепенные действия: документ, арт -->
           <div class="plus-wrap">
-            <button class="btn-icon" :class="(artMode || canvasGenMode) ? 'rec-active' : ''" @click="plusMenu=!plusMenu" title="Ещё: документ, арт">➕</button>
+            <button class="btn-icon" :class="(artMode || canvasGenMode) ? 'rec-active' : ''" @click="plusMenu=!plusMenu" title="Ещё: документ, арт" aria-label="Ещё: документ, арт">➕</button>
             <div v-if="plusMenu" class="plus-backdrop" @click="plusMenu=false"></div>
             <div v-if="plusMenu" class="plus-menu">
               <button @click="canvasGenMode=true; artMode=false; plusMenu=false">📄 Создать документ/код (Canvas)</button>
@@ -3319,19 +3482,23 @@ createApp({
             </div>
           </div>
           <label class="btn-icon" style="margin:0; cursor:pointer" title="Прикрепить файл: фото, аудио, видео или документ (Word/PDF/текст)">
-            📎<input type="file" multiple accept="image/*,audio/*,video/*,.pdf,.doc,.docx,.odt,.rtf,.txt,.md,.csv" style="display:none" @change="onAttach" />
+            📎<input type="file" multiple accept="image/*,audio/*,video/*,.pdf,.doc,.docx,.odt,.rtf,.txt,.md,.csv"
+                   class="file-input" @change="onAttach"
+                   aria-label="Прикрепить файл к сообщению: фото, аудио, видео или документ" />
           </label>
           <!-- Голос — отдельной кнопкой: запись/стоп в один клик -->
           <button class="btn-icon" :class="recording ? 'rec-active' : ''" @click="toggleRecord"
-                  :title="recording ? 'Остановить запись' : 'Записать голос'">{{ recording ? '⏺ стоп' : '🎤' }}</button>
+                  :title="recording ? 'Остановить запись' : 'Записать голос'" :aria-label="recording ? 'Остановить запись' : 'Записать голос'">{{ recording ? '⏺ стоп' : '🎤' }}</button>
           <!-- Режиссёр (только в группе): панель кнопок «вызвать/исключить» -->
           <button v-if="currentIsGroup" class="btn-icon" :class="directorBar ? 'rec-active' : ''"
-                  @click="directorBar = !directorBar" title="Режиссёр: кто отвечает и в каком порядке">🎬</button>
+                  @click="directorBar = !directorBar" title="Режиссёр: кто отвечает и в каком порядке" aria-label="Режиссёр: кто отвечает и в каком порядке">🎬</button>
           <!-- Режим ассистента: держим у поля ввода, а не только в настройках —
                переключать его нужно ровно тогда, когда пишешь прикладную просьбу. -->
           <button class="btn-icon" :class="params.assistant_mode ? 'rec-active' : ''"
                   @click="toggleAssistantMode"
                   :title="params.assistant_mode
+                    ? 'Режим ассистента ВКЛЮЧЁН: персонаж не отыгрывает, а выполняет задачу. Нажмите, чтобы вернуть отыгрыш'
+                    : 'Режим ассистента: выполнять задачи без отыгрыша. Для одного сообщения можно просто написать ((текст))'" :aria-label="params.assistant_mode
                     ? 'Режим ассистента ВКЛЮЧЁН: персонаж не отыгрывает, а выполняет задачу. Нажмите, чтобы вернуть отыгрыш'
                     : 'Режим ассистента: выполнять задачи без отыгрыша. Для одного сообщения можно просто написать ((текст))'">🎓</button>
           <textarea ref="composer" v-model="input" rows="1" class="composer-input"
@@ -3349,28 +3516,28 @@ createApp({
     <!-- ===== Канвас: документ/код рядом с чатом (side-by-side, как в Gemini) ===== -->
     <div class="canvas-pane" v-if="canvasOpen && canvas">
       <div class="canvas-head">
-        <button class="btn-icon only-mobile" @click="mobilePane='chat'" title="К чату">💬</button>
+        <button class="btn-icon only-mobile" @click="mobilePane='chat'" title="К чату" aria-label="К чату">💬</button>
         <input v-model="canvas.title" class="canvas-title" @blur="saveCanvas" placeholder="Без названия" />
         <select v-model="canvas.kind" @change="saveCanvas" class="canvas-kind" title="Тип канваса">
           <option value="document">📄 документ</option>
           <option value="code">💻 код</option>
         </select>
-        <button class="btn-icon" @click="undoCanvas" :disabled="!canvas.can_undo || canvasBusy" title="Откатить к предыдущей версии">↩</button>
-        <button class="btn-icon" @click="exportCanvas('docx')" title="Экспорт в Word">📄</button>
-        <button class="btn-icon" @click="exportCanvas('pdf')" title="Экспорт в PDF">📑</button>
-        <button class="btn-icon" @click="closeCanvas" title="Закрыть канвас">✕</button>
+        <button class="btn-icon" @click="undoCanvas" :disabled="!canvas.can_undo || canvasBusy" title="Откатить к предыдущей версии" aria-label="Откатить к предыдущей версии">↩</button>
+        <button class="btn-icon" @click="exportCanvas('docx')" title="Экспорт в Word" aria-label="Экспорт в Word">📄</button>
+        <button class="btn-icon" @click="exportCanvas('pdf')" title="Экспорт в PDF" aria-label="Экспорт в PDF">📑</button>
+        <button class="btn-icon" @click="closeCanvas" title="Закрыть канвас" aria-label="Закрыть канвас">✕</button>
       </div>
 
       <!-- Единый тулбар: слева — контекстные действия (форматирование / копировать код),
            справа — переключатель «Редактор / Просмотр» (для веб-кода — live-результат). -->
       <div class="canvas-tabs">
         <template v-if="canvas.kind==='document' && canvasView==='edit'">
-          <button class="canvas-fmt" @click="wrapSelection('**','**')" title="Жирный"><b>B</b></button>
-          <button class="canvas-fmt" @click="wrapSelection('*','*')" title="Курсив"><i>I</i></button>
-          <button class="canvas-fmt" @click="wrapSelection('## ','')" title="Заголовок">H</button>
-          <button class="canvas-fmt" @click="wrapSelection('\`','\`')" title="Моноширинный">&lt;/&gt;</button>
+          <button class="canvas-fmt" @click="wrapSelection('**','**')" title="Жирный" aria-label="Жирный"><b>B</b></button>
+          <button class="canvas-fmt" @click="wrapSelection('*','*')" title="Курсив" aria-label="Курсив"><i>I</i></button>
+          <button class="canvas-fmt" @click="wrapSelection('## ','')" title="Заголовок" aria-label="Заголовок">H</button>
+          <button class="canvas-fmt" @click="wrapSelection('\`','\`')" title="Моноширинный" aria-label="Моноширинный">&lt;/&gt;</button>
         </template>
-        <button v-if="canvas.kind==='code'" class="canvas-fmt" @click="copyCanvas" :title="copied ? 'Скопировано' : 'Скопировать код'">{{ copied ? '✓ Скопировано' : '⧉ Скопировать код' }}</button>
+        <button v-if="canvas.kind==='code'" class="canvas-fmt" @click="copyCanvas" :title="copied ? 'Скопировано' : 'Скопировать код'" :aria-label="copied ? 'Скопировано' : 'Скопировать код'">{{ copied ? '✓ Скопировано' : '⧉ Скопировать код' }}</button>
         <div style="flex:1"></div>
         <button :class="{ active: canvasView==='edit' }" @click="canvasView='edit'">✎ {{ canvas.kind==='code' ? 'Код' : 'Редактор' }}</button>
         <button :class="{ active: canvasView==='preview' }" @click="canvasView='preview'">{{ canvasIsWeb ? '▶ Превью' : '👁 Просмотр' }}</button>
@@ -3399,7 +3566,7 @@ createApp({
 
     <!-- ===== Правый drawer: настройки (выезжающий оверлей) ===== -->
     <div v-if="drawerTab" class="drawer-backdrop" @click="drawerTab=null"></div>
-    <div class="drawer" v-if="drawerTab">
+    <div class="drawer" v-if="drawerTab" role="dialog" aria-modal="true" aria-label="Настройки">
       <div class="tabs">
         <button :class="['tab-btn', drawerTab==='generation'?'active':'']" @click="drawerTab='generation'">Генерация</button>
         <button v-if="isAdmin" :class="['tab-btn', drawerTab==='connection'?'active':'']" @click="drawerTab='connection'">Подключение</button>
@@ -3407,7 +3574,7 @@ createApp({
         <button :class="['tab-btn', drawerTab==='memory'?'active':'']" @click="drawerTab='memory'">Память</button>
         <button :class="['tab-btn', drawerTab==='persona'?'active':'']" @click="drawerTab='persona'">Персона</button>
         <div style="flex:1"></div>
-        <button class="tab-btn" @click="drawerTab=null" title="Закрыть">✕</button>
+        <button class="tab-btn" @click="drawerTab=null" title="Закрыть" aria-label="Закрыть">✕</button>
       </div>
       <div class="body">
 
@@ -3432,8 +3599,8 @@ createApp({
           <div class="row" style="gap:6px; margin:0 0 6px; flex-wrap:wrap">
             <button v-for="m in economyModes" :key="m.id"
                     :class="isEconomyMode(m) ? 'btn-primary' : ''"
-                    :title="m.hint" @click="applyEconomyMode(m)">{{ m.label }}</button>
-            <button @click="usageOpen = true; loadUsage()" title="Сколько токенов реально потрачено">📊 Расход</button>
+                    :title="m.hint" @click="applyEconomyMode(m)" :aria-label="m.hint">{{ m.label }}</button>
+            <button @click="usageOpen = true; loadUsage()" title="Сколько токенов реально потрачено" aria-label="Сколько токенов реально потрачено">📊 Расход</button>
           </div>
 
           <label>🧠 Окно контекста — память диалога (токенов) <span class="range-val">{{ params.context_tokens >= 1000000 ? '1 млн (максимум)' : params.context_tokens }}</span>
@@ -3568,8 +3735,8 @@ createApp({
             <div class="row-between"><b>{{ p.is_default ? '⭐ ' : '' }}{{ p.name }}</b>
               <span>
                 <button @click="applyPreset(p)">Применить</button>
-                <button @click="setDefaultPreset(p)" :title="'Сделать по умолчанию'">⭐</button>
-                <button class="btn-danger" @click="deletePreset(p)">🗑</button>
+                <button @click="setDefaultPreset(p)" :title="'Сделать по умолчанию'" :aria-label="'Сделать по умолчанию'">⭐</button>
+                <button class="btn-danger" @click="deletePreset(p)" :aria-label="'Удалить пресет ' + p.name">🗑</button>
               </span></div>
           </div>
         </div>
@@ -3614,7 +3781,8 @@ createApp({
             <div class="row" style="margin-bottom:10px">
               <img v-if="charEdit.avatar_path" :src="charEdit.avatar_path" class="avatar" style="width:48px;height:48px" />
               <label class="btn" style="margin:0; cursor:pointer">Загрузить файл
-                <input type="file" accept="image/*" style="display:none" @change="onAvatarFile" />
+                <input type="file" accept="image/*" class="file-input" @change="onAvatarFile"
+                       aria-label="Загрузить аватар персонажа" />
               </label>
               <button v-if="charEdit.avatar_path" class="btn-danger" @click="charEdit.avatar_path=''; saveCharacter()">убрать</button>
             </div>
@@ -3691,8 +3859,8 @@ createApp({
               <span style="display:inline-flex; align-items:center; gap:4px">
                 <span class="scope-tag" :class="h.session_id ? 'session' : (h.character_id ? 'character' : 'global')">{{ h.session_id ? '💬 чат' : (h.character_id ? '🎭 перс.' : '🌐 глоб.') }}</span>
                 <span class="tag">{{ h.always_on ? 'always' : ((h.keywords || []).join(',') || h.category) }}</span>
-                <button class="btn-icon" @click="editHorae(h)">✎</button>
-                <button class="btn-danger" @click="deleteHorae(h)">🗑</button>
+                <button class="btn-icon" @click="editHorae(h)" :aria-label="'Изменить запись памяти: ' + (h.title || h.category)">✎</button>
+                <button class="btn-danger" @click="deleteHorae(h)" :aria-label="'Удалить запись памяти: ' + (h.title || h.category)">🗑</button>
               </span>
             </div>
             <div class="muted">{{ h.content }}</div>
@@ -3714,7 +3882,8 @@ createApp({
             <div class="row" style="margin-top:6px">
               <img v-if="personaNew.avatar_path" :src="personaNew.avatar_path" class="avatar" style="width:40px;height:40px" />
               <label class="btn" style="margin:0;cursor:pointer">Внешность (фото)
-                <input type="file" accept="image/*" style="display:none" @change="onPersonaAvatar" />
+                <input type="file" accept="image/*" class="file-input" @change="onPersonaAvatar"
+                       aria-label="Загрузить фотографию персоны" />
               </label>
             </div>
             <button class="btn-primary" @click="createPersona" style="margin-top:6px">Создать персону</button>
@@ -3722,7 +3891,7 @@ createApp({
           <div class="card" v-for="p in personas" :key="p.id">
             <div class="row-between">
               <span class="row" style="gap:8px"><img v-if="p.avatar_path" :src="p.avatar_path" class="avatar" /><b>{{ p.name }}</b></span>
-              <button class="btn-danger" @click="deletePersona(p)">🗑</button>
+              <button class="btn-danger" @click="deletePersona(p)" :aria-label="'Удалить персону ' + p.name">🗑</button>
             </div>
             <div class="muted">{{ p.description }}</div>
           </div>
@@ -3749,7 +3918,7 @@ createApp({
             <div class="card" v-for="f in friends" :key="'fr'+f.id">
               <div class="row-between">
                 <b>👥 {{ f.username }}</b>
-                <button class="btn-danger" @click="removeFriend(f)" title="Удалить из друзей">Удалить</button>
+                <button class="btn-danger" @click="removeFriend(f)" title="Удалить из друзей" aria-label="Удалить из друзей">Удалить</button>
               </div>
             </div>
             <p class="muted" style="margin-top:8px">Делиться чатом: откройте чат в списке слева и нажмите 🔗 — друг увидит его в разделе «Доступные мне». Так же делятся и групповые чаты.</p>
@@ -3778,10 +3947,10 @@ createApp({
 
   <!-- ===== Админ-модалка ===== -->
   <div v-if="adminOpen" class="modal-backdrop" @click.self="adminOpen=false">
-    <div class="modal">
+    <div class="modal" role="dialog" aria-modal="true" aria-label="Администрирование">
       <div class="row-between" style="margin-bottom:10px">
         <h3 style="margin:0">Администрирование</h3>
-        <button class="btn-icon" @click="adminOpen=false">✕</button>
+        <button class="btn-icon" @click="adminOpen=false" aria-label="Закрыть администрирование">✕</button>
       </div>
 
       <!-- Запрос пароля администратора -->
@@ -3869,9 +4038,9 @@ createApp({
               <span>{{ u.username }} <span class="tag">{{ u.role }}</span>
                 <span v-if="u.telegram_id" class="muted">tg:{{ u.telegram_id }}</span></span>
               <span>
-                <button v-if="u.role!=='admin'" @click="setUserRole(u,'admin')" title="Сделать админом">⬆ админ</button>
-                <button v-else @click="setUserRole(u,'user')" title="Снять админа">⬇ юзер</button>
-                <button class="btn-danger" @click="deleteUser(u)">🗑</button>
+                <button v-if="u.role!=='admin'" @click="setUserRole(u,'admin')" title="Сделать админом" aria-label="Сделать админом">⬆ админ</button>
+                <button v-else @click="setUserRole(u,'user')" title="Снять админа" aria-label="Снять админа">⬇ юзер</button>
+                <button class="btn-danger" @click="deleteUser(u)" :aria-label="'Удалить пользователя ' + u.username">🗑</button>
               </span>
             </div>
           </div>
@@ -3882,16 +4051,17 @@ createApp({
 
   <!-- ===== Модалка «База знаний чата» ===== -->
   <div v-if="kbOpen" class="modal-backdrop" @click.self="kbOpen=false">
-    <div class="modal" style="width:460px">
+    <div class="modal" style="width:460px" role="dialog" aria-modal="true" aria-label="База знаний чата">
       <div class="row-between" style="margin-bottom:10px">
         <h3 style="margin:0">📚 База знаний чата</h3>
-        <button class="btn-icon" @click="kbOpen=false">✕</button>
+        <button class="btn-icon" @click="kbOpen=false" aria-label="Закрыть базу знаний">✕</button>
       </div>
       <p class="muted" style="margin-top:0">Файлы, которые персонажи учитывают в КАЖДОМ ответе (в личном и групповом чате). Документы (PDF, Word, txt) читаются как текст; картинки/аудио/видео прикладываются целиком. Добавляйте при создании чата и в любой момент.</p>
       <div class="row" style="margin:8px 0">
         <label class="btn-primary" style="margin:0; cursor:pointer">
           {{ kbUploading ? '⏳ Загрузка…' : '➕ Добавить файлы' }}
-          <input type="file" multiple style="display:none" :disabled="kbUploading"
+          <input type="file" multiple class="file-input" :disabled="kbUploading"
+                 aria-label="Добавить файлы в базу знаний чата"
                  accept="image/*,audio/*,video/*,.pdf,.doc,.docx,.odt,.rtf,.txt,.md,.csv" @change="onKnowledgeFiles" />
         </label>
       </div>
@@ -3903,7 +4073,7 @@ createApp({
             <span class="grow" style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap" :title="f.name">{{ f.name }}</span>
             <span v-if="f.has_text" class="tag" title="Документ прочитан как текст">текст</span>
           </span>
-          <button class="btn-danger" @click="deleteKnowledge(f)" title="Удалить из базы знаний">🗑</button>
+          <button class="btn-danger" @click="deleteKnowledge(f)" title="Удалить из базы знаний" aria-label="Удалить из базы знаний">🗑</button>
         </div>
       </div>
     </div>
@@ -3911,10 +4081,10 @@ createApp({
 
   <!-- ===== Модалка участников (добавить/убрать, чат→группа) ===== -->
   <div v-if="membersOpen" class="modal-backdrop" @click.self="membersOpen=false">
-    <div class="modal" style="width:440px">
+    <div class="modal" style="width:440px" role="dialog" aria-modal="true" aria-label="Участники группы">
       <div class="row-between" style="margin-bottom:10px">
         <h3 style="margin:0">{{ currentIsGroup ? 'Участники группы' : 'Добавить персонажа' }}</h3>
-        <button class="btn-icon" @click="membersOpen=false">✕</button>
+        <button class="btn-icon" @click="membersOpen=false" aria-label="Закрыть участников">✕</button>
       </div>
       <p v-if="!currentIsGroup" class="muted" style="margin-top:0">Добавив персонажа, вы превратите этот чат в групповой. Ведущий персонаж останется в группе.</p>
 
@@ -3927,7 +4097,7 @@ createApp({
               <span class="member-ava"><img v-if="m.avatar_path" :src="m.avatar_path" /><span v-else>{{ (m.name||'?').charAt(0) }}</span></span>
               <b>{{ m.name }}</b>
             </span>
-            <button class="btn-danger" :disabled="currentGroup.members.length <= 1" @click="removeMember(m)" title="Убрать из группы">Убрать</button>
+            <button class="btn-danger" :disabled="currentGroup.members.length <= 1" @click="removeMember(m)" title="Убрать из группы" aria-label="Убрать из группы">Убрать</button>
           </div>
         </div>
         <div class="hr"></div>
@@ -3949,10 +4119,10 @@ createApp({
 
   <!-- ===== Модалка создания группового чата ===== -->
   <div v-if="groupModal" class="modal-backdrop" @click.self="groupModal=false">
-    <div class="modal">
+    <div class="modal" role="dialog" aria-modal="true" aria-label="Создание группы">
       <div class="row-between" style="margin-bottom:10px">
         <h3 style="margin:0">Новый групповой чат</h3>
-        <button class="btn-icon" @click="groupModal=false">✕</button>
+        <button class="btn-icon" @click="groupModal=false" aria-label="Закрыть создание группы">✕</button>
       </div>
       <label>Название<input v-model="groupName" /></label>
       <label>Сцена / сеттинг (детально влияет на ролевую — общая обстановка для всех)
@@ -3985,10 +4155,10 @@ createApp({
   <!-- ===== Профиль / привязка Telegram ===== -->
   <!-- ===== Модалка приглашения друзей в чат ===== -->
   <div v-if="inviteOpen" class="modal-backdrop" @click.self="inviteOpen=false">
-    <div class="modal" style="width:420px">
+    <div class="modal" style="width:420px" role="dialog" aria-modal="true" aria-label="Приглашение в чат">
       <div class="row-between" style="margin-bottom:12px">
         <h3 style="margin:0">Пригласить в чат</h3>
-        <button class="btn-icon" @click="inviteOpen=false">✕</button>
+        <button class="btn-icon" @click="inviteOpen=false" aria-label="Закрыть приглашение">✕</button>
       </div>
       <div v-if="!friends.length" class="empty-state">
         <div class="empty-icon">🫂</div>
@@ -4013,10 +4183,10 @@ createApp({
   </div>
 
   <div v-if="profileOpen" class="modal-backdrop" @click.self="profileOpen=false">
-    <div class="modal">
+    <div class="modal" role="dialog" aria-modal="true" aria-label="Профиль">
       <div class="row-between" style="margin-bottom:10px">
         <h3 style="margin:0">Профиль</h3>
-        <button class="btn-icon" @click="profileOpen=false">✕</button>
+        <button class="btn-icon" @click="profileOpen=false" aria-label="Закрыть профиль">✕</button>
       </div>
       <p>Аккаунт: <b>{{ currentUserObj && currentUserObj.username }}</b>
         <span class="tag">{{ currentUserObj && currentUserObj.role }}</span></p>
@@ -4037,10 +4207,10 @@ createApp({
 
   <!-- ===== Отладочный лог LLM ===== -->
   <div v-if="debugOpen" class="modal-backdrop" @click.self="closeDebug">
-    <div class="modal" style="width:640px">
+    <div class="modal" style="width:640px" role="dialog" aria-modal="true" aria-label="Отладка LLM">
       <div class="row-between" style="margin-bottom:8px">
         <h3 style="margin:0">🐞 Отладка LLM</h3>
-        <span><button @click="clearDebug">Очистить</button> <button class="btn-icon" @click="closeDebug">✕</button></span>
+        <span><button @click="clearDebug">Очистить</button> <button class="btn-icon" @click="closeDebug" aria-label="Закрыть отладку">✕</button></span>
       </div>
       <p class="muted">Последние запросы к прокси: модель, что отправлено и что вернулось. Обновляется автоматически.</p>
       <p v-if="!debugEntries.length" class="muted">Пока пусто — отправьте сообщение или сгенерируйте арт.</p>
@@ -4068,10 +4238,10 @@ createApp({
 
   <!-- ===== Расход токенов ===== -->
   <div v-if="usageOpen" class="modal-backdrop" @click.self="usageOpen=false">
-    <div class="modal" style="width:640px">
+    <div class="modal" style="width:640px" role="dialog" aria-modal="true" aria-label="Расход токенов">
       <div class="row-between" style="margin-bottom:8px">
         <h3 style="margin:0">📊 Расход токенов</h3>
-        <span><button @click="loadUsage">Обновить</button> <button class="btn-icon" @click="usageOpen=false">✕</button></span>
+        <span><button @click="loadUsage">Обновить</button> <button class="btn-icon" @click="usageOpen=false" aria-label="Закрыть отчёт о расходе">✕</button></span>
       </div>
       <p class="muted">Сколько токенов реально ушло провайдеру за последние 7 дней. <b>Вход</b> — весь контекст, который мы отправили; <b>из кэша</b> — та его часть, что стоила в разы дешевле; <b>ответ</b> и <b>размышления</b> — вывод, самый дорогой вид токенов.</p>
       <p v-if="!usage" class="muted">Загрузка…</p>
@@ -4116,7 +4286,7 @@ createApp({
 
   <!-- ===== Диалог (подтверждение/ввод) вместо браузерных confirm/prompt ===== -->
   <div v-if="dialog" class="modal-backdrop" @click.self="dialogCancel" @keydown.esc="dialogCancel">
-    <div class="modal dialog-modal">
+    <div class="modal dialog-modal" role="dialog" aria-modal="true">
       <h3>{{ dialog.title }}</h3>
       <p v-if="dialog.message" class="dialog-msg">{{ dialog.message }}</p>
       <input v-if="dialog.mode==='prompt'" ref="dialogInput" v-model="dialog.value"
@@ -4136,20 +4306,20 @@ createApp({
   <div v-if="canvasOpen && canvas && canvasSelText && toolbarPos" class="canvas-toolbar"
        :style="{ top: toolbarPos.top + 'px', left: toolbarPos.left + 'px' }" @mousedown.prevent>
     <template v-if="canvas.kind==='code'">
-      <button @click="quickAction('Добавь подробные комментарии, объясняющие, что делает код.')" :disabled="canvasBusy" title="Комментарии">💬</button>
-      <button @click="quickAction('Найди и исправь баги в этом фрагменте.')" :disabled="canvasBusy" title="Найти баги">🐞</button>
-      <button @click="quickAction('Сделай ревью: улучши читаемость и структуру, не меняя поведение.')" :disabled="canvasBusy" title="Ревью">🔍</button>
-      <button @click="translateCode" :disabled="canvasBusy" title="Перевести на другой язык">🔁</button>
+      <button @click="quickAction('Добавь подробные комментарии, объясняющие, что делает код.')" :disabled="canvasBusy" title="Комментарии" aria-label="Комментарии">💬</button>
+      <button @click="quickAction('Найди и исправь баги в этом фрагменте.')" :disabled="canvasBusy" title="Найти баги" aria-label="Найти баги">🐞</button>
+      <button @click="quickAction('Сделай ревью: улучши читаемость и структуру, не меняя поведение.')" :disabled="canvasBusy" title="Ревью" aria-label="Ревью">🔍</button>
+      <button @click="translateCode" :disabled="canvasBusy" title="Перевести на другой язык" aria-label="Перевести на другой язык">🔁</button>
     </template>
     <template v-else>
-      <button @click="quickAction('Сократи примерно вдвое, сохранив суть.')" :disabled="canvasBusy" title="Короче">↧</button>
-      <button @click="quickAction('Расширь, добавь деталей и примеров.')" :disabled="canvasBusy" title="Подробнее">↥</button>
-      <button @click="quickAction('Перепиши в строгом профессиональном тоне.')" :disabled="canvasBusy" title="Строже">🎩</button>
-      <button @click="quickAction('Перепиши простым языком, понятно для новичка.')" :disabled="canvasBusy" title="Проще">🙂</button>
-      <button @click="quickAction('Исправь грамматику, орфографию и пунктуацию, не меняя стиль.')" :disabled="canvasBusy" title="Грамматика">✓</button>
+      <button @click="quickAction('Сократи примерно вдвое, сохранив суть.')" :disabled="canvasBusy" title="Короче" aria-label="Короче">↧</button>
+      <button @click="quickAction('Расширь, добавь деталей и примеров.')" :disabled="canvasBusy" title="Подробнее" aria-label="Подробнее">↥</button>
+      <button @click="quickAction('Перепиши в строгом профессиональном тоне.')" :disabled="canvasBusy" title="Строже" aria-label="Строже">🎩</button>
+      <button @click="quickAction('Перепиши простым языком, понятно для новичка.')" :disabled="canvasBusy" title="Проще" aria-label="Проще">🙂</button>
+      <button @click="quickAction('Исправь грамматику, орфографию и пунктуацию, не меняя стиль.')" :disabled="canvasBusy" title="Грамматика" aria-label="Грамматика">✓</button>
     </template>
     <span class="ct-sep"></span>
-    <button @click="focusCanvasAi" :disabled="canvasBusy" title="Своя команда для выделенного">✨</button>
+    <button @click="focusCanvasAi" :disabled="canvasBusy" title="Своя команда для выделенного" aria-label="Своя команда для выделенного">✨</button>
   </div>
   </template>
   `,
