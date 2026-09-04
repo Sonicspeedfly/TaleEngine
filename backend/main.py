@@ -804,8 +804,45 @@ async def _session_previews(db, ids: list[int]) -> dict[int, dict]:
             "preview": text[:120],
             "last_at": _iso_utc(msg.created_at) if msg else None,
             "messages": count,
+            # id последнего сообщения — ключ сортировки по активности (см.
+            # _sort_by_activity). Отдаём его и клиенту: он монотонный и позволяет
+            # отличить «чат обновился» без разбора дат.
+            "last_id": last_id,
         }
     return out
+
+
+def _sort_by_activity(rows: list, previews: dict[int, dict]) -> list:
+    """
+    Порядок списка чатов: закреплённые наверх, остальные — по ПОСЛЕДНЕЙ АКТИВНОСТИ.
+
+    Раньше сортировка шла по ChatSession.id (дате создания), а в строке списка
+    показывалось время последней реплики. Столбец, по которому пользователь ищет
+    глазами, не совпадал с порядком строк: чат, где писали час назад, но который
+    создан полгода назад, лежал под десятком пустых брошенных чатов.
+
+    Считаем в Python, а не в SQL: _session_previews уже достал max(Message.id)
+    на весь список двумя запросами, и пересобирать основной запрос в join с
+    подзапросом (мимо accounts.scope_query) ради того же результата — лишний риск.
+    """
+    def key(s):
+        p = previews.get(s.id) or {}
+        # pinned_at сводим к числу, а не сравниваем как даты: если в базе окажется
+        # смещённое значение рядом с наивным, сравнение дат бросит TypeError и
+        # список чатов перестанет открываться вовсе. Число не бросает никогда.
+        pinned_rank = s.pinned_at.timestamp() if s.pinned_at else 0.0
+        return (
+            # 1. Закреплённые выше всех.
+            1 if s.pinned_at else 0,
+            # 2. Между закреплёнными — по времени закрепления, свежие выше.
+            pinned_rank,
+            # 3. Внутри группы — по последнему сообщению. У пустого чата
+            #    сообщений нет, и он честно опускается вниз своей группы.
+            p.get("last_id") or 0,
+            # 4. Ничья (оба пустые) — по id, новый выше.
+            s.id,
+        )
+    return sorted(rows, key=key, reverse=True)
 
 
 @app.get("/api/sessions")
@@ -831,6 +868,7 @@ async def list_sessions(
     q = accounts.scope_query(q, models.ChatSession, user)
     rows = (await db.execute(q)).scalars().all()
     previews = await _session_previews(db, [s.id for s in rows])
+    rows = _sort_by_activity(rows, previews)
     return [
         {
             "id": s.id,
@@ -1071,6 +1109,7 @@ async def list_groups(user=Depends(current_user), db: AsyncSession = Depends(get
     q = accounts.scope_query(q, models.ChatSession, user)
     rows = (await db.execute(q)).scalars().all()
     previews = await _session_previews(db, [s.id for s in rows])
+    rows = _sort_by_activity(rows, previews)
     result = []
     for s in rows:
         members = await group_chat.load_members(db, s.id)
@@ -1082,6 +1121,12 @@ async def list_groups(user=Depends(current_user), db: AsyncSession = Depends(get
                 "scenario": s.scenario,
                 "timezone": s.timezone or "",
                 "pinned": s.pinned_at is not None,
+                # Метаданные сессии — те же поля, что у личных чатов. Без них клиент
+                # открывал группу как {id} и считал заметку автора пустой, после чего
+                # первое же изменение на вкладке «Персона» стирало её в базе.
+                "author_note": s.author_note,
+                "persona_id": s.persona_id,
+                "background": s.background,
                 **previews.get(s.id, {"preview": "", "last_at": None, "messages": 0}),
                 # avatar_path нужен для аватарок реплик в групповом чате.
                 "members": [

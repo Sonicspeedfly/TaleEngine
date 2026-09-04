@@ -944,21 +944,29 @@ createApp({
       await this.loadSessions();
       this.openSession({ id: r.session_id });
     },
+    // Найти полную карточку чата по id в уже загруженных списках.
+    // openSession зовут из восьми мест, и половина передаёт голый {id}
+    // (импорт, шаринг, превращение чата в группу, восстановление после F5).
+    // Без этого дровер показывал бы пустые метаданные вместо настоящих.
+    _sessionCard(id) {
+      return this.sessions.find((x) => x.id === id)
+        || this.groups.find((x) => x.id === id)
+        || this.sharedSessions.find((x) => x.id === id)
+        || null;
+    },
     async openSession(s) {
       if (s.id === this.sessionId && !this.sharedView) return; // уже открыт
       this._handoffStreaming();  // текущую генерацию (если есть) доигрываем в фоне
       this.sharedView = null;   // это мой собственный чат, а не «чужой»
       this.sessionId = s.id;
       this._clearPending(s.id); // открыли чат — снимаем метку «пришёл ответ»
-      this.authorNote = s.author_note || "";
-      this.sessionPersonaId = s.persona_id || null;
-      this.sessionBg = s.background || "";
-      // Часовой пояс чата: из сессии; для групп (открываются как {id}) — из списка групп.
-      this.sessionTimezone = s.timezone || "";
-      if (!this.sessionTimezone) {
-        const g = this.groups.find((x) => x.id === s.id);
-        this.sessionTimezone = (g && g.timezone) || "";
-      }
+      // Метаданные берём из переданного объекта, а недостающее дотягиваем из
+      // списков: переданный {id} не должен выглядеть как «у чата всё пусто».
+      const card = ("author_note" in s) ? s : (this._sessionCard(s.id) || s);
+      this.authorNote = card.author_note || "";
+      this.sessionPersonaId = card.persona_id || null;
+      this.sessionBg = card.background || "";
+      this.sessionTimezone = card.timezone || "";
       // Пояс ещё не задан — определяем по браузеру и сохраняем за этим чатом.
       // Пользователь может сменить его во вкладке «Персона» (настройка на чат).
       if (!this.sessionTimezone) this._autoTimezone();
@@ -985,7 +993,7 @@ createApp({
       // Группа: открываем по id из списка групп.
       if (saved.isGroup) {
         const g = this.groups.find((x) => x.id === saved.sessionId);
-        if (g) { await this.openSession({ id: g.id }); return true; }
+        if (g) { await this.openSession(g); return true; }
       }
       // Обычный чат: выбираем персонажа и открываем именно этот чат.
       if (saved.characterId) {
@@ -1066,7 +1074,7 @@ createApp({
       const s = this.sessions.find((x) => x.id === sid);
       if (s) return this.openSession(s);
       const g = this.groups.find((x) => x.id === sid);
-      if (g) return this.openSession({ id: g.id });
+      if (g) return this.openSession(g);
       const sh = this.sharedSessions.find((x) => x.id === sid);
       if (sh) return this.openSharedSession(sh);
       return this.openSession({ id: sid }); // запасной вариант: хотя бы покажем сообщения
@@ -2420,15 +2428,29 @@ createApp({
       e.target.value = "";
     },
     async deletePersona(p) { await this.api("/personas/" + p.id, { method: "DELETE" }); await this.loadPersonas(); },
-    async applySessionMeta() {
+    // Сохранить метаданные чата — ТОЛЬКО те поля, которые пользователь трогал.
+    //
+    // Раньше метод слал все три поля разом, и это молча стирало данные: группа
+    // открывается как {id}, метаданных в объекте нет, поэтому authorNote получал
+    // пустую строку, и первое же изменение часового пояса записывало эту пустоту
+    // в базу. Сервер делает model_dump(exclude_none=True), то есть null он
+    // отбрасывает, а пустую СТРОКУ записывает — страдали author_note и timezone.
+    //
+    // fields приходит из шаблона как объектный литерал. Явная проверка нужна
+    // потому, что @change="applySessionMeta" передал бы сюда Event, и его поля
+    // ушли бы в PATCH.
+    async applySessionMeta(fields) {
       if (!this.sessionId) return;
+      const ok = fields && typeof fields === "object" && !(fields instanceof Event);
+      if (!ok) return;
+      const payload = {};
+      for (const [k, v] of Object.entries(fields)) {
+        if (v !== undefined) payload[k] = v;
+      }
+      if (!Object.keys(payload).length) return;
       await this.api("/sessions/" + this.sessionId, {
         method: "PATCH",
-        body: JSON.stringify({
-          author_note: this.authorNote,
-          persona_id: this.sessionPersonaId,
-          timezone: this.sessionTimezone || "",
-        }),
+        body: JSON.stringify(payload),
       });
     },
 
@@ -2938,7 +2960,7 @@ createApp({
           <div v-for="g in groups" :key="g.id"
                :class="['list-item', g.id === sessionId ? 'active' : '']"
                :title="g.title + ' — чат #' + g.id"
-               @click="openSession({ id: g.id })">
+               @click="openSession(g)">
             <span v-if="pendingChats.includes(g.id)" class="reply-dot" title="Пришёл новый ответ"></span>
             <div class="grow">{{ g.title }}
               <span class="muted">{{ g.members.map(m => m.name).join(', ') }}</span>
@@ -3681,7 +3703,7 @@ createApp({
         <div v-if="drawerTab==='persona'">
           <h3>Персона пользователя</h3>
           <label>Активная персона в этом чате
-            <select v-model="sessionPersonaId" @change="applySessionMeta">
+            <select v-model="sessionPersonaId" @change="applySessionMeta({ persona_id: sessionPersonaId })">
               <option :value="null">— нет —</option>
               <option v-for="p in personas" :key="p.id" :value="p.id">{{ p.name }}</option>
             </select>
@@ -3737,17 +3759,17 @@ createApp({
           <h3>Часовой пояс этого чата 🕒</h3>
           <p class="muted">Нейросеть видит ваше текущее время (утро/ночь, день недели) и метки времени сообщений показываются в этом поясе. Настройка сохраняется для каждого чата отдельно; по умолчанию берётся из браузера.</p>
           <label>Часовой пояс
-            <input v-model="sessionTimezone" list="tz-list" placeholder="например Europe/Moscow" @change="applySessionMeta" />
+            <input v-model="sessionTimezone" list="tz-list" placeholder="например Europe/Moscow" @change="applySessionMeta({ timezone: sessionTimezone })" />
             <datalist id="tz-list"><option v-for="tz in tzOptions" :key="tz" :value="tz"></option></datalist>
           </label>
           <div class="row">
-            <button @click="_autoTimezone(); applySessionMeta()">📍 Определить по браузеру</button>
+            <button @click="_autoTimezone(); applySessionMeta({ timezone: sessionTimezone })">📍 Определить по браузеру</button>
           </div>
 
           <div class="hr"></div>
           <h3>Заметка автора (Author's Note)</h3>
           <p class="muted">Подмешивается у самого конца контекста — сильно влияет на ответ.</p>
-          <textarea v-model="authorNote" rows="3" @blur="applySessionMeta" placeholder="например: Пиши от третьего лица, держи мрачный тон."></textarea>
+          <textarea v-model="authorNote" rows="3" @blur="applySessionMeta({ author_note: authorNote })" placeholder="например: Пиши от третьего лица, держи мрачный тон."></textarea>
         </div>
 
       </div>
