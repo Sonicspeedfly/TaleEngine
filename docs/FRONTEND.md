@@ -4,6 +4,14 @@
 markdown-it и DOMPurify, затем `app.js`. Сервер раздаёт всё это как статику.
 Node.js, npm и шаг компиляции не нужны.
 
+**Локальные копии вместо CDN.** Если в `frontend/vendor/` лежит файл с тем же
+именем, что в адресе CDN (`vue.global.prod.js`, `markdown-it.min.js`,
+`purify.min.js`, `katex.min.js`/`.css`, `lame.min.js`), `serve_index` в `main.py`
+отдаёт страницу с `/vendor/<имя>` и перечисляет копии в
+`<meta name="tale-vendor">`; по этому списку `vendorUrl()` в `app.js` подменяет
+и то, что грузится по надобности (KaTeX, lamejs). Папка в `.gitignore` — у
+каждого сервера своя; править `index.html`/`app.js` на сервере не нужно.
+
 ## Файлы
 
 - **`index.html`** — точка входа: подключает зависимости (CDN), монтирует приложение,

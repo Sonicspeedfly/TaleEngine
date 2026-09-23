@@ -40,6 +40,21 @@ function sortChats(rows) {
     || (b.id || 0) - (a.id || 0));
 }
 
+// Локальная копия библиотеки вместо CDN. Сервер перечисляет файлы из
+// frontend/vendor/ в <meta name="tale-vendor"> (см. serve_index в main.py) и сам
+// подменяет адреса в index.html; здесь то же для того, что app.js грузит по
+// надобности (KaTeX, lamejs). Раньше ради этого app.js правили прямо на
+// сервере, и каждый git pull упирался в правку. Список читается один раз.
+let vendorFiles = null;
+function vendorUrl(url) {
+  if (vendorFiles === null) {
+    const meta = document.querySelector('meta[name="tale-vendor"]');
+    vendorFiles = new Set(((meta && meta.content) || "").split(",").filter(Boolean));
+  }
+  const name = url.split("/").pop();
+  return vendorFiles.has(name) ? "/vendor/" + name : url;
+}
+
 // Событие «список чатов изменился». Шлют его все мутации (создание, удаление,
 // переименование, закреп, новая реплика), слушает одно место в mounted, которое
 // перечитывает список — сайдбар больше не ждёт F5.
@@ -765,7 +780,8 @@ createApp({
     _loadOnce(key, urls) {
       this._loading = this._loading || {};
       if (this._loading[key]) return this._loading[key];
-      this._loading[key] = Promise.all(urls.map((url) => new Promise((resolve, reject) => {
+      this._loading[key] = Promise.all(urls.map((cdn) => new Promise((resolve, reject) => {
+        const url = vendorUrl(cdn);
         let el;
         if (url.endsWith(".css")) {
           el = document.createElement("link");
