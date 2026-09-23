@@ -54,7 +54,20 @@ ISO-строкой с «Z» — у user-сообщения это время о�
 ### `horae_entries` — `HoraeEntry`
 Запись памяти Horae. `session_id` (NULL = глобальный лор) и/или `character_id`
 (лорбук из карточки). Поля: `category`, `title`, `content`, `keywords` (JSON),
-`always_on` (подмешивать всегда), `enabled`, `priority`. См. [HORAE.md](HORAE.md).
+`always_on` (подмешивать всегда), `enabled`, `priority`, `meta` (JSON, служебное:
+у авто-сводки — `last_message_id`, указатель «учтено до»). См. [HORAE.md](HORAE.md).
+
+### `horae_facts` — `HoraeFact`
+Атомарный факт долговременной памяти чата (слой 3 Horae, `backend/horae_recall.py`).
+Извлекается фоном из переписки старше активного окна; на каждом ходу в контекст
+попадают только факты, похожие на текущую реплику. Поля: `session_id`, `content`
+(одно утверждение, до 300 символов), `embedding` (JSON — единичный вектор,
+округлённый до 6 знаков; NULL, пока эмбеддинги не настроены или не досчитаны),
+`embed_model` (какой моделью посчитан вектор: векторы разных моделей несопоставимы,
+при смене модели факты пересчитываются), `source_message_id` (последнее сообщение
+фрагмента, из которого извлечён факт: по нему считается свежесть и отсекаются
+факты, чей источник модель и так видит дословно), `created_at`. Удаляются вместе
+с чатом (`database._cleanup_orphans`) и при удалении сообщений, из которых взяты.
 
 ### `personas` — `Persona`
 Персона пользователя (кем он отыгрывает): `name`, `description`, `avatar_path`, `owner_id`.
@@ -86,7 +99,12 @@ ISO-строкой с «Z» — у user-сообщения это время о�
 
 ### `app_settings` — `AppSetting`
 Универсальное key-value (JSON) хранилище настроек приложения. Ключи:
-- `connection` — подключение к LiteLLM (base_url, api_key, default_model, image_model);
+- `connection` — подключение к LiteLLM (base_url, api_key, default_model, image_model,
+  `summary_model` — быстрая модель для фоновой сводки и фактов, `embedding_model` —
+  модель эмбеддингов фактов; пустые = модель чата / поиск фактов по словам);
+- `ui` — общие настройки интерфейса, в том числе памяти: `auto_summary`,
+  `summary_every`, `memory_window` (активное окно, по умолчанию 20; 0 = вся
+  история), `horae_facts` (факты выключены только явным `false`);
 - `security` — `access_code`, `admin_password`, `accounts_enabled`, `basic_auth`;
 - `telegram` — токен, `enabled`, `default_character_id`, `model`, `open_to_all`,
   `whitelist[]`, `requests[]`.

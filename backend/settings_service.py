@@ -29,6 +29,11 @@ def default_connection() -> dict:
         # Запасная модель на случай сбоя основной (+ авто-повтор ею).
         "fallback_model": "",
         "auto_fallback": True,
+        # Память Horae: быстрая модель для фоновой сводки и извлечения фактов
+        # (пусто = модель чата) и модель эмбеддингов для поиска фактов (пусто =
+        # сравнение по словам, без векторов).
+        "summary_model": "",
+        "embedding_model": "",
     }
 
 
@@ -49,6 +54,7 @@ async def set_connection(db, data: dict) -> dict:
     allowed = {
         "use_proxy", "base_url", "api_key", "default_model", "image_model",
         "image_via_chat", "fallback_model", "auto_fallback",
+        "summary_model", "embedding_model",
     }
     clean = {}
     for k, v in data.items():

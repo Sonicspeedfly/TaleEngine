@@ -147,7 +147,7 @@ def _cleanup_orphans(sync_conn) -> None:
     if "chat_sessions" not in tables:
         return
     # 1. Осиротевшие дочерние строки (чат, на который они ссылаются, уже удалён).
-    for tbl in ("messages", "group_members", "canvases", "session_shares"):
+    for tbl in ("messages", "group_members", "canvases", "session_shares", "horae_facts"):
         if tbl in tables:
             sync_conn.execute(text(
                 f"DELETE FROM {tbl} WHERE session_id NOT IN (SELECT id FROM chat_sessions)"

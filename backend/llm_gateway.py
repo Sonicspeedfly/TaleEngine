@@ -10,6 +10,7 @@
 
 Вся обработка — на сервере: браузер только шлёт текст и слушает токены.
 """
+import asyncio
 import logging
 from typing import AsyncGenerator, Optional
 
@@ -504,6 +505,65 @@ async def complete(
     return "".join([
         chunk async for chunk in stream_completion(messages, params, connection, kind=kind)
     ])
+
+
+# Эмбеддинги нужны памяти на КАЖДОМ ходу (вектор текущей реплики), поэтому ждать
+# их дольше нескольких секунд нельзя: зависший провайдер задерживал бы ответ в
+# чате. Не успели — память молча переходит на сравнение по словам.
+_EMBED_TIMEOUT = 10
+
+
+async def embed(texts: list[str], connection: Optional[dict] = None) -> list[list[float]] | None:
+    """
+    Векторы (эмбеддинги) текстов для поиска фактов памяти Horae (см. horae_recall).
+
+    Модель — connection["embedding_model"], маршрут тот же, что у чата (прокси или
+    напрямую). Пустая модель — эмбеддинги выключены, возвращаем None. Любая ошибка
+    или таймаут — тоже None, а не исключение: без векторов память работает по
+    словам, а вот упавший из-за них ход пользователь не простил бы.
+    """
+    conn = connection or {}
+    model_name = (conn.get("embedding_model") or "").strip()
+    texts = [t or " " for t in (texts or [])]  # пустая строка у части провайдеров — 400
+    if not model_name or not texts:
+        return None
+    kwargs: dict = {
+        "input": texts,
+        "timeout": _EMBED_TIMEOUT,
+        **_route_kwargs(connection, model_name),
+    }
+    entry = debug_log.log_request(
+        "embedding", kwargs["model"], kwargs.get("api_base"),
+        {"texts": len(texts), "chars": sum(len(t) for t in texts)},
+    )
+    try:
+        # wait_for поверх timeout провайдера: у части маршрутов LiteLLM свой
+        # таймаут не соблюдает, а висеть дольше обещанного память не имеет права.
+        resp = await asyncio.wait_for(litellm.aembedding(**kwargs), _EMBED_TIMEOUT + 2)
+        data = getattr(resp, "data", None)
+        if data is None and isinstance(resp, dict):
+            data = resp.get("data")
+        items = []
+        for pos, item in enumerate(data or []):
+            vec = getattr(item, "embedding", None)
+            idx = getattr(item, "index", None)
+            if isinstance(item, dict):
+                vec = item.get("embedding", vec)
+                idx = item.get("index", idx)
+            items.append((idx if isinstance(idx, int) else pos, vec))
+        # Порядок — по index из ответа: провайдер не обязан возвращать векторы в
+        # порядке входа, а перепутанный вектор тихо привязал бы факт к чужому смыслу.
+        items.sort(key=lambda p: p[0])
+        vectors = [[float(x) for x in vec] for _, vec in items if vec]
+        if len(vectors) != len(texts):
+            raise ValueError(f"получено {len(vectors)} векторов на {len(texts)} текстов")
+    except Exception as exc:  # noqa: BLE001 — без векторов память работает по словам
+        logging.getLogger("aichat.horae").warning("Эмбеддинги (%s) недоступны: %s", model_name, exc)
+        debug_log.finish(entry, "error", error=str(exc) or type(exc).__name__)
+        return None
+    usage_stats.record("embedding", kwargs["model"], usage_stats.extract_usage(resp))
+    debug_log.finish(entry, "ok", preview=f"{len(vectors)} × {len(vectors[0]) if vectors else 0}")
+    return vectors
 
 
 async def generate_image(

@@ -224,6 +224,28 @@ class HoraeEntry(Base):
     )
 
 
+class HoraeFact(Base):
+    """
+    Атомарный факт долговременной памяти чата (слой 3 Horae, см. horae_recall).
+
+    Извлекается фоном из старой части переписки и индексируется эмбеддингом.
+    На каждом ходу в контекст попадают только факты, похожие на текущую реплику.
+    """
+    __tablename__ = "horae_facts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("chat_sessions.id"), index=True)
+    content: Mapped[str] = mapped_column(Text, default="")
+    # Вектор эмбеддинга (список float) и модель, которой он посчитан: векторы
+    # разных моделей несопоставимы. NULL — эмбеддинги не настроены.
+    embedding: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    embed_model: Mapped[str] = mapped_column(String(200), default="")
+    # Последнее сообщение фрагмента, из которого извлечён факт: по нему считается
+    # свежесть и отсекаются факты, чей источник и так лежит в активном окне.
+    source_message_id: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 class Persona(Base):
     """Персона пользователя — кем он отыгрывает (имя + описание + внешность)."""
     __tablename__ = "personas"

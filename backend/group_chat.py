@@ -360,6 +360,11 @@ async def build_group_messages(
     messages.extend(knowledge_block(kb_text, kb_media))
     if author_note and author_note.strip():
         messages.append({"role": "system", "content": f"[Author's Note]\n{author_note.strip()}"})
+    # Факты из давней части группы (слой 3 памяти Horae). Фоновая сводка
+    # извлекает их и из групп, и без этого места группа их копила, но не вспоминала.
+    recalled_block = await _group_recalled(db, session, msgs)
+    if recalled_block:
+        messages.append({"role": "system", "content": recalled_block})
     # Якорь характера + post-history перед ответом (личность не «плывёт»).
     from backend.horae_memory import _render_char_anchor
     messages.append({"role": "system", "content": _render_char_anchor(char_dict)})
@@ -392,6 +397,41 @@ async def build_group_messages(
         ]
     messages.append({"role": "user", "content": user_content})
     return messages
+
+
+async def _group_recalled(db, session, msgs) -> str:
+    """
+    Блок фактов памяти, похожих на последние реплики группы. Пусто — нет блока.
+
+    Активного окна у группы нет (транскрипт режется бюджетом, см. _fit_transcript),
+    поэтому факты последних DEFAULT_WINDOW сообщений не берём — они и так в
+    транскрипте дословно. Любой сбой памяти ход группы не роняет.
+    """
+    try:
+        from backend import horae_recall
+        from backend.models import AppSetting
+        from backend.settings_service import get_connection
+
+        ui_row = await db.get(AppSetting, "ui")
+        ui = ui_row.value if ui_row and isinstance(ui_row.value, dict) else {}
+        if ui.get("horae_facts") is False or not msgs:
+            return ""
+        # Запрос — свежая реплика; две перед ней — только хвост для понимания.
+        # Слитые в один текст, они вспоминали факты по одним именам героев,
+        # которые в групповой сцене звучат в каждой реплике (см.
+        # horae_recall.lexical_similarities).
+        context = "\n".join((m.content or "") for m in reversed(msgs[-3:-1]))
+        window = msgs[-horae_recall.DEFAULT_WINDOW:]
+        facts = await horae_recall.recall(
+            db, session.id, msgs[-1].content or "", await get_connection(db),
+            newest_id=msgs[-1].id, exclude_from_id=window[0].id, context=context,
+        )
+        return horae_recall.render_recalled(facts)
+    except Exception:  # noqa: BLE001 — память не должна ронять ход группы
+        import logging
+
+        logging.getLogger("aichat.horae").exception("Память группы %s не собралась", session.id)
+        return ""
 
 
 def _fit_transcript(lines: list[str], system: str, token_budget: int) -> str:

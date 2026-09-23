@@ -181,9 +181,14 @@ async def test_summary_recovers_after_messages_are_deleted():
     Указатель «до какого сообщения учтено» мог уехать в будущее: пользователь
     удалял последние сообщения (а SQLite переиспользует id), и условие
     «id > указателя» не выполнялось НИКОГДА — сводка молча умирала навсегда.
+
+    Лечится прижатием к последнему оставшемуся сообщению, а НЕ сбросом в ноль:
+    сброс заново скармливал модели весь чат с начала как «новые события» поверх
+    старой сводки — хроника откатывалась к первой сцене на десятки ходов.
     """
     from backend import main, models
     from backend.database import AsyncSessionLocal, engine, init_db
+    from backend.horae_recall import DEFAULT_WINDOW
 
     await engine.dispose()
     await init_db()
@@ -198,33 +203,56 @@ async def test_summary_recovers_after_messages_are_deleted():
         await db.commit()
         await db.refresh(sess)
         sid = sess.id
-        for i in range(12):
-            db.add(models.Message(session_id=sid, role="user", content=f"событие {i}"))
+        old = [models.Message(session_id=sid, role="user", content=f"событие {i}") for i in range(40)]
+        db.add_all(old)
         # Указатель «из будущего» — как после удаления свежих сообщений.
         db.add(models.HoraeEntry(
             session_id=sid, category="summary", title="📜 Память чата (авто)",
             content="старая память", always_on=True, enabled=True,
-            meta={"last_message_id": 10_000_000},
+            meta={"last_message_id": 10_000_000, "v": 2},
         ))
+        # Факт из удалённого сообщения — в памяти его быть не должно.
+        db.add(models.HoraeFact(session_id=sid, content="Удалённое событие",
+                                source_message_id=10_000_000))
         await db.commit()
+        old_max = old[-1].id
 
-    called = {}
+    seen: list[str] = []
 
     async def fake_complete(messages, params=None, connection=None, kind="service"):
-        called["yes"] = True
-        return "Память пересобрана после удаления сообщений."
+        seen.append(str(messages))
+        return "Память дописана новыми событиями."
+
+    async def pointer_and_facts():
+        async with AsyncSessionLocal() as db:
+            entry = (await db.execute(select(models.HoraeEntry).where(
+                models.HoraeEntry.session_id == sid,
+                models.HoraeEntry.category == "summary",
+            ))).scalars().first()
+            facts = (await db.execute(select(models.HoraeFact.content).where(
+                models.HoraeFact.session_id == sid))).scalars().all()
+            return (entry.meta or {}).get("last_message_id"), entry.content, facts
 
     with patch("backend.main.complete", new=fake_complete):
         await main._maybe_update_summary(sid)
+    pointer, content, facts = await pointer_and_facts()
+    # Всё, что осталось в чате, уже было в сводке: переписывать его заново нельзя.
+    assert seen == [], "старый чат не должен уходить в сводку второй раз"
+    assert pointer == old_max and content == "старая память"
+    assert facts == []
 
-    assert called.get("yes"), "сводка обязана ожить, а не молчать навсегда"
+    # Новые сообщения снова попадают в память — и только они.
     async with AsyncSessionLocal() as db:
-        entry = (await db.execute(select(models.HoraeEntry).where(
-            models.HoraeEntry.session_id == sid,
-            models.HoraeEntry.category == "summary",
-        ))).scalars().first()
-    assert "пересобрана" in entry.content
-    assert 0 < (entry.meta or {}).get("last_message_id", 0) < 10_000_000
+        for i in range(12 + DEFAULT_WINDOW):
+            db.add(models.Message(session_id=sid, role="user", content=f"новое {i}"))
+        await db.commit()
+    with patch("backend.main.complete", new=fake_complete):
+        await main._maybe_update_summary(sid)
+    assert seen, "сводка обязана ожить, а не молчать навсегда"
+    assert "новое 0" in seen[0] and "событие 0" not in seen[0]
+    assert "старая память" in seen[0]  # старая сводка дописывается, а не теряется
+    pointer, content, _ = await pointer_and_facts()
+    assert old_max < pointer < 10_000_000 and "дописана" in content
     await engine.dispose()
 
 
