@@ -3996,6 +3996,41 @@ def _asset_version(name: str) -> str:
     return digest
 
 
+# Библиотеки с CDN, которые сервер может отдавать сам: frontend/vendor/<имя
+# файла из адреса CDN>. Там, где jsdelivr медленный или недоступен, без этого
+# страница открывалась пустой — Vue не загружался. Раньше CDN меняли на /vendor/
+# правкой index.html и app.js прямо на сервере, и каждый `git pull` упирался в
+# эти правки. Теперь подмену делает сервер, а папки нет — всё идёт с CDN.
+_CDN_URL_RE = re.compile(r"https://cdn\.jsdelivr\.net/npm/[^\"'\s<>]+")
+
+
+def _vendor_files() -> set[str]:
+    """Имена файлов в frontend/vendor/ (пусто, если папки нет)."""
+    try:
+        return {p.name for p in (_frontend_dir / "vendor").iterdir() if p.is_file()}
+    except OSError:
+        return set()
+
+
+def _localize_cdn(html: str, vendor: set[str]) -> str:
+    """
+    CDN-адреса, для которых есть локальная копия, -> /vendor/<имя>. Список копий
+    уходит в <meta name="tale-vendor">: по нему app.js подменяет и то, что
+    грузит сам по надобности (KaTeX, lamejs).
+    """
+    if not vendor:
+        return html
+
+    def local(m):
+        url = m.group(0)
+        name = url.rsplit("/", 1)[-1]
+        return f"/vendor/{name}" if name in vendor else url
+
+    html = _CDN_URL_RE.sub(local, html)
+    names = ",".join(sorted(n for n in vendor if "," not in n and '"' not in n))
+    return html.replace("</head>", f'  <meta name="tale-vendor" content="{names}" />\n  </head>', 1)
+
+
 if _frontend_dir.exists():
 
     @app.get("/", include_in_schema=False)
@@ -4011,6 +4046,7 @@ if _frontend_dir.exists():
         html = (_frontend_dir / "index.html").read_text(encoding="utf-8")
         for asset in ("app.js", "styles.css"):
             html = html.replace(f'"/{asset}"', f'"/{asset}?v={_asset_version(asset)}"')
+        html = _localize_cdn(html, _vendor_files())
         return Response(html, media_type="text/html; charset=utf-8")
 
     app.mount("/", StaticFiles(directory=str(_frontend_dir), html=True), name="frontend")
