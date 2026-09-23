@@ -24,6 +24,7 @@ def test_ctx_budget_ui_overrides_default():
 async def test_auto_summary_creates_entry_and_tracks_progress():
     from backend import main, models
     from backend.database import AsyncSessionLocal, engine, init_db
+    from backend.horae_recall import DEFAULT_WINDOW
 
     # Пул соединений мог быть создан в чужом event loop (TestClient) — сбрасываем.
     await engine.dispose()
@@ -38,7 +39,9 @@ async def test_auto_summary_creates_entry_and_tracks_progress():
         db.add(sess)
         await db.commit()
         await db.refresh(sess)
-        for i in range(12):
+        # 12 сообщений старше активного окна плюс само окно: сводка сжимает только
+        # то, что старше окна (последние реплики модель и так видит дословно).
+        for i in range(12 + DEFAULT_WINDOW):
             db.add(models.Message(
                 session_id=sess.id,
                 role="user" if i % 2 == 0 else "assistant",
@@ -51,6 +54,8 @@ async def test_auto_summary_creates_entry_and_tracks_progress():
         # Суммаризатору передаётся и старая сводка, и новые события.
         joined = str(messages)
         assert "Новые события" in joined and "событие номер 0" in joined
+        # Реплики активного окна ждут: их ещё могут перегенерировать или править.
+        assert "событие номер 12" not in joined and "событие номер 31" not in joined
         # Расход служебных вызовов учитывается отдельно от самого чата.
         assert kind == "summary"
         return "Герои пережили двенадцать событий и заключили союз."

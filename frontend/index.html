@@ -2,7 +2,12 @@
 <html lang="ru">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <!-- interactive-widget=resizes-content: экранная клавиатура СЖИМАЕТ страницу,
+         а не наезжает на неё. По умолчанию Chrome на Android только сдвигает
+         видимую область к полю ввода, и кнопка «Отправить», стоящая на телефоне
+         строкой ниже поля, оставалась под клавиатурой. iOS атрибут пока не
+         читает — там композер держат 100dvh и потолки стопки полос в CSS. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content" />
     <meta name="theme-color" content="#12141a" />
     <title>TaleEngine</title>
 

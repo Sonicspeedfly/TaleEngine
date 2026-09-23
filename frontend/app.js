@@ -13,6 +13,46 @@ const md = window.markdownit({ breaks: true, linkify: true });
 
 const { createApp } = Vue;
 
+// Порядок единого списка чатов — тот же ключ, что у сервера (_sort_by_activity):
+//   1. закреп — абсолютный приоритет: закреплённый чат никогда не опускается
+//      ниже незакреплённого, как бы давно в нём ни писали;
+//   2. внутри обеих групп — последняя активность, свежие выше. Активность
+//      (activity_at) — последняя реплика либо создание чата, что позже: новый
+//      пустой чат стоит наверху, а не под брошенными полгода назад;
+//   3. ничья по секундам — id последней реплики (sortKey), затем id чата.
+// Раньше клиент сливал личные чаты с группами и пересортировывал всё по одному
+// last_id без закрепа вовсе: активный незакреплённый чат перепрыгивал пины.
+//
+// Это ЕДИНСТВЕННЫЙ компаратор чатов на клиенте: им упорядочены и сайдбар, и
+// «Недавние диалоги» первого экрана, и чаты в палитре. Два порядка в двух местах
+// рано или поздно разъезжаются, и тогда один и тот же чат стоит первым в одном
+// списке и пятым в другом.
+//
+// Сортируем КОПИЮ: sort() меняет массив на месте, и вызов на реактивном
+// источнике (allSessions, groups) из computed переставлял бы сами данные,
+// заново будя все зависящие от них вычисления.
+function sortChats(rows) {
+  const ts = (v) => { const t = v ? Date.parse(v) : NaN; return Number.isFinite(t) ? t : 0; };
+  return rows.slice().sort((a, b) =>
+    (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0)
+    || ts(b.activity_at) - ts(a.activity_at)
+    || (b.sortKey || 0) - (a.sortKey || 0)
+    || (b.id || 0) - (a.id || 0));
+}
+
+// Событие «список чатов изменился». Шлют его все мутации (создание, удаление,
+// переименование, закреп, новая реплика), слушает одно место в mounted, которое
+// перечитывает список — сайдбар больше не ждёт F5.
+const CHATLIST_EVENT = "taleengine:chatlist-updated";
+// Тот же сигнал между вкладками. Без него чат, созданный или закреплённый в
+// одной вкладке, в соседней появлялся только после F5 — ровно та болезнь, от
+// которой лечит CHATLIST_EVENT, только на уровень выше.
+const CHATLIST_CHANNEL = "taleengine";
+// Метка своей вкладки: сообщения канала, отправленные нами же, пропускаем.
+// BroadcastChannel и так не доставляет их отправителю, но второй экземпляр
+// канала в той же вкладке (горячая перезагрузка, расширение) получил бы эхо.
+const TAB_ID = Math.random().toString(36).slice(2) + Date.now().toString(36);
+
 createApp({
   data() {
     return {
@@ -78,6 +118,18 @@ createApp({
 
       // --- Правая панель ---
       drawerTab: null,         // generation | connection | character | memory | persona | null (по умолчанию СКРЫТ)
+      // Грубый указатель (палец). Раскрытие действий строки по наведению на
+      // таком устройстве не срабатывает НИКОГДА, поэтому там нужна не та же
+      // разметка с другим оформлением, а другое раскрытие: одна кнопка вместо
+      // пяти. Читается один раз при старте: тип указателя за сеанс не меняется.
+      coarse: false,
+      // Узкое окно (та же граница 768px, что у мобильной вёрстки в CSS). Решение
+      // «прятать вторичные действия под ⋯» зависит и от пальца, и от ширины:
+      // тип указателя сам по себе не знает, что десктопное окно сужено до
+      // телефонного, и тогда девять кнопок уезжали бы в прокрутку мышью.
+      narrow: false,
+      rowMenu: null,           // ключ строки списка с раскрытыми действиями
+      msgMenu: null,           // id сообщения с раскрытой строкой действий
 
       // --- Параметры генерации (вкладка Generation) ---
       params: {
@@ -108,7 +160,7 @@ createApp({
       presetName: "",
 
       // --- Подключение к LiteLLM (вкладка Connection) ---
-      connection: { use_proxy: true, base_url: "http://localhost:4000", api_key: "", default_model: "gpt-4o", image_model: "", image_via_chat: false, fallback_model: "", auto_fallback: true },
+      connection: { use_proxy: true, base_url: "http://localhost:4000", api_key: "", default_model: "gpt-4o", image_model: "", image_via_chat: false, fallback_model: "", auto_fallback: true, summary_model: "", embedding_model: "" },
       models: [],
       connStatus: "",
       connOk: null,
@@ -122,6 +174,12 @@ createApp({
       // «Сводка сюжета (авто)» — старые события не выпадают из памяти.
       autoSummary: true,
       summaryEvery: 10,         // каждые сколько сообщений обновлять сводку (это платный запрос)
+      // Активное окно: столько последних сообщений идут в модель как есть
+      // (0 — вся история). 20, а не 40: в очень длинных чатах сорок реплик
+      // дословно уже сами размывают внимание модели, а всё старше окна она и так
+      // получает хроникой из сводки. Значение совпадает с DEFAULT_WINDOW сервера.
+      memoryWindow: 20,
+      horaeFacts: true,         // извлекать атомарные факты и подмешивать релевантные
       groupReplyDelay: 3,       // пауза (сек) между ответами персонажей в группе
       groupWaiting: 0,          // идёт пауза перед следующим ответом группы (сек)
 
@@ -224,9 +282,9 @@ createApp({
       // ЗАВЕРШЁННЫЙ ответ, а не каждый токен, иначе речь перезапускается десятки
       // раз в секунду и слушать её невозможно.
       liveStatus: "",
-      // Недавние чаты для блока быстрого старта на первом экране. Список приходит
-      // из /sessions без фильтра по персонажу и уже отсортирован по активности.
-      recentChats: [],
+      // Недавние чаты первого экрана — теперь computed (см. recentChats): копия
+      // среза allSessions, которую надо было не забыть обновить, отставала от
+      // сайдбара и не знала ни о группах, ни о закрепе.
 
       // --- Приборы: телеметрия хода ---
       // Замеры делаются на КЛИЕНТЕ: токенизатор провайдера браузеру недоступен,
@@ -244,7 +302,51 @@ createApp({
 
       // --- Режим ленты ---
       // Одно поле, как composerMode: normal | scene | work.
-      viewMode: localStorage.getItem("viewMode") || "normal",
+      // Режим «Работа с документом» намеренно НЕ восстанавливается из хранилища:
+      // канвас живёт на сервере, а canvasOpen и canvas на старте всегда false и
+      // null. Восстановленный «work» включал бы ровно ту ложь, ради которой
+      // переписан setViewMode: режим подсвечен, а экран неотличим от обычного.
+      viewMode: localStorage.getItem("viewMode") === "scene" ? "scene" : "normal",
+      // Три режима одной комнаты — списком в data, а не таблицей внутри строкового
+      // шаблона: по нему идёт v-for сегмента в шапке, и рядом с самим viewMode
+      // видно, из каких ровно трёх значений это поле состоит.
+      viewModes: [
+        { id: "normal", icon: "💬", label: "Обычный", hint: "реплики как переписка" },
+        { id: "scene", icon: "🎭", label: "Сцена", hint: "фон истории, имена янтарём" },
+        { id: "work", icon: "📄", label: "Работа с документом", hint: "лента 42%, канвас 58%" },
+      ],
+
+      // ---------- Раскладка оболочки ----------
+      // ВТОРАЯ ось, не путать с viewMode. viewMode это свойство ЛЕНТЫ: как
+      // выглядят реплики. shellLayout — свойство ОБОЛОЧКИ: как расставлено
+      // вокруг ленты всё остальное.
+      //
+      // Держим их раздельно намеренно. Продукт задуман как студия, которую
+      // ролевик обустраивает под себя, и обустраивать он должен комнату, а не
+      // выбирать между девятью безымянными сочетаниями. Поэтому раскладка —
+      // редкая настройка «как у меня стоит мебель», а режим ленты остаётся
+      // частым переключением по ходу истории.
+      shellLayout: localStorage.getItem("shellLayout") || "modes",
+      shellLayouts: [
+        {
+          id: "modes",
+          icon: "🎛",
+          label: "Комнаты",
+          hint: "режим ленты поднят в первичную навигацию: сегмент сверху виден всегда",
+        },
+        {
+          id: "document",
+          icon: "📖",
+          label: "Страница",
+          hint: "контролы уходят на поля во время чтения и возвращаются по намерению",
+        },
+        {
+          id: "name",
+          icon: "⌘",
+          label: "По имени",
+          hint: "постоянного списка нет, всё вызывается строкой поиска и команд",
+        },
+      ],
 
       // --- Единый список чатов ---
       // Все чаты пользователя, а не только выбранного персонажа. Раньше раздел
@@ -268,6 +370,17 @@ createApp({
         { id: "export", label: "/export — выгрузить чат", sub: "нативный формат" },
         { id: "settings", label: "/settings — настройки", sub: "панель параметров" },
         { id: "clear", label: "/clear — очистить поле ввода", sub: "сбросить режим композера" },
+        // Режимы ленты. Палитра объявлена единым входом ко всему, но три главных
+        // состояния приложения в неё не входили: добраться до них можно было
+        // только мышью и только через безымянное «⋯».
+        { id: "view-normal", label: "Режим: обычный", sub: "реплики как переписка" },
+        { id: "view-scene", label: "Режим: сцена", sub: "фон истории, имена янтарём" },
+        { id: "view-work", label: "Режим: работа с документом", sub: "лента 42%, канвас 58%" },
+        // Раскладка — редкая настройка, и в «⋯» она лежала бы мёртвым грузом
+        // рядом с двенадцатью другими пунктами. В палитре её находят по имени.
+        { id: "shell-modes", label: "Раскладка: комнаты", sub: "сегмент режимов сверху" },
+        { id: "shell-document", label: "Раскладка: страница", sub: "контролы на полях, лента как текст" },
+        { id: "shell-name", label: "Раскладка: по имени", sub: "без постоянного списка" },
       ],
       groupDirector: false,
       liveBubbles: [], // живые пузыри разных персонажей при стриминге группы
@@ -278,6 +391,10 @@ createApp({
       needAuth: false,        // показывать экран входа/регистрации (режим аккаунтов)
       authTab: "login",       // login | register
       authForm: { username: "", password: "" },
+      // Подтверждение пароля держим ОТДЕЛЬНО от authForm: authForm уходит на
+      // сервер целиком (JSON.stringify), и подтверждению там делать нечего.
+      authPassword2: "",
+      authPassShown: false,   // показать пароль текстом — обе строки разом
       friends: [],
       friendsIncoming: [],
       newFriendName: "",
@@ -503,9 +620,10 @@ createApp({
     },
 
     // ---------- Единый список чатов ----------
-    // Личные, групповые и расшаренные в одной ленте с признаком вида. Сортировка
-    // по последней активности: last_id монотонен и приходит с сервера для
-    // личных и групповых, у расшаренных его может не быть — они идут следом.
+    // Личные, групповые и расшаренные в одной ленте с признаком вида. Порядок —
+    // sortChats: закреп выше всего, затем последняя активность (activity_at
+    // приходит с сервера у всех трёх видов). Закреп расшаренного чата — дело его
+    // владельца, у меня такой чат всегда среди незакреплённых.
     unifiedChats() {
       const rows = [];
       for (const s of this.allSessions) {
@@ -518,9 +636,22 @@ createApp({
         });
       }
       for (const s of this.sharedSessions) {
-        rows.push({ ...s, kind: "shared", sortKey: -1 });
+        rows.push({ ...s, kind: "shared", pinned: false, sortKey: s.last_id || 0 });
       }
-      return rows.sort((a, b) => b.sortKey - a.sortKey);
+      return sortChats(rows);
+    },
+    // «Недавние диалоги» первого экрана — голова того же единого списка, а не
+    // отдельный срез личных чатов: порядок и закреп здесь ровно как в сайдбаре.
+    recentChats() {
+      return this.unifiedChats.slice(0, 5);
+    },
+    // Сокращать строку действий под сообщением до четырёх главных и «⋯»: на
+    // пальце (наведения нет, каждая цель 44px) и в узком окне (места нет).
+    // Широкий планшет — палец, значит сокращаем; узкое окно с мышью — места нет,
+    // значит тоже. Остаётся только широкий экран с мышью: там строка видна
+    // целиком и проявляется по наведению (см. @media (hover: hover) в CSS).
+    compactActions() {
+      return this.coarse || this.narrow;
     },
     // Чипы фильтра: только персонажи, у которых чаты реально есть.
     chatFilterChips() {
@@ -618,7 +749,11 @@ createApp({
         // Достаём реальный текст ошибки сервера (а не просто код).
         let detail = "HTTP " + res.status;
         try { const j = await res.json(); if (j && j.detail) detail = j.detail; } catch (e) {}
-        throw new Error(detail);
+        // Код ответа — рядом с текстом: вызывающему иногда важно отличить
+        // «чата больше нет» (403/404) от сбоя сети, а по тексту это ненадёжно.
+        const err = new Error(detail);
+        err.status = res.status;
+        throw err;
       }
       return res.status === 204 ? null : res.json();
     },
@@ -866,14 +1001,34 @@ createApp({
     async loadCharacters() {
       this.characters = await this.api("/characters");
     },
+    // Создать персонажа И ДОВЕСТИ НАМЕРЕНИЕ ДО КОНЦА.
+    //
+    // Раньше метод заканчивался на loadCharacters(): запись в базе появлялась,
+    // а на экране не менялось НИЧЕГО. Для нового пользователя это был первый
+    // осмысленный клик в продукте — «Новый диалог», ввёл имя, вернулся на тот
+    // же самый экран. Хуже всего, что путь при этом отработал успешно, и
+    // понять, что произошло, было неоткуда.
+    //
+    // Теперь клик доводится до места, ради которого он делался: персонаж
+    // выбран, чат создан и открыт, карточка показана с фокусом в «Описании» —
+    // единственном поле, без которого персонаж отвечает обобщённо.
     async createCharacter() {
       const name = await this.askPrompt("Имя нового персонажа", { placeholder: "Например: Алиса" });
       if (!name) return;
-      await this.api("/characters", {
+      const created = await this.api("/characters", {
         method: "POST",
         body: JSON.stringify({ name, first_message: "", system_prompt: "" }),
       });
       await this.loadCharacters();
+      const ch = (created && this.characters.find((c) => c.id === created.id)) || null;
+      if (!ch) return;
+      await this.selectCharacter(ch);
+      await this.newChat();
+      this.drawerTab = "character";
+      this.$nextTick(() => {
+        const el = document.querySelector("[data-first-field]");
+        if (el) el.focus();
+      });
     },
     async importCharacter(e) {
       const file = e.target.files[0];
@@ -884,6 +1039,9 @@ createApp({
       e.target.value = "";
       if (!res.ok) { this.showToast("Не удалось импортировать персонажа (код " + res.status + ")"); return; }
       await this.loadCharacters();
+      // Импорт карточки может принести и чаты (нативный формат), и лор Horae —
+      // список перечитываем, а не угадываем, что именно пришло.
+      this.notifyChatListChanged();
     },
     // Выбор персонажа теперь ТОЛЬКО меняет контекст: показывает карточку в
     // редакторе и ставит фильтр списка чатов. Раньше он же открывал первый чат
@@ -909,12 +1067,15 @@ createApp({
         }),
       });
       await this.loadCharacters();
+      // Имя персонажа стоит подписью в каждой строке его чатов.
+      this.notifyChatListChanged();
     },
     async deleteCharacter(c) {
       if (!(await this.askConfirm("Удалить персонажа «" + c.name + "»?", { okText: "Удалить" }))) return;
       await this.api("/characters/" + c.id, { method: "DELETE" });
       if (this.selectedCharacterId === c.id) { this.selectedCharacterId = null; this.sessionId = null; this.messages = []; }
       await this.loadCharacters();
+      this.notifyChatListChanged(); // чаты удалённого персонажа уходят из сайдбара
     },
     async exportCharacter(c) {
       // Экспорт в карточку SillyTavern V2 (вместе с лорбуком из памяти Horae).
@@ -957,7 +1118,11 @@ createApp({
       } catch (e) {
         this.chatError = "Не удалось сгенерировать документ: " + e.message;
         await this.loadMessages();
-      } finally { this.canvasGenerating = false; }
+      } finally {
+        this.canvasGenerating = false;
+        // И при успехе, и при ошибке запрос пользователя уже лёг в чат репликой.
+        this.notifyChatListChanged(this.sessionId);
+      }
     },
     // ПРАВКА открытого канваса на месте (мутация activeDocument, без нового файла).
     async editOpenCanvas(prompt) {
@@ -981,7 +1146,10 @@ createApp({
       } catch (e) {
         this.chatError = "Не удалось изменить документ: " + e.message;
         await this.loadMessages();
-      } finally { this.canvasBusy = false; }
+      } finally {
+        this.canvasBusy = false;
+        this.notifyChatListChanged(this.sessionId);
+      }
     },
     // Интент: «создать НОВЫЙ файл с нуля» (тогда — генерация нового канваса).
     _isNewCanvasIntent(t) {
@@ -1122,6 +1290,10 @@ createApp({
     },
     closeCanvas() {
       this.saveCanvas(); this.canvasOpen = false; this.mobilePane = "chat";
+      // Закрыли документ, оставшись в режиме «Работа», — и режим тут же снова
+      // становился ложью: подсвечен, а раскладки 42/58 нет, потому что нет
+      // .with-canvas. Из режима выходим вместе с документом.
+      if (this.viewMode === "work") this.setViewMode("normal");
       // Канваса больше нет — команда для него бессмысленна.
       if (this.composerMode === "canvasCmd") this.composerMode = "text";
     },
@@ -1132,15 +1304,19 @@ createApp({
     },
     async newChat() {
       const r = await this.api("/sessions?character_id=" + this.selectedCharacterId, { method: "POST" });
-      await this.loadSessions();
-      this.openSession({ id: r.session_id });
+      await this.syncChatList(r.session_id);
+      this.openSession(this._sessionCard(r.session_id) || { id: r.session_id });
     },
     // Найти полную карточку чата по id в уже загруженных списках.
     // openSession зовут из восьми мест, и половина передаёт голый {id}
     // (импорт, шаринг, превращение чата в группу, восстановление после F5).
     // Без этого дровер показывал бы пустые метаданные вместо настоящих.
     _sessionCard(id) {
+      // allSessions тоже: новый чат попадает туда на том же refreshChatList, а
+      // sessions перечитывается только при выбранном персонаже — без этой строки
+      // только что созданный чат открывался бы как голый {id}.
       return this.sessions.find((x) => x.id === id)
+        || this.allSessions.find((x) => x.id === id)
         || this.groups.find((x) => x.id === id)
         || this.sharedSessions.find((x) => x.id === id)
         || null;
@@ -1195,6 +1371,69 @@ createApp({
       this.loadCtxStats();
     },
     closeInspector() { this.inspectorOpen = false; },
+    // Как на этом ходу искались факты. facts_mode присылает новый сервер;
+    // старый знает только facts_enabled, и тогда честно говорим «включены»,
+    // не выдумывая способ поиска.
+    memFactsLabel(mem) {
+      // Сбой памяти сервер отдаёт как facts_mode "off" — без этой проверки
+      // человек с включёнными фактами читал бы «выключены» и шёл искать
+      // галочку в настройках, а не причину в логе.
+      if (mem && mem.error) return "ошибка";
+      if (!mem || mem.facts_enabled === false || mem.facts_mode === "off") return "выключены";
+      if (mem.facts_mode === "vector") return "по смыслу (эмбеддинги)";
+      if (mem.facts_mode === "lexical") return "по совпадению слов";
+      return "включены";
+    },
+    // Что стало с репликами старше активного окна. Раньше решал один признак
+    // dropped, и при dropped = 0 инспектор писал «вся история помещается в
+    // окно». Но сервер не выбрасывает реплики, пока сводка их не учла (выключенная
+    // авто-сводка, свежий импорт длинного чата), и тогда триста реплик при окне
+    // в двадцать тоже давали dropped = 0 — отчёт врал ровно в том случае, ради
+    // которого его смотрят. history.total — сколько реплик ушло в обрезку уже
+    // ПОСЛЕ окна: больше окна при dropped = 0 значит «окно не сжато».
+    memWindowLabel(stats) {
+      const mem = (stats && stats.memory) || {};
+      if (!mem.window) return "Окно выключено — история идёт целиком";
+      if (mem.dropped) return "Старше окна, идут хроникой из сводки";
+      const total = stats.history && typeof stats.history.total === "number" ? stats.history.total : 0;
+      // Причину («сводка не догнала» или «не набран шаг сжатия») клиент не
+      // различит — у него нет id реплик; говорим то, что верно в обоих случаях.
+      if (total > mem.window) return "Окно ещё не сжато — история идёт целиком";
+      return "Вся история помещается в окно";
+    },
+    // «⋯» под сообщением. На телефоне лента действий уже экрана, а её полоса
+    // прокрутки спрятана, и раскрытые вторичные кнопки уходили за правый край
+    // без единого намёка, что туда можно пролистать. После переключения
+    // держим сам переключатель в поле зрения и заново решаем, нужен ли намёк.
+    // Кнопку и ленту берём ДО $nextTick: currentTarget события к тому моменту
+    // уже обнулён.
+    toggleMsgMenu(m, ev) {
+      const btn = ev && ev.currentTarget;
+      const strip = btn && btn.closest ? btn.closest(".msg-actions") : null;
+      this.msgMenu = this.msgMenu === m.id ? null : m.id;
+      this.$nextTick(() => {
+        if (!strip || !document.contains(strip)) return;
+        if (document.contains(btn)) btn.scrollIntoView({ block: "nearest", inline: "nearest" });
+        this.msgStripEdge(strip);
+      });
+    },
+    // Намёк «лента длиннее видимого»: атрибут data-more включает затухание
+    // правого края (см. .msg-actions[data-more] в CSS). Одним CSS переполнение
+    // не распознать, а затухание на коротком ряду гасило бы последнюю кнопку
+    // зря. Долистали до конца — намёк снимаем: показывать там больше нечего.
+    msgStripEdge(strip) {
+      if (!strip) return;
+      const more = strip.scrollWidth - strip.clientWidth - strip.scrollLeft > 2;
+      if (more) strip.setAttribute("data-more", "");
+      else strip.removeAttribute("data-more");
+    },
+    // Русское множественное число: 1 факт, 2 факта, 5 фактов, 11 фактов, 21 факт.
+    plural(n, one, few, many) {
+      const m10 = n % 10, m100 = n % 100;
+      if (m10 === 1 && m100 !== 11) return one;
+      if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return few;
+      return many;
+    },
 
     // Телеметрия хода. Тикер живёт в обычном поле с префиксом _: реактивный
     // дескриптор таймера Vue обернул бы в Proxy (см. заметку про _bgJobs).
@@ -1228,12 +1467,82 @@ createApp({
     // геттер вычислился бы один раз при инициализации.
     ttft() { return this.genFirstAt ? (this.genFirstAt - this.genStartAt) / 1000 : 0; },
 
+    // ---------- Раскладка оболочки ----------
+    // Смена раскладки обязана быть мгновенной и без перезагрузки: человек
+    // выбирает мебель, глядя на свою настоящую переписку, а не на пустой экран.
+    // Поэтому всё держится на классе корня и CSS, а не на пересборке дерева.
+    setShellLayout(id) {
+      if (!this.shellLayouts.some((s) => s.id === id)) return;
+      this.shellLayout = id;
+      localStorage.setItem("shellLayout", id);
+      // Раскладка «по имени» не держит постоянного списка. Если сайдбар остался
+      // открытым от прежней раскладки, он повис бы поверх ленты без причины.
+      if (id === "name") this.sidebarOpen = false;
+      // Смена раскладки переставляет весь экран, а без объявления слепой
+      // пользователь узнаёт об этом только наткнувшись на переехавший контрол.
+      const s = this.shellLayouts.find((x) => x.id === id);
+      if (s) this.liveStatus = "Раскладка: " + s.label;
+    },
+
     // ---------- Режим ленты ----------
-    setViewMode(m) {
+    async setViewMode(m) {
+      // Прежнее условие открывало канвас только при уже загруженном документе
+      // (m === "work" && !this.canvasOpen && this.canvas), а до первой генерации
+      // документа не существует ни у кого. Поэтому пункт «Работа с документом»
+      // отрисовывался включённым и не делал РОВНО НИЧЕГО: раскладка 42/58 висит
+      // на классе .with-canvas, а его без канваса неоткуда взять.
+      if (m === "work") {
+        // Режим обязан либо открыть документ, либо сказать, почему не может.
+        // Переключиться молча и оставить экран прежним — это и есть ложь.
+        if (!this.sessionId) {
+          this.showToast("Документ живёт внутри чата: сначала откройте или создайте диалог");
+          return;
+        }
+        this.viewMode = m;
+        localStorage.setItem("viewMode", m);
+        // Зовём БЕЗУСЛОВНО. С проверкой `if (!this.canvasOpen)` защита от чужого
+        // документа была мёртвой: она живёт внутри ensureWorkCanvas, а в
+        // единственном сценарии, ради которого написана, до неё не доходило
+        // управление. Воспроизводилось так: открыть документ в чате A, перейти
+        // в чат B (openSession поля canvas и canvasOpen не обнуляет), нажать 📄 —
+        // и канвас чата A показывался как документ чата B. Метод сам
+        // короткозамыкает, когда документ уже открыт и принадлежит этому чату.
+        await this.ensureWorkCanvas();
+        return;
+      }
       this.viewMode = m;
       localStorage.setItem("viewMode", m);
-      // «Работа с документом» без открытого Канваса бессмысленна — открываем его.
-      if (m === "work" && !this.canvasOpen && this.canvas) this.canvasOpen = true;
+    },
+    // Документ для режима «Работа». Сначала ищем уже существующий в этом чате:
+    // иначе каждый вход в режим плодил бы в базе пустой канвас. Если чат ещё
+    // ничего не сгенерировал, заводим пустой черновик — пустой редактор честнее
+    // экрана, неотличимого от обычного режима.
+    async ensureWorkCanvas() {
+      // Канвас ДРУГОГО чата переиспользовать нельзя: openSession поле canvas не
+      // обнуляет, и документ соседнего диалога открылся бы здесь как свой.
+      if (this.canvas && this.canvas.session_id === this.sessionId) {
+        this.canvasOpen = true; this.mobilePane = "canvas"; return;
+      }
+      try {
+        const rows = await this.api("/canvas?session_id=" + this.sessionId);
+        if (rows && rows.length) return this.openCanvas(rows[0].id);
+        this.canvas = await this.api("/canvas", {
+          method: "POST",
+          body: JSON.stringify({ session_id: this.sessionId, title: "Черновик", kind: "document", content: "" }),
+        });
+        this.canvasInstruction = "";
+        this.clearSel();
+        // Пустой документ показываем редактором, а не предпросмотром: рендер
+        // пустой строки — это пустой экран, из которого не видно, куда печатать.
+        this.canvasView = "edit";
+        this.canvasOpen = true;
+        this.mobilePane = "canvas";
+      } catch (e) {
+        // Не вышло — откатываем режим: нажатая кнопка без документа это та же ложь.
+        this.viewMode = "normal";
+        localStorage.setItem("viewMode", "normal");
+        this.showToast("Не удалось открыть документ: " + (e && e.message ? e.message : e));
+      }
     },
 
     // ---------- Нечёткий поиск ----------
@@ -1279,7 +1588,10 @@ createApp({
       const it = item || this.paletteItems[this.paletteIndex];
       if (!it) return;
       this.closePalette();
-      if (it.kind === "chat") return this.openRecent(it.row);
+      // Через openChatRow, как в сайдбаре и «Недавних»: строка может быть чужим
+      // расшаренным чатом, а openRecent открыл бы его как свой — с активными
+      // настройками чата и автоподстановкой пояса прямо в сессию владельца.
+      if (it.kind === "chat") return this.openChatRow(it.row);
       if (it.kind === "char") {
         const c = this.characters.find((x) => x.id === it.id);
         if (c) { this.selectCharacter(c); this.sidebarOpen = true; }
@@ -1287,6 +1599,12 @@ createApp({
       }
       if (it.kind === "msg") return this.jumpToMessage(it.sid, it.id);
       // Команды.
+      // Диспетчеризация режимов: id вида view-<режим>, само значение — хвост
+      // после дефиса, чтобы список команд и список viewModes не разъезжались.
+      if (it.id === "view-normal" || it.id === "view-scene" || it.id === "view-work") {
+        return this.setViewMode(it.id.slice(5));
+      }
+      if (it.id.indexOf("shell-") === 0) return this.setShellLayout(it.id.slice(6));
       if (it.id === "new") return this.startNewChat();
       if (it.id === "model" || it.id === "settings") { this.drawerTab = "generation"; return; }
       if (it.id === "export") {
@@ -1365,7 +1683,7 @@ createApp({
           method: "POST",
           body: JSON.stringify({ message_id: m.id }),
         });
-        await Promise.all([this.loadSessions(), this.loadAllSessions(), this.loadGroups()]);
+        await this.syncChatList(r.session_id);
         await this.openSession(this._sessionCard(r.session_id) || { id: r.session_id });
         this.showToast("Ветка создана: " + r.messages + " реплик");
       } catch (e) {
@@ -1374,20 +1692,191 @@ createApp({
     },
 
     // ---------- Первый экран ----------
-    // Все чаты без фильтра по персонажу: бэкенд отдаёт их отсортированными по
-    // последней активности, поэтому «недавние» здесь означает именно недавние.
-    async loadRecent() {
-      try { this.recentChats = (await this.api("/sessions")).slice(0, 5); }
-      catch (e) { this.recentChats = []; }
-    },
     // Все чаты пользователя одним списком. Это основной источник сайдбара;
     // loadSessions (чаты одного персонажа) остаётся для мест, где нужен
     // именно контекст персонажа.
+    //
+    // Ошибка НЕ обнуляет список. Раньше здесь стояло allSessions = [], и теперь,
+    // когда список перечитывается фоном после каждой реплики, один моргнувший
+    // запрос стирал бы весь сайдбар до следующего успешного. Старые строки
+    // честнее пустоты: они устарели на один ход, а не исчезли.
     async loadAllSessions() {
+      try { this.allSessions = await this.api("/sessions"); } catch (e) { /* оставляем прежние */ }
+    },
+    // Чаты, которыми со мной поделились. Раньше их перечитывал только таймер
+    // друзей раз в 20 секунд, и общий чат после приглашения появлялся с
+    // задержкой, а в режиме без аккаунтов запрос и вовсе незачем слать.
+    async loadSharedSessions() {
+      if (!this.authStatus.accounts_enabled || !this.userToken) return;
+      try { this.sharedSessions = await this.api("/sessions/shared"); } catch (e) { /* оставляем прежние */ }
+    },
+    // Перечитать всё, из чего собран сайдбар. Сайдбар строится из allSessions,
+    // groups и sharedSessions, а мутации раньше обновляли только sessions (чаты
+    // выбранного персонажа) — новый, переименованный или закреплённый чат
+    // появлялся в списке лишь после F5. Параллельные вызовы склеиваются: пока
+    // идёт чтение, новый вызов только ставит флаг «ещё раз» и получает тот же
+    // промис, поэтому пачка мутаций даёт не больше двух проходов, а не десяток.
+    refreshChatList() {
+      if (this._chatListLoading) { this._chatListAgain = true; return this._chatListLoading; }
+      // Фокус внутри сайдбара. Строки с устойчивым ключом (вид + id) Vue
+      // переиспользует, но фокус это не спасает: закреп переставляет строку, и
+      // keyed-diff двигает её узел через insertBefore — перенос подключённого
+      // узла снимает с него фокус, хотя сам узел остаётся в документе. А если
+      // строку убрали (чат удалён в другой вкладке), фокус и вовсе падает на
+      // <body>. В обоих случаях клавиатурный путь начинался бы с начала
+      // страницы — возвращаем фокус туда, где он был, или хотя бы в список.
+      const focused = document.activeElement;
+      const inSidebar = !!(focused && focused.closest && focused.closest(".sidebar"));
+      const run = async () => {
+        try {
+          do {
+            this._chatListAgain = false;
+            // Каждый источник ловит свою ошибку сам: иначе сбой одного запроса
+            // ронял бы весь Promise.all необработанным отказом из слушателя
+            // события, а два других, уже успевших прийти, всё равно применились бы.
+            await Promise.all([
+              this.selectedCharacterId ? this.loadSessions().catch(() => {}) : null,
+              this.loadAllSessions(),
+              this.loadGroups().catch(() => {}),
+              this.loadSharedSessions(),
+            ]);
+          } while (this._chatListAgain);
+        } finally { this._chatListLoading = null; }
+        if (inSidebar) {
+          this.$nextTick(() => {
+            // Фокус никуда не делся (строка осталась на месте) — не трогаем.
+            if (document.activeElement === focused) return;
+            // Фокус ушёл сам (человек за это время кликнул или протабал дальше) —
+            // не отбираем. Возвращаем, только если он упал на <body>.
+            const act = document.activeElement;
+            if (act && act !== document.body) return;
+            if (document.contains(focused)) { focused.focus({ preventScroll: true }); return; }
+            // Строка чата (row2), а не первая строка сайдбара: та — персонаж.
+            const next = document.querySelector(".sidebar .list-item.row2 .row-main")
+              || document.querySelector(".sidebar .list-item .row-main");
+            if (next) next.focus();
+          });
+        }
+      };
+      this._chatListLoading = run();
+      return this._chatListLoading;
+    },
+    // Сообщить всем, что список чатов устарел. Слушатель в mounted перечитывает
+    // его с небольшой задержкой, поэтому серия мутаций даёт один запрос.
+    // sid — чат, в котором что-то поменялось (если известен): соседняя вкладка,
+    // где открыт тот же чат, перечитает и его ленту, а не только список.
+    notifyChatListChanged(sid) {
+      window.dispatchEvent(new CustomEvent(CHATLIST_EVENT, { detail: { sid: sid || null } }));
+      this._broadcastChatList(sid);
+    },
+    // Для мутаций, которым обновлённые строки нужны СРАЗУ (открыть только что
+    // созданный чат, найти его карточку): перечитываем без дебаунса и сообщаем
+    // соседним вкладкам. Местное событие здесь не шлём — оно дало бы второй,
+    // лишний запрос следом за этим.
+    syncChatList(sid) {
+      this._broadcastChatList(sid);
+      return this.refreshChatList();
+    },
+    _broadcastChatList(sid) {
+      if (!this._chatChannel) return;
+      try { this._chatChannel.postMessage({ type: "chatlist", from: TAB_ID, sid: sid || null }); } catch (e) {}
+    },
+    // Сигнал пришёл из соседней вкладки. Наружу его НЕ пересылаем: иначе две
+    // вкладки гоняли бы одно сообщение друг другу бесконечно.
+    _onChatChannel(ev) {
+      const d = ev && ev.data;
+      if (!d || d.type !== "chatlist" || d.from === TAB_ID) return;
+      window.dispatchEvent(new CustomEvent(CHATLIST_EVENT, { detail: { sid: d.sid || null, remote: true } }));
+    },
+    // Единый приёмник CHATLIST_EVENT. Дебаунс склеивает пачку событий (закреп +
+    // новая реплика, или «job» и «done» короткого ответа) в один запрос.
+    _onChatListEvent(e) {
+      // До входа не трогаем API: 401 от фонового запроса взводит needAccess, и
+      // человек, вошедший по логину, упирался бы следом в экран кода доступа.
+      // Сигнал из соседней вкладки или возвращение к окну приходят и на воротах.
+      if (!this._appReady) return;
+      const d = (e && e.detail) || {};
+      clearTimeout(this._chatListTimer);
+      this._chatListTimer = setTimeout(async () => {
+        await this.refreshChatList();
+        this._checkOpenChatAlive();
+      }, 120);
+      // Реплика пришла в чат, который открыт и здесь: иначе соседняя вкладка
+      // показывала бы новый ответ в превью сайдбара, а в самой ленте — нет.
+      // Ошибку глотаем: чат могли удалить в той вкладке, что прислала сигнал,
+      // и тогда перечитка падает 403 — такой чат закрывает _checkOpenChatAlive
+      // после обновления списка, а не необработанный отказ в консоли.
+      if (d.remote && d.sid && d.sid === this.sessionId && this._feedIdle()) {
+        this.loadMessages().catch(() => {});
+      }
+    },
+    // Можно ли сейчас перечитать ленту открытого чата фоном. Перечитка ЗАМЕНЯЕТ
+    // messages последним окном, поэтому нельзя: во время своей генерации (стёрла
+    // бы живой пузырь стрима), правки (правку чинит своё сохранение), генерации
+    // и доработки в Канвасе (у них временный пузырь id "tmp" без streaming),
+    // подгрузки старых сообщений и прыжка в начало (порция истории пропала бы
+    // из-под читателя вместе с позицией прокрутки).
+    _feedIdle() {
+      return !this.streaming && !this.editingId && !this.canvasGenerating
+        && !this.canvasBusy && !this.loadingOlder && !this.jumpBusy;
+    },
+    // Открытый чат пропал из списка — например, его удалили в соседней вкладке.
+    // Раньше он оставался открытым: лента, сокет и поле ввода смотрели в
+    // удалённый чат, а каждое возвращение к вкладке снова дёргало его ленту и
+    // получало ошибку. Одного отсутствия в списке мало (список мог не
+    // дочитаться, чат мог появиться между запросами), поэтому спрашиваем
+    // сервер и закрываем только на честный отказ 403/404, а не на сбой сети.
+    async _checkOpenChatAlive() {
+      const sid = this.sessionId;
+      if (!sid || this.sharedView || this.streaming) return;
+      if (this.unifiedChats.some((r) => r.id === sid)) return;
       try {
-        this.allSessions = await this.api("/sessions");
-        this.recentChats = this.allSessions.slice(0, 5);
-      } catch (e) { this.allSessions = []; }
+        await this.api("/sessions/" + sid + "/messages?limit=1");
+        return;
+      } catch (e) {
+        if (e.status !== 403 && e.status !== 404) return;
+      }
+      if (this.sessionId !== sid) return;   // пока спрашивали, человек ушёл в другой чат
+      // Поколение сокета сдвигаем ДО закрытия: onclose старого сокета тогда
+      // видит чужое поколение и не планирует переподключение к удалённому чату.
+      this._wsGen = (this._wsGen || 0) + 1;
+      if (this.ws) { try { this.ws.close(); } catch (e) {} }
+      this._stopHeartbeat();
+      if (this._wsReconnectTimer) { clearTimeout(this._wsReconnectTimer); this._wsReconnectTimer = null; }
+      this.connected = false;
+      this.sessionId = null;
+      this.messages = [];
+      this.showToast("Этот чат удалён в другой вкладке или на другом устройстве");
+    },
+    // Минутный опрос, пока вкладка на виду. Ленту открытого чата перечитываем
+    // только если в списке у него появилась реплика новее последней показанной:
+    // перечитывать её каждую минуту вслепую — лишний запрос почти всегда.
+    async _pollChatList() {
+      if (!this._appReady || document.visibilityState !== "visible") return;
+      await this.refreshChatList();
+      await this._checkOpenChatAlive();
+      if (!this.sessionId || !this._feedIdle()) return;
+      const row = this.unifiedChats.find((r) => r.id === this.sessionId);
+      const shown = this.messages.reduce((mx, m) => (typeof m.id === "number" && m.id > mx ? m.id : mx), 0);
+      if (row && row.last_id && row.last_id > shown) this.loadMessages().catch(() => {});
+    },
+    // Возвращение к вкладке. Реплики, пришедшие через Telegram-бота, сервер
+    // никому не объявляет, поэтому единственный честный момент их подобрать —
+    // когда человек снова смотрит на приложение. Не чаще раза в 10 секунд:
+    // focus и visibilitychange приходят парой на одно и то же возвращение.
+    //
+    // Идём тем же путём, что и минутный опрос, а не «удалённым» сигналом с sid
+    // открытого чата: тот перечитывал ленту на КАЖДОЕ возвращение вслепую. В
+    // длинном чате это срезало подгруженную историю до последних 400 реплик
+    // прямо под читателем (alt-tab, клик в превью Канваса и обратно), а заодно
+    // стирало временный пузырь Канваса. Опрос перечитывает ленту, только если
+    // в списке у чата есть реплика новее показанной.
+    _onChatListWake() {
+      if (document.visibilityState !== "visible") return;
+      const now = Date.now();
+      if (now - (this._chatListWokeAt || 0) < 10000) return;
+      this._chatListWokeAt = now;
+      this._pollChatList();
     },
     async startNewChat() {
       if (this.selectedCharacter) { await this.newChat(); return; }
@@ -1404,6 +1893,7 @@ createApp({
     // Строка единого списка: личный чат, группа и общий чат открываются
     // по-разному, но для пользователя это одна и та же строка.
     async openChatRow(s) {
+      this.rowMenu = null;   // открыли чат — раскрытые действия соседней строки больше не нужны
       if (s.kind === "shared") return this.openSharedSession(s);
       return this.openRecent(s);
     },
@@ -1478,9 +1968,10 @@ createApp({
       try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || ""; } catch (e) {}
       if (!tz || !this.sessionId) return;
       this.sessionTimezone = tz;
-      this.api("/sessions/" + this.sessionId, {
+      const sid = this.sessionId;
+      this.api("/sessions/" + sid, {
         method: "PATCH", body: JSON.stringify({ timezone: tz }),
-      }).catch(() => {});
+      }).then(() => this._patchSessionRow(sid, { timezone: tz })).catch(() => {});
     },
     // Открыть чат, которым со мной поделился друг (только из раздела «Доступные мне»).
     async openSharedSession(s) {
@@ -1520,6 +2011,7 @@ createApp({
         if (ev.type !== "done" && ev.type !== "error") return; // токены в фоне не нужны
         try { es.close(); } catch (_) {}
         delete this._bgJobs[sid];
+        this.notifyChatListChanged(sid);
         if (this.sessionId === sid) { this.loadMessages(); return; } // уже вернулись сюда
         if (!this.pendingChats.includes(sid)) this.pendingChats.push(sid);
         if (this.soundOn) this.playChime();
@@ -1535,8 +2027,8 @@ createApp({
     },
     // Открыть чат по id, найдя его среди обычных/групповых/расшаренных.
     _openById(sid) {
-      const s = this.sessions.find((x) => x.id === sid);
-      if (s) return this.openSession(s);
+      const s = this.sessions.find((x) => x.id === sid) || this.allSessions.find((x) => x.id === sid);
+      if (s) return this.openRecent(s);   // openRecent подтянет и контекст персонажа
       const g = this.groups.find((x) => x.id === sid);
       if (g) return this.openSession(g);
       const sh = this.sharedSessions.find((x) => x.id === sid);
@@ -1602,15 +2094,13 @@ createApp({
       if (!(await this.askConfirm("Удалить этот чат?", { okText: "Удалить" }))) return;
       await this.api("/sessions/" + s.id, { method: "DELETE" });
       if (this.sessionId === s.id) { this.sessionId = null; this.messages = []; }
-      await this.loadSessions();
-      await this.loadGroups();
+      await this.syncChatList(s.id);
     },
     async renameSession(s) {
       const title = await this.askPrompt("Новое название чата", { value: s.title, placeholder: "Название чата" });
       if (!title) return;
       await this.api("/sessions/" + s.id, { method: "PATCH", body: JSON.stringify({ title }) });
-      await this.loadSessions();
-      await this.loadGroups();
+      await this.syncChatList(s.id);
     },
 
     // ---------- Групповые чаты ----------
@@ -1658,14 +2148,14 @@ createApp({
         } catch (e) { /* пропускаем */ }
       }
       this.groupModal = false;
-      await this.loadGroups();
-      this.openSession({ id: r.session_id });
+      await this.syncChatList(r.session_id);
+      this.openSession(this._sessionCard(r.session_id) || { id: r.session_id });
     },
     async toggleDirector() {
       if (!this.currentGroup) return;
       const val = !this.currentGroup.director;
       await this.api("/sessions/" + this.sessionId, { method: "PATCH", body: JSON.stringify({ director: val }) });
-      await this.loadGroups();
+      await this.syncChatList(this.sessionId);
     },
     // ---------- Управление участниками (добавить/убрать, чат→группа) ----------
     openMembers() {
@@ -1695,8 +2185,8 @@ createApp({
         });
         this.membersOpen = false;
         this.memberAddSelected = [];
-        await this.loadGroups();
-        await this.loadSessions();
+        // Чат мог стать группой: из личных он уходит, в группах появляется.
+        await this.syncChatList(this.sessionId);
         // Чат стал групповым — переоткрываем как группу, чтобы подхватить участников.
         if (!wasGroup) { this.selectedCharacterId = null; await this.openSession({ id: this.sessionId }); }
         await this.loadMessages();
@@ -1707,7 +2197,7 @@ createApp({
       if (!(await this.askConfirm("Убрать «" + m.name + "» из группы? Его прошлые реплики останутся.", { okText: "Убрать" }))) return;
       try {
         await this.api("/sessions/" + this.sessionId + "/members/" + m.id, { method: "DELETE" });
-        await this.loadGroups();
+        await this.syncChatList(this.sessionId);
         this.showToast("Персонаж убран из группы");
       } catch (e) { this.showToast(e.message); }
     },
@@ -2029,7 +2519,14 @@ createApp({
       if (ev.type === "token" || ev.type === "thought" || ev.type === "done" || ev.type === "error") {
         this.processingNote = false;
       }
-      if (ev.type === "job") this.currentJobId = ev.job_id;
+      if (ev.type === "job") {
+        this.currentJobId = ev.job_id;
+        // «job» сервер шлёт ПОСЛЕ того, как сохранил реплику пользователя (или
+        // начал перегенерацию). Это первый момент, когда чат честно поднимается
+        // в списке: ждать «done» значило бы держать его на старом месте всю
+        // генерацию, а длинный ответ идёт минуту.
+        this.notifyChatListChanged(this.sessionId);
+      }
       else if (ev.type === "waiting") {
         // Пауза между ответами персонажей в группе (защита от 429).
         this.groupWaiting = Math.round(ev.seconds || 0);
@@ -2068,6 +2565,10 @@ createApp({
       this.groupWaiting = 0;
       // Сервер — источник истины: перечитываем сообщения (там уже новый ответ/свайп).
       await this.loadMessages();
+      // Новая реплика двигает чат вверх (среди своих: пины не перепрыгивает)
+      // и меняет превью в сайдбаре. Ошибка и остановка приходят сюда же, и
+      // список нужен и им: реплика пользователя уже сохранена.
+      this.notifyChatListChanged(this.sessionId);
       this.currentReply = "";
       this.currentThought = "";
       this.liveBubbles = [];
@@ -2231,6 +2732,9 @@ createApp({
         this._postWithProgress("/sessions/" + this.sessionId + "/send_form", fd).then((r) => {
           this.currentJobId = r.job_id;
           this.processingNote = true; // файл на сервере — дальше работает нейросеть
+          // HTTP-ход не получает события «job» по сокету: реплика сохранена,
+          // когда сервер вернул job_id, — здесь чат и поднимается в списке.
+          this.notifyChatListChanged(this.sessionId);
           this.resumeSSE(r.job_id);
         }).catch((e) => {
           this.chatError = "Не удалось отправить файл: " + e.message;
@@ -2244,6 +2748,7 @@ createApp({
         }).then((r) => {
           this.currentJobId = r.job_id;
           this.processingNote = true;
+          this.notifyChatListChanged(this.sessionId);
           this.resumeSSE(r.job_id);
         }).catch((e) => {
           this.chatError = "Не удалось отправить вложение: " + e.message;
@@ -2317,6 +2822,8 @@ createApp({
       }
       await this.api("/messages/" + msg.id, { method: "PATCH", body: JSON.stringify({ active_swipe: next }) });
       this.loadMessages();
+      // Другой вариант ответа — другое превью последней реплики в сайдбаре.
+      this.notifyChatListChanged(this.sessionId);
     },
     startEdit(msg) {
       this.editingId = msg.id;
@@ -2345,11 +2852,14 @@ createApp({
       await this.api("/messages/" + this.editingId, { method: "PATCH", body: JSON.stringify({ content: this.editingText }) });
       this.editingId = null;
       this.loadMessages();
+      this.notifyChatListChanged(this.sessionId);   // правка последней реплики меняет превью
     },
     async deleteMessage(msg) {
       if (!(await this.askConfirm("Удалить сообщение?", { okText: "Удалить" }))) return;
       await this.api("/messages/" + msg.id, { method: "DELETE" });
       this.loadMessages();
+      // Удалили последнюю реплику — у чата сменились превью, время и место в списке.
+      this.notifyChatListChanged(this.sessionId);
     },
     // Скопировать текст сообщения в буфер обмена одной кнопкой.
     async copyMessage(m) {
@@ -2634,6 +3144,7 @@ createApp({
           body: JSON.stringify({ prompt: "", mode }),
         });
         await this.loadMessages();
+        this.notifyChatListChanged(this.sessionId);   // картинка — новая реплика чата
       } catch (e) {
         // Показываем РЕАЛЬНУЮ ошибку сервера/прокси (а не общую фразу).
         this.chatError = "Арт не удался: " + e.message;
@@ -2660,6 +3171,7 @@ createApp({
         await this._postWithProgress("/sessions/" + this.sessionId + "/image",
           { prompt: desc, mode: "prompt", attachments });
         await this.loadMessages();
+        this.notifyChatListChanged(this.sessionId);
       } catch (e) {
         this.chatError = "Арт не удался: " + e.message;
       }
@@ -2675,6 +3187,7 @@ createApp({
           body: JSON.stringify({ mode: "scene", from_message_id: m.id }),
         });
         await this.loadMessages();
+        this.notifyChatListChanged(this.sessionId);
       } catch (e) {
         this.chatError = "Арт не удался: " + e.message;
       }
@@ -2736,11 +3249,13 @@ createApp({
     async setBackground(value) {
       this.sessionBg = value;
       this.bgPicker = false;
-      if (this.sessionId) {
-        await this.api("/sessions/" + this.sessionId, {
+      const sid = this.sessionId;
+      if (sid) {
+        await this.api("/sessions/" + sid, {
           method: "PATCH",
           body: JSON.stringify({ background: value }),
         });
+        this._patchSessionRow(sid, { background: value });
       }
     },
     uploadBackground(e) {
@@ -2770,7 +3285,7 @@ createApp({
       await this.loadCharacters();
       this.selectedCharacterId = data.character_id;
       this.charEdit = this.characters.find((c) => c.id === data.character_id) || null;
-      await this.loadSessions();
+      await this.syncChatList(data.session_id);
       await this.openSession({ id: data.session_id });
       await this.loadHorae();
       // Явно сообщаем, что импортировалось, в т.ч. подхватилась ли память Horae.
@@ -2826,11 +3341,14 @@ createApp({
       if (ui && "auto_summary" in ui) this.autoSummary = ui.auto_summary !== false;
       if (ui && ui.group_reply_delay != null) this.groupReplyDelay = Number(ui.group_reply_delay);
       if (ui && ui.summary_every != null) this.summaryEvery = Number(ui.summary_every);
+      if (ui && ui.memory_window != null) this.memoryWindow = Number(ui.memory_window);
+      if (ui && "horae_facts" in ui) this.horaeFacts = ui.horae_facts !== false;
     },
     // ---------- Закрепление чатов и персонажей ----------
-    // Порядок считает сервер (закреплённые сверху, последний закреплённый первым),
-    // поэтому после переключения просто перечитываем список — не пересортировываем
-    // на клиенте, иначе две реализации порядка неизбежно разъедутся.
+    // После переключения перечитываем список, а не правим флаг у строки на месте:
+    // pinned_at назначает сервер («сейчас» в момент закрепления), и порядок
+    // среди закреплённых без него не восстановить. Сам порядок единого списка
+    // считает sortChats по тем же правилам, что и сервер для каждого вида.
     async togglePinSession(s) {
       const next = !s.pinned;
       try {
@@ -2838,8 +3356,7 @@ createApp({
           method: "PATCH",
           body: JSON.stringify({ pinned: next }),
         });
-        if (s.is_group) await this.loadGroups();
-        else await this.loadSessions();
+        await this.syncChatList(s.id);
         this.showToast(next ? "📌 Чат закреплён наверху" : "Чат откреплён");
       } catch (e) {
         this.showToast("Не удалось закрепить: " + e.message);
@@ -2891,6 +3408,8 @@ createApp({
             auto_summary: this.autoSummary,
             group_reply_delay: this.groupReplyDelay,
             summary_every: this.summaryEvery,
+            memory_window: this.memoryWindow,
+            horae_facts: this.horaeFacts,
             jailbreak: this.jailbreak,
           }),
         }).catch(() => {});
@@ -3006,10 +3525,26 @@ createApp({
         if (v !== undefined) payload[k] = v;
       }
       if (!Object.keys(payload).length) return;
-      await this.api("/sessions/" + this.sessionId, {
+      const sid = this.sessionId;
+      await this.api("/sessions/" + sid, {
         method: "PATCH",
         body: JSON.stringify(payload),
       });
+      this._patchSessionRow(sid, payload);
+    },
+    // Сохранённые метаданные чата — в его строку списка, и сразу. openSession
+    // берёт заметку автора, персону, фон и пояс из строки, по которой кликнули,
+    // а строка до следующего перечитывания списка хранила значения ДО правки.
+    // Итог был хуже, чем «показывает старое»: вернулся в чат без новой реплики,
+    // увидел прежнюю заметку, кликнул в поле и вышел — blur записывал старое
+    // значение обратно на сервер поверх только что сохранённого. Строку правим
+    // на месте во всех списках, где она есть, а соседним вкладкам сообщаем.
+    _patchSessionRow(sid, fields) {
+      for (const list of [this.sessions, this.allSessions, this.groups]) {
+        const row = list.find((x) => x.id === sid);
+        if (row) Object.assign(row, fields);
+      }
+      this.notifyChatListChanged(sid);
     },
 
     // ---------- Доступ к приложению ----------
@@ -3036,7 +3571,30 @@ createApp({
         return await r.json();
       } catch (e) { return null; }
     },
+    // Переключение вкладок ворот. Ошибка гасится вместе с вкладкой: иначе
+    // «Пароли не совпадают», полученное на регистрации, продолжало висеть над
+    // формой входа, где такой проверки нет вовсе. Фокус переносится вручную —
+    // в tablist фокусируема только выбранная вкладка, и без переноса фокус
+    // остался бы на кнопке, только что ушедшей из табуляции.
+    setAuthTab(tab, moveFocus) {
+      this.authTab = tab;
+      this.accessError = "";
+      if (!moveFocus) return;
+      this.$nextTick(() => {
+        const el = this.$refs[tab === "register" ? "gateTabRegister" : "gateTabLogin"];
+        if (el) el.focus();
+      });
+    },
     async submitAuth() {
+      // Регистрация проверяется ДО запроса: сервер принимает пароль любой
+      // длины и подтверждение не сверяет, а восстановления пароля в продукте
+      // нет — сброс делает только администратор. Опечатка в пароле при
+      // регистрации отрезает человека от всех его историй, и заметить её
+      // после отправки уже негде.
+      if (this.authTab === "register") {
+        if (this.authForm.password.length < 8) { this.accessError = "Пароль короче 8 символов"; return; }
+        if (this.authForm.password !== this.authPassword2) { this.accessError = "Пароли не совпадают"; return; }
+      }
       const path = this.authTab === "register" ? "/api/auth/register" : "/api/auth/login_user";
       const r = await fetch(path, {
         method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(this.authForm),
@@ -3198,6 +3756,19 @@ createApp({
       this.saveUiPrefs();
       this.showToast(`Режим расхода: ${m.label}`);
     },
+    // Число из поля лимита: целое в [0, max]. Пустое поле или мусор оставляют
+    // прежнее значение. Сервер проверяет эти лимиты строго (целое 0..1000), и
+    // «2,5» или стёртое поле, уйди они в params, ломали бы ошибкой 422 КАЖДЫЙ
+    // следующий ход, а не одну настройку. Поле тут же показывает то, что
+    // сохранилось, — иначе при совпадении с прежним значением Vue не перерисовал
+    // бы его, и в поле осталось бы непринятое «-5».
+    numFromInput(ev, max, current) {
+      const raw = String((ev && ev.target && ev.target.value) || "").trim().replace(",", ".");
+      const n = raw === "" ? NaN : Number(raw);
+      const v = Number.isFinite(n) ? Math.min(max, Math.max(0, Math.round(n))) : current;
+      if (ev && ev.target) ev.target.value = v;
+      return v;
+    },
 
     // ---------- Профиль / привязка Telegram ----------
     openProfile() { this.profileOpen = true; this.linkCode = ""; },
@@ -3314,6 +3885,9 @@ createApp({
 
     // ---------- Инициализация приложения (после прохождения гейта) ----------
     async initApp() {
+      // Ворота пройдены: с этого момента фоновые перечитки списка чатов
+      // (сигнал соседней вкладки, возвращение к окну, минутный опрос) законны.
+      this._appReady = true;
       await this.loadConnection();
       await this.loadPresets();
       const def = this.presets.find((p) => p.is_default);
@@ -3404,6 +3978,18 @@ createApp({
   },
 
   watch: {
+    // Новые пустые чаты ловим на любом перечитывании списков — откуда бы чат ни
+    // взялся: эта вкладка, соседняя, импорт или Telegram-бот.
+    // Меню «⋯» закрывают не только его кнопкой: любое вторичное действие,
+    // сужение окна, открытие меню у соседней реплики. После каждого такого
+    // закрытия намёк data-more у прежней ленты устаревал и гасил её правый край
+    // — у реплик пользователя ровно там, где стоит «⋯». Пересчитываем все ленты
+    // с намёком, а не только ту, по которой нажали.
+    msgMenu() {
+      this.$nextTick(() => {
+        document.querySelectorAll(".msg-actions[data-more]").forEach((el) => this.msgStripEdge(el));
+      });
+    },
     // Любое изменение параметров генерации сохраняем в системе (с дебаунсом).
     params: { handler() { this.saveUiPrefs(); }, deep: true },
     soundOn(v) { localStorage.setItem("soundOn", v ? "1" : "0"); },
@@ -3460,6 +4046,45 @@ createApp({
     // Клавиши перемещения по чату: Home/End и Alt+↑/↓ (см. _onNavKey — в полях
     // ввода они не перехватываются).
     document.addEventListener("keydown", this._onNavKey);
+    // Реактивный список чатов: мутации шлют CHATLIST_EVENT, здесь его ловим
+    // (см. _onChatListEvent). Vue перерисует только изменившиеся строки
+    // (key = вид + id): без моргания, без сброса прокрутки сайдбара и без потери
+    // фокуса — список при перечитке не очищается, новые строки просто ложатся
+    // на место старых.
+    window.addEventListener(CHATLIST_EVENT, this._onChatListEvent);
+    // Соседние вкладки. Проверка наличия обязательна: BroadcastChannel нет в
+    // старых Safari, а конструктор бросает в песочнице с запрещённым хранилищем.
+    try {
+      if (typeof BroadcastChannel !== "undefined") {
+        this._chatChannel = new BroadcastChannel(CHATLIST_CHANNEL);
+        this._chatChannel.onmessage = this._onChatChannel;
+      }
+    } catch (e) { this._chatChannel = null; }
+    // Реплики из Telegram-бота сервер не объявляет: подбираем их, когда человек
+    // возвращается к вкладке, и раз в минуту, пока вкладка на виду. Скрытую
+    // вкладку не опрашиваем — там список всё равно никто не видит.
+    document.addEventListener("visibilitychange", this._onChatListWake);
+    window.addEventListener("focus", this._onChatListWake);
+    this._chatListPoll = setInterval(this._pollChatList, 60000);
+    // Ширина окна для строки действий под сообщением. Слушаем изменение, а не
+    // читаем один раз: окно десктопа сужают и расширяют на ходу, и строка
+    // должна перестраиваться вместе с вёрсткой, а не после F5.
+    try {
+      const mq = window.matchMedia && window.matchMedia("(max-width: 767.98px)");
+      if (mq) {
+        this.narrow = mq.matches;
+        const onMq = (ev) => { this.narrow = ev.matches; if (!ev.matches) this.msgMenu = null; };
+        if (mq.addEventListener) mq.addEventListener("change", onMq);
+        else if (mq.addListener) mq.addListener(onMq);   // Safari до 14
+      }
+    } catch (e) { this.narrow = false; }
+    // Тип указателя. Раскрытие действий по наведению существует только для
+    // мыши: правило вынесено в @media (hover: hover), и на телефоне оно не
+    // срабатывает никогда — там нужна своя механика раскрытия, а не та же
+    // разметка в другом оформлении.
+    try {
+      this.coarse = !!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches);
+    } catch (e) { this.coarse = false; }
     this.accessCode = localStorage.getItem("accessCode") || "";
     this.adminPassword = localStorage.getItem("adminPassword") || "";
     this.userToken = localStorage.getItem("userToken") || "";
@@ -3487,16 +4112,73 @@ createApp({
   <div v-if="needAuth" class="gate">
     <div class="gate-box">
       <h2>TaleEngine</h2>
-      <div class="row" style="gap:6px; margin-bottom:8px">
-        <button :class="authTab==='login'?'btn-primary':''" @click="authTab='login'" style="flex:1">Вход</button>
-        <button :class="authTab==='register'?'btn-primary':''" @click="authTab='register'" style="flex:1">Регистрация</button>
+      <!-- Вкладки были парой кнопок, у которых состояние несла ОДНА css-заливка:
+           в дереве доступности лежали два одинаковых пункта, и какой из них
+           открыт — не сообщалось ничем. Теперь это настоящий tablist: роль,
+           aria-selected и стрелки влево/вправо. type="button" проставлен явно —
+           кнопка без типа внутри формы отправляет её. -->
+      <div class="row" style="gap:6px; margin-bottom:8px" role="tablist" aria-label="Вход или регистрация">
+        <button type="button" ref="gateTabLogin" id="gate-tab-login" role="tab"
+                aria-controls="gate-panel" :aria-selected="authTab==='login' ? 'true' : 'false'"
+                :tabindex="authTab==='login' ? 0 : -1"
+                :class="authTab==='login'?'btn-primary':''" style="flex:1"
+                @click="setAuthTab('login')"
+                @keydown.left.prevent="setAuthTab('register', true)"
+                @keydown.right.prevent="setAuthTab('register', true)">Вход</button>
+        <button type="button" ref="gateTabRegister" id="gate-tab-register" role="tab"
+                aria-controls="gate-panel" :aria-selected="authTab==='register' ? 'true' : 'false'"
+                :tabindex="authTab==='register' ? 0 : -1"
+                :class="authTab==='register'?'btn-primary':''" style="flex:1"
+                @click="setAuthTab('register')"
+                @keydown.left.prevent="setAuthTab('login', true)"
+                @keydown.right.prevent="setAuthTab('login', true)">Регистрация</button>
       </div>
-      <input v-model="authForm.username" placeholder="Логин" />
-      <input v-model="authForm.password" type="password" placeholder="Пароль" @keyup.enter="submitAuth" style="margin-top:6px" />
-      <p v-if="accessError" class="status-err">{{ accessError }}</p>
-      <button class="btn-primary" style="width:100%; margin-top:8px" @click="submitAuth">
-        {{ authTab==='register' ? 'Зарегистрироваться' : 'Войти' }}
-      </button>
+      <div id="gate-panel" role="tabpanel"
+           :aria-labelledby="authTab==='register' ? 'gate-tab-register' : 'gate-tab-login'">
+        <!-- Постоянный текст, а не подсказка по наведению: восстановления пароля
+             в продукте нет, сбросить его может только администратор, и цена
+             незнания здесь — все истории, которые человек напишет. О таком
+             предупреждают до того, как пароль придуман, а не после. -->
+        <p v-if="authTab==='register'" id="gate-pass-warn" class="gate-warn">
+          Восстановления пароля нет. Забыли — сбросить сможет только
+          администратор, а до этого ваши истории останутся недоступны.
+          Сохраните пароль в менеджере паролей.
+        </p>
+        <!-- Настоящая form: Enter срабатывает из любого поля, а не только из
+             пароля, куда он был подвешен вручную. required вернул честную
+             реакцию на пустую отправку — раньше пустая форма уходила на сервер
+             и возвращалась чужим по смыслу «Неверный логин или пароль». -->
+        <form @submit.prevent="submitAuth">
+          <!-- Подпись даёт <label>, а не placeholder: placeholder исчезает с
+               первым набранным символом, и у поля не остаётся имени ни на
+               экране, ни в дереве доступности (WCAG 3.3.2). -->
+          <label>Логин
+            <input v-model="authForm.username" type="text" required autocomplete="username" />
+          </label>
+          <!-- autocomplete здесь не украшение: без него менеджер паролей не
+               предлагает сохранить учётку, а восстанавливать её потом нечем. -->
+          <label>Пароль
+            <input v-model="authForm.password" :type="authPassShown ? 'text' : 'password'"
+                   required :minlength="authTab==='register' ? 8 : null"
+                   :autocomplete="authTab==='register' ? 'new-password' : 'current-password'"
+                   :aria-describedby="authTab==='register' ? 'gate-pass-warn' : null" />
+            <span v-if="authTab==='register'" class="gate-hint">Не короче 8 символов.</span>
+          </label>
+          <label v-if="authTab==='register'">Повторите пароль
+            <input v-model="authPassword2" :type="authPassShown ? 'text' : 'password'"
+                   required autocomplete="new-password" />
+          </label>
+          <!-- Показ пароля — обычный чекбокс, а не кнопка внутри поля: он
+               открывает обе строки разом, и именно так проверяют совпадение. -->
+          <label class="check">
+            <input type="checkbox" v-model="authPassShown" /> Показать пароль
+          </label>
+          <p v-if="accessError" class="status-err" role="alert">{{ accessError }}</p>
+          <button type="submit" class="btn-primary" style="width:100%; margin-top:8px">
+            {{ authTab==='register' ? 'Зарегистрироваться' : 'Войти' }}
+          </button>
+        </form>
+      </div>
     </div>
   </div>
 
@@ -3504,20 +4186,38 @@ createApp({
     <div class="gate-box">
       <h2>TaleEngine</h2>
       <p class="muted">Приложение защищено кодом доступа.</p>
-      <input v-model="accessInput" type="password" placeholder="Код доступа" @keyup.enter="submitAccess" />
-      <p v-if="accessError" class="status-err">{{ accessError }}</p>
-      <button class="btn-primary" style="width:100%; margin-top:8px" @click="submitAccess">Войти</button>
+      <!-- Та же болезнь, что и на входе: поле было подписано только
+           placeholder-ом и оставалось безымянным с первого символа, а Enter
+           висел на самом поле вместо формы. -->
+      <form @submit.prevent="submitAccess">
+        <label>Код доступа
+          <!-- Код общий на всю установку, а не личный пароль: autocomplete
+               выключен, чтобы менеджер паролей не завёл под него учётку. -->
+          <input v-model="accessInput" type="password" required autocomplete="off" />
+        </label>
+        <p v-if="accessError" class="status-err" role="alert">{{ accessError }}</p>
+        <button type="submit" class="btn-primary" style="width:100%; margin-top:8px">Войти</button>
+      </form>
     </div>
   </div>
 
   <template v-else>
-  <div :class="['app-grid', !sidebarOpen ? 'sb-hidden' : '', canvasOpen ? 'with-canvas' : '', 'pane-' + mobilePane, 'view-' + viewMode]">
+  <div :class="['app-grid', !sidebarOpen ? 'sb-hidden' : '', canvasOpen ? 'with-canvas' : '', 'pane-' + mobilePane, 'view-' + viewMode, 'shell-' + shellLayout]">
+
+    <!-- Заголовок первого уровня. Во всём приложении не было НИ ОДНОГО h1:
+         скринридер открывал страницу без точки входа, а команда «перейти к
+         заголовку 1» не находила ничего. Глазами он не нужен — название чата
+         и так стоит в шапке, — поэтому .sr-only, а не видимая строка. -->
+    <h1 class="sr-only">TaleEngine</h1>
 
     <!-- Затемнение под мобильным сайдбаром -->
     <div v-if="sidebarOpen" class="backdrop" @click="sidebarOpen=false"></div>
 
     <!-- ===== Левый сайдбар: разделы-аккордеоны ===== -->
-    <div :class="['sidebar', sidebarOpen ? 'open' : '']">
+    <!-- Ориентир навигации. В дереве доступности не было ни одного ориентира:
+         быстрый переход по регионам (rotor, D в NVDA) приводил в пустоту, и до
+         списка чатов приходилось табать через всю шапку. -->
+    <div :class="['sidebar', sidebarOpen ? 'open' : '']" role="navigation" aria-label="Персонажи и чаты">
 
       <!-- Раздел: Персонажи -->
       <div class="acc">
@@ -3539,7 +4239,9 @@ createApp({
             </label>
           </div>
           <div class="list-search" v-if="characters.length > 5">
-            <input v-model="charFilter" placeholder="Поиск по персонажам…" @click.stop />
+            <!-- Полю поиска нужно ИМЯ, а не только подсказка: placeholder гаснет
+                 на первом же введённом символе и именем поля не считается. -->
+            <input v-model="charFilter" placeholder="Поиск по персонажам…" aria-label="Поиск по персонажам" @click.stop />
             <button v-if="charFilter" class="btn-icon" @click.stop="charFilter=''" title="Очистить" aria-label="Очистить">✕</button>
           </div>
           <!-- Строка списка это КНОПКА, а не div с обработчиком: иначе с клавиатуры
@@ -3547,8 +4249,9 @@ createApp({
                кнопки, а не внутри неё: интерактивный элемент внутри кнопки
                недопустим и ломает и клавиатуру, и скринридер. -->
           <div v-for="c in filteredCharacters" :key="c.id"
-               :class="['list-item', c.id === selectedCharacterId ? 'active' : '', c.pinned ? 'pinned' : '']">
-            <button type="button" class="row-main" @click="selectCharacter(c)"
+               :class="['list-item', c.id === selectedCharacterId ? 'active' : '', c.pinned ? 'pinned' : '',
+                        rowMenu === 'c'+c.id ? 'row-menu-open' : '']">
+            <button type="button" class="row-main" @click="rowMenu = null; selectCharacter(c)"
                     :aria-current="c.id === selectedCharacterId ? 'true' : null"
                     :aria-label="'Персонаж ' + c.name + (c.pinned ? ', закреплён' : '')">
               <span class="avatar" aria-hidden="true"><img v-if="c.avatar_path" :src="c.avatar_path" class="avatar" alt="" />{{ c.avatar_path ? '' : c.name.charAt(0) }}</span>
@@ -3557,14 +4260,28 @@ createApp({
                 <span class="row-name">{{ c.name }}</span>
               </span>
             </button>
-            <span class="row-actions">
+            <button v-if="coarse && rowMenu !== 'c'+c.id" class="btn-icon row-more"
+                    @click.stop="rowMenu = 'c'+c.id"
+                    title="Действия с персонажем" aria-label="Действия с персонажем"
+                    aria-expanded="false">⋯</button>
+            <span class="row-actions" v-if="!coarse || rowMenu === 'c'+c.id">
               <button class="btn-icon" @click.stop="togglePinCharacter(c)"
                       :title="c.pinned ? 'Открепить' : 'Закрепить наверху'" :aria-label="c.pinned ? 'Открепить' : 'Закрепить наверху'">{{ c.pinned ? '📍' : '📌' }}</button>
               <button class="btn-icon" @click.stop="exportCharacter(c)" title="Экспорт (JSON + лор Horae)" aria-label="Экспорт (JSON + лор Horae)">⬇</button>
               <button class="btn-icon" @click.stop="deleteCharacter(c)" title="Удалить" aria-label="Удалить">🗑</button>
+              <button v-if="coarse" class="btn-icon" @click.stop="rowMenu = null"
+                      title="Свернуть" aria-label="Свернуть действия">✕</button>
             </span>
           </div>
           <div v-if="charFilter && !filteredCharacters.length" class="list-empty">Ничего не найдено</div>
+          <!-- Пустое состояние существовало только для поиска: при нуле
+               персонажей раздел показывал две кнопки и пустоту под ними, и
+               ничто не говорило, что делать дальше и с чего начинается
+               хорошая история. -->
+          <div v-else-if="!charFilter && !characters.length" class="list-empty">
+            Персонажей пока нет. Создайте своего кнопкой «+ Новый» — или
+            импортируйте готовую карточку SillyTavern (PNG или JSON).
+          </div>
         </div>
       </div>
 
@@ -3600,11 +4317,12 @@ createApp({
                     :aria-pressed="chatFilterChar === ch.id ? 'true' : 'false'">{{ ch.name }} · {{ ch.n }}</button>
           </div>
           <div class="list-search" v-if="unifiedChats.length > 5">
-            <input v-model="chatFilter" placeholder="Поиск по названиям…" @click.stop />
+            <input v-model="chatFilter" placeholder="Поиск по названиям…" aria-label="Поиск по названиям чатов" @click.stop />
             <button v-if="chatFilter" class="btn-icon" @click.stop="chatFilter=''" title="Очистить" aria-label="Очистить">✕</button>
           </div>
           <div v-for="s in visibleChats" :key="s.kind + s.id"
-               :class="['list-item', 'row2', s.id === sessionId ? 'active' : '', s.pinned ? 'pinned' : '']">
+               :class="['list-item', 'row2', s.id === sessionId ? 'active' : '', s.pinned ? 'pinned' : '',
+                        rowMenu === 's'+s.id ? 'row-menu-open' : '']">
             <button type="button" class="row-main" @click="openChatRow(s)"
                     :title="s.title + ' — чат #' + s.id"
                     :aria-current="s.id === sessionId ? 'true' : null"
@@ -3622,13 +4340,24 @@ createApp({
               </span>
               <span class="row-time" v-if="s.last_at" aria-hidden="true">{{ shortWhen(s.last_at) }}</span>
             </button>
-            <span class="row-actions" v-if="s.kind !== 'shared'">
+            <!-- На тач-устройствах пять действий прячутся за одну кнопку.
+                 Раньше вынос из потока жил только внутри @media (hover: hover),
+                 и на телефоне пять кнопок по 44px занимали 234 из 315 пикселей
+                 сайдбара: заголовку и превью оставалось около 58, то есть
+                 отличить один чат от другого было нельзя. -->
+            <button v-if="coarse && s.kind !== 'shared' && rowMenu !== 's'+s.id"
+                    class="btn-icon row-more" @click.stop="rowMenu = 's'+s.id"
+                    title="Действия с чатом" aria-label="Действия с чатом"
+                    aria-expanded="false">⋯</button>
+            <span class="row-actions" v-if="s.kind !== 'shared' && (!coarse || rowMenu === 's'+s.id)">
               <button class="btn-icon" @click.stop="togglePinSession(s)"
                       :title="s.pinned ? 'Открепить' : 'Закрепить наверху'" :aria-label="s.pinned ? 'Открепить' : 'Закрепить наверху'">{{ s.pinned ? '📍' : '📌' }}</button>
               <button class="btn-icon" @click.stop="exportSession(s)" title="Экспорт чата (нативный формат AiChat)" aria-label="Экспорт чата (нативный формат AiChat)">💾</button>
               <button v-if="authStatus.accounts_enabled" class="btn-icon" @click.stop="openInvite(s)" title="Пригласить друга" aria-label="Пригласить друга">🔗</button>
               <button class="btn-icon" @click.stop="renameSession(s)" title="Переименовать" aria-label="Переименовать">✎</button>
               <button class="btn-icon" @click.stop="deleteSession(s)" title="Удалить чат" aria-label="Удалить чат">🗑</button>
+              <button v-if="coarse" class="btn-icon" @click.stop="rowMenu = null"
+                      title="Свернуть" aria-label="Свернуть действия">✕</button>
             </span>
           </div>
           <div v-if="!visibleChats.length" class="list-empty">
@@ -3645,14 +4374,19 @@ createApp({
     </div>
 
     <!-- ===== Центр: чат ===== -->
-    <div class="chat" @dragover.prevent="dragOver = !!sessionId" @dragleave.prevent="dragOver=false" @drop.prevent="onDrop">
+    <!-- Основная область. Без role="main" пропуск к содержимому не работал:
+         прыгать было некуда, и каждый вход в приложение начинался с обхода
+         сайдбара целиком. -->
+    <div class="chat" role="main" @dragover.prevent="dragOver = !!sessionId" @dragleave.prevent="dragOver=false" @drop.prevent="onDrop">
       <div v-if="dragOver" class="drop-overlay">📎 Отпустите файл — он прикрепится к сообщению</div>
       <div class="chat-header">
         <button class="btn-icon hamburger" @click="sidebarOpen=!sidebarOpen" title="Меню" aria-label="Меню">☰</button>
         <button v-if="canvasOpen" class="btn-icon only-mobile" @click="mobilePane='canvas'" title="Открыть Canvas" aria-label="Открыть Canvas">📋</button>
         <!-- Аватарка персонажа (для группы — первого участника с аватаркой) -->
         <span v-if="sessionId" class="header-ava">
-          <img v-if="headerAvatar" :src="headerAvatar" />
+          <!-- Пустой alt обязателен: без атрибута скринридер зачитывает вслух
+               путь к файлу аватарки, а имя персонажа и так стоит рядом текстом. -->
+          <img v-if="headerAvatar" :src="headerAvatar" alt="" />
           <span v-else>{{ currentIsGroup ? '👥' : (currentSessionTitle || 'T').charAt(0).toUpperCase() }}</span>
         </span>
         <!-- Идентичность чата: одна строка вместо заголовка и дублирующей его
@@ -3667,6 +4401,20 @@ createApp({
              flex:1 делил бы полосу пополам, подвешивая плашку обрыва связи ровно
              посередине шапки, вдали и от заголовка, и от кнопок. -->
         <span v-if="!connected" class="pill status-err" title="Связь с сервером потеряна, идёт переподключение">⟳ реконнект</span>
+        <!-- Три режима — центральное понятие продукта, но жили они в безымянном
+             «⋯» среди двенадцати плоских пунктов: пока меню закрыто, концепции
+             на экране не существовало, а «Сцена» стояла в одном ряду со «Звук
+             вкл». Здесь они на виду и ровно одной группой, а не тремя лишними
+             иконками в общей полосе: у поля viewMode одно значение, и орган
+             управления у него обязан быть один. Из «⋯» пункты убраны — дубля нет. -->
+        <div class="view-seg" role="group" aria-label="Режим ленты">
+          <button v-for="m in viewModes" :key="'vm' + m.id" class="btn-icon"
+                  :class="viewMode === m.id ? 'on' : ''"
+                  :aria-pressed="viewMode === m.id ? 'true' : 'false'"
+                  :title="m.label + ' — ' + m.hint"
+                  :aria-label="'Режим ленты: ' + m.label + ', ' + m.hint"
+                  @click="setViewMode(m.id)">{{ m.icon }}</button>
+        </div>
         <button class="btn-icon" @click="openPalette()"
                 title="Поиск по сообщениям и команды (Ctrl+K)"
                 aria-label="Поиск по сообщениям и команды, Ctrl+K">🔍</button>
@@ -3696,15 +4444,21 @@ createApp({
           <button class="btn-icon" @click="headerMenu=!headerMenu" title="Ещё" aria-label="Ещё">⋯</button>
           <div v-if="headerMenu" class="plus-backdrop" @click="headerMenu=false"></div>
           <div v-if="headerMenu" class="plus-menu header-menu">
-            <!-- Режим ленты: одно поле viewMode, три взаимоисключающих значения.
-                 Как и с composerMode, состояние ровно одно, поэтому «сцена» и
-                 «работа с документом» не могут оказаться включены одновременно. -->
-            <span class="menu-label">Режим ленты</span>
-            <button v-for="m in [['normal','💬 Обычный'],['scene','🎭 Сцена'],['work','📄 Работа с документом']]"
-                    :key="'vm'+m[0]" :class="viewMode === m[0] ? 'on' : ''"
-                    :aria-pressed="viewMode === m[0] ? 'true' : 'false'"
-                    @click="setViewMode(m[0]); headerMenu=false">{{ m[1] }}</button>
-            <span class="menu-sep" role="separator"></span>
+            <!-- Режимы ленты отсюда убраны: они переехали в сегментированный
+                 переключатель шапки. Держать их в двух местах нельзя — у одного
+                 состояния один орган управления, иначе человек ищет, какой из
+                 двух главнее, вместо того чтобы переключать комнату. -->
+            <!-- Обустройство комнаты. Раскладка меняется редко — раз выбрал и
+                 живёшь, — поэтому её место здесь и в палитре, а не рядом с
+                 режимом ленты в шапке: частое и редкое рядом путают. -->
+            <div class="menu-group" role="group" aria-label="Раскладка оболочки">
+              <span class="menu-group-title">Раскладка</span>
+              <button v-for="s in shellLayouts" :key="'sl' + s.id"
+                      :class="{ on: shellLayout === s.id }"
+                      :aria-pressed="shellLayout === s.id ? 'true' : 'false'"
+                      :title="s.hint"
+                      @click="setShellLayout(s.id); headerMenu=false">{{ s.icon }} {{ s.label }}</button>
+            </div>
             <button v-if="sessionId" @click="openInspector(); headerMenu=false">🔬 Инспектор хода</button>
             <button v-if="sessionId" @click="openKnowledge(); headerMenu=false">📚 База знаний</button>
             <button v-if="sessionId && !sharedView" @click="openMembers(); headerMenu=false">👥➕ {{ currentIsGroup ? 'Участники группы' : 'Добавить персонажа' }}</button>
@@ -3731,7 +4485,7 @@ createApp({
         </div>
         <div v-if="chatImages.length" class="bg-row">
           <span class="muted" style="align-self:center">Из чата:</span>
-          <img v-for="(u,i) in chatImages" :key="i" :src="u" class="bg-thumb" @click="setBackground(u)" />
+          <img v-for="(u,i) in chatImages" :key="i" :src="u" class="bg-thumb" @click="setBackground(u)" :alt="'Кадр из чата ' + (i + 1)" />
         </div>
       </div>
 
@@ -3755,8 +4509,11 @@ createApp({
           </div>
           <div class="start-recent" v-if="recentChats.length">
             <span class="start-recent-head">Недавние диалоги</span>
-            <button v-for="s in recentChats" :key="'rc'+s.id" class="start-chat"
-                    @click="openRecent(s)" :aria-label="'Открыть чат ' + s.title">
+            <!-- Теперь это голова единого списка: здесь бывают и группы, и общие
+                 чаты. Ключ тот же, что у строки сайдбара (вид + id), а открываем
+                 через openChatRow — общий чат открывается иначе, чем свой. -->
+            <button v-for="s in recentChats" :key="'rc' + s.kind + s.id" class="start-chat"
+                    @click="openChatRow(s)" :aria-label="'Открыть чат ' + s.title">
               <span class="grow">{{ s.title }}</span>
               <span class="when" v-if="s.last_at">{{ shortWhen(s.last_at) }}</span>
             </button>
@@ -3771,7 +4528,7 @@ createApp({
           <!-- Аватарка: персонаж/участник группы у ответа, персона/профиль у пользователя -->
           <div v-if="m.role === 'user' || m.role === 'assistant'" class="msg-ava"
                :title="m.role === 'assistant' ? (m.speaker_name || (selectedCharacter && selectedCharacter.name) || '') : ''">
-            <img v-if="msgAvatar(m)" :src="msgAvatar(m)" loading="lazy" />
+            <img v-if="msgAvatar(m)" :src="msgAvatar(m)" loading="lazy" alt="" />
             <span v-else>{{ msgAvatarLetter(m) }}</span>
           </div>
           <div class="msg-body">
@@ -3785,7 +4542,11 @@ createApp({
           <div class="bubble">
             <!-- режим редактирования: авто-фокус, авто-высота, Ctrl+Enter / Esc -->
             <div v-if="editingId === m.id" class="edit-box">
+              <!-- Поле правки не имело имени вообще: ни label, ни placeholder,
+                   ни aria-label — вслух это был просто «редактируемый текст», и
+                   в ленте на сорок сообщений было не понять, какое правишь. -->
               <textarea ref="editArea" v-model="editingText" class="edit-area"
+                        aria-label="Правка сообщения"
                         @input="autoGrowEdit" @keydown="onEditKeydown"></textarea>
               <div class="row edit-actions">
                 <span class="muted edit-hint">Ctrl+Enter — сохранить · Esc — отмена</span>
@@ -3797,7 +4558,16 @@ createApp({
             <!-- ответ ИИ + плашка документа (ответ-Канвас) -->
             <div v-else-if="m.canvas_id">
               <div v-if="m.content" v-html="renderMd(m.content)" style="margin-bottom:8px"></div>
-              <div class="doc-card" @click="openCanvas(m.canvas_id)" title="Открыть в Canvas">
+              <!-- Карточка документа была обычным div с @click: с клавиатуры на
+                   неё нельзя ни встать, ни нажать — ответ-Канвас открывался
+                   только мышью. Настоящей кнопкой её не делаем: пришлось бы
+                   гасить кнопочный скин и просадку scale(0.94) на всю карточку,
+                   поэтому роль и клавиши добавлены атрибутами. -->
+              <div class="doc-card" role="button" tabindex="0"
+                   @click="openCanvas(m.canvas_id)"
+                   @keydown.enter="openCanvas(m.canvas_id)"
+                   @keydown.space.prevent="openCanvas(m.canvas_id)"
+                   title="Открыть в Canvas">
                 <span class="doc-card-icon">{{ m.canvas_kind === 'code' ? '💻' : '📄' }}</span>
                 <span class="doc-card-body">
                   <span class="doc-card-title">{{ m.canvas_title || 'Документ' }}</span>
@@ -3813,7 +4583,10 @@ createApp({
                 <!-- a.data есть только у своего свежеотправленного (оптимистичного) сообщения;
                      у загруженных из БД — тянем лениво по attUrl (кэшируется браузером). -->
                 <div class="att-item">
-                  <img v-if="a.type==='image'" :src="a.data || a.preview || attUrl(m, ai)" loading="lazy" class="att-img" @click="lightbox = a.data || a.preview || attUrl(m, ai)" title="Открыть" />
+                  <!-- У вложения alt содержательный, а не пустой: картинка в
+                       переписке — это содержимое реплики, и с пустым alt она
+                       пропала бы из ответа целиком. -->
+                  <img v-if="a.type==='image'" :src="a.data || a.preview || attUrl(m, ai)" loading="lazy" class="att-img" @click="lightbox = a.data || a.preview || attUrl(m, ai)" :alt="a.name ? 'Изображение ' + a.name : 'Изображение в сообщении'" title="Открыть" />
                   <audio v-else-if="a.type==='audio'" :src="a.data || a.preview || attUrl(m, ai)" controls preload="none" class="att-audio"></audio>
                   <video v-else-if="a.type==='video' || ((a.mime || '').startsWith('video'))" :src="a.data || a.preview || attUrl(m, ai)" controls preload="metadata" class="att-video"></video>
                   <a v-else class="att-doc" :href="a.data || a.preview || attUrl(m, ai)" :download="a.name || 'файл'" title="Скачать">{{ attIcon(a) }} {{ a.name || 'документ' }}</a>
@@ -3829,36 +4602,78 @@ createApp({
           </div>
 
           <div class="msg-meta">
-            <!-- свайпы только у ассистента и если их больше одного / это последний ответ -->
-            <span v-if="m.role === 'assistant' && !m.canvas_id" class="swipes">
-              <button class="btn-icon" @click="swipe(m, -1)" :disabled="m.active_swipe === 0"
-                      aria-label="Предыдущий вариант ответа">◀</button>
-              {{ m.active_swipe + 1 }}/{{ (m.swipes || [m.content]).length }}
-              <button class="btn-icon" @click="swipe(m, 1)" :title="m.id === lastAssistantId ? 'Ещё вариант' : ''"
-                      :aria-label="m.id === lastAssistantId ? 'Сгенерировать ещё вариант ответа' : 'Следующий вариант ответа'">▶</button>
+            <!-- Две группы: сведения (варианты, время, модель) и действия. На
+                 узком экране они встают в две строки: сведения сверху, действия
+                 ниже одной лентой с горизонтальной прокруткой. Раньше всё жило в
+                 одном flex с переносом и на телефоне рассыпалось в 3-4 неровные
+                 строки, где кнопки переезжали между рядами от длины имени модели. -->
+            <span class="msg-info">
+              <!-- свайпы только у ассистента и если их больше одного / это последний ответ -->
+              <span v-if="m.role === 'assistant' && !m.canvas_id" class="swipes">
+                <button class="btn-icon" @click="swipe(m, -1)" :disabled="m.active_swipe === 0"
+                        aria-label="Предыдущий вариант ответа">◀</button>
+                {{ m.active_swipe + 1 }}/{{ (m.swipes || [m.content]).length }}
+                <button class="btn-icon" @click="swipe(m, 1)" :title="m.id === lastAssistantId ? 'Ещё вариант' : ''"
+                        :aria-label="m.id === lastAssistantId ? 'Сгенерировать ещё вариант ответа' : 'Следующий вариант ответа'">▶</button>
+              </span>
+              <!-- Время: у user — когда отправил, у assistant — когда пришёл ответ (в поясе чата) -->
+              <span v-if="m.created_at" class="tag msg-time" :title="fmtWhenFull(m.created_at)">🕒 {{ fmtWhen(m.created_at) }}</span>
+              <span v-if="m.model_used" class="tag msg-model" :title="m.model_used">{{ m.model_used }}</span>
             </span>
-            <!-- Время: у user — когда отправил, у assistant — когда пришёл ответ (в поясе чата) -->
-            <span v-if="m.created_at" class="tag msg-time" :title="fmtWhenFull(m.created_at)">🕒 {{ fmtWhen(m.created_at) }}</span>
-            <span v-if="m.model_used" class="tag">{{ m.model_used }}</span>
-            <!-- У длинного ответа верх уезжает за экран, и вернуться к нему
-                 прокруткой на глаз неудобно — даём точный прыжок. -->
-            <button v-if="(m.content || '').length > 800" class="btn-icon"
-                    @click="scrollMessageStart(m.id)" title="К началу этого сообщения">⇞</button>
-            <button v-if="!m.canvas_id" class="btn-icon" @click="copyMessage(m)" title="Скопировать текст" aria-label="Скопировать текст">📋</button>
-            <template v-if="!m.canvas_id">
-              <button class="btn-icon" @click="replyTo(m)" title="Ответить на это сообщение" aria-label="Ответить на это сообщение">↩</button>
-              <button class="btn-icon" @click="startEdit(m)" title="Редактировать" aria-label="Редактировать">✎</button>
-              <button v-if="m.role === 'assistant' && m.id === lastAssistantId" class="btn-icon" @click="regenerate" title="Перегенерировать" aria-label="Перегенерировать">↻</button>
-              <button v-if="m.role === 'assistant' && m.id === lastAssistantId" class="btn-icon" @click="continueReply" title="Продолжить" aria-label="Продолжить">⏩</button>
-              <button class="btn-icon" @click="artFromMessage(m)" title="Нарисовать по этому сообщению" aria-label="Нарисовать по этому сообщению">🎨</button>
-              <!-- Ветка от реплики: развилка сюжета перестаёт эмулироваться
-                   откруткой свайпа в середине чата, после которой вся дальнейшая
-                   переписка отвечала на вариант, которого уже не видно. -->
-              <button class="btn-icon" @click="forkFrom(m)"
-                      title="Форкнуть отсюда: новый чат с историей до этой реплики"
-                      aria-label="Форкнуть отсюда: новый чат с историей до этой реплики">⑂</button>
-            </template>
-            <button class="btn-icon" @click="deleteMessage(m)" title="Удалить" aria-label="Удалить">🗑</button>
+            <span class="msg-actions" role="group" aria-label="Действия с сообщением"
+                  @scroll.passive="msgStripEdge($event.currentTarget)">
+              <!-- Четыре главных действия стоят всегда и всегда в одном порядке:
+                   копировать, править, перегенерировать, удалить. Вторичные
+                   (ответить, к началу, продолжить, арт, ветка) на пальце и в узком
+                   окне уходят за «⋯» — одиннадцать кнопок по 44px занимали под
+                   КАЖДОЙ репликой больше места, чем короткий ответ, и на телефоне
+                   рассыпались в 3-4 неровных ряда. На широком экране с мышью
+                   видно всё сразу: там строку и так проявляет наведение.
+                   Порядок в обоих режимах общий, меняется только видимость:
+                   иначе привычная кнопка переезжала бы при сужении окна.
+
+                   Удалить и «⋯» стоят ПЕРЕД вторичными, а не после них. Раньше
+                   раскрытые вторичные вставали перед ними, и на телефоне (лента
+                   ~300px) раскрытие выталкивало за край и «Удалить», и сам «✕»,
+                   по которому только что нажали. Теперь главные и переключатель
+                   не двигаются никогда, а за край уходят только вторичные. -->
+              <button v-if="!m.canvas_id" class="btn-icon" @click="copyMessage(m)" title="Скопировать текст" aria-label="Скопировать текст">📋</button>
+              <button v-if="!m.canvas_id" class="btn-icon" @click="startEdit(m)" title="Редактировать" aria-label="Редактировать">✎</button>
+              <button v-if="!m.canvas_id && m.role === 'assistant' && m.id === lastAssistantId" class="btn-icon"
+                      @click="regenerate" title="Перегенерировать" aria-label="Перегенерировать">↻</button>
+              <button class="btn-icon" @click="deleteMessage(m)" title="Удалить" aria-label="Удалить">🗑</button>
+              <!-- Одна кнопка-переключатель, а не пара «⋯»/«✕» с разными
+                   элементами: у пары aria-expanded навсегда застывал в «false», и
+                   о раскрытом состоянии скринридер не узнавал ничем. Кнопки нет,
+                   когда прятать нечего (плашка документа без длинного текста). -->
+              <button v-if="compactActions && (!m.canvas_id || (m.content || '').length > 800)"
+                      class="btn-icon msg-more" :class="msgMenu === m.id ? 'on' : ''"
+                      @click="toggleMsgMenu(m, $event)"
+                      :aria-expanded="msgMenu === m.id ? 'true' : 'false'"
+                      :title="msgMenu === m.id ? 'Свернуть действия' : 'Ещё действия'"
+                      :aria-label="msgMenu === m.id ? 'Свернуть действия' : 'Ещё действия с сообщением'">{{ msgMenu === m.id ? '✕' : '⋯' }}</button>
+              <!-- Вторичные действия. Раскрытое меню закрывается тем же нажатием,
+                   что выполняет действие: открытым оно оставалось бы висеть под
+                   репликой, к которой человек уже не вернётся. -->
+              <template v-if="!compactActions || msgMenu === m.id">
+                <button v-if="!m.canvas_id" class="btn-icon" @click="msgMenu = null; replyTo(m)" title="Ответить на это сообщение" aria-label="Ответить на это сообщение">↩</button>
+                <!-- У длинного ответа верх уезжает за экран, и вернуться к нему
+                     прокруткой на глаз неудобно — даём точный прыжок. -->
+                <button v-if="(m.content || '').length > 800" class="btn-icon"
+                        @click="msgMenu = null; scrollMessageStart(m.id)" title="К началу этого сообщения"
+                        aria-label="К началу этого сообщения">⇞</button>
+                <template v-if="!m.canvas_id">
+                  <button v-if="m.role === 'assistant' && m.id === lastAssistantId" class="btn-icon" @click="msgMenu = null; continueReply()" title="Продолжить" aria-label="Продолжить">⏩</button>
+                  <button class="btn-icon" @click="msgMenu = null; artFromMessage(m)" title="Нарисовать по этому сообщению" aria-label="Нарисовать по этому сообщению">🎨</button>
+                  <!-- Ветка от реплики: развилка сюжета перестаёт эмулироваться
+                       откруткой свайпа в середине чата, после которой вся дальнейшая
+                       переписка отвечала на вариант, которого уже не видно. -->
+                  <button class="btn-icon" @click="msgMenu = null; forkFrom(m)"
+                          title="Форкнуть отсюда: новый чат с историей до этой реплики"
+                          aria-label="Форкнуть отсюда: новый чат с историей до этой реплики">⑂</button>
+                </template>
+              </template>
+            </span>
           </div>
           </div><!-- /.msg-body -->
         </div>
@@ -3873,7 +4688,7 @@ createApp({
         <!-- стриминг: группа (несколько персонажей по очереди) -->
         <div v-for="(b, i) in liveBubbles" :key="'live'+i" class="msg assistant">
           <div class="msg-ava">
-            <img v-if="memberAvatar(b.name)" :src="memberAvatar(b.name)" />
+            <img v-if="memberAvatar(b.name)" :src="memberAvatar(b.name)" alt="" />
             <span v-else>{{ (b.name || '?').charAt(0).toUpperCase() }}</span>
           </div>
           <div class="msg-body">
@@ -3888,7 +4703,7 @@ createApp({
         <!-- стриминг: одиночный ответ -->
         <div v-if="streaming && !liveBubbles.length" class="msg assistant">
           <div class="msg-ava">
-            <img v-if="msgAvatar({ role: 'assistant' })" :src="msgAvatar({ role: 'assistant' })" />
+            <img v-if="msgAvatar({ role: 'assistant' })" :src="msgAvatar({ role: 'assistant' })" alt="" />
             <span v-else>{{ msgAvatarLetter({ role: 'assistant' }) }}</span>
           </div>
           <div class="msg-body">
@@ -3916,7 +4731,17 @@ createApp({
         <button class="btn-icon accent" @click="scrollToBottom()" title="К последнему сообщению (End)" aria-label="К последнему сообщению (End)">⤓</button>
       </div>
 
-      <div class="composer" v-if="sessionId">
+      <!-- Композер — отдельный ориентир: это единственное место, куда пишут, и
+           возвращаться в него из ленты на сорок сообщений надо одним движением,
+           а не полусотней нажатий Tab. -->
+      <div class="composer" v-if="sessionId" role="region" aria-label="Написать сообщение">
+        <!-- Все полосы над полем ввода — в одной прокручиваемой обёртке с потолком
+             по высоте экрана. Каждая полоса по отдельности невелика, но в худшем
+             случае они встают разом: режим ассистента, режиссёр, ошибка, ответ на
+             реплику, десяток вложений, загрузка файлов — и вместе выталкивали
+             поле ввода с «Отправить» за нижний край телефона. Теперь сжимается
+             и прокручивается только эта стопка, а строка ввода всегда на виду. -->
+        <div class="composer-bars">
         <!-- Режим ассистента включён — показываем явно: иначе легко забыть, что
              персонаж сейчас не отыгрывает, и удивиться «сухому» ответу. -->
         <div v-if="params.assistant_mode" class="director-bar">
@@ -3957,13 +4782,17 @@ createApp({
              плейсхолдере, а Esc возвращает обычное сообщение. Раньше три режима
              давали три одинаковые синие полосы над полем ввода, и на телефоне
              при нескольких полосах на саму переписку оставалось полторы строки. -->
-        <div class="chips" v-if="pendingAttachments.length">
+        <!-- Лента вложений ограничена по высоте и прокручивается сама. Раньше
+             десять картинок растягивали её на весь экран: переписку не было
+             видно, а поле ввода и «Отправить» уезжали под навигацию телефона. -->
+        <div class="chips att-strip" v-if="pendingAttachments.length"
+             role="list" :aria-label="'Вложения: ' + pendingAttachments.length">
           <span class="chip att-chip" :class="{ 'att-loading': a.loading, 'att-error': a.error }"
-                v-for="(a, i) in pendingAttachments" :key="a.id">
+                v-for="(a, i) in pendingAttachments" :key="a.id" role="listitem">
             <span v-if="a.loading" class="att-state">⏳</span>
             <span v-else-if="a.error" class="att-state">⚠</span>
             <template v-else>
-              <img v-if="a.type==='image'" :src="a.data || a.preview" class="att-thumb" @click="lightbox=a.data || a.preview" title="Открыть" />
+              <img v-if="a.type==='image'" :src="a.data || a.preview" class="att-thumb" @click="lightbox=a.data || a.preview" :alt="a.name ? 'Вложение ' + a.name : 'Прикреплённое изображение'" title="Открыть" />
               <audio v-else-if="a.type==='audio'" :src="a.data" controls class="att-audio-sm"></audio>
               <span v-else-if="a.type==='video'" class="att-state">🎬</span>
               <span v-else class="att-state">📄</span>
@@ -3971,7 +4800,7 @@ createApp({
             <span class="att-name" :title="a.name || ''">
               {{ a.error ? 'ошибка' : (a.name || (a.type==='audio' ? 'аудио' : 'файл')) }}<i v-if="a.size"> · {{ fmtSize(a.size) }}</i>
             </span>
-            <a href="#" class="att-x" @click.prevent="removeAttachment(i)" title="Убрать">✕</a>
+            <a href="#" class="att-x" @click.prevent="removeAttachment(i)" title="Убрать" :aria-label="'Убрать вложение ' + (a.name || '')">✕</a>
           </span>
         </div>
         <!-- Пока файлы читаются — предупреждаем, что отправка подождёт их -->
@@ -3990,10 +4819,17 @@ createApp({
              class="art-indicator files-bar">
           📡 Файл загружен на сервер — нейросеть получает и обрабатывает его… Большие файлы обрабатываются до нескольких минут.
         </div>
+        </div><!-- /.composer-bars -->
         <div class="row">
           <!-- [+] второстепенные действия: документ, арт -->
           <div class="plus-wrap">
-            <button class="btn-icon" :class="composerMode !== 'text' ? 'rec-active' : ''"
+            <!-- Выбранный режим составителя — обычное «включено», а не тревога:
+                 красным здесь помечалось нормальное состояние, и цвет аварии
+                 обесценивался. aria-pressed сюда не годится: нажатие открывает
+                 меню, а не включает режим, — состояние меню несёт aria-expanded,
+                 сам режим виден на кнопке отправки и в плейсхолдере. -->
+            <button class="btn-icon" :class="composerMode !== 'text' ? 'on' : ''"
+                    :aria-expanded="plusMenu ? 'true' : 'false'"
                     @click="plusMenu=!plusMenu" title="Ещё: документ, арт" aria-label="Ещё: документ, арт">➕</button>
             <div v-if="plusMenu" class="plus-backdrop" @click="plusMenu=false"></div>
             <div v-if="plusMenu" class="plus-menu">
@@ -4011,19 +4847,33 @@ createApp({
           <!-- Голос — отдельной кнопкой: запись/стоп в один клик -->
           <button class="btn-icon" :class="recording ? 'rec-active' : ''" @click="toggleRecord"
                   :title="recording ? 'Остановить запись' : 'Записать голос'" :aria-label="recording ? 'Остановить запись' : 'Записать голос'">{{ recording ? '⏺ стоп' : '🎤' }}</button>
-          <!-- Режиссёр (только в группе): панель кнопок «вызвать/исключить» -->
-          <button v-if="currentIsGroup" class="btn-icon" :class="directorBar ? 'rec-active' : ''"
+          <!-- Режиссёр (только в группе): панель кнопок «вызвать/исключить».
+               Открытая панель — включённый тумблер, а не авария: красная заливка
+               уравнивала её с идущей записью голоса. Кнопка раскрывает панель,
+               поэтому состояние несёт aria-expanded: подпись у открытого и
+               закрытого состояний одна и та же, и раньше о нём говорил только цвет. -->
+          <button v-if="currentIsGroup" class="btn-icon" :class="directorBar ? 'on' : ''"
+                  :aria-expanded="directorBar ? 'true' : 'false'"
                   @click="directorBar = !directorBar" title="Режиссёр: кто отвечает и в каком порядке" aria-label="Режиссёр: кто отвечает и в каком порядке">🎬</button>
           <!-- Режим ассистента: держим у поля ввода, а не только в настройках —
-               переключать его нужно ровно тогда, когда пишешь прикладную просьбу. -->
-          <button class="btn-icon" :class="params.assistant_mode ? 'rec-active' : ''"
+               переключать его нужно ровно тогда, когда пишешь прикладную просьбу.
+               Состояние — заливкой выбора: красный обещал сбой, которого нет.
+               aria-pressed нужен ради ВЫКЛЮЧЕННОГО состояния: там подпись
+               описывает, что кнопка сделает, а не то, что режим снят. -->
+          <button class="btn-icon" :class="params.assistant_mode ? 'on' : ''"
+                  :aria-pressed="params.assistant_mode ? 'true' : 'false'"
                   @click="toggleAssistantMode"
                   :title="params.assistant_mode
                     ? 'Режим ассистента ВКЛЮЧЁН: персонаж не отыгрывает, а выполняет задачу. Нажмите, чтобы вернуть отыгрыш'
                     : 'Режим ассистента: выполнять задачи без отыгрыша. Для одного сообщения можно просто написать ((текст))'" :aria-label="params.assistant_mode
                     ? 'Режим ассистента ВКЛЮЧЁН: персонаж не отыгрывает, а выполняет задачу. Нажмите, чтобы вернуть отыгрыш'
                     : 'Режим ассистента: выполнять задачи без отыгрыша. Для одного сообщения можно просто написать ((текст))'">🎓</button>
+          <!-- Имя главному полю приложения давал только placeholder, а он не
+               имя: часть скринридеров его не читает, и поле оставалось безымянным.
+               Берём тот же текст — так подпись вслух совпадает с видимой, и
+               режим композера (Канвас, арт, группа) слышен наравне с видимым. -->
           <textarea ref="composer" v-model="input" rows="1" class="composer-input"
+                    :aria-label="composerPlaceholder"
                     :placeholder="composerPlaceholder"
                     @input="autoGrow" @keydown="onComposerKeydown" @paste="onPaste"></textarea>
           <button v-if="streaming" class="btn-danger" @click="stop">■ Стоп</button>
@@ -4092,7 +4942,11 @@ createApp({
 
       <!-- Единый тулбар: слева — контекстные действия (форматирование / копировать код),
            справа — переключатель «Редактор / Просмотр» (для веб-кода — live-результат). -->
-      <div class="canvas-tabs">
+      <!-- Переключатель «Редактор / Просмотр» — тоже вкладки, и тоже без ролей:
+           о включённом режиме говорил один класс active, то есть исключительно
+           цвет. Слева в той же полосе живут кнопки форматирования; вкладками
+           считаются только те два элемента, у которых стоит role="tab". -->
+      <div class="canvas-tabs" role="tablist" aria-label="Режим канваса">
         <template v-if="canvas.kind==='document' && canvasView==='edit'">
           <button class="canvas-fmt" @click="wrapSelection('**','**')" title="Жирный" aria-label="Жирный"><b>B</b></button>
           <button class="canvas-fmt" @click="wrapSelection('*','*')" title="Курсив" aria-label="Курсив"><i>I</i></button>
@@ -4101,11 +4955,16 @@ createApp({
         </template>
         <button v-if="canvas.kind==='code'" class="canvas-fmt" @click="copyCanvas" :title="copied ? 'Скопировано' : 'Скопировать код'" :aria-label="copied ? 'Скопировано' : 'Скопировать код'">{{ copied ? '✓ Скопировано' : '⧉ Скопировать код' }}</button>
         <div style="flex:1"></div>
-        <button :class="{ active: canvasView==='edit' }" @click="canvasView='edit'">✎ {{ canvas.kind==='code' ? 'Код' : 'Редактор' }}</button>
-        <button :class="{ active: canvasView==='preview' }" @click="canvasView='preview'">{{ canvasIsWeb ? '▶ Превью' : '👁 Просмотр' }}</button>
+        <button id="canvas-tab-edit" role="tab" aria-controls="canvas-body"
+                :aria-selected="canvasView==='edit' ? 'true' : 'false'"
+                :class="{ active: canvasView==='edit' }" @click="canvasView='edit'">✎ {{ canvas.kind==='code' ? 'Код' : 'Редактор' }}</button>
+        <button id="canvas-tab-preview" role="tab" aria-controls="canvas-body"
+                :aria-selected="canvasView==='preview' ? 'true' : 'false'"
+                :class="{ active: canvasView==='preview' }" @click="canvasView='preview'">{{ canvasIsWeb ? '▶ Превью' : '👁 Просмотр' }}</button>
       </div>
 
-      <div class="canvas-body">
+      <div class="canvas-body" id="canvas-body" role="tabpanel"
+           :aria-labelledby="canvasView==='edit' ? 'canvas-tab-edit' : 'canvas-tab-preview'">
         <!-- Редактор (правят и ИИ, и пользователь) -->
         <textarea v-show="canvasView==='edit'" ref="canvasEditor" v-model="canvas.content"
                   :class="['canvas-editor', canvas.kind==='code' ? 'mono' : '']"
@@ -4129,19 +4988,32 @@ createApp({
     <!-- ===== Правый drawer: настройки (выезжающий оверлей) ===== -->
     <div v-if="drawerTab" class="drawer-backdrop" @click="drawerTab=null"></div>
     <div class="drawer" v-if="drawerTab" role="dialog" aria-modal="true" aria-label="Настройки">
-      <div class="tabs">
-        <button :class="['tab-btn', drawerTab==='generation'?'active':'']" @click="drawerTab='generation'">Генерация</button>
-        <button v-if="isAdmin" :class="['tab-btn', drawerTab==='connection'?'active':'']" @click="drawerTab='connection'">Подключение</button>
-        <button :class="['tab-btn', drawerTab==='character'?'active':'']" @click="drawerTab='character'">Персонаж</button>
-        <button :class="['tab-btn', drawerTab==='memory'?'active':'']" @click="drawerTab='memory'">Память</button>
-        <button :class="['tab-btn', drawerTab==='persona'?'active':'']" @click="drawerTab='persona'">Персона</button>
+      <!-- Полоса вкладок объявлена вкладками. Ролей tab/tablist в файле не было
+           вообще: скринридер читал пять обычных кнопок и не сообщал ни какая из
+           них открыта, ни сколько их всего — состояние несла только заливка. -->
+      <div class="tabs" role="tablist" aria-label="Разделы настроек">
+        <button id="drawer-tab-generation" role="tab" aria-controls="drawer-panel-generation"
+                :aria-selected="drawerTab==='generation' ? 'true' : 'false'"
+                :class="['tab-btn', drawerTab==='generation'?'active':'']" @click="drawerTab='generation'">Генерация</button>
+        <button v-if="isAdmin" id="drawer-tab-connection" role="tab" aria-controls="drawer-panel-connection"
+                :aria-selected="drawerTab==='connection' ? 'true' : 'false'"
+                :class="['tab-btn', drawerTab==='connection'?'active':'']" @click="drawerTab='connection'">Подключение</button>
+        <button id="drawer-tab-character" role="tab" aria-controls="drawer-panel-character"
+                :aria-selected="drawerTab==='character' ? 'true' : 'false'"
+                :class="['tab-btn', drawerTab==='character'?'active':'']" @click="drawerTab='character'">Персонаж</button>
+        <button id="drawer-tab-memory" role="tab" aria-controls="drawer-panel-memory"
+                :aria-selected="drawerTab==='memory' ? 'true' : 'false'"
+                :class="['tab-btn', drawerTab==='memory'?'active':'']" @click="drawerTab='memory'">Память</button>
+        <button id="drawer-tab-persona" role="tab" aria-controls="drawer-panel-persona"
+                :aria-selected="drawerTab==='persona' ? 'true' : 'false'"
+                :class="['tab-btn', drawerTab==='persona'?'active':'']" @click="drawerTab='persona'">Персона</button>
         <div style="flex:1"></div>
         <button class="tab-btn" @click="drawerTab=null" title="Закрыть" aria-label="Закрыть">✕</button>
       </div>
       <div class="body">
 
         <!-- ВКЛАДКА: Генерация -->
-        <div v-if="drawerTab==='generation'">
+        <div v-if="drawerTab==='generation'" id="drawer-panel-generation" role="tabpanel" aria-labelledby="drawer-tab-generation">
           <h3>Параметры генерации</h3>
           <label>Модель <input v-model="params.model" list="models-list" placeholder="как в прокси" />
             <datalist id="models-list"><option v-for="m in models" :key="m" :value="m"></option></datalist>
@@ -4174,22 +5046,31 @@ createApp({
           </div>
           <p class="muted" style="margin:2px 0 10px">Сколько ИСТОРИИ чата видит модель на каждый ход. <b>Важно про цену:</b> у Gemini вход свыше ~200 тыс. токенов тарифицируется <b>вдвое дороже — целиком</b>, поэтому 200к выгоднее 1 млн почти без потери памяти. Что не влезло — сохранит авто-сводка (вкладка «Память»).</p>
 
-          <label>📎 Файлы в памяти диалога
-            <select v-model.number="params.history_files_mb">
-              <option :value="0">все файлы — полная память (дорого)</option>
-              <option :value="20">до ~20 МБ на ход</option>
-              <option :value="8">до ~8 МБ на ход (по умолчанию)</option>
-              <option :value="3">до ~3 МБ на ход (экономно)</option>
-            </select>
-          </label>
-          <label>📎 …и только из последних сообщений
-            <select v-model.number="params.history_files_turns">
-              <option :value="0">без ограничения по возрасту (дорого)</option>
-              <option :value="24">из последних 24</option>
-              <option :value="12">из последних 12 (по умолчанию)</option>
-              <option :value="6">из последних 6 (экономно)</option>
-            </select>
-          </label>
+          <!-- Своё число вместо четырёх готовых: у кого чат из десятков фото,
+               тому 8 МБ мало, а 20 уже дорого. Поле пишет значение по change,
+               а не по вводу: пустое поле посреди набора не должно улетать на
+               сервер (см. numFromInput). Кнопки — прежние варианты в один клик. -->
+          <label>📎 Файлы в памяти диалога (МБ на ход) <span class="range-val">{{ params.history_files_mb ? 'до ' + params.history_files_mb + ' МБ' : 'все файлы' }}</span>
+            <input type="number" min="0" max="1000" step="1" inputmode="numeric"
+                   :value="params.history_files_mb"
+                   @change="params.history_files_mb = numFromInput($event, 1000, params.history_files_mb)" /></label>
+          <div class="row" style="gap:6px; margin:-4px 0 6px; flex-wrap:wrap">
+            <button v-for="p in [[3,'3 МБ'],[8,'8 МБ'],[20,'20 МБ'],[0,'все файлы']]" :key="'mb' + p[0]"
+                    :class="params.history_files_mb === p[0] ? 'btn-primary' : ''"
+                    :aria-pressed="params.history_files_mb === p[0] ? 'true' : 'false'"
+                    @click="params.history_files_mb = p[0]">{{ p[1] }}</button>
+          </div>
+          <label>📎 …и только из последних сообщений <span class="range-val">{{ params.history_files_turns ? params.history_files_turns + ' сообщ.' : 'без ограничения' }}</span>
+            <input type="number" min="0" max="1000" step="1" inputmode="numeric"
+                   :value="params.history_files_turns"
+                   @change="params.history_files_turns = numFromInput($event, 1000, params.history_files_turns)" /></label>
+          <div class="row" style="gap:6px; margin:-4px 0 6px; flex-wrap:wrap">
+            <button v-for="p in [[6,'6'],[12,'12'],[24,'24'],[0,'все']]" :key="'turns' + p[0]"
+                    :class="params.history_files_turns === p[0] ? 'btn-primary' : ''"
+                    :aria-pressed="params.history_files_turns === p[0] ? 'true' : 'false'"
+                    @click="params.history_files_turns = p[0]">{{ p[1] }}</button>
+          </div>
+          <p class="muted" style="margin:2px 0 10px">0 в любом из двух полей — без ограничения (дорого). По умолчанию 8 МБ из последних 12 сообщений.</p>
           <p class="muted" style="margin:2px 0 10px"><b>Главная статья расхода в долгих чатах.</b> Прежние фото/аудио/видео пересылаются модели заново на КАЖДОМ ходу — она их «видит», а не вспоминает по пометкам. Одно видео без ограничений = десятки тысяч токенов входа в каждом ходу до конца чата. Файл вне окна модель по-прежнему знает по пометке <code>[видео: имя]</code>.</p>
 
           <label>📚 База знаний в контексте
@@ -4239,7 +5120,7 @@ createApp({
             </details>
           </template>
 
-          <p v-if="reasoningConflict" class="danger-text" style="margin:2px 0 10px; font-size:13px">
+          <p v-if="reasoningConflict" class="danger-text" style="margin:2px 0 10px; font-size:var(--fs-100)">
             ⚠ <b>Размышления возвращают цензуру.</b> У вас выбран уровень размышлений «{{ params.reasoning_effort }}» вместе со снятыми фильтрами. У Gemini режим размышлений добавляет СВОЮ модерацию поверх <code>safety_settings</code> — она душит контент даже при пороге OFF. Если ловите пустые ответы — поставьте размышления в «выключены».
           </p>
 
@@ -4252,9 +5133,17 @@ createApp({
               <input v-model="jailbreakPresetName" placeholder="имя пресета" style="flex:1; min-width:120px" />
               <button class="btn-primary" @click="saveJailbreakPreset">Сохранить</button>
             </div>
+            <!-- Тег пресета несёт действие «применить», но был просто span с
+                 @click: с клавиатуры пресет применить было нельзя. Настоящей
+                 кнопкой тег стать не может — внутри него живёт ссылка удаления,
+                 а интерактивное внутри интерактивного ломает и то и другое. -->
             <div class="row" style="gap:6px; flex-wrap:wrap">
               <span v-for="(p, i) in jailbreak.presets" :key="i" class="tag" style="cursor:pointer"
-                    @click="applyJailbreakPreset(p)" :title="p.text.slice(0, 200)">
+                    role="button" tabindex="0" :aria-label="'Применить пресет ' + p.name"
+                    @click="applyJailbreakPreset(p)"
+                    @keydown.enter="applyJailbreakPreset(p)"
+                    @keydown.space.prevent="applyJailbreakPreset(p)"
+                    :title="p.text.slice(0, 200)">
                 {{ p.name }} <a href="#" @click.stop.prevent="deleteJailbreakPreset(i)">✕</a>
               </span>
             </div>
@@ -4309,7 +5198,7 @@ createApp({
         </div>
 
         <!-- ВКЛАДКА: Подключение -->
-        <div v-if="drawerTab==='connection'">
+        <div v-if="drawerTab==='connection'" id="drawer-panel-connection" role="tabpanel" aria-labelledby="drawer-tab-connection">
           <h3>Подключение к LiteLLM</h3>
           <p class="muted">Обработка идёт на сервере. Браузер в прокси не ходит.</p>
           <label class="check"><input type="checkbox" v-model="connection.use_proxy" /> Использовать LiteLLM-прокси</label>
@@ -4325,6 +5214,22 @@ createApp({
             <input v-model="connection.fallback_model" list="models-list" placeholder="например gemini-2.5-flash" />
           </label>
           <label class="check"><input type="checkbox" v-model="connection.auto_fallback" /> Автоматически отвечать запасной моделью при сбое основной</label>
+          <div class="hr"></div>
+          <h3>Модели памяти Horae</h3>
+          <p class="muted">Сводка сюжета и факты считаются фоном после ходов. Быстрая дешёвая модель справляется с этим не хуже основной.</p>
+          <!-- У каждого поля — своя однострочная подсказка прямо под ним, а не
+               общий абзац сверху: «что будет, если оставить пустым» решается у
+               конкретного поля, и искать ответ выше по панели никто не станет. -->
+          <label>Быстрая модель для сводки и фактов
+            <input v-model="connection.summary_model" list="models-list" placeholder="например gemini-2.5-flash"
+                   aria-describedby="conn-summary-hint" />
+            <span id="conn-summary-hint" class="field-hint">Пусто — сводку и факты считает модель по умолчанию.</span>
+          </label>
+          <label>Модель эмбеддингов (необязательно)
+            <input v-model="connection.embedding_model" placeholder="например text-embedding-3-small / gemini-embedding-001"
+                   aria-describedby="conn-embed-hint" />
+            <span id="conn-embed-hint" class="field-hint">Пусто — факты подбираются по совпадению слов; с моделью — по смыслу.</span>
+          </label>
           <div class="row">
             <button class="btn-primary" @click="testConnection">Проверить и загрузить модели</button>
             <button @click="saveConnection">Сохранить</button>
@@ -4339,14 +5244,14 @@ createApp({
         </div>
 
         <!-- ВКЛАДКА: Персонаж -->
-        <div v-if="drawerTab==='character'">
+        <div v-if="drawerTab==='character'" id="drawer-panel-character" role="tabpanel" aria-labelledby="drawer-tab-character">
           <h3>Редактор персонажа</h3>
           <div v-if="charEdit">
             <p class="muted" style="margin:0 0 8px">Изменения сохраняются автоматически при выходе из поля.</p>
             <label>Имя<input v-model="charEdit.name" placeholder="Имя персонажа" @change="saveCharacter" /></label>
             <label>Аватар</label>
             <div class="row" style="margin-bottom:10px">
-              <img v-if="charEdit.avatar_path" :src="charEdit.avatar_path" class="avatar" style="width:48px;height:48px" />
+              <img v-if="charEdit.avatar_path" :src="charEdit.avatar_path" class="avatar" style="width:48px;height:48px" alt="" />
               <label class="btn" style="margin:0; cursor:pointer">Загрузить файл
                 <input type="file" accept="image/*" class="file-input" @change="onAvatarFile"
                        aria-label="Загрузить аватар персонажа" />
@@ -4354,7 +5259,7 @@ createApp({
               <button v-if="charEdit.avatar_path" class="btn-danger" @click="charEdit.avatar_path=''; saveCharacter()">убрать</button>
             </div>
             <label>Описание
-              <textarea rows="4" v-model="charEdit.description" @change="saveCharacter"
+              <textarea rows="4" v-model="charEdit.description" @change="saveCharacter" data-first-field
                         placeholder="Кто это: внешность, происхождение, ключевые факты биографии"></textarea></label>
             <label>Характер (personality)
               <textarea rows="3" v-model="charEdit.personality" @change="saveCharacter"
@@ -4383,7 +5288,7 @@ createApp({
         </div>
 
         <!-- ВКЛАДКА: Память Horae -->
-        <div v-if="drawerTab==='memory'">
+        <div v-if="drawerTab==='memory'" id="drawer-panel-memory" role="tabpanel" aria-labelledby="drawer-tab-memory">
           <h3>Память Horae 🧠</h3>
           <label class="check"><input type="checkbox" v-model="autoSummary" @change="saveUiPrefs" />
             📜 Авто-сводка сюжета: ИИ обновляет запись «Память чата (авто)» — события, выпавшие из окна контекста, остаются в памяти модели.</label>
@@ -4395,6 +5300,19 @@ createApp({
             </select>
           </label>
           <p class="muted" style="margin:2px 0 10px">Каждое обновление сводки — <b>отдельный платный запрос</b> к модели, помимо самого ответа в чате. Реже = дешевле, но память чуть грубее. Расход видно в 📊 (строка <code>summary</code>).</p>
+          <label v-if="autoSummary">Активное окно (сколько последних сообщений модель видит дословно) <span class="range-val">{{ memoryWindow ? memoryWindow + ' сообщ.' : 'вся история' }}</span>
+            <input type="number" min="0" max="1000" step="1" inputmode="numeric"
+                   :value="memoryWindow"
+                   @change="memoryWindow = numFromInput($event, 1000, memoryWindow); saveUiPrefs()" /></label>
+          <div v-if="autoSummary" class="row" style="gap:6px; margin:-4px 0 6px; flex-wrap:wrap">
+            <button v-for="p in [[20,'20'],[40,'40'],[80,'80'],[150,'150'],[0,'вся история']]" :key="'win' + p[0]"
+                    :class="memoryWindow === p[0] ? 'btn-primary' : ''"
+                    :aria-pressed="memoryWindow === p[0] ? 'true' : 'false'"
+                    @click="memoryWindow = p[0]; saveUiPrefs()">{{ p[1] }}</button>
+          </div>
+          <p v-if="autoSummary" class="muted" style="margin:2px 0 10px">Всё старше окна модель получает сжатым: хроникой и состоянием чата из сводки. В очень длинных чатах так ответы точнее, а ход дешевле. Из окна уходит только то, что сводка уже учла: пока она догоняет длинный чат, модель видит историю целиком.</p>
+          <label v-if="autoSummary" class="check"><input type="checkbox" v-model="horaeFacts" @change="saveUiPrefs" />
+            🧩 Факты: вместе со сводкой ИИ выписывает из переписки отдельные факты (имена, обещания, предметы), а на каждом ходу в контекст попадают только те, что связаны с вашей репликой.</label>
           <div class="hr"></div>
           <p class="muted">Долговременная память ролей. <b>always_on</b> — подмешивается в КАЖДЫЙ запрос (состояние, инвентарь, факты); иначе срабатывает по ключевым словам, как World Info. Области:
             <span class="scope-tag global">🌐 глоб.</span> во всех чатах,
@@ -4407,13 +5325,16 @@ createApp({
             <input v-model="horaeEdit.keywords" placeholder="ключевые слова через запятую" style="margin-bottom:2px" />
             <p class="muted" style="margin:0 0 6px; font-size:12px">Срабатывают по слову целиком и его склонениям: <code>меч</code> поймает «мечи», «мечом», «мечами», а <code>король</code> — «короля», «королём». На другие слова с тем же началом (<code>кот</code> → «который», «котёл») <b>не</b> срабатывает. Нужно шире — поставьте звёздочку: <code>замк*</code> поймает «замка», «замком», «замковый». Фраза с пробелом (<code>тёмный лес</code>) ищется как есть.</p>
             <div class="row" style="margin-bottom:6px">
-              <select v-model="horaeEdit.category"><option>lore</option><option>state</option><option>inventory</option><option>character</option><option>hidden</option></select>
+              <!-- Оба выпадающих списка стояли без подписи: ни label, ни
+                   aria-label — вслух они читались как «список, lore» и «список,
+                   глобально», без единого слова о том, что именно выбирают. -->
+              <select v-model="horaeEdit.category" aria-label="Категория записи памяти"><option>lore</option><option>state</option><option>inventory</option><option>character</option><option>hidden</option></select>
               <input type="number" v-model.number="horaeEdit.priority" placeholder="приоритет" style="width:90px" />
             </div>
             <label class="check"><input type="checkbox" v-model="horaeEdit.always_on" /> always_on</label>
             <label class="check"><input type="checkbox" v-model="horaeEdit.enabled" /> включено</label>
             <div class="row" v-if="!horaeEdit.id">
-              <select v-model="horaeEdit.scope"><option value="global">глобально</option><option value="session">только этот чат</option></select>
+              <select v-model="horaeEdit.scope" aria-label="Область видимости записи"><option value="global">глобально</option><option value="session">только этот чат</option></select>
             </div>
             <div class="row">
               <button class="btn-primary" @click="saveHorae">{{ horaeEdit.id ? 'Обновить' : 'Добавить' }}</button>
@@ -4435,7 +5356,7 @@ createApp({
         </div>
 
         <!-- ВКЛАДКА: Персона + Author's Note -->
-        <div v-if="drawerTab==='persona'">
+        <div v-if="drawerTab==='persona'" id="drawer-panel-persona" role="tabpanel" aria-labelledby="drawer-tab-persona">
           <h3>Персона пользователя</h3>
           <label>Активная персона в этом чате
             <select v-model="sessionPersonaId" @change="applySessionMeta({ persona_id: sessionPersonaId })">
@@ -4447,7 +5368,7 @@ createApp({
             <input v-model="personaNew.name" placeholder="Имя персоны" style="margin-bottom:6px" />
             <textarea v-model="personaNew.description" rows="2" placeholder="Описание (кто я)"></textarea>
             <div class="row" style="margin-top:6px">
-              <img v-if="personaNew.avatar_path" :src="personaNew.avatar_path" class="avatar" style="width:40px;height:40px" />
+              <img v-if="personaNew.avatar_path" :src="personaNew.avatar_path" class="avatar" style="width:40px;height:40px" alt="" />
               <label class="btn" style="margin:0;cursor:pointer">Внешность (фото)
                 <input type="file" accept="image/*" class="file-input" @change="onPersonaAvatar"
                        aria-label="Загрузить фотографию персоны" />
@@ -4457,7 +5378,7 @@ createApp({
           </div>
           <div class="card" v-for="p in personas" :key="p.id">
             <div class="row-between">
-              <span class="row" style="gap:8px"><img v-if="p.avatar_path" :src="p.avatar_path" class="avatar" /><b>{{ p.name }}</b></span>
+              <span class="row" style="gap:8px"><img v-if="p.avatar_path" :src="p.avatar_path" class="avatar" alt="" /><b>{{ p.name }}</b></span>
               <button class="btn-danger" @click="deletePersona(p)" :aria-label="'Удалить персону ' + p.name">🗑</button>
             </div>
             <div class="muted">{{ p.description }}</div>
@@ -4644,7 +5565,7 @@ createApp({
                  accept="image/*,audio/*,video/*,.pdf,.doc,.docx,.odt,.rtf,.txt,.md,.csv" @change="onKnowledgeFiles" />
         </label>
       </div>
-      <div v-if="!kbFiles.length" class="muted" style="font-size:13px; padding:6px 0">База знаний пуста. Добавьте справочные файлы — лор, документы, картинки, аудио.</div>
+      <div v-if="!kbFiles.length" class="muted" style="font-size:var(--fs-100); padding:6px 0">База знаний пуста. Добавьте справочные файлы — лор, документы, картинки, аудио.</div>
       <div class="card" v-for="f in kbFiles" :key="f.id">
         <div class="row-between">
           <span class="row" style="gap:8px; min-width:0">
@@ -4673,7 +5594,7 @@ createApp({
         <div class="card" v-for="m in currentGroup.members" :key="'m'+m.id">
           <div class="row-between">
             <span class="row" style="gap:8px">
-              <span class="member-ava"><img v-if="m.avatar_path" :src="m.avatar_path" /><span v-else>{{ (m.name||'?').charAt(0) }}</span></span>
+              <span class="member-ava"><img v-if="m.avatar_path" :src="m.avatar_path" alt="" /><span v-else>{{ (m.name||'?').charAt(0) }}</span></span>
               <b>{{ m.name }}</b>
             </span>
             <button class="btn-danger" :disabled="currentGroup.members.length <= 1" @click="removeMember(m)" title="Убрать из группы" aria-label="Убрать из группы">Убрать</button>
@@ -4684,10 +5605,10 @@ createApp({
 
       <!-- Кого добавить -->
       <p class="muted" style="margin:4px 0">Добавить в чат:</p>
-      <div v-if="!availableToAdd().length" class="muted" style="font-size:13px">Все персонажи уже в чате — создайте нового во вкладке слева.</div>
+      <div v-if="!availableToAdd().length" class="muted" style="font-size:var(--fs-100)">Все персонажи уже в чате — создайте нового во вкладке слева.</div>
       <div class="card" v-for="c in availableToAdd()" :key="'add'+c.id">
         <label class="check"><input type="checkbox" :checked="memberAddSelected.includes(c.id)" @change="toggleMemberAdd(c.id)" />
-          <span class="row" style="gap:8px"><span class="member-ava"><img v-if="c.avatar_path" :src="c.avatar_path" /><span v-else>{{ (c.name||'?').charAt(0) }}</span></span> {{ c.name }}</span>
+          <span class="row" style="gap:8px"><span class="member-ava"><img v-if="c.avatar_path" :src="c.avatar_path" alt="" /><span v-else>{{ (c.name||'?').charAt(0) }}</span></span> {{ c.name }}</span>
         </label>
       </div>
       <button class="btn-primary" style="margin-top:12px" :disabled="!memberAddSelected.length" @click="addMembers">
@@ -4717,7 +5638,7 @@ createApp({
       <template v-if="authStatus.accounts_enabled">
         <div class="hr"></div>
         <p class="muted" style="margin:0 0 6px">Пригласить друзей в комнату (необязательно):</p>
-        <div v-if="!friends.length" class="muted" style="font-size:13px">У вас пока нет друзей — добавьте их во вкладке «Персона».</div>
+        <div v-if="!friends.length" class="muted" style="font-size:var(--fs-100)">У вас пока нет друзей — добавьте их во вкладке «Персона».</div>
         <div v-else class="invite-list" style="max-height:170px">
           <label v-for="f in friends" :key="'gi'+f.id" :class="['invite-item', groupInviteSelected.includes(f.username) ? 'active' : '']">
             <input type="checkbox" :checked="groupInviteSelected.includes(f.username)" @change="toggleGroupInvite(f.username)" />
@@ -4869,7 +5790,12 @@ createApp({
 
   <!-- ===== Всплывающие уведомления (тосты) ===== -->
   <div class="toast-wrap">
-    <div v-for="t in toasts" :key="t.id" class="toast" @click="toastClick(t)">{{ t.text }}</div>
+    <!-- Тост кликабелен: он переводит в чат, где пришёл ответ. Но это был div
+         без роли и без табуляции — с клавиатуры уведомление нельзя было ни
+         открыть, ни убрать, оно просто исчезало через восемь секунд. -->
+    <div v-for="t in toasts" :key="t.id" class="toast" role="button" tabindex="0"
+         @click="toastClick(t)" @keydown.enter="toastClick(t)"
+         @keydown.space.prevent="toastClick(t)">{{ t.text }}</div>
   </div>
 
   <!-- ===== Диалог (подтверждение/ввод) вместо браузерных confirm/prompt ===== -->
@@ -4950,6 +5876,51 @@ createApp({
             <span class="tag">{{ h.always_on ? 'always' : (h.keywords.join(', ') || h.category) }}</span>
             <span class="ins-w">{{ h.tokens }}</span>
           </div>
+
+          <!-- Долгая память чата: активное окно, хроника и отобранные факты.
+               Без этого раздела трёхслойная память была чёрным ящиком: ни сколько
+               реплик ушло в сводку, ни какие факты модель получила на этом ходу,
+               ни каким способом их искали, узнать было неоткуда. Каждое поле
+               отчёта необязательно: старый сервер их не присылает, и тогда
+               раздел просто не рисуется, а не падает на undefined. -->
+          <template v-if="ctxStats.memory || (ctxStats.recalled && ctxStats.recalled.length)">
+            <h4 class="ins-sub">Память Horae: окно, хроника, факты</h4>
+            <template v-if="ctxStats.memory">
+              <!-- Сбой памяти показываем прямо: сервер в этом случае шлёт окно 0 и
+                   факты «off», и без этой строки инспектор уверял бы, что факты
+                   выключены настройкой, а история просто помещается в окно. -->
+              <div v-if="ctxStats.memory.error" class="ins-block ins-cut">
+                <span class="ins-dot" aria-hidden="true"></span>
+                <span class="grow">Память не собралась на этом ходу — история идёт целиком</span>
+              </div>
+              <div class="ins-block ins-static">
+                <span class="grow">Активное окно</span>
+                <span class="ins-w">{{ ctxStats.memory.window ? ctxStats.memory.window + ' сообщ.' : (ctxStats.memory.error ? '—' : 'выключено') }}</span>
+              </div>
+              <div v-if="!ctxStats.memory.error" class="ins-block ins-static">
+                <span class="grow">{{ memWindowLabel(ctxStats) }}</span>
+                <span class="ins-w" v-if="ctxStats.memory.dropped">{{ ctxStats.memory.dropped }} реплик</span>
+              </div>
+              <div v-if="ctxStats.memory.covered_upto" class="ins-block ins-static">
+                <span class="grow">Сводка учла реплики до</span>
+                <span class="ins-w">#{{ ctxStats.memory.covered_upto }}</span>
+              </div>
+              <div class="ins-block ins-static">
+                <span class="grow">Факты</span>
+                <span class="ins-w">{{ memFactsLabel(ctxStats.memory) }}</span>
+              </div>
+            </template>
+            <p v-if="ctxStats.recalled && ctxStats.recalled.length" class="muted ins-note">
+              Отобрано {{ ctxStats.recalled.length }} {{ plural(ctxStats.recalled.length, 'факт', 'факта', 'фактов') }} для следующего хода:</p>
+            <p v-else-if="ctxStats.memory && !ctxStats.memory.error && ctxStats.memory.facts_enabled !== false" class="muted ins-note">
+              Связанных с разговором фактов не нашлось — блок фактов в ход не добавлен.</p>
+            <div v-for="(f, i) in (ctxStats.recalled || [])" :key="'rf'+i" class="ins-fact">
+              <span class="ins-fact-text">{{ f.content }}</span>
+              <span v-if="typeof f.similarity === 'number'" class="tag ins-w"
+                    :title="'Сходство с репликой: ' + f.similarity.toFixed(2) + (typeof f.score === 'number' ? ', итоговый вес с учётом свежести: ' + f.score.toFixed(2) : '')">
+                {{ f.similarity.toFixed(2) }}</span>
+            </div>
+          </template>
         </template>
       </div>
     </div>
@@ -4964,6 +5935,10 @@ createApp({
       <input ref="paletteInput" v-model="paletteQuery" class="palette-input"
              placeholder="Чат, персонаж, команда со /, или фраза из переписки…"
              aria-label="Поиск по чатам, персонажам, командам и репликам"
+             role="combobox" aria-autocomplete="list" aria-haspopup="listbox"
+             aria-controls="palette-list"
+             :aria-expanded="paletteItems.length ? 'true' : 'false'"
+             :aria-activedescendant="paletteItems.length ? 'palette-option-' + paletteIndex : null"
              @keydown.down.prevent="paletteMove(1)"
              @keydown.up.prevent="paletteMove(-1)"
              @keydown.enter.prevent="paletteRun()" />
@@ -4971,9 +5946,15 @@ createApp({
         <span>↑↓ — выбор · Enter — открыть · Esc — закрыть</span>
         <span v-if="searchBusy">ищу по репликам…</span>
       </div>
-      <div class="palette-list" v-if="paletteItems.length">
+      <!-- Список результатов объявлен списком выбора, а строки — вариантами.
+           Раньше стрелки ↑↓ переставляли подсветку молча: скринридер не
+           произносил ни новую строку, ни её номер, и вести палитру с клавиатуры
+           было нельзя — при том, что подсказка внизу поля предлагает ровно это. -->
+      <div class="palette-list" id="palette-list" role="listbox" aria-label="Результаты поиска" v-if="paletteItems.length">
         <button v-for="(it, i) in paletteItems" :key="it.kind + '-' + it.id + '-' + i"
                 class="palette-item" :class="{ on: i === paletteIndex }"
+                role="option" tabindex="-1" :id="'palette-option-' + i"
+                :aria-selected="i === paletteIndex ? 'true' : 'false'"
                 @click="paletteRun(it)" @mousemove="paletteIndex = i">
           <span class="palette-kind" aria-hidden="true">{{ it.kind === 'cmd' ? '⌘' : it.kind === 'char' ? '🎭' : it.kind === 'msg' ? '🔍' : '💬' }}</span>
           <span class="palette-text">
@@ -4989,7 +5970,14 @@ createApp({
   </div>
 
   <!-- ===== Лайтбокс: полноэкранный предпросмотр картинки ===== -->
-  <div v-if="lightbox" class="lightbox" @click="lightbox=null"><img :src="lightbox" /></div>
+  <!-- Гашение по клику было единственным способом закрыть картинку: ни роли,
+       ни табуляции у слоя не было, и для скринридера полноэкранного просмотра
+       просто не существовало. Esc закрывал его и раньше — узнать об этом было
+       неоткуда. -->
+  <div v-if="lightbox" class="lightbox" role="button" tabindex="0"
+       aria-label="Закрыть изображение"
+       @click="lightbox=null" @keydown.enter="lightbox=null"
+       @keydown.space.prevent="lightbox=null"><img :src="lightbox" alt="Изображение во весь экран" /></div>
 
   <!-- ===== Плавающий тулбар Канваса: появляется при выделении (как в Notion) ===== -->
   <div v-if="canvasOpen && canvas && canvasSelText && toolbarPos" class="canvas-toolbar"

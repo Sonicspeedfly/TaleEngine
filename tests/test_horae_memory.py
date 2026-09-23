@@ -351,7 +351,7 @@ def test_summary_record_rendered_as_tail_block():
         user_message="дальше?",
     )
     tail = " ".join(m["content"] for m in messages if m["role"] == "system")
-    assert "Что было в истории" in tail and "заключили союз" in tail
+    assert "Что было в истории" in tail and "ХРОНИКА И СОСТОЯНИЕ ЧАТА" in tail and "заключили союз" in tail
 
 
 def test_user_time_block_injected_before_user_message():

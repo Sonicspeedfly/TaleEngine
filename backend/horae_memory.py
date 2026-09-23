@@ -651,6 +651,25 @@ def _attachment_manifest(history: list[dict], current_content) -> str:
     )
 
 
+def _visible_recalled(recalled_facts, history_ids, total: int, start: int) -> list[dict]:
+    """
+    Факты памяти, которых модель ещё не видит дословно, — не больше TOP_K.
+
+    Отсев идёт по ПЕРВОМУ сообщению, пережившему обрезку по бюджету: всё, что
+    раньше него, в контекст не попало, и факты оттуда — единственное, что от
+    этих сообщений осталось. id неизвестны — не отсеиваем ничего (как и окно,
+    неизвестный id мы не угадываем).
+    """
+    from backend.horae_recall import TOP_K
+
+    facts = [f for f in (recalled_facts or []) if (f.get("content") or "").strip()]
+    if facts and history_ids is not None and len(history_ids) == total and start < total:
+        first = history_ids[start]
+        if first is not None:
+            facts = [f for f in facts if int(f.get("source_message_id") or 0) < first]
+    return facts[:TOP_K]
+
+
 def assemble_context(
     *,
     character: dict,
@@ -671,6 +690,8 @@ def assemble_context(
     knowledge_media: list | None = None,
     global_instructions: str = "",
     ooc: bool = False,
+    recalled_facts: list[dict] | None = None,
+    history_ids: list | None = None,
     report: dict | None = None,
 ) -> list[dict]:
     """
@@ -690,6 +711,14 @@ def assemble_context(
     :param ooc: реплика «вне роли» — пользователь обращается к ассистенту, а не к
         персонажу. Снимает требование держать образ и убирает якорь роли из конца,
         иначе прикладная просьба проигрывает ролевой инструкции (см. ASSISTANT_GUIDE).
+
+    :param recalled_facts: факты из давней части чата, отобранные по сходству с
+        текущей репликой (см. horae_recall.rank_facts), по убыванию score. Пусто —
+        блок не добавляется.
+    :param history_ids: id сообщений по элементам history. Если известны, из
+        recalled_facts отсеиваются факты, чей источник модель и так видит
+        дословно — считая уже ПОСЛЕ обрезки истории по бюджету; остаётся не
+        больше horae_recall.TOP_K.
 
     :param report: если передан словарь, функция складывает в него разбор хода:
         вес каждого блока, сработавшие записи памяти и что срезал бюджет. Заполняется
@@ -760,8 +789,14 @@ def assemble_context(
         {"role": m["role"], "content": m["content"]} for m in history[start:]
     ]
     used += sum(costs[start:])
+    recalled_facts = _visible_recalled(recalled_facts, history_ids, len(history), start)
 
     if report is not None:
+        report["recalled"] = [
+            {"content": f.get("content", ""), "score": f.get("score"),
+             "similarity": f.get("similarity")}
+            for f in recalled_facts
+        ]
         report["history"] = {
             "total": len(history),
             "included": len(trimmed_history),
@@ -792,9 +827,22 @@ def assemble_context(
     tail: list[dict] = []
 
     # Что было в диалоге раньше (авто-сводка Horae) — как отдельный свежий блок.
+    # Когда активное окно отрезает старую переписку, это единственное, что от
+    # неё остаётся, поэтому блок стоит у конца, где влияет сильнее.
     if summary_recs:
         body = "\n".join(f"- {(r.title or 'Сводка')}: {r.content.strip()}" for r in summary_recs)
-        tail.append({"role": "system", "content": "[Что было в истории — помни это]\n" + body})
+        tail.append({"role": "system", "content": (
+            "[ХРОНИКА И СОСТОЯНИЕ ЧАТА] Что было в истории — помни это.\n" + body
+        )})
+
+    # Факты из давней части чата, похожие на текущую реплику. Нет таких — нет и
+    # блока: пустой или натянутый блок памяти модель охотно «дополняет» выдумкой.
+    if recalled_facts:
+        from backend.horae_recall import render_recalled
+
+        recalled_block = render_recalled(recalled_facts)
+        if recalled_block:
+            tail.append({"role": "system", "content": recalled_block})
 
     # Манифест приложенных файлов + напоминание изучать их.
     manifest = _attachment_manifest(trimmed_history, user_attachments_content)
@@ -1025,6 +1073,7 @@ async def build_context_from_db(
     global_instructions: str = "",
     assistant_mode: bool = False,
     report: dict | None = None,
+    history_ids: list[int | None] | None = None,
 ) -> list[dict]:
     """
     Достаёт из БД память Horae, персону, заметку автора и историю сообщений,
@@ -1038,6 +1087,9 @@ async def build_context_from_db(
     :param session: ORM-объект ChatSession (нужны его id, persona_id, author_note).
     :param history: если None — берём всю историю сессии из БД. Можно передать свою
         (например, для «регенерации» — историю БЕЗ последнего ответа ассистента).
+    :param history_ids: id сообщений по элементам переданной history. По ним
+        активное окно памяти решает, что уже учтено сводкой и может уйти из
+        контекста. Не передали — из переданной истории ничего не выбрасывается.
 
     ВАЖНО: при обычном ходе вызывать ДО сохранения нового сообщения пользователя,
     иначе оно задвоится в истории.
@@ -1086,6 +1138,17 @@ async def build_context_from_db(
         history = await messages_to_history_db(
             session_db, msgs, history_files_limit, history_files_turns
         )
+        history_ids = [m.id for m in msgs]
+    elif history_ids is None or len(history_ids) != len(history):
+        # id переданной истории неизвестны. Угадывать их («первые N сообщений
+        # чата») нельзя: история, собранная не с начала чата или с пропусками,
+        # сопоставилась бы со ЧУЖИМИ id, и окно молча выбросило бы сообщения,
+        # которых нет в сводке. Неизвестный id окно не выбрасывает никогда.
+        history_ids = [None] * len(history)
+
+    history, history_ids, recalled = await _long_memory(
+        session_db, session, history, history_ids, user_message, report
+    )
 
     char_dict = {
         "name": character.name,
@@ -1115,5 +1178,98 @@ async def build_context_from_db(
         knowledge_media=knowledge_media,
         global_instructions=global_instructions,
         ooc=ooc,
+        recalled_facts=recalled,
+        history_ids=history_ids,
         report=report,
     )
+
+
+async def _long_memory(session_db, session, history, history_ids, user_message, report):
+    """
+    Слои 1 и 3 долгой памяти (см. horae_recall): активное окно и отбор фактов.
+
+    Возвращает (история, id её сообщений, факты-кандидаты). Кандидаты — все
+    факты выше порога; какие из них в контексте лишние, решает assemble_context
+    после обрезки по бюджету. Любой сбой здесь не мешает ходу — тогда история
+    идёт целиком, а фактов нет, то есть поведение как до памяти.
+    Импорты тоже внутри try: сломанный или недостающий модуль памяти раньше
+    ронял КАЖДЫЙ ход чата вместо того, чтобы просто выключить память.
+    """
+    import logging
+
+    # Отчёт для инспектора заполняется сразу: и при сбое клиент видит, что
+    # память не сработала, а не пустое место.
+    memo = {
+        "window": 0, "dropped": 0, "covered_upto": 0,
+        "facts_enabled": False, "facts_mode": "off",
+    }
+    if report is not None:
+        report["memory"] = memo
+    try:
+        from sqlalchemy import select
+
+        from backend import horae_recall
+        from backend.models import AppSetting, HoraeEntry
+        from backend.settings_service import get_connection
+
+        ui_row = await session_db.get(AppSetting, "ui")
+        ui = ui_row.value if ui_row and isinstance(ui_row.value, dict) else {}
+        try:
+            window = int(ui.get("memory_window", horae_recall.DEFAULT_WINDOW))
+        except (TypeError, ValueError):
+            window = horae_recall.DEFAULT_WINDOW
+        use_facts = ui.get("horae_facts") is not False
+
+        # Указатель «учтено до» берём только у сводки, которая РЕАЛЬНО идёт в
+        # контекст: включённой и «всегда активной». Выключенная не идёт вовсе, а
+        # без always_on авто-запись не подмешивается никогда — её единственное
+        # ключевое слово «__auto__» в тексте не встречается. Раньше хватало
+        # enabled: пользователь снимал «всегда» с записи «Память чата (авто)»,
+        # блок хроники пропадал, а окно продолжало выбрасывать старую переписку
+        # как «пересказанную» — она не оставалась ни дословно, ни в пересказе.
+        entry = (await session_db.execute(
+            select(HoraeEntry).where(
+                HoraeEntry.session_id == session.id, HoraeEntry.category == "summary",
+                HoraeEntry.enabled == True,  # noqa: E712
+                HoraeEntry.always_on == True,  # noqa: E712
+            )
+        )).scalars().first()
+        # И только у сводки нового формата: указатель сводки до 2.4.0 врёт о
+        # покрытии (см. horae_recall.SUMMARY_FORMAT). Легаси-метку «last:N» из
+        # keywords здесь тоже намеренно НЕ читаем — по той же причине.
+        covered = horae_recall.trusted_pointer(entry.meta if entry is not None else None)
+
+        start = horae_recall.window_start(history_ids, covered, window)
+
+        recalled: list[dict] = []
+        stats: dict = {}
+        if use_facts:
+            # Запрос к памяти — текущая реплика, а хвост разговора идёт
+            # отдельно: он помогает понять «а что с ним?», но сам по себе факт
+            # не вспоминает. Слитые в один текст, они давали блок памяти почти
+            # на каждом ходу: прошлая реплика персонажа всегда называет героев.
+            context = "\n".join(
+                _plain_text(m.get("content")) for m in reversed(history[-2:])
+            )
+            known_ids = [i for i in history_ids if i]
+            # Факты из сообщений, которые модель увидит дословно, отсеивает
+            # assemble_context — уже ПОСЛЕ обрезки по бюджету. Раньше отсекали
+            # здесь по началу окна: при memory_window = 0 это были все факты
+            # чата, а сообщения, срезанные бюджетом внутри окна, не попадали ни
+            # в контекст, ни в память. Поэтому здесь берём всех кандидатов.
+            recalled = await horae_recall.recall(
+                session_db, session.id, user_message, await get_connection(session_db),
+                newest_id=known_ids[-1] if known_ids else 0,
+                context=context, top_k=None, stats=stats,
+            )
+        memo.update(
+            window=window, dropped=start, covered_upto=covered, facts_enabled=use_facts,
+            facts_mode=stats.get("mode", "lexical") if use_facts else "off",
+            facts_candidates=stats.get("candidates", 0),
+            facts_backfilling=bool(stats.get("backfilling")),
+        )
+        return history[start:], history_ids[start:], recalled
+    except Exception:  # noqa: BLE001 — память не должна ронять ход
+        logging.getLogger("aichat.horae").exception("Долгая память чата %s не собралась", session.id)
+        memo.update(dropped=0, facts_mode="off", error=True)
+        return history, history_ids, []
