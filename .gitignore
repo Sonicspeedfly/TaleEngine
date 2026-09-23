@@ -1,5 +1,6 @@
-# Секреты
+# Секреты (и их резервные копии: scrub_secrets.py оставляет .env.bak-<дата>)
 .env
+.env.bak*
 
 # База данных и данные среды выполнения
 data/*.db
@@ -21,3 +22,6 @@ frontend/dist/
 .vscode/
 .idea/
 data/*.bak*
+
+# Состояние локального сервера вопросов impeccable (pid, порт, пульс) — не часть дизайн-системы
+.impeccable/questions/

@@ -1,0 +1,71 @@
+{
+  "buildPath": "comp",
+  "detector": {
+    "ignoreRules": [
+      "side-tab"
+    ],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "design-system-color",
+        "value": "#0f1020",
+        "createdAt": "2026-09-13T09:03:40.204Z",
+        "reason": "User confirmed: chat wallpaper gradient picked by the reader, content data rather than UI chrome"
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#1a1530",
+        "createdAt": "2026-09-13T09:03:40.424Z",
+        "reason": "User confirmed: chat wallpaper gradient picked by the reader, content data rather than UI chrome"
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#3a1c2b",
+        "createdAt": "2026-09-13T09:03:40.623Z",
+        "reason": "User confirmed: chat wallpaper gradient picked by the reader, content data rather than UI chrome"
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#7a3b2e",
+        "createdAt": "2026-09-13T09:03:40.817Z",
+        "reason": "User confirmed: chat wallpaper gradient picked by the reader, content data rather than UI chrome"
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#0e2018",
+        "createdAt": "2026-09-13T09:03:41.055Z",
+        "reason": "User confirmed: chat wallpaper gradient picked by the reader, content data rather than UI chrome"
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#1d3b2a",
+        "createdAt": "2026-09-13T09:03:41.258Z",
+        "reason": "User confirmed: chat wallpaper gradient picked by the reader, content data rather than UI chrome"
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#0b2030",
+        "createdAt": "2026-09-13T09:03:41.462Z",
+        "reason": "User confirmed: chat wallpaper gradient picked by the reader, content data rather than UI chrome"
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#15455c",
+        "createdAt": "2026-09-13T09:03:41.648Z",
+        "reason": "User confirmed: chat wallpaper gradient picked by the reader, content data rather than UI chrome"
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#1c1f26",
+        "createdAt": "2026-09-13T09:03:41.835Z",
+        "reason": "User confirmed: chat wallpaper gradient picked by the reader, content data rather than UI chrome"
+      },
+      {
+        "rule": "design-system-color",
+        "value": "#2b313d",
+        "createdAt": "2026-09-13T09:03:42.023Z",
+        "reason": "User confirmed: chat wallpaper gradient picked by the reader, content data rather than UI chrome"
+      }
+    ]
+  }
+}

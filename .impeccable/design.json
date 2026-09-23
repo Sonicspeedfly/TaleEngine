@@ -1,0 +1,1023 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-09-06T00:49:32Z",
+  "title": "Design System: TaleEngine",
+  "extensions": {
+    "colorMeta": {
+      "cornflower": {
+        "role": "primary",
+        "displayName": "Василёк в полночь",
+        "canonical": "#8aa3ff",
+        "oklch": "oklch(73.5% 0.137 271.2)",
+        "tonalRamp": [
+          "oklch(15.0% 0.137 271.2)",
+          "oklch(26.4% 0.137 271.2)",
+          "oklch(37.9% 0.137 271.2)",
+          "oklch(49.3% 0.137 271.2)",
+          "oklch(60.7% 0.137 271.2)",
+          "oklch(72.1% 0.137 271.2)",
+          "oklch(83.6% 0.137 271.2)",
+          "oklch(95.0% 0.137 271.2)"
+        ],
+        "lightValue": "#2f47b8"
+      },
+      "cornflower-border": {
+        "role": "primary",
+        "displayName": "Кромка василька",
+        "canonical": "#6d8cff",
+        "oklch": "oklch(67.2% 0.173 269.9)",
+        "tonalRamp": [
+          "oklch(15.0% 0.173 269.9)",
+          "oklch(26.4% 0.173 269.9)",
+          "oklch(37.9% 0.173 269.9)",
+          "oklch(49.3% 0.173 269.9)",
+          "oklch(60.7% 0.173 269.9)",
+          "oklch(72.1% 0.173 269.9)",
+          "oklch(83.6% 0.173 269.9)",
+          "oklch(95.0% 0.173 269.9)"
+        ],
+        "lightValue": "#2f47b8"
+      },
+      "indigo-fill": {
+        "role": "primary",
+        "displayName": "Индиговая заливка",
+        "canonical": "#4058c4",
+        "oklch": "oklch(50.4% 0.170 269.8)",
+        "tonalRamp": [
+          "oklch(15.0% 0.170 269.8)",
+          "oklch(26.4% 0.170 269.8)",
+          "oklch(37.9% 0.170 269.8)",
+          "oklch(49.3% 0.170 269.8)",
+          "oklch(60.7% 0.170 269.8)",
+          "oklch(72.1% 0.170 269.8)",
+          "oklch(83.6% 0.170 269.8)",
+          "oklch(95.0% 0.170 269.8)"
+        ],
+        "lightValue": "#3a51b8"
+      },
+      "indigo-fill-hover": {
+        "role": "primary",
+        "displayName": "Индиго при наведении",
+        "canonical": "#3a51b8",
+        "oklch": "oklch(47.8% 0.165 269.6)",
+        "tonalRamp": [
+          "oklch(15.0% 0.165 269.6)",
+          "oklch(26.4% 0.165 269.6)",
+          "oklch(37.9% 0.165 269.6)",
+          "oklch(49.3% 0.165 269.6)",
+          "oklch(60.7% 0.165 269.6)",
+          "oklch(72.1% 0.165 269.6)",
+          "oklch(83.6% 0.165 269.6)",
+          "oklch(95.0% 0.165 269.6)"
+        ],
+        "lightValue": "#2f47b8"
+      },
+      "indigo-fill-active": {
+        "role": "primary",
+        "displayName": "Индиго при нажатии",
+        "canonical": "#33489f",
+        "oklch": "oklch(43.6% 0.143 269.4)",
+        "tonalRamp": [
+          "oklch(15.0% 0.143 269.4)",
+          "oklch(26.4% 0.143 269.4)",
+          "oklch(37.9% 0.143 269.4)",
+          "oklch(49.3% 0.143 269.4)",
+          "oklch(60.7% 0.143 269.4)",
+          "oklch(72.1% 0.143 269.4)",
+          "oklch(83.6% 0.143 269.4)",
+          "oklch(95.0% 0.143 269.4)"
+        ],
+        "lightValue": "#263a99"
+      },
+      "footlight-amber": {
+        "role": "secondary",
+        "displayName": "Свет рампы",
+        "canonical": "#f0ad78",
+        "oklch": "oklch(79.9% 0.105 58.9)",
+        "tonalRamp": [
+          "oklch(15.0% 0.105 58.9)",
+          "oklch(26.4% 0.105 58.9)",
+          "oklch(37.9% 0.105 58.9)",
+          "oklch(49.3% 0.105 58.9)",
+          "oklch(60.7% 0.105 58.9)",
+          "oklch(72.1% 0.105 58.9)",
+          "oklch(83.6% 0.105 58.9)",
+          "oklch(95.0% 0.105 58.9)"
+        ],
+        "note": "Только режим «Тёмный зал»: цвет живёт внутри .view-scene и темы не имеет."
+      },
+      "stage-parchment": {
+        "role": "secondary",
+        "displayName": "Пергамент",
+        "canonical": "#d9cfc6",
+        "oklch": "oklch(86.0% 0.017 64.6)",
+        "tonalRamp": [
+          "oklch(15.0% 0.017 64.6)",
+          "oklch(26.4% 0.017 64.6)",
+          "oklch(37.9% 0.017 64.6)",
+          "oklch(49.3% 0.017 64.6)",
+          "oklch(60.7% 0.017 64.6)",
+          "oklch(72.1% 0.017 64.6)",
+          "oklch(83.6% 0.017 64.6)",
+          "oklch(95.0% 0.017 64.6)"
+        ],
+        "note": "Только режим «Тёмный зал»: цвет живёт внутри .view-scene и темы не имеет."
+      },
+      "signal-ok": {
+        "role": "tertiary",
+        "displayName": "Норма",
+        "canonical": "#4cc281",
+        "oklch": "oklch(73.0% 0.143 155.9)",
+        "tonalRamp": [
+          "oklch(15.0% 0.143 155.9)",
+          "oklch(26.4% 0.143 155.9)",
+          "oklch(37.9% 0.143 155.9)",
+          "oklch(49.3% 0.143 155.9)",
+          "oklch(60.7% 0.143 155.9)",
+          "oklch(72.1% 0.143 155.9)",
+          "oklch(83.6% 0.143 155.9)",
+          "oklch(95.0% 0.143 155.9)"
+        ],
+        "lightValue": "#1c7a4c"
+      },
+      "signal-warn": {
+        "role": "tertiary",
+        "displayName": "Внимание",
+        "canonical": "#deb35b",
+        "oklch": "oklch(78.8% 0.117 83.4)",
+        "tonalRamp": [
+          "oklch(15.0% 0.117 83.4)",
+          "oklch(26.4% 0.117 83.4)",
+          "oklch(37.9% 0.117 83.4)",
+          "oklch(49.3% 0.117 83.4)",
+          "oklch(60.7% 0.117 83.4)",
+          "oklch(72.1% 0.117 83.4)",
+          "oklch(83.6% 0.117 83.4)",
+          "oklch(95.0% 0.117 83.4)"
+        ],
+        "lightValue": "#8a6410"
+      },
+      "signal-danger": {
+        "role": "tertiary",
+        "displayName": "Тревога, текстовая",
+        "canonical": "#ef7d75",
+        "oklch": "oklch(71.6% 0.142 25.4)",
+        "tonalRamp": [
+          "oklch(15.0% 0.142 25.4)",
+          "oklch(26.4% 0.142 25.4)",
+          "oklch(37.9% 0.142 25.4)",
+          "oklch(49.3% 0.142 25.4)",
+          "oklch(60.7% 0.142 25.4)",
+          "oklch(72.1% 0.142 25.4)",
+          "oklch(83.6% 0.142 25.4)",
+          "oklch(95.0% 0.142 25.4)"
+        ],
+        "lightValue": "#b3252c"
+      },
+      "danger-fill": {
+        "role": "tertiary",
+        "displayName": "Тревога, заливочная",
+        "canonical": "#b3434a",
+        "oklch": "oklch(53.8% 0.146 19.8)",
+        "tonalRamp": [
+          "oklch(15.0% 0.146 19.8)",
+          "oklch(26.4% 0.146 19.8)",
+          "oklch(37.9% 0.146 19.8)",
+          "oklch(49.3% 0.146 19.8)",
+          "oklch(60.7% 0.146 19.8)",
+          "oklch(72.1% 0.146 19.8)",
+          "oklch(83.6% 0.146 19.8)",
+          "oklch(95.0% 0.146 19.8)"
+        ],
+        "lightValue": "#b3252c"
+      },
+      "night-ink": {
+        "role": "neutral",
+        "displayName": "Чернильная ночь",
+        "canonical": "#0f1116",
+        "oklch": "oklch(17.8% 0.011 268.1)",
+        "tonalRamp": [
+          "oklch(15.0% 0.011 268.1)",
+          "oklch(26.4% 0.011 268.1)",
+          "oklch(37.9% 0.011 268.1)",
+          "oklch(49.3% 0.011 268.1)",
+          "oklch(60.7% 0.011 268.1)",
+          "oklch(72.1% 0.011 268.1)",
+          "oklch(83.6% 0.011 268.1)",
+          "oklch(95.0% 0.011 268.1)"
+        ],
+        "lightValue": "#ffffff"
+      },
+      "night-raised": {
+        "role": "neutral",
+        "displayName": "Поднятое",
+        "canonical": "#171a21",
+        "oklch": "oklch(21.8% 0.015 266.9)",
+        "tonalRamp": [
+          "oklch(15.0% 0.015 266.9)",
+          "oklch(26.4% 0.015 266.9)",
+          "oklch(37.9% 0.015 266.9)",
+          "oklch(49.3% 0.015 266.9)",
+          "oklch(60.7% 0.015 266.9)",
+          "oklch(72.1% 0.015 266.9)",
+          "oklch(83.6% 0.015 266.9)",
+          "oklch(95.0% 0.015 266.9)"
+        ],
+        "lightValue": "#f4f5f7"
+      },
+      "night-overlay": {
+        "role": "neutral",
+        "displayName": "Оверлей",
+        "canonical": "#20242e",
+        "oklch": "oklch(26.1% 0.020 267.9)",
+        "tonalRamp": [
+          "oklch(15.0% 0.020 267.9)",
+          "oklch(26.4% 0.020 267.9)",
+          "oklch(37.9% 0.020 267.9)",
+          "oklch(49.3% 0.020 267.9)",
+          "oklch(60.7% 0.020 267.9)",
+          "oklch(72.1% 0.020 267.9)",
+          "oklch(83.6% 0.020 267.9)",
+          "oklch(95.0% 0.020 267.9)"
+        ],
+        "lightValue": "#ffffff"
+      },
+      "night-control": {
+        "role": "neutral",
+        "displayName": "Контрол",
+        "canonical": "#2b303c",
+        "oklch": "oklch(30.9% 0.023 267.3)",
+        "tonalRamp": [
+          "oklch(15.0% 0.023 267.3)",
+          "oklch(26.4% 0.023 267.3)",
+          "oklch(37.9% 0.023 267.3)",
+          "oklch(49.3% 0.023 267.3)",
+          "oklch(60.7% 0.023 267.3)",
+          "oklch(72.1% 0.023 267.3)",
+          "oklch(83.6% 0.023 267.3)",
+          "oklch(95.0% 0.023 267.3)"
+        ],
+        "lightValue": "#e9ecf1"
+      },
+      "night-hover": {
+        "role": "neutral",
+        "displayName": "Наведение",
+        "canonical": "#262c38",
+        "oklch": "oklch(29.3% 0.024 264.1)",
+        "tonalRamp": [
+          "oklch(15.0% 0.024 264.1)",
+          "oklch(26.4% 0.024 264.1)",
+          "oklch(37.9% 0.024 264.1)",
+          "oklch(49.3% 0.024 264.1)",
+          "oklch(60.7% 0.024 264.1)",
+          "oklch(72.1% 0.024 264.1)",
+          "oklch(83.6% 0.024 264.1)",
+          "oklch(95.0% 0.024 264.1)"
+        ],
+        "lightValue": "#dfe3ea"
+      },
+      "night-selected": {
+        "role": "neutral",
+        "displayName": "Выбор",
+        "canonical": "#2c3a63",
+        "oklch": "oklch(35.7% 0.074 268.3)",
+        "tonalRamp": [
+          "oklch(15.0% 0.074 268.3)",
+          "oklch(26.4% 0.074 268.3)",
+          "oklch(37.9% 0.074 268.3)",
+          "oklch(49.3% 0.074 268.3)",
+          "oklch(60.7% 0.074 268.3)",
+          "oklch(72.1% 0.074 268.3)",
+          "oklch(83.6% 0.074 268.3)",
+          "oklch(95.0% 0.074 268.3)"
+        ],
+        "lightValue": "#dbe3fb"
+      },
+      "border-subtle": {
+        "role": "neutral",
+        "displayName": "Разделитель",
+        "canonical": "#2f3542",
+        "oklch": "oklch(32.9% 0.025 265.6)",
+        "tonalRamp": [
+          "oklch(15.0% 0.025 265.6)",
+          "oklch(26.4% 0.025 265.6)",
+          "oklch(37.9% 0.025 265.6)",
+          "oklch(49.3% 0.025 265.6)",
+          "oklch(60.7% 0.025 265.6)",
+          "oklch(72.1% 0.025 265.6)",
+          "oklch(83.6% 0.025 265.6)",
+          "oklch(95.0% 0.025 265.6)"
+        ],
+        "lightValue": "#e2e5ea"
+      },
+      "border-strong": {
+        "role": "neutral",
+        "displayName": "Обводка контрола",
+        "canonical": "#667084",
+        "oklch": "oklch(54.4% 0.034 264.2)",
+        "tonalRamp": [
+          "oklch(15.0% 0.034 264.2)",
+          "oklch(26.4% 0.034 264.2)",
+          "oklch(37.9% 0.034 264.2)",
+          "oklch(49.3% 0.034 264.2)",
+          "oklch(60.7% 0.034 264.2)",
+          "oklch(72.1% 0.034 264.2)",
+          "oklch(83.6% 0.034 264.2)",
+          "oklch(95.0% 0.034 264.2)"
+        ],
+        "lightValue": "#8a93a3"
+      },
+      "text-primary": {
+        "role": "neutral",
+        "displayName": "Основной текст",
+        "canonical": "#e8eaef",
+        "oklch": "oklch(93.7% 0.007 268.5)",
+        "tonalRamp": [
+          "oklch(15.0% 0.007 268.5)",
+          "oklch(26.4% 0.007 268.5)",
+          "oklch(37.9% 0.007 268.5)",
+          "oklch(49.3% 0.007 268.5)",
+          "oklch(60.7% 0.007 268.5)",
+          "oklch(72.1% 0.007 268.5)",
+          "oklch(83.6% 0.007 268.5)",
+          "oklch(95.0% 0.007 268.5)"
+        ],
+        "lightValue": "#151719"
+      },
+      "text-secondary": {
+        "role": "neutral",
+        "displayName": "Вторичный текст",
+        "canonical": "#a4adbc",
+        "oklch": "oklch(74.5% 0.024 260.7)",
+        "tonalRamp": [
+          "oklch(15.0% 0.024 260.7)",
+          "oklch(26.4% 0.024 260.7)",
+          "oklch(37.9% 0.024 260.7)",
+          "oklch(49.3% 0.024 260.7)",
+          "oklch(60.7% 0.024 260.7)",
+          "oklch(72.1% 0.024 260.7)",
+          "oklch(83.6% 0.024 260.7)",
+          "oklch(95.0% 0.024 260.7)"
+        ],
+        "lightValue": "#565d69"
+      },
+      "text-tertiary": {
+        "role": "neutral",
+        "displayName": "Третичный текст",
+        "canonical": "#868f9f",
+        "oklch": "oklch(64.8% 0.026 262.1)",
+        "tonalRamp": [
+          "oklch(15.0% 0.026 262.1)",
+          "oklch(26.4% 0.026 262.1)",
+          "oklch(37.9% 0.026 262.1)",
+          "oklch(49.3% 0.026 262.1)",
+          "oklch(60.7% 0.026 262.1)",
+          "oklch(72.1% 0.026 262.1)",
+          "oklch(83.6% 0.026 262.1)",
+          "oklch(95.0% 0.026 262.1)"
+        ],
+        "lightValue": "#6f7784"
+      },
+      "text-on-accent": {
+        "role": "neutral",
+        "displayName": "Текст на акценте",
+        "canonical": "#ffffff",
+        "oklch": "oklch(100.0% 0.000 89.9)",
+        "tonalRamp": [
+          "oklch(15.0% 0.000 89.9)",
+          "oklch(26.4% 0.000 89.9)",
+          "oklch(37.9% 0.000 89.9)",
+          "oklch(49.3% 0.000 89.9)",
+          "oklch(60.7% 0.000 89.9)",
+          "oklch(72.1% 0.000 89.9)",
+          "oklch(83.6% 0.000 89.9)",
+          "oklch(95.0% 0.000 89.9)"
+        ],
+        "lightValue": "#ffffff"
+      },
+      "bubble-user": {
+        "role": "neutral",
+        "displayName": "Реплика человека",
+        "canonical": "#2f3f75",
+        "oklch": "oklch(38.3% 0.094 269.2)",
+        "tonalRamp": [
+          "oklch(15.0% 0.094 269.2)",
+          "oklch(26.4% 0.094 269.2)",
+          "oklch(37.9% 0.094 269.2)",
+          "oklch(49.3% 0.094 269.2)",
+          "oklch(60.7% 0.094 269.2)",
+          "oklch(72.1% 0.094 269.2)",
+          "oklch(83.6% 0.094 269.2)",
+          "oklch(95.0% 0.094 269.2)"
+        ],
+        "lightValue": "#dbe3fb"
+      },
+      "bubble-assistant": {
+        "role": "neutral",
+        "displayName": "Реплика модели",
+        "canonical": "#232a38",
+        "oklch": "oklch(28.5% 0.028 264.0)",
+        "tonalRamp": [
+          "oklch(15.0% 0.028 264.0)",
+          "oklch(26.4% 0.028 264.0)",
+          "oklch(37.9% 0.028 264.0)",
+          "oklch(49.3% 0.028 264.0)",
+          "oklch(60.7% 0.028 264.0)",
+          "oklch(72.1% 0.028 264.0)",
+          "oklch(83.6% 0.028 264.0)",
+          "oklch(95.0% 0.028 264.0)"
+        ],
+        "lightValue": "#f1f3f6"
+      },
+      "code-ink": {
+        "role": "neutral",
+        "displayName": "Подложка кода",
+        "canonical": "#0b0d12",
+        "oklch": "oklch(15.9% 0.011 268.0)",
+        "tonalRamp": [
+          "oklch(15.0% 0.011 268.0)",
+          "oklch(26.4% 0.011 268.0)",
+          "oklch(37.9% 0.011 268.0)",
+          "oklch(49.3% 0.011 268.0)",
+          "oklch(60.7% 0.011 268.0)",
+          "oklch(72.1% 0.011 268.0)",
+          "oklch(83.6% 0.011 268.0)",
+          "oklch(95.0% 0.011 268.0)"
+        ],
+        "lightValue": "#f4f5f7"
+      },
+      "moonlit-lilac": {
+        "role": "neutral",
+        "displayName": "Лунная сирень",
+        "canonical": "#c7b8ff",
+        "oklch": "oklch(82.0% 0.100 293.8)",
+        "tonalRamp": [
+          "oklch(15.0% 0.100 293.8)",
+          "oklch(26.4% 0.100 293.8)",
+          "oklch(37.9% 0.100 293.8)",
+          "oklch(49.3% 0.100 293.8)",
+          "oklch(60.7% 0.100 293.8)",
+          "oklch(72.1% 0.100 293.8)",
+          "oklch(83.6% 0.100 293.8)",
+          "oklch(95.0% 0.100 293.8)"
+        ],
+        "lightValue": "#5b3fa8"
+      },
+      "scope-global": {
+        "role": "tertiary",
+        "displayName": "Область: глобальный лор",
+        "canonical": "#8fb3ff",
+        "oklch": "oklch(77.0% 0.116 264.4)",
+        "tonalRamp": [
+          "oklch(15.0% 0.116 264.4)",
+          "oklch(26.4% 0.116 264.4)",
+          "oklch(37.9% 0.116 264.4)",
+          "oklch(49.3% 0.116 264.4)",
+          "oklch(60.7% 0.116 264.4)",
+          "oklch(72.1% 0.116 264.4)",
+          "oklch(83.6% 0.116 264.4)",
+          "oklch(95.0% 0.116 264.4)"
+        ],
+        "lightValue": "#2f47b8"
+      },
+      "scope-session": {
+        "role": "tertiary",
+        "displayName": "Область: этот чат",
+        "canonical": "#6fd3a0",
+        "oklch": "oklch(79.2% 0.120 159.7)",
+        "tonalRamp": [
+          "oklch(15.0% 0.120 159.7)",
+          "oklch(26.4% 0.120 159.7)",
+          "oklch(37.9% 0.120 159.7)",
+          "oklch(49.3% 0.120 159.7)",
+          "oklch(60.7% 0.120 159.7)",
+          "oklch(72.1% 0.120 159.7)",
+          "oklch(83.6% 0.120 159.7)",
+          "oklch(95.0% 0.120 159.7)"
+        ],
+        "lightValue": "#166b43"
+      },
+      "scope-character": {
+        "role": "tertiary",
+        "displayName": "Область: персонаж",
+        "canonical": "#d8a76f",
+        "oklch": "oklch(76.1% 0.093 69.4)",
+        "tonalRamp": [
+          "oklch(15.0% 0.093 69.4)",
+          "oklch(26.4% 0.093 69.4)",
+          "oklch(37.9% 0.093 69.4)",
+          "oklch(49.3% 0.093 69.4)",
+          "oklch(60.7% 0.093 69.4)",
+          "oklch(72.1% 0.093 69.4)",
+          "oklch(83.6% 0.093 69.4)",
+          "oklch(95.0% 0.093 69.4)"
+        ],
+        "lightValue": "#7d5a0e"
+      },
+      "seg-character": {
+        "role": "tertiary",
+        "displayName": "Вес: персонаж",
+        "canonical": "#8aa3ff",
+        "oklch": "oklch(73.5% 0.137 271.2)",
+        "tonalRamp": [
+          "oklch(15.0% 0.137 271.2)",
+          "oklch(26.4% 0.137 271.2)",
+          "oklch(37.9% 0.137 271.2)",
+          "oklch(49.3% 0.137 271.2)",
+          "oklch(60.7% 0.137 271.2)",
+          "oklch(72.1% 0.137 271.2)",
+          "oklch(83.6% 0.137 271.2)",
+          "oklch(95.0% 0.137 271.2)"
+        ],
+        "lightValue": "#2f47b8"
+      },
+      "seg-persona": {
+        "role": "tertiary",
+        "displayName": "Вес: персона",
+        "canonical": "#5ccf8d",
+        "oklch": "oklch(77.1% 0.142 155.7)",
+        "tonalRamp": [
+          "oklch(15.0% 0.142 155.7)",
+          "oklch(26.4% 0.142 155.7)",
+          "oklch(37.9% 0.142 155.7)",
+          "oklch(49.3% 0.142 155.7)",
+          "oklch(60.7% 0.142 155.7)",
+          "oklch(72.1% 0.142 155.7)",
+          "oklch(83.6% 0.142 155.7)",
+          "oklch(95.0% 0.142 155.7)"
+        ],
+        "lightValue": "#166b43"
+      },
+      "seg-horae": {
+        "role": "tertiary",
+        "displayName": "Вес: память",
+        "canonical": "#deb35b",
+        "oklch": "oklch(78.8% 0.117 83.4)",
+        "tonalRamp": [
+          "oklch(15.0% 0.117 83.4)",
+          "oklch(26.4% 0.117 83.4)",
+          "oklch(37.9% 0.117 83.4)",
+          "oklch(49.3% 0.117 83.4)",
+          "oklch(60.7% 0.117 83.4)",
+          "oklch(72.1% 0.117 83.4)",
+          "oklch(83.6% 0.117 83.4)",
+          "oklch(95.0% 0.117 83.4)"
+        ],
+        "lightValue": "#7d5a0e"
+      },
+      "seg-guides": {
+        "role": "tertiary",
+        "displayName": "Вес: указания",
+        "canonical": "#a2a9b4",
+        "oklch": "oklch(73.3% 0.018 259.4)",
+        "tonalRamp": [
+          "oklch(15.0% 0.018 259.4)",
+          "oklch(26.4% 0.018 259.4)",
+          "oklch(37.9% 0.018 259.4)",
+          "oklch(49.3% 0.018 259.4)",
+          "oklch(60.7% 0.018 259.4)",
+          "oklch(72.1% 0.018 259.4)",
+          "oklch(83.6% 0.018 259.4)",
+          "oklch(95.0% 0.018 259.4)"
+        ],
+        "lightValue": "#5a6270"
+      },
+      "seg-history": {
+        "role": "tertiary",
+        "displayName": "Вес: история",
+        "canonical": "#6f7a8e",
+        "oklch": "oklch(57.8% 0.034 262.4)",
+        "tonalRamp": [
+          "oklch(15.0% 0.034 262.4)",
+          "oklch(26.4% 0.034 262.4)",
+          "oklch(37.9% 0.034 262.4)",
+          "oklch(49.3% 0.034 262.4)",
+          "oklch(60.7% 0.034 262.4)",
+          "oklch(72.1% 0.034 262.4)",
+          "oklch(83.6% 0.034 262.4)",
+          "oklch(95.0% 0.034 262.4)"
+        ],
+        "lightValue": "#39414d"
+      },
+      "seg-tail": {
+        "role": "tertiary",
+        "displayName": "Вес: хвост",
+        "canonical": "#e08b5c",
+        "oklch": "oklch(71.6% 0.121 48.9)",
+        "tonalRamp": [
+          "oklch(15.0% 0.121 48.9)",
+          "oklch(26.4% 0.121 48.9)",
+          "oklch(37.9% 0.121 48.9)",
+          "oklch(49.3% 0.121 48.9)",
+          "oklch(60.7% 0.121 48.9)",
+          "oklch(72.1% 0.121 48.9)",
+          "oklch(83.6% 0.121 48.9)",
+          "oklch(95.0% 0.121 48.9)"
+        ],
+        "lightValue": "#9c4a1c"
+      },
+      "stage-scrim": {
+        "role": "secondary",
+        "displayName": "Подложка сцены",
+        "canonical": "rgba(14, 12, 15, 0.88)",
+        "note": "Непрозрачность посчитана по худшему случаю (белое фото): текст 12.16, имя говорящего 7.51. Ниже 0.88 имя перестаёт держать 7:1. Шкалы не имеет: это не цвет, а порог."
+      }
+    },
+    "typographyMeta": {
+      "headline": {
+        "displayName": "Заголовок ленты",
+        "purpose": "Заголовок первого уровня внутри ответа модели."
+      },
+      "title": {
+        "displayName": "Подзаголовок",
+        "purpose": "Заголовок второго уровня, поле командной палитры, шапка инспектора."
+      },
+      "body": {
+        "displayName": "Чтение",
+        "purpose": "Текст сообщения. Лента — поверхность чтения, кегль крупнее интерфейсного."
+      },
+      "ui": {
+        "displayName": "Оболочка",
+        "purpose": "Значение по умолчанию для интерфейса: кнопки, поля, строки списков."
+      },
+      "label": {
+        "displayName": "Метка",
+        "purpose": "Подписи полей, метаданные, чипы, теги, время, счётчики."
+      },
+      "mono": {
+        "displayName": "Моноширинный",
+        "purpose": "Блоки кода, инлайн-код, тело промпта в инспекторе."
+      }
+    },
+    "shadows": [
+      {
+        "name": "--shadow-1",
+        "value": "0 6px 20px rgba(0, 0, 0, 0.45)",
+        "light": "0 6px 20px rgba(16, 18, 22, 0.12)",
+        "purpose": "Всплытие: выпадающие меню и вложенные панели."
+      },
+      {
+        "name": "--shadow-2",
+        "value": "0 12px 34px rgba(0, 0, 0, 0.55)",
+        "light": "0 12px 34px rgba(16, 18, 22, 0.16)",
+        "purpose": "Наложение: модальные окна и командная палитра, самый верхний слой."
+      },
+      {
+        "name": "--shadow-drawer",
+        "value": "-10px 0 30px rgba(0, 0, 0, 0.45)",
+        "light": "-10px 0 30px rgba(16, 18, 22, 0.18)",
+        "purpose": "Шторка: направлена влево, потому что панель приходит справа."
+      },
+      {
+        "name": "--shadow-sidebar",
+        "value": "8px 0 28px rgba(0, 0, 0, 0.45)",
+        "light": "8px 0 28px rgba(16, 18, 22, 0.18)",
+        "purpose": "Сайдбар на узком экране: зеркало шторки, панель приходит слева."
+      },
+      {
+        "name": "--shadow-toast",
+        "value": "0 8px 24px rgba(0, 0, 0, 0.45)",
+        "light": "0 8px 24px rgba(16, 18, 22, 0.16)",
+        "purpose": "Тост: плюс акцентная полоса слева 3px."
+      },
+      {
+        "name": "--shadow-lightbox",
+        "value": "0 10px 40px rgba(0, 0, 0, 0.6)",
+        "light": "0 10px 40px rgba(16, 18, 22, 0.24)",
+        "purpose": "Картинка во весь экран."
+      }
+    ],
+    "motion": [
+      {
+        "name": "--dur-press",
+        "value": "80ms",
+        "purpose": "Просадка кнопки под пальцем (scale 0.94). Единственная тактильная обратная связь."
+      },
+      {
+        "name": "--dur-1",
+        "value": "120ms",
+        "purpose": "Цвет, фон и граница контрола. Собрала прежние 0.12 / 0.14 / 0.15 / 0.16."
+      },
+      {
+        "name": "--dur-2",
+        "value": "180ms",
+        "purpose": "Появление: реплика, шторка, тост. Собрала прежние 0.18 / 0.2."
+      },
+      {
+        "name": "--dur-3",
+        "value": "260ms",
+        "purpose": "Панели: аккордеон, сайдбар, полоса заполнения. Собрала прежние 0.25 / 0.26 / 0.3."
+      },
+      {
+        "name": "--ease",
+        "value": "cubic-bezier(0.2, 0, 0.2, 1)",
+        "purpose": "Смена состояния: трогается резче, чем тормозит."
+      },
+      {
+        "name": "--ease-out",
+        "value": "cubic-bezier(0, 0, 0.2, 1)",
+        "purpose": "Появление: у входящего элемента нет разгона, он уже в движении."
+      },
+      {
+        "name": "reduced-motion",
+        "value": "@media (prefers-reduced-motion: reduce) -> 0.01ms",
+        "purpose": "Системная настройка отключает движение разом, включая появление реплик."
+      }
+    ],
+    "layers": [
+      {
+        "name": "--z-nav",
+        "value": 12,
+        "purpose": "Кнопки навигации по ленте."
+      },
+      {
+        "name": "--z-menu-backdrop",
+        "value": 19,
+        "purpose": "Подложка меню «плюс»."
+      },
+      {
+        "name": "--z-menu",
+        "value": 20,
+        "purpose": "Меню «плюс» и выпадающие списки."
+      },
+      {
+        "name": "--z-overlay",
+        "value": 30,
+        "purpose": "Меню шапки, накладка канваса."
+      },
+      {
+        "name": "--z-canvas-full",
+        "value": 45,
+        "purpose": "Канвас во весь экран на узком экране."
+      },
+      {
+        "name": "--z-sidebar-backdrop",
+        "value": 49,
+        "purpose": "Подложка сайдбара."
+      },
+      {
+        "name": "--z-sidebar",
+        "value": 50,
+        "purpose": "Сайдбар поверх содержимого на узком экране."
+      },
+      {
+        "name": "--z-drawer-backdrop",
+        "value": 55,
+        "purpose": "Подложка шторки."
+      },
+      {
+        "name": "--z-drawer",
+        "value": 56,
+        "purpose": "Шторка настроек."
+      },
+      {
+        "name": "--z-modal-backdrop",
+        "value": 60,
+        "purpose": "Подложка модалки."
+      },
+      {
+        "name": "--z-modal",
+        "value": 70,
+        "purpose": "Модалка, колокольчик, подсказка."
+      },
+      {
+        "name": "--z-dropdown",
+        "value": 71,
+        "purpose": "Список внутри колокольчика."
+      },
+      {
+        "name": "--z-toast",
+        "value": 90,
+        "purpose": "Тосты."
+      },
+      {
+        "name": "--z-lightbox",
+        "value": 95,
+        "purpose": "Картинка во весь экран."
+      },
+      {
+        "name": "--z-gate",
+        "value": 100,
+        "purpose": "Экран входа: выше всего."
+      }
+    ],
+    "scrims": [
+      {
+        "name": "--scrim",
+        "value": "rgba(0, 0, 0, 0.5)",
+        "purpose": "Затемнение под шторкой, модалкой и сайдбаром. Было три значения на одну работу."
+      },
+      {
+        "name": "--scrim-strong",
+        "value": "rgba(0, 0, 0, 0.85)",
+        "purpose": "Лайтбокс: смотрят картинку, а не интерфейс."
+      }
+    ],
+    "focus": [
+      {
+        "name": "--focus-ring",
+        "value": "2px solid var(--accent)",
+        "purpose": "Одно кольцо на всё приложение. Снаружи отступ +2px, внутри строки списка -2px."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "mobile",
+        "value": "767.98px",
+        "purpose": "Единственный порог. Ниже: шторки снизу, палитра к верхней кромке, цели 44px."
+      }
+    ],
+    "themes": {
+      "note": "Две равноправные темы. Тёмная — среда, в которой система сочинялась и в которой посчитан весь контраст; светлая объявлена целиком в :root[data-theme=\"light\"]. Автопереключение по prefers-color-scheme пока не включено: значение lightValue в colorMeta — вторая половина каждого цвета.",
+      "dark": ":root",
+      "light": ":root[data-theme=\"light\"]"
+    }
+  },
+  "components": [
+    {
+      "name": "Главная кнопка",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Основное действие в панели или диалоге. Ховер темнеет, а не светлеет.",
+      "html": "<button class=\"ds-btn-primary\">Сохранить</button>",
+      "css": ".ds-btn-primary { cursor: pointer; background: var(--accent-fill, #4058c4); color: var(--text-on-accent, #fff); border: 1px solid var(--accent-fill, #4058c4); border-radius: var(--r-md, 8px); padding: 6px 10px; font: 14px/1.5 \"Segoe UI\", system-ui, sans-serif; transition: background .14s ease, border-color .14s ease, transform .08s ease; } .ds-btn-primary:hover { background: var(--accent-fill-hover, #3a51b8); border-color: var(--accent-border, #6d8cff); } .ds-btn-primary:active { background: var(--accent-fill-active, #33489f); transform: scale(.94); } .ds-btn-primary:focus-visible { outline: 2px solid var(--accent, #8aa3ff); outline-offset: 2px; }"
+    },
+    {
+      "name": "Обычная кнопка",
+      "kind": "button",
+      "refersTo": "button",
+      "description": "Второстепенное действие. Заливка контрола, граница разделителем.",
+      "html": "<button class=\"ds-btn\">Отмена</button>",
+      "css": ".ds-btn { cursor: pointer; background: var(--surface-3, #2b303c); color: var(--text-primary, #e8eaef); border: 1px solid var(--border-subtle, #2f3542); border-radius: var(--r-md, 8px); padding: 6px 10px; font: 14px/1.5 \"Segoe UI\", system-ui, sans-serif; transition: border-color .14s ease, transform .08s ease; } .ds-btn:hover { border-color: var(--accent, #8aa3ff); } .ds-btn:active { transform: scale(.94); } .ds-btn:focus-visible { outline: 2px solid var(--accent, #8aa3ff); outline-offset: 2px; }"
+    },
+    {
+      "name": "Иконочная кнопка",
+      "kind": "button",
+      "refersTo": "button-icon",
+      "description": "Действие у сообщения или в шапке. Не меньше 44px по ширине под палец.",
+      "html": "<button class=\"ds-btn-icon\" aria-label=\"Ответить\"><svg width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><polyline points=\"9 17 4 12 9 7\"></polyline><path d=\"M20 18v-2a4 4 0 0 0-4-4H4\"></path></svg></button>",
+      "css": ".ds-btn-icon { cursor: pointer; display: inline-flex; align-items: center; justify-content: center; min-width: 44px; padding: 3px 7px; background: transparent; border: 1px solid transparent; border-radius: var(--r-md, 8px); color: var(--text-secondary, #a4adbc); transition: background .12s ease, color .12s ease, transform .08s ease; } .ds-btn-icon:hover { color: var(--text-primary, #e8eaef); background: var(--surface-hover, #262c38); } .ds-btn-icon:active { transform: scale(.94); } .ds-btn-icon:focus-visible { outline: 2px solid var(--accent, #8aa3ff); outline-offset: 2px; }"
+    },
+    {
+      "name": "Поле ввода",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "Обводка контрольная, а не разделительная: поле опознаётся как редактируемое до клика.",
+      "html": "<input class=\"ds-input\" type=\"text\" placeholder=\"Имя персонажа\" />",
+      "css": ".ds-input { width: 100%; background: var(--surface-0, #0f1116); color: var(--text-primary, #e8eaef); border: 1px solid var(--border-strong, #667084); border-radius: var(--r-md, 8px); padding: 7px 9px; font: 14px/1.5 \"Segoe UI\", system-ui, sans-serif; } .ds-input::placeholder { color: var(--text-secondary, #a4adbc); } .ds-input:focus { outline: none; border-color: var(--accent, #8aa3ff); } .ds-input:focus-visible { outline: 2px solid var(--accent, #8aa3ff); outline-offset: 2px; }"
+    },
+    {
+      "name": "Строка списка",
+      "kind": "nav",
+      "refersTo": "list-row",
+      "description": "Сигнатурный компонент: строка — контейнер, содержимое — кнопка во всю ширину. Выбор кодируется тремя признаками разом.",
+      "html": "<div class=\"ds-row ds-row-active\"><button class=\"ds-row-main\"><span class=\"ds-row-ava\">Э</span><span class=\"ds-row-title\">Эльвира, дознаватель</span><span class=\"ds-row-time\">14:02</span></button></div><div class=\"ds-row\"><button class=\"ds-row-main\"><span class=\"ds-row-ava\">М</span><span class=\"ds-row-title\">Марш через Гиблый лог</span><span class=\"ds-row-time\">вчера</span></button></div>",
+      "css": ".ds-row { display: flex; align-items: center; border-left: 3px solid transparent; padding: 0; } .ds-row:hover { background: var(--surface-hover, #262c38); } .ds-row-active { background: var(--surface-selected, #2c3a63); border-left-color: var(--accent, #8aa3ff); } .ds-row-main { flex: 1; min-width: 0; width: 100%; display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: transparent; border: none; border-radius: inherit; color: var(--text-primary, #e8eaef); font: 14px/1.5 \"Segoe UI\", system-ui, sans-serif; text-align: left; cursor: pointer; } .ds-row-main:active { transform: none; } .ds-row-main:focus-visible { outline: 2px solid var(--accent, #8aa3ff); outline-offset: -2px; } .ds-row-ava { flex: none; width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; background: var(--surface-3, #2b303c); color: var(--text-secondary, #a4adbc); } .ds-row-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } .ds-row-time { flex: none; font-size: 12px; color: var(--text-secondary, #a4adbc); }"
+    },
+    {
+      "name": "Чип фильтра",
+      "kind": "chip",
+      "refersTo": "filter-chip",
+      "description": "Пилюля значит состояние, которое включается и выключается. Включённый берёт заливку выбора.",
+      "html": "<div class=\"ds-chip-row\"><button class=\"ds-chip ds-chip-on\">Эльвира</button><button class=\"ds-chip\">Гиблый лог</button><button class=\"ds-chip\">Общие</button></div>",
+      "css": ".ds-chip-row { display: flex; flex-wrap: wrap; gap: 4px; } .ds-chip { cursor: pointer; padding: 3px 9px; font-size: 12px; border-radius: 999px; background: var(--surface-3, #2b303c); border: 1px solid var(--border-subtle, #2f3542); color: var(--text-secondary, #a4adbc); transition: border-color .14s ease, transform .08s ease; } .ds-chip:hover { border-color: var(--accent, #8aa3ff); } .ds-chip:active { transform: scale(.94); } .ds-chip-on { background: var(--surface-selected, #2c3a63); border-color: var(--accent-border, #6d8cff); color: var(--text-primary, #e8eaef); } .ds-chip:focus-visible { outline: 2px solid var(--accent, #8aa3ff); outline-offset: 2px; }"
+    },
+    {
+      "name": "Карточка",
+      "kind": "card",
+      "refersTo": "card",
+      "description": "Контейнер настроек и записей памяти. Тени нет: карточка никуда не всплыла.",
+      "html": "<div class=\"ds-card\"><div class=\"ds-card-head\"><strong>Запись памяти</strong><span class=\"ds-tag\">сцена</span></div><p class=\"ds-card-body\">Дознаватель помнит, что ключ остался у моста.</p></div>",
+      "css": ".ds-card { background: var(--surface-2, #20242e); border: 1px solid var(--border-subtle, #2f3542); border-radius: var(--r-lg, 12px); padding: 10px; color: var(--text-primary, #e8eaef); font: 14px/1.5 \"Segoe UI\", system-ui, sans-serif; transition: border-color .12s ease; } .ds-card:hover { border-color: var(--border-strong, #667084); } .ds-card-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; } .ds-card-body { margin: 6px 0 0; color: var(--text-secondary, #a4adbc); } .ds-tag { font-size: 12px; padding: 1px 6px; border-radius: var(--r-sm, 6px); background: var(--surface-3, #2b303c); color: var(--text-secondary, #a4adbc); }"
+    },
+    {
+      "name": "Реплики ленты",
+      "kind": "custom",
+      "refersTo": "bubble-assistant",
+      "description": "Поверхность чтения: кегль 16px против 14px в оболочке. Курсив модели — лунная сирень.",
+      "html": "<div class=\"ds-feed\"><div class=\"ds-msg ds-msg-assistant\"><div class=\"ds-bubble\">Дознаватель поднимает лампу. <em>Свет выхватывает мокрые доски.</em></div></div><div class=\"ds-msg ds-msg-user\"><div class=\"ds-bubble\">Я делаю шаг назад.</div></div></div>",
+      "css": ".ds-feed { display: flex; flex-direction: column; gap: 14px; } .ds-msg { max-width: 760px; } .ds-msg-user { align-self: flex-end; } .ds-msg-assistant { align-self: flex-start; } .ds-bubble { padding: 10px 14px; border-radius: var(--r-lg, 12px); font-size: 16px; line-height: 1.5; color: var(--text-primary, #e8eaef); overflow-wrap: anywhere; } .ds-msg-assistant .ds-bubble { background: var(--bubble-assistant, #232a38); } .ds-msg-user .ds-bubble { background: var(--bubble-user, #2f3f75); } .ds-bubble em { color: var(--emphasis, #c7b8ff); }"
+    },
+    {
+      "name": "Телеметрия",
+      "kind": "custom",
+      "refersTo": null,
+      "description": "Приборы у композера. Полоса — кнопка, открывающая инспектор промпта.",
+      "html": "<div class=\"ds-tele\"><button class=\"ds-tele-main\"><span class=\"ds-gauge\"><span class=\"ds-gauge-fill\"></span></span><span>62% окна · 18 400 токенов</span></button><span class=\"ds-tele-sub\">41 ток/с · первый через 0.8 с</span></div>",
+      "css": ".ds-tele { display: flex; align-items: center; gap: 12px; font-size: 12px; color: var(--text-secondary, #a4adbc); font-family: \"Segoe UI\", system-ui, sans-serif; } .ds-tele-main { display: flex; align-items: center; gap: 8px; padding: 4px 8px; cursor: pointer; background: transparent; border: 1px solid transparent; border-radius: var(--r-md, 8px); color: inherit; font: inherit; } .ds-tele-main:hover { background: var(--surface-hover, #262c38); border-color: var(--border-subtle, #2f3542); } .ds-tele-main:focus-visible { outline: 2px solid var(--accent, #8aa3ff); outline-offset: 2px; } .ds-gauge { width: 84px; height: 6px; flex: none; border-radius: 999px; background: var(--surface-3, #2b303c); overflow: hidden; display: block; } .ds-gauge-fill { display: block; width: 62%; height: 100%; background: var(--accent, #8aa3ff); } .ds-tele-sub { opacity: .85; }"
+    },
+    {
+      "name": "Реплика на сцене",
+      "kind": "custom",
+      "refersTo": null,
+      "description": "Режим «Тёмный зал»: фон принадлежит пользователю, поэтому у реплики собственная подложка. Ниже 0.88 имя перестаёт держать 7:1.",
+      "html": "<div class=\"ds-scene\"><div class=\"ds-scene-msg\"><div class=\"ds-scene-name\">Эльвира</div><div class=\"ds-scene-bubble\">Ключ у моста. <em>Она не оборачивается.</em></div></div></div>",
+      "css": ".ds-scene { padding: 26px 18px; background: linear-gradient(120deg, #6b6152, #cfc4b4); border-radius: var(--r-lg, 12px); } .ds-scene-msg { max-width: 720px; } .ds-scene-name { color: #f0ad78; font-size: 12px; letter-spacing: .14em; text-transform: uppercase; margin-bottom: 4px; font-family: \"Segoe UI\", system-ui, sans-serif; } .ds-scene-bubble { background: rgba(14, 12, 15, .88); border: 1px solid rgba(240, 235, 230, .10); backdrop-filter: blur(2px); border-radius: var(--r-lg, 12px); padding: 10px 14px; font-size: 16px; line-height: 1.5; color: var(--text-primary, #e8eaef); font-family: \"Segoe UI\", system-ui, sans-serif; } .ds-scene-bubble em { color: #d9cfc6; font-style: italic; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "Тёмная комната рассказчика",
+    "overview": "Комната одна, ламп в ней три. Приложение не выбирает за человека, чем оно сегодня является: тем же нажатием он переключает его между пультом (приборы под рукой — счётчик окна контекста, скорость ответа, инспектор промпта), тёмным залом (реплики на собственной подложке, имена говорящих янтарём, ремарки курсивом, фон истории задаёт сам пользователь) и рукописью (лента ужимается до 42%, канвас забирает 58%). Меняется мебель — комната остаётся: те же токены, те же границы, тот же закон контраста.\n\nПлотность высокая и намеренная. Это не витрина, а место, где сидят часами. Поэтому система экономит не место, а внимание: интерфейс держится в холодной сине-серой гамме и почти не окрашивается, чтобы цветом говорили только три вещи — что выбрано, что происходит и что пошло не так.\n\nСвет здесь дорогой. Единственный хроматический цвет оболочки — васильковый акцент. Когда включается зал, оболочка гаснет ещё сильнее, и единственным тёплым пятном на экране остаётся имя говорящего.",
+    "keyCharacteristics": [
+      "Тёмная база (#0f1116), холодная сине-серая гамма, один акцент.",
+      "Плоско по умолчанию: глубину несут границы, а не разница заливок.",
+      "Четыре ступени поверхностей, четыре скругления, пять кеглей — и всё.",
+      "Три режима просмотра как три состояния одной комнаты.",
+      "Контраст считается, а не подбирается на глаз: каждое значение проверено.",
+      "Один порог адаптива — 767.98px; ниже него шторки становятся нижними."
+    ],
+    "rules": [
+      {
+        "name": "Правило одной подсветки",
+        "body": "У оболочки один хроматический цвет — василёк. Новый акцент не добавляется; если что-то нужно выделить, у системы уже есть заливка выбора, акцентная полоса слева и кольцо фокуса.",
+        "section": "colors"
+      },
+      {
+        "name": "Правило тёмного ховера",
+        "body": "Наведение на заливку **затемняет** её. Прежний ховер осветлял фон до акцента и ронял пару текст/фон с 4.26 до 2.50 — надпись растворялась ровно в момент наведения. Теперь контраст растёт: 6.16 → 6.89.",
+        "section": "colors"
+      },
+      {
+        "name": "Правило двух красных",
+        "body": "Красный текста и красный заливки — разные цвета. Один тон не может одновременно читаться текстом на тёмном и держать белый текст поверх себя; попытка обойтись одним всегда ломает одну из двух ролей.",
+        "section": "colors"
+      },
+      {
+        "name": "Правило трёх сигналов",
+        "body": "Выбранная строка кодируется тремя признаками разом: заливка, акцентная полоса слева, основной цвет текста. Наведение — только слабой нейтральной заливкой. Одинаковые состояния лишают человека понимания, какая строка открыта.",
+        "section": "colors"
+      },
+      {
+        "name": "Правило ленты",
+        "body": "Лента крупнее оболочки — 16px против 14px. Уравнять их значит превратить историю в ещё одну панель.",
+        "section": "typography"
+      },
+      {
+        "name": "Правило пяти ступеней",
+        "body": "Кегли только 12 / 14 / 16 / 18 / 22. Микроразмеров (10px, 11px) в системе нет: ступени в 7% и 2.4% глаз не различает — они дают не иерархию, а ощущение неаккуратной вёрстки.",
+        "section": "typography"
+      },
+      {
+        "name": "Правило одного порога",
+        "body": "Один брейкпоинт на всё приложение. Второй порог заводится только под доказанный слом, а не под гипотетический планшет.",
+        "section": "layout"
+      },
+      {
+        "name": "Правило 44 пикселей",
+        "body": "Всё, во что целятся пальцем, — не меньше 44×44. Там, где визуальный размер меньше, зона нажатия добирается псевдоэлементом, а не раздуванием самого элемента.",
+        "section": "layout"
+      },
+      {
+        "name": "Правило именованных слоёв",
+        "body": "`z-index` берётся из шкалы `--z-*`, а не пишется числом. Пятнадцать ступеней от `--z-nav` (12) до `--z-gate` (100); у каждого наложения своя, и у подложки — на единицу ниже её панели. Число, написанное по месту, невозможно сверить, не прочитав весь файл.",
+        "section": "layout"
+      },
+      {
+        "name": "Правило всплытия",
+        "body": "Тень — признак слоя, а не украшение. Если элемент никуда не всплыл, тени у него нет.",
+        "section": "elevation"
+      },
+      {
+        "name": "Правило края",
+        "body": "Там, где заливки почти равны, разделение обязана дать граница. Убрать границу «для чистоты» — значит склеить два слоя в один.",
+        "section": "elevation"
+      },
+      {
+        "name": "Правило пилюли",
+        "body": "Пилюля значит «состояние, которое можно включить или выключить». Кнопка-действие пилюлей не бывает — иначе форма перестаёт что-либо сообщать.",
+        "section": "shapes"
+      },
+      {
+        "name": "Правило четырёх длительностей",
+        "body": "Новая анимация берёт готовую ступень. Пятнадцатая длительность «чуть быстрее предыдущей» — это не настройка, а отказ выбрать роль: до этой правки 0.12 и 0.14 стояли на одной и той же работе, а всего длительностей было четырнадцать.",
+        "section": "components"
+      },
+      {
+        "name": "Правило одного вызова",
+        "body": "Длительность и кривая вне шкалы допустимы там, где точка вызова одна: подсветка сообщения после прыжка (`jump-flash`, 0.9s) и пульс загружаемого вложения (`att-pulse`, 1s, `ease-in-out` — обе системные кривые тормозят в конце, а бесконечное дыхание не должно). Это показ длиной с человеческий взгляд, а не переход состояния, и токен на единственный вызов не с чем сверять. Ступень заводится со второго места применения. Настройку «меньше движения» это не обходит: блок с `*` гасит и литералы.",
+        "section": "components"
+      }
+    ],
+    "dos": [
+      "Do брать цвет только из семантического слоя (--surface-*, --text-*, --accent-*).",
+      "Do заводить каждый новый цвет сразу в двух темах: тёмная и светлая равноправны.",
+      "Do затемнять заливку при наведении и проверять пару после этого.",
+      "Do кодировать состояние минимум двумя признаками, из которых хотя бы один — не цвет.",
+      "Do держать кольцо фокуса видимым на всём, во что можно попасть с клавиатуры, включая скрытые файловые поля.",
+      "Do гасить кнопочный скин, когда кнопка играет роль строки или панели.",
+      "Do проверять новый оттенок расчётом контраста, а не глазом.",
+      "Do брать длительность, кривую и слой из шкалы (--dur-*, --ease*, --z-*)."
+    ],
+    "donts": [
+      "Don't превращать это в корпоративный дашборд: плитки с метриками, круговые диаграммы, градиентные карточки.",
+      "Don't добавлять второй хроматический акцент. Василёк один.",
+      "Don't осветлять заливку при наведении.",
+      "Don't разделять слои одной лишь разницей фонов: в тёмной теме её потолок 1.24.",
+      "Don't вешать тень на то, что никуда не всплыло.",
+      "Don't вводить кегль меньше 12px и скругление вне четырёх ступеней.",
+      "Don't прятать интерактивное через display: none: элемент выпадает из табуляции и из дерева доступности.",
+      "Don't класть текст прямо на пользовательский фон в режиме сцены. Своя подложка обязательна, минимум 0.88.",
+      "Don't делать пилюлю из кнопки-действия."
+    ]
+  }
+}
