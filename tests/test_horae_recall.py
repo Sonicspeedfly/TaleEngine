@@ -12,8 +12,16 @@ from unittest.mock import patch
 import pytest
 from sqlalchemy import select
 
+from backend import hierarchical_memory as hm
 from backend import horae_recall as hr
 from backend.horae_memory import assemble_context
+
+
+def _answer(messages, text: str) -> str:
+    """Ответ подменной модели: на факты — как прежде, на сводку — валидный снимок hms-1."""
+    if messages[0]["content"] == hr.FACTS_PROMPT:
+        return text
+    return hm.render_snapshot({hm.SEC_CHRONICLE: f"- [#1–#12] {text}"})
 
 
 def _char():
@@ -381,7 +389,7 @@ async def test_summary_pass_extracts_and_stores_facts():
         calls.append(messages[0]["content"])
         if messages[0]["content"] == hr.FACTS_PROMPT:
             return "- Эльвира пообещала вернуть Артуру кинжал\n- Артур ранен в плечо\n"
-        return "### Текущее состояние сюжета\nГерои в пути."
+        return _answer(messages, "Герои в пути.")
 
     with patch("backend.main.complete", new=fake_complete):
         await main._maybe_update_summary(sid)
@@ -415,7 +423,7 @@ async def test_summary_survives_fact_failure():
     async def fake_complete(messages, params=None, connection=None, kind="service"):
         if messages[0]["content"] == hr.FACTS_PROMPT:
             raise RuntimeError("быстрая модель упала")
-        return "Сводка на месте."
+        return _answer(messages, "Сводка на месте.")
 
     with patch("backend.main.complete", new=fake_complete):
         await main._maybe_update_summary(sid)
@@ -424,7 +432,7 @@ async def test_summary_survives_fact_failure():
         entry = (await db.execute(select(models.HoraeEntry).where(
             models.HoraeEntry.session_id == sid,
             models.HoraeEntry.category == "summary"))).scalars().first()
-    assert entry is not None and entry.content == "Сводка на месте."
+    assert entry is not None and "Сводка на месте." in entry.content
     await engine.dispose()
 
 
@@ -995,7 +1003,7 @@ async def test_summary_skips_active_window_and_takes_long_messages_whole():
 
     async def fake_complete(messages, params=None, connection=None, kind="service"):
         seen.append(messages[-1]["content"])
-        return "Сводка."
+        return _answer(messages, "Сводка.")
 
     with patch("backend.main.complete", new=fake_complete):
         await main._maybe_update_summary(sid)
@@ -1027,7 +1035,7 @@ async def test_summary_fast_model_keeps_safety_off():
 
     async def fake_complete(messages, params=None, connection=None, kind="service"):
         calls.append((params, dict(connection or {})))
-        return "Сводка."
+        return _answer(messages, "Сводка.")
 
     async def fake_connection(db):
         return {"default_model": "chat-model", "summary_model": "fast-model"}
@@ -1167,10 +1175,13 @@ async def test_legacy_summary_is_rebuilt_before_it_is_replaced():
 
     await _fresh_db()
     _, sid, ids = await _make_chat(40 + hr.DEFAULT_WINDOW)
-    async with AsyncSessionLocal() as db:  # по 5 сообщений на кусок сводки: 8 кусков
+    # По 5 сообщений на кусок сводки: 8 кусков. Длина реплики — от бюджета куска
+    # в символах (в 2.5.0 он вырос с 24 000 до MEMORY_BATCH_CHARS = 80 000).
+    filler = "текст " * ((main._SUMMARY_CHUNK_CHARS // 5 - 200) // 6)
+    async with AsyncSessionLocal() as db:
         from backend import models
         for mid in ids:
-            (await db.get(models.Message, mid)).content = f"сцена #{mid} " + "текст " * 780
+            (await db.get(models.Message, mid)).content = f"сцена #{mid} " + filler
         await db.commit()
     await _set_legacy_summary(sid, ids[-1])
 
@@ -1178,7 +1189,7 @@ async def test_legacy_summary_is_rebuilt_before_it_is_replaced():
 
     async def fake_complete(messages, params=None, connection=None, kind="service"):
         prompts.append(messages[-1]["content"])
-        return f"НОВАЯ СВОДКА {len(prompts)}"
+        return _answer(messages, f"НОВАЯ СВОДКА {len(prompts)}")
 
     with patch("backend.main.complete", new=fake_complete):
         await main._maybe_update_summary(sid)
@@ -1194,7 +1205,7 @@ async def test_legacy_summary_is_rebuilt_before_it_is_replaced():
     with patch("backend.main.complete", new=fake_complete):
         await main._maybe_update_summary(sid)
     entry = await _summary_entry(sid)
-    assert entry.content.startswith("НОВАЯ СВОДКА") and "rebuild" not in entry.meta
+    assert "НОВАЯ СВОДКА" in entry.content and "rebuild" not in entry.meta
     assert entry.meta["v"] == hr.SUMMARY_FORMAT
     # 35 из 40 сообщений старше окна пересказаны; остаток меньше summary_every
     # ждёт, как и у обычного сводчика, и пока лежит в контексте дословно.
@@ -1222,7 +1233,7 @@ async def test_oversized_message_is_cut_to_head_and_tail():
 
     async def fake_complete(messages, params=None, connection=None, kind="service"):
         seen.append(messages[-1]["content"])
-        return "Сводка."
+        return _answer(messages, "Сводка.")
 
     with patch("backend.main.complete", new=fake_complete):
         await main._maybe_update_summary(sid)
@@ -1279,9 +1290,11 @@ async def test_imported_summary_without_pointer_is_not_replaced_early():
 
     await _fresh_db()
     _, sid, ids = await _make_chat(40 + hr.DEFAULT_WINDOW)
+    # По 5 сообщений на кусок (см. test_legacy_summary_is_rebuilt_before_it_is_replaced).
+    filler = "текст " * ((main._SUMMARY_CHUNK_CHARS // 5 - 200) // 6)
     async with AsyncSessionLocal() as db:
         for mid in ids:
-            (await db.get(models.Message, mid)).content = f"сцена #{mid} " + "текст " * 780
+            (await db.get(models.Message, mid)).content = f"сцена #{mid} " + filler
         db.add(models.HoraeEntry(
             session_id=sid, category="summary", title="📜 Память чата (авто)",
             content="ХРОНИКА ИЗ ИМПОРТА", always_on=True, enabled=True,
@@ -1290,7 +1303,7 @@ async def test_imported_summary_without_pointer_is_not_replaced_early():
         await db.commit()
 
     async def fake_complete(messages, params=None, connection=None, kind="service"):
-        return "частичный пересказ"
+        return _answer(messages, "частичный пересказ")
 
     with patch("backend.main.complete", new=fake_complete):
         await main._summary_pass(sid)  # один кусок из восьми
@@ -1317,7 +1330,7 @@ async def test_restarted_summary_does_not_re_extract_facts():
     async def fake_complete(messages, params=None, connection=None, kind="service"):
         is_facts = messages[0]["content"] == hr.FACTS_PROMPT
         kinds.append("facts" if is_facts else "summary")
-        return f"Факт номер {len(kinds)} про Артура" if is_facts else "Сводка."
+        return f"Факт номер {len(kinds)} про Артура" if is_facts else _answer(messages, "Сводка.")
 
     with patch("backend.main.complete", new=fake_complete):
         await main._maybe_update_summary(sid)
@@ -1354,7 +1367,7 @@ async def test_chunk_changed_during_model_call_is_not_recorded():
         async with AsyncSessionLocal() as db:
             (await db.get(models.Message, ids[5])).content = "ПЕРЕПИСАНО во время сводки"
             await db.commit()
-        return "Сводка по старому тексту."
+        return _answer(messages, "Сводка по старому тексту.")
 
     with patch("backend.main.complete", new=meddling_complete):
         await main._maybe_update_summary(sid)
@@ -1367,7 +1380,7 @@ async def test_chunk_changed_during_model_call_is_not_recorded():
 
     async def fake_complete(messages, params=None, connection=None, kind="service"):
         seen.append(messages[-1]["content"])
-        return "Сводка."
+        return _answer(messages, "Сводка.")
 
     with patch("backend.main.complete", new=fake_complete):
         await main._maybe_update_summary(sid)

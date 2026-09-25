@@ -186,9 +186,10 @@ async def test_summary_recovers_after_messages_are_deleted():
     сброс заново скармливал модели весь чат с начала как «новые события» поверх
     старой сводки — хроника откатывалась к первой сцене на десятки ходов.
     """
+    from backend import hierarchical_memory as hm
     from backend import main, models
     from backend.database import AsyncSessionLocal, engine, init_db
-    from backend.horae_recall import DEFAULT_WINDOW
+    from backend.horae_recall import DEFAULT_WINDOW, FACTS_PROMPT
 
     await engine.dispose()
     await init_db()
@@ -221,7 +222,9 @@ async def test_summary_recovers_after_messages_are_deleted():
 
     async def fake_complete(messages, params=None, connection=None, kind="service"):
         seen.append(str(messages))
-        return "Память дописана новыми событиями."
+        if messages[0]["content"] == FACTS_PROMPT:
+            return "Память дописана новыми событиями."
+        return hm.render_snapshot({hm.SEC_CHRONICLE: "- [#1–#12] Память дописана новыми событиями."})
 
     async def pointer_and_facts():
         async with AsyncSessionLocal() as db:
