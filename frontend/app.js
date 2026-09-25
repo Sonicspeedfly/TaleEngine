@@ -190,11 +190,21 @@ createApp({
       autoSummary: true,
       summaryEvery: 10,         // каждые сколько сообщений обновлять сводку (это платный запрос)
       // Активное окно: столько последних сообщений идут в модель как есть
-      // (0 — вся история). 20, а не 40: в очень длинных чатах сорок реплик
-      // дословно уже сами размывают внимание модели, а всё старше окна она и так
-      // получает хроникой из сводки. Значение совпадает с DEFAULT_WINDOW сервера.
-      memoryWindow: 20,
+      // (0 — вся история). Значение совпадает с DEFAULT_WINDOW сервера (50).
+      // Прежние 20 одним разом поднимает миграция в loadUiPrefs (флаг
+      // memory_defaults_v), выбранное вручную потом не перетирается.
+      memoryWindow: 50,
       horaeFacts: true,         // извлекать атомарные факты и подмешивать релевантные
+      // Мастер-память чата (иерархическая пакетная): параметры ручной пересборки.
+      // Глобальные, как остальные ключи памяти; дефолты = MEMORY_* сервера.
+      memoryBatch: 20,          // сообщений в одном пакете сжатия (1–200)
+      memoryDelayMs: 1500,      // пауза между запросами к модели сводки, мс (0–60000)
+      memorySnapshotTokens: 12000, // бюджет мастер-снимка, токенов (1000–200000)
+      // Статус памяти ОТКРЫТОГО чата (GET /sessions/{id}/memory) или null: ещё
+      // не загружен, старый сервер без эндпоинта, нет доступа. Шаблон на null
+      // показывает пустое состояние, а не падает на memStatus.snapshot.
+      memStatus: null,
+      memBusy: false,           // идёт запрос панели: первая загрузка, запуск, сброс
       groupReplyDelay: 3,       // пауза (сек) между ответами персонажей в группе
       groupWaiting: 0,          // идёт пауза перед следующим ответом группы (сек)
 
@@ -701,6 +711,33 @@ createApp({
     ctxLevel() {
       const p = this.ctxFill;
       return p >= 90 ? "crit" : p >= 70 ? "warn" : "ok";
+    },
+    // Монитор токенов: три яруса хода из отчёта инспектора (ctxStats.tiers).
+    // Старый сервер их не присылает — тогда null, и монитор просто не рисуется.
+    memTiers() {
+      const t = this.ctxStats && this.ctxStats.tiers;
+      return t && typeof t === "object" ? t : null;
+    },
+    // Сегменты полосы и подписи к ним одним списком: вкладка «Память» и
+    // инспектор рисуют по нему одну и ту же разбивку, и подписи не разъедутся.
+    memTierRows() {
+      const t = this.memTiers;
+      if (!t) return [];
+      const k = t.window_messages;
+      const win = typeof k === "number"
+        ? "Окно (" + this.fmtNum(k) + " " + this.plural(k, "сообщение", "сообщения", "сообщений") + ")"
+        : "Окно";
+      return [
+        { cls: "seg-guides", label: "Системный промпт и якоря", tokens: t.system },
+        { cls: "seg-horae", label: "Мастер-снимок и факты", tokens: t.memory },
+        { cls: "seg-history", label: win, tokens: t.window },
+      ].map((r) => ({ ...r, pct: this.sharePct(r.tokens, t.total) }));
+    },
+    // Задание памяти идёт или ждёт очереди: показываем прогресс, опрашиваем
+    // статус и не даём запустить второе.
+    memJobActive() {
+      const job = this.memStatus && this.memStatus.job;
+      return !!job && (job.status === "running" || job.status === "queued");
     },
     // Стоимость показываем ТОЛЬКО если пользователь задал свой тариф: у каждого
     // прокси он свой, и выдуманное число здесь хуже отсутствующего.
@@ -1449,6 +1486,19 @@ createApp({
       if (m10 === 1 && m100 !== 11) return one;
       if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return few;
       return many;
+    },
+    // Число с разделителем тысяч, как в строке прогресса сервера («4 200»).
+    // Нет числа — прочерк, а не «NaN» или ложный «0»: поле мог не прислать
+    // старый сервер.
+    fmtNum(n) {
+      const v = Number(n);
+      return n == null || n === "" || !Number.isFinite(v) ? "—" : v.toLocaleString("ru-RU");
+    },
+    // Доля части в процентах — ширина сегмента полосы и строки монитора токенов.
+    // Пустой знаменатель (пустой чат, старый сервер) даёт 0, а не «NaN%» в подписи.
+    sharePct(part, whole) {
+      const w = Number(whole);
+      return w > 0 ? ((Number(part) || 0) / w) * 100 : 0;
     },
 
     // Телеметрия хода. Тикер живёт в обычном поле с префиксом _: реактивный
@@ -3323,17 +3373,24 @@ createApp({
     // ---------- Сохранение настроек интерфейса в системе (БД) ----------
     async loadUiPrefs(applyParams = true) {
       const ui = await this.api("/settings/ui");
+      // Сработала ли разовая миграция: тогда её флаг надо записать сразу, а не
+      // ждать, пока человек сам что-нибудь поменяет (флаги пишет saveUiPrefs).
+      let migrated = false;
       if (applyParams && ui && ui.params) this.params = { ...this.params, ...ui.params };
       // Мягкая миграция старых сохранённых настроек.
       if (applyParams) {
         // Прежний дефолт max_tokens=1024 резал ответы (особенно с рассуждениями).
         if (!this.params.max_tokens || this.params.max_tokens <= 1024) this.params.max_tokens = 8192;
+        // Пустое окно — не выбор человека, а поломка профиля: чиним всегда.
+        if (!this.params.context_tokens) this.params.context_tokens = 200000;
         // Сохранённое окно в 1 млн — прошлый дефолт «максимум Gemini». Он незаметно
         // уводил КАЖДЫЙ ход в удвоенный тариф (у Gemini вход свыше ~200 тыс. стоит
-        // вдвое), поэтому один раз опускаем до 200к. Захотите обратно — выставьте
-        // 1 млн вручную, повторно настройка не перетирается.
-        if (!this.params.context_tokens || this.params.context_tokens === 1000000) {
-          this.params.context_tokens = 200000;
+        // вдвое), поэтому один раз опускаем до 200к. «Один раз» раньше было только
+        // в комментарии: проверка шла на каждой загрузке и сбрасывала и 1 млн,
+        // выставленный вручную. Теперь её закрывает флаг ctx_budget_v.
+        if (ui && ui.ctx_budget_v !== 2) {
+          if (this.params.context_tokens === 1000000) this.params.context_tokens = 200000;
+          migrated = true;
         }
         // Новые настройки экономии могли не сохраниться в старых профилях.
         if (this.params.history_files_turns == null) this.params.history_files_turns = 12;
@@ -3358,7 +3415,18 @@ createApp({
       if (ui && ui.group_reply_delay != null) this.groupReplyDelay = Number(ui.group_reply_delay);
       if (ui && ui.summary_every != null) this.summaryEvery = Number(ui.summary_every);
       if (ui && ui.memory_window != null) this.memoryWindow = Number(ui.memory_window);
+      // Окно по умолчанию выросло с 20 до 50 (мастер-память, 2.5.0). Сохранённое
+      // 20 почти всегда — прежний дефолт, а не выбор, поэтому один раз поднимаем
+      // его до 50. После флага memory_defaults_v 20 снова можно выставить руками.
+      if (ui && ui.memory_defaults_v !== 2) {
+        if (ui.memory_window == null || Number(ui.memory_window) === 20) this.memoryWindow = 50;
+        migrated = true;
+      }
       if (ui && "horae_facts" in ui) this.horaeFacts = ui.horae_facts !== false;
+      if (ui && ui.memory_batch != null) this.memoryBatch = Number(ui.memory_batch);
+      if (ui && ui.memory_delay_ms != null) this.memoryDelayMs = Number(ui.memory_delay_ms);
+      if (ui && ui.memory_snapshot_tokens != null) this.memorySnapshotTokens = Number(ui.memory_snapshot_tokens);
+      if (migrated) this.saveUiPrefs();
     },
     // ---------- Закрепление чатов и персонажей ----------
     // После переключения перечитываем список, а не правим флаг у строки на месте:
@@ -3426,6 +3494,14 @@ createApp({
             summary_every: this.summaryEvery,
             memory_window: this.memoryWindow,
             horae_facts: this.horaeFacts,
+            memory_batch: this.memoryBatch,
+            memory_delay_ms: this.memoryDelayMs,
+            memory_snapshot_tokens: this.memorySnapshotTokens,
+            // Флаги разовых миграций (см. loadUiPrefs). PUT заменяет значение
+            // целиком: не допиши их сюда — следующее же сохранение стёрло бы
+            // флаги, и миграции снова перетёрли бы окно 20 и бюджет 1 млн.
+            memory_defaults_v: 2,
+            ctx_budget_v: 2,
             jailbreak: this.jailbreak,
           }),
         }).catch(() => {});
@@ -3503,6 +3579,185 @@ createApp({
       await this.loadHorae();
     },
     async deleteHorae(h) { await this.api("/horae/" + h.id, { method: "DELETE" }); await this.loadHorae(); },
+
+    // ---------- Мастер-память чата (иерархическая пакетная) ----------
+    // Статус открытого чата: снимок, буфер пересборки, бэклог, задание.
+    // Каждый запрос помечен номером: ↻, опрос и смена чата обгоняют друг друга,
+    // и поздний ответ старого запроса вернул бы «running» уже после «done» —
+    // опрос ожил бы, а тост о завершении пришёл бы дважды. Пишем только ответ
+    // последнего запроса и только для того чата, который всё ещё открыт.
+    async loadMemStatus() {
+      const sid = this.sessionId;
+      const seq = (this._memSeq = (this._memSeq || 0) + 1);
+      if (!sid) { this._stopMemPoll(); this.memStatus = null; return; }
+      // «Загружаю…» — только пока показывать нечего: опрос раз в 1,5 с иначе
+      // мигал бы выключенными кнопками всю пересборку.
+      const first = !this.memStatus;
+      if (first) this.memBusy = true;
+      let st = null;
+      let failed = null;
+      try {
+        st = await this.api("/sessions/" + sid + "/memory");
+      } catch (e) {
+        failed = e;
+      }
+      if (first) this.memBusy = false;
+      if (seq !== this._memSeq || this.sessionId !== sid) return;
+      // Сбой сети или 5xx посреди пересборки не гасит опрос: задание идёт на
+      // сервере, следующий запрос его покажет. 4xx — честный отказ (чат удалён,
+      // старый сервер без эндпоинта, сменился код доступа): пустое состояние.
+      if (failed && (!failed.status || failed.status >= 500) && this.memJobActive) {
+        this._pollMem();
+        return;
+      }
+      // Ответ не того вида приравниваем к «статуса нет»: шаблон читает snapshot
+      // и backlog без проверок и на чужом JSON упал бы при рендере.
+      if (!st || typeof st !== "object" || !st.snapshot || !st.backlog) st = null;
+      const prev = this.memStatus && this.memStatus.job ? this.memStatus.job.status : null;
+      this.memStatus = st;
+      if (this.memJobActive) { this._pollMem(); return; }
+      this._stopMemPoll();
+      const job = st && st.job;
+      if (!job || (prev !== "running" && prev !== "queued")) return;
+      if (job.status === "done") {
+        const n = Number(job.processed) || 0;
+        const t = job.state_tokens != null ? job.state_tokens : st.snapshot.tokens;
+        this.showToast("🧠 Память пересобрана: " + this.fmtNum(n) + " "
+          + this.plural(n, "сообщение", "сообщения", "сообщений") + " → " + this.fmtNum(t) + " "
+          + this.plural(Number(t) || 0, "токен", "токена", "токенов"));
+      } else if (job.status === "error") {
+        this.showToast("⚠ Память: " + (job.error || "задание прервано"));
+      } else if (job.status === "cancelled") {
+        this.showToast("Пересборка остановлена, готовое сохранено");
+      }
+      // Снимок и факты поменялись: бюджет хода и список записей уже другие.
+      this.loadCtxStats();
+      this.loadHorae().catch(() => {});
+    },
+    // Опрос, пока задание queued/running. Таймер живёт в поле с префиксом _
+    // (Vue его не проксирует) и всегда один: перед постановкой прежний
+    // снимается, иначе ↻ посреди опроса запускал бы вторую цепочку запросов.
+    _pollMem() {
+      this._stopMemPoll();
+      this._memTimer = setTimeout(() => { this._memTimer = null; this.loadMemStatus(); }, 1500);
+    },
+    _stopMemPoll() {
+      clearTimeout(this._memTimer);
+      this._memTimer = null;
+    },
+    // Запуск задания: «rebuild» — пересборка с нуля (или продолжение
+    // прерванной, resume), «catchup» — сжать только то, что ещё не учтено.
+    // Каждый пакет — платный запрос к модели сводки, поэтому пересборка с нуля
+    // спрашивает подтверждение с оценкой числа пакетов. Считаем от ВСЕЙ истории
+    // старше окна, а не от backlog.pending: pending идёт от текущего указателя,
+    // а пересборка с нуля начинает с первого сообщения.
+    async startMemJob(mode, resume = false) {
+      const sid = this.sessionId;
+      if (!sid || this.memBusy) return;
+      if (mode === "rebuild" && !resume) {
+        const b = (this.memStatus && this.memStatus.backlog) || {};
+        const older = Math.max(0, (Number(b.messages_total) || 0) - (Number(b.window) || 0));
+        const k = Math.ceil(older / Math.max(1, Number(this.memoryBatch) || 1));
+        const ok = await this.askConfirm(
+          "Пересобрать память с нуля? Примерно " + k + " " + this.plural(k, "пакет", "пакета", "пакетов")
+          + " = " + k + " " + this.plural(k, "платный запрос", "платных запроса", "платных запросов")
+          + " к модели сводки (плюс факты). Старый снимок работает до конца пересборки.",
+          { title: "Пересборка памяти", okText: "Пересобрать", danger: false });
+        if (!ok || this.sessionId !== sid) return;
+      }
+      this.memBusy = true;
+      try {
+        const r = await this.api("/sessions/" + sid + "/memory/rebuild", {
+          method: "POST",
+          body: JSON.stringify({ mode, resume: !!resume, batch_size: this.memoryBatch, delay_ms: this.memoryDelayMs }),
+        });
+        // Задание из ответа кладём в статус сразу: короткая догонялка может
+        // закончиться раньше, чем мы перечитаем статус, и тогда «предыдущим»
+        // оказался бы «done» прошлого задания — тост о новом не пришёл бы.
+        if (r && r.job && this.memStatus && this.sessionId === sid) {
+          this.memStatus = { ...this.memStatus, job: r.job };
+        }
+      } catch (e) {
+        // 409 — задание этого чата уже идёт (другая вкладка, двойной клик).
+        this.showToast(e.status === 409 ? "Уже идёт" : "⚠ Память: " + e.message);
+      } finally {
+        this.memBusy = false;
+      }
+      await this.loadMemStatus();
+    },
+    // Остановка между пакетами: сервер доделывает текущий пакет и сохраняет
+    // готовое, поэтому статус ещё какое-то время «running» — опрос дождётся
+    // «cancelled» и сам покажет тост.
+    async cancelMemJob() {
+      const sid = this.sessionId;
+      if (!sid) return;
+      try {
+        await this.api("/sessions/" + sid + "/memory/cancel", { method: "POST" });
+      } catch (e) {
+        this.showToast("⚠ Память: " + e.message);
+      }
+      await this.loadMemStatus();
+    },
+    // Сброс: снимок, буфер пересборки и атомарные факты чата. Сообщения
+    // остаются, и окно снова отдаёт модели всю историю, пока память не
+    // соберётся заново, — поэтому после сброса пересчитываем и бюджет хода.
+    async purgeMemory() {
+      const sid = this.sessionId;
+      if (!sid || this.memBusy) return;
+      if (!(await this.askConfirm("Сбросить память чата? Сотрутся мастер-снимок, буфер пересборки и атомарные факты. Сообщения останутся.", { okText: "Сбросить" }))) return;
+      if (this.sessionId !== sid) return;
+      this.memBusy = true;
+      let ok = false;
+      try {
+        const r = await this.api("/sessions/" + sid + "/memory", { method: "DELETE" });
+        const n = (r && Number(r.facts_deleted)) || 0;
+        this.showToast("🧠 Память чата сброшена" + (n ? " · удалено фактов: " + this.fmtNum(n) : ""));
+        ok = true;
+      } catch (e) {
+        this.showToast("⚠ Память: " + e.message);
+      } finally {
+        this.memBusy = false;
+      }
+      await this.loadMemStatus();
+      if (!ok) return;
+      this.loadCtxStats();
+      this.loadHorae().catch(() => {});
+    },
+    // Экспорт снимка в .md. Сырой fetch, а не api(): ответ — файл, а не JSON.
+    // Имя придумывает сервер (в нём название чата), поэтому берём его из
+    // Content-Disposition и только без заголовка — своё.
+    async exportMemory() {
+      const sid = this.sessionId;
+      if (!sid) return;
+      let res;
+      try {
+        res = await fetch("/api/sessions/" + sid + "/memory/export?facts=1", { headers: this.authHeaders() });
+      } catch (e) {
+        this.showToast("⚠ Память: сеть недоступна, снимок не выгружен");
+        return;
+      }
+      if (res.status === 404) { this.showToast("Снимка ещё нет"); return; }
+      if (!res.ok) {
+        if (res.status === 401) this.needAccess = true;
+        this.showToast("Экспорт не удался (код " + res.status + ")");
+        return;
+      }
+      const blob = await res.blob();
+      const name = this._dispositionName(res.headers.get("Content-Disposition"));
+      this.downloadBlob(blob, name || "memory-" + sid + ".md");
+    },
+    // Имя файла из Content-Disposition. Сначала filename*=UTF-8''… (RFC 5987):
+    // кириллица названия чата приходит только там, процент-кодированной. Затем
+    // простой filename=. Битая кодировка или нет ни того ни другого — "".
+    _dispositionName(header) {
+      if (!header) return "";
+      const ext = /filename\*\s*=\s*UTF-8''([^;]+)/i.exec(header);
+      if (ext) {
+        try { return decodeURIComponent(ext[1].trim().replace(/^"|"$/g, "")); } catch (e) { /* ниже — простое имя */ }
+      }
+      const plain = /filename\s*=\s*(?:"([^"]*)"|([^;]+))/i.exec(header);
+      return plain ? (plain[1] || plain[2] || "").trim() : "";
+    },
 
     // ---------- Персоны и заметка автора ----------
     async loadPersonas() { this.personas = await this.api("/personas"); },
@@ -3772,16 +4027,18 @@ createApp({
       this.saveUiPrefs();
       this.showToast(`Режим расхода: ${m.label}`);
     },
-    // Число из поля лимита: целое в [0, max]. Пустое поле или мусор оставляют
-    // прежнее значение. Сервер проверяет эти лимиты строго (целое 0..1000), и
-    // «2,5» или стёртое поле, уйди они в params, ломали бы ошибкой 422 КАЖДЫЙ
-    // следующий ход, а не одну настройку. Поле тут же показывает то, что
-    // сохранилось, — иначе при совпадении с прежним значением Vue не перерисовал
-    // бы его, и в поле осталось бы непринятое «-5».
-    numFromInput(ev, max, current) {
+    // Число из поля лимита: целое в [min, max] (min по умолчанию 0). Пустое поле
+    // или мусор оставляют прежнее значение. Сервер проверяет эти лимиты строго
+    // (целое 0..1000), и «2,5» или стёртое поле, уйди они в params, ломали бы
+    // ошибкой 422 КАЖДЫЙ следующий ход, а не одну настройку. Поле тут же
+    // показывает то, что сохранилось, — иначе при совпадении с прежним значением
+    // Vue не перерисовал бы его, и в поле осталось бы непринятое «-5». Нижняя
+    // граница нужна полям мастер-памяти: пакет из 0 сообщений или снимок в
+    // 0 токенов сервер отвергнет так же, как «-5».
+    numFromInput(ev, max, current, min = 0) {
       const raw = String((ev && ev.target && ev.target.value) || "").trim().replace(",", ".");
       const n = raw === "" ? NaN : Number(raw);
-      const v = Number.isFinite(n) ? Math.min(max, Math.max(0, Math.round(n))) : current;
+      const v = Number.isFinite(n) ? Math.min(max, Math.max(min, Math.round(n))) : current;
       if (ev && ev.target) ev.target.value = v;
       return v;
     },
@@ -4040,9 +4297,20 @@ createApp({
     },
     // Полоса заполнения окна должна относиться к ОТКРЫТОМУ чату, иначе она
     // показывала бы вес предыдущего.
+    // То же со статусом мастер-памяти: опрос прежнего чата снимаем, иначе его
+    // ответ (и тост о завершении) пришёл бы в чужой чат. Статус нужен только
+    // открытой вкладке «Память» — без неё запрос не шлём.
     sessionId() {
       this.ctxStats = null;
       this.loadCtxStats();
+      this._stopMemPoll();
+      this.memStatus = null;
+      if (this.drawerTab === "memory") this.loadMemStatus();
+    },
+    // Вкладку «Память» открывают не только её кнопкой (импорт чата переключает
+    // на неё сам), поэтому статус грузим по факту смены вкладки.
+    drawerTab(tab) {
+      if (tab === "memory") this.loadMemStatus();
     },
     // Ввод в палитре: поиск по репликам идёт на сервер с дебаунсом, чтобы не
     // слать запрос на каждую букву.
@@ -5306,6 +5574,77 @@ createApp({
         <!-- ВКЛАДКА: Память Horae -->
         <div v-if="drawerTab==='memory'" id="drawer-panel-memory" role="tabpanel" aria-labelledby="drawer-tab-memory">
           <h3>Память Horae 🧠</h3>
+          <!-- Мастер-память ОТКРЫТОГО чата: статус снимка, ручная пересборка с
+               прогрессом, экспорт и сброс, параметры пакетов и монитор токенов.
+               Эндпоинтов может не быть (старый сервер) — тогда memStatus = null,
+               блок показывает пустое состояние, а кнопки заданий выключены. -->
+          <section v-if="sessionId" class="card mem-master" aria-labelledby="mem-master-h">
+            <div class="row-between"><h4 id="mem-master-h">🧠 Мастер-память этого чата</h4>
+              <button class="btn-icon" @click="loadMemStatus" aria-label="Обновить статус памяти">↻</button></div>
+            <p class="muted" v-if="memStatus && memStatus.snapshot.exists">
+              Снимок {{ fmtNum(memStatus.snapshot.tokens) }} / {{ fmtNum(memStatus.snapshot.budget) }} ток.
+              · учтено до #{{ memStatus.snapshot.covered_upto }}
+              · ждут сжатия {{ memStatus.backlog.pending }}
+              <span v-if="!memStatus.snapshot.structured" class="tag">старая схема — пересоберите</span>
+              <span v-if="memStatus.snapshot.over_budget" class="tag">больше бюджета</span></p>
+            <p class="muted" v-else-if="memStatus">Снимка нет: окно пропускает историю целиком.
+              Ждут сжатия {{ memStatus.backlog.pending }}.</p>
+            <p class="muted" v-else>{{ memBusy ? 'Загружаю статус памяти…' : 'Статус памяти недоступен.' }}</p>
+            <p class="muted" v-if="memStatus && memStatus.staging && !memJobActive">
+              Пересборка прервана на #{{ memStatus.staging.last_message_id }}.
+              <button class="btn-primary" :disabled="memBusy" @click="startMemJob('rebuild', true)">Продолжить</button></p>
+            <!-- Прогресс не только цветом: рядом с полосой строка сервера с
+                 числами «Обработано 140/800 | Сжато до 4 200 токенов». -->
+            <div v-if="memJobActive" class="mem-progress" role="status" aria-live="polite">
+              <span class="upload-track"><span class="upload-fill"
+                :style="{ width: (memStatus.job.total ? Math.round(memStatus.job.processed / memStatus.job.total * 100) : 0) + '%' }"></span></span>
+              <div class="muted">{{ memStatus.job.line || 'В очереди…' }}</div>
+              <div class="muted" v-if="memStatus.job.phase === 'retry'">Сбой API — повтор через {{ memStatus.job.retry_in_s }} с</div>
+              <div class="muted" v-else-if="memStatus.job.phase === 'wait'">Пауза между запросами…</div>
+              <button class="btn-danger" @click="cancelMemJob">Остановить</button>
+            </div>
+            <p v-if="memStatus && memStatus.job && memStatus.job.status === 'error'" class="danger-text">⚠ {{ memStatus.job.error }}</p>
+            <div class="row mem-actions">
+              <button class="btn-primary" :disabled="memBusy || memJobActive || !memStatus" @click="startMemJob('rebuild')">Пересобрать с нуля</button>
+              <button :disabled="memBusy || memJobActive || !memStatus || !memStatus.backlog.pending" @click="startMemJob('catchup')">Догнать</button>
+              <button :disabled="!memStatus || !memStatus.snapshot.exists" @click="exportMemory">Экспорт .md</button>
+              <button class="btn-danger" :disabled="memBusy || memJobActive || !memStatus" @click="purgeMemory">Сбросить память</button>
+            </div>
+            <!-- Поля пишут значение по change, а не по вводу, через numFromInput:
+                 стёртое поле или «2,5» не должны улететь на сервер (422). -->
+            <label>Размер пакета
+              <input type="number" min="1" max="200" step="1" inputmode="numeric"
+                     :value="memoryBatch" aria-describedby="mem-batch-hint"
+                     @change="memoryBatch = numFromInput($event, 200, memoryBatch, 1); saveUiPrefs()" />
+              <span id="mem-batch-hint" class="field-hint">Сообщений в одном запросе к модели сводки, 1–200. Больше — меньше запросов, но каждый тяжелее.</span></label>
+            <label>Пауза между запросами, мс
+              <input type="number" min="0" max="60000" step="100" inputmode="numeric"
+                     :value="memoryDelayMs" aria-describedby="mem-delay-hint"
+                     @change="memoryDelayMs = numFromInput($event, 60000, memoryDelayMs); saveUiPrefs()" />
+              <span id="mem-delay-hint" class="field-hint">0–60000. Пауза бережёт лимит запросов провайдера при длинной пересборке.</span></label>
+            <label>Бюджет снимка, токенов
+              <input type="number" min="1000" max="200000" step="1000" inputmode="numeric"
+                     :value="memorySnapshotTokens" aria-describedby="mem-snap-hint"
+                     @change="memorySnapshotTokens = numFromInput($event, 200000, memorySnapshotTokens, 1000); saveUiPrefs()" />
+              <span id="mem-snap-hint" class="field-hint">1000–200000. Столько снимок занимает в каждом ходе: больше — подробнее память, но дороже ход.</span></label>
+            <!-- Монитор токенов: из чего складывается ход — системный промпт с
+                 якорями, мастер-снимок с фактами и дословное окно. Числа стоят
+                 в подписях, полоса лишь повторяет их цветом. -->
+            <template v-if="memTiers">
+              <div class="ins-bar" aria-hidden="true">
+                <i v-for="r in memTierRows" :key="'mt' + r.cls" :class="r.cls" :style="{ width: r.pct + '%' }"></i>
+              </div>
+              <ul class="mem-tiers">
+                <li v-for="r in memTierRows" :key="'ml' + r.cls">
+                  <span class="ins-dot" :class="r.cls" aria-hidden="true"></span>
+                  <span>{{ r.label }} — {{ fmtNum(r.tokens) }}</span></li>
+              </ul>
+              <p class="muted mem-tier-note">Итого {{ fmtNum(memTiers.total) }} ток.<br>
+                из бюджета хода {{ fmtNum(memTiers.budget) }} ({{ Math.round(sharePct(memTiers.total, memTiers.budget)) }}%)<br>
+                из лимита модели {{ fmtNum(memTiers.model_limit || 1000000) }} ({{ Math.round(sharePct(memTiers.total, memTiers.model_limit || 1000000)) }}%)</p>
+            </template>
+            <p v-else-if="!ctxStats" class="muted">Откройте чат, чтобы увидеть бюджет</p>
+          </section>
           <label class="check"><input type="checkbox" v-model="autoSummary" @change="saveUiPrefs" />
             📜 Авто-сводка сюжета: ИИ обновляет запись «Память чата (авто)» — события, выпавшие из окна контекста, остаются в памяти модели.</label>
           <label v-if="autoSummary">Как часто обновлять сводку
@@ -5321,7 +5660,7 @@ createApp({
                    :value="memoryWindow"
                    @change="memoryWindow = numFromInput($event, 1000, memoryWindow); saveUiPrefs()" /></label>
           <div v-if="autoSummary" class="row" style="gap:6px; margin:-4px 0 6px; flex-wrap:wrap">
-            <button v-for="p in [[20,'20'],[40,'40'],[80,'80'],[150,'150'],[0,'вся история']]" :key="'win' + p[0]"
+            <button v-for="p in [[20,'20'],[50,'50'],[80,'80'],[150,'150'],[0,'вся история']]" :key="'win' + p[0]"
                     :class="memoryWindow === p[0] ? 'btn-primary' : ''"
                     :aria-pressed="memoryWindow === p[0] ? 'true' : 'false'"
                     @click="memoryWindow = p[0]; saveUiPrefs()">{{ p[1] }}</button>
@@ -5852,6 +6191,19 @@ createApp({
             {{ ctxStats.budget.toLocaleString('ru') }} · {{ ctxFill }}% окна
             <span v-if="ctxStats.model" class="tag">{{ ctxStats.model }}</span>
           </div>
+          <!-- Три яруса хода — та же разбивка, что в мониторе вкладки «Память»
+               (строки из memTierRows). Старый сервер tiers не присылает: тогда
+               блока нет, остальной инспектор работает как раньше. -->
+          <template v-if="memTiers">
+            <div class="ins-bar" aria-hidden="true">
+              <i v-for="r in memTierRows" :key="'it' + r.cls" :class="r.cls" :style="{ width: r.pct + '%' }"></i>
+            </div>
+            <ul class="mem-tiers">
+              <li v-for="r in memTierRows" :key="'il' + r.cls">
+                <span class="ins-dot" :class="r.cls" aria-hidden="true"></span>
+                <span>{{ r.label }} — {{ fmtNum(r.tokens) }}</span></li>
+            </ul>
+          </template>
           <!-- Полоса весов: видно, что именно занимает контекст, до чтения списка. -->
           <div class="ins-bar" aria-hidden="true">
             <i v-for="b in ctxStats.blocks" :key="'bar'+b.key" :class="'seg-' + b.key"
