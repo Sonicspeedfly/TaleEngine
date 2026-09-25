@@ -268,3 +268,316 @@ def test_prompts_carry_the_schema_and_rules():
     # Менеджер подставляет плейсхолдеры через str.format — лишних скобок быть не должно.
     compact = hm.COMPACT_PROMPT.format(budget="12 000", keep=12)
     assert "12 000" in compact and "{" not in compact
+
+
+# ==================== Менеджер: вызов, слияние, сжатие, свёртка ====================
+
+class _Clock:
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+
+def _mgr(llm, **cfg):
+    clock, sleeps = _Clock(), []
+
+    async def sleep(s):
+        sleeps.append(round(s, 3))
+        clock.t += s
+
+    m = hm.HierarchicalMemoryManager(llm, hm.MemoryConfig(**{"delay_ms": 0, **cfg}),
+                                     sleep=sleep, clock=clock, estimate_tokens=len)
+    return m, sleeps
+
+
+class _Err(Exception):
+    def __init__(self, status, retry_after=None):
+        super().__init__(f"HTTP {status}")
+        self.status_code = status
+        self.response = SimpleNamespace(status_code=status,
+                                        headers={"retry-after": str(retry_after)} if retry_after else {})
+
+
+def _echo_llm(record):
+    """Возвращает валидный снимок, чья хроника — диапазон пакета из запроса."""
+    async def llm(messages):
+        record.append(messages)
+        user = messages[1]["content"]
+        rng = user.split("[Новые события ", 1)[1].split("]", 1)[0]
+        prev = user.split("[Текущая память]\n", 1)[1].split("\n\n[Новые события", 1)[0]
+        chron = "" if prev == hm.EMPTY_STATE else hm.parse_sections(prev)[hm.SEC_CHRONICLE] + "\n"
+        return _wrap(_snap(chron=chron + f"- [{rng}] пакет"))
+    return llm
+
+
+async def test_fold_carries_previous_state_into_each_batch():
+    calls = []
+    m, _ = _mgr(_echo_llm(calls), batch_size=2)
+    res = await m.scan_and_compress_history([_msg(i) for i in range(1, 6)])
+    assert res.status == "done" and res.batches == 3 and res.processed == 5
+    assert calls[0][1]["content"].startswith("[Текущая память]\n(пока пусто)")
+    assert "[Новые события #1–#2]" in calls[0][1]["content"]
+    assert "- [#1–#2] пакет" in calls[1][1]["content"]           # State_1 ушёл в пакет 2
+    assert "- [#3–#4] пакет" in calls[2][1]["content"]
+    assert hm.parse_sections(res.state)[hm.SEC_CHRONICLE].count("пакет") == 3
+    assert calls[0][0]["content"] == hm.MASTER_STATE_PROMPT
+
+
+async def test_delay_between_every_request():
+    m, sleeps = _mgr(_echo_llm([]), batch_size=1, delay_ms=1500)
+    await m.scan_and_compress_history([_msg(i) for i in range(1, 4)])
+    assert sleeps == [1.5, 1.5]  # перед 2-м и 3-м запросом, не перед первым
+
+
+async def test_rate_limit_is_retried_with_backoff_and_retry_after():
+    attempts = []
+
+    async def flaky(messages):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise _Err(429)
+        if len(attempts) == 2:
+            raise _Err(503, retry_after=7)
+        return _wrap(_snap())
+
+    m, sleeps = _mgr(flaky)
+    out = await m.call([{"role": "user", "content": "x"}])
+    assert hm.ENVELOPE_OPEN in out and sleeps == [2.0, 7.0]
+
+
+async def test_auth_error_is_fatal_and_not_retried():
+    attempts = []
+
+    async def denied(messages):
+        attempts.append(1)
+        raise _Err(401)
+
+    m, sleeps = _mgr(denied)
+    with pytest.raises(hm.MemoryLLMError) as e:
+        await m.call([{"role": "user", "content": "x"}])
+    assert e.value.kind == "auth" and not e.value.retryable
+    assert len(attempts) == 1 and sleeps == []
+
+
+async def test_retries_are_bounded():
+    async def down(messages):
+        raise _Err(500)
+
+    m, sleeps = _mgr(down, max_retries=2)
+    with pytest.raises(hm.MemoryLLMError) as e:
+        await m.call([{"role": "user", "content": "x"}])
+    assert e.value.kind == "server" and sleeps == [2.0, 4.0]
+
+
+async def test_cancelled_error_is_never_swallowed():
+    async def cancelled(messages):
+        raise asyncio.CancelledError()
+
+    m, _ = _mgr(cancelled)
+    with pytest.raises(asyncio.CancelledError):
+        await m.call([{"role": "user", "content": "x"}])
+
+
+def test_classify_explain_block_texts():
+    length = hm.classify_error(RuntimeError("…\nТехнически: ПУСТОЙ ответ, finish_reason=LENGTH."))
+    blocked = hm.classify_error(RuntimeError("…\nТехнически: ПУСТОЙ ответ, finish_reason=SAFETY."))
+    empty = hm.classify_error(RuntimeError("…\nТехнически: ПУСТОЙ ответ, finish_reason=не указан."))
+    assert (length.kind, blocked.kind, empty.kind) == ("length", "blocked", "empty")
+    assert empty.retryable and not blocked.retryable
+
+
+async def test_malformed_answer_gets_a_correction_turn():
+    answers = [_wrap("просто пересказ без разделов"), _wrap(_snap())]
+    seen = []
+
+    async def llm(messages):
+        seen.append(messages)
+        return answers.pop(0)
+
+    m, _ = _mgr(llm)
+    batch = hm.plan_batch([_msg(1)], batch_size=20, max_chars=10**6)
+    state = await m.merge_block("", batch)
+    assert hm.is_structured(state)
+    assert seen[1][-1]["role"] == "user" and "Ответ отклонён" in seen[1][-1]["content"]
+    assert seen[1][-2] == {"role": "assistant", "content": _wrap("просто пересказ без разделов")}
+
+
+async def test_persistent_garbage_raises_and_writes_nothing():
+    async def llm(messages):
+        return "ерунда"
+
+    m, _ = _mgr(llm, validation_retries=2)
+    batch = hm.plan_batch([_msg(1)], batch_size=20, max_chars=10**6)
+    with pytest.raises(hm.SnapshotValidationError):
+        await m.merge_block("", batch)
+
+
+async def test_guard_runs_after_merge():
+    prev = _snap(lists="### Треки\n- «Lacrimosa» — утрата (#2)\n- «Nocturne» — надежда (#9)")
+
+    async def forgetful(messages):
+        return _wrap(_snap(lists="### Треки\n- «Lacrimosa» — утрата (#2)"))
+
+    m, _ = _mgr(forgetful)
+    batch = hm.plan_batch([_msg(10)], batch_size=20, max_chars=10**6)
+    state = await m.merge_block(prev, batch)
+    assert "«Nocturne» — надежда (#9)" in state
+    assert any("возвращены" in w for w in m.warnings)
+
+
+async def test_over_budget_snapshot_is_compacted_into_arcs():
+    long_chron = "\n".join(f"- [#{i}–#{i}] событие {i}" for i in range(1, 80))
+    prompts = []
+
+    async def llm(messages):
+        prompts.append(messages[0]["content"])
+        if messages[0]["content"] == hm.MASTER_STATE_PROMPT:
+            return _wrap(_snap(chron=long_chron))
+        return _wrap(_snap(chron="- [#1–#79] Арка «Дорога»: всё важное"))
+
+    m, _ = _mgr(llm, snapshot_tokens=600)
+    batch = hm.plan_batch([_msg(80)], batch_size=20, max_chars=10**6)
+    state = await m.merge_block("", batch)
+    assert "Арка «Дорога»" in state and len(prompts) == 2
+    assert prompts[1].startswith(hm.COMPACT_PROMPT.split("{", 1)[0])
+
+
+async def test_length_error_compacts_state_then_retries_merge():
+    calls = []
+
+    async def llm(messages):
+        calls.append(messages[0]["content"])
+        if len(calls) == 1:
+            raise RuntimeError("Технически: ПУСТОЙ ответ, finish_reason=LENGTH.")
+        return _wrap(_snap())
+
+    m, _ = _mgr(llm)
+    batch = hm.plan_batch([_msg(1)], batch_size=20, max_chars=10**6)
+    await m.merge_block(_snap(), batch)
+    assert calls[0] == hm.MASTER_STATE_PROMPT and calls[-1] == hm.MASTER_STATE_PROMPT
+    assert any(c != hm.MASTER_STATE_PROMPT for c in calls[1:-1])  # было сжатие
+
+
+async def test_cancel_stops_between_batches_and_keeps_progress():
+    cancel = asyncio.Event()
+    progress = []
+
+    async def llm(messages):
+        cancel.set()  # отмена приходит, пока модель считает первый пакет
+        return _wrap(_snap())
+
+    m, _ = _mgr(llm, batch_size=1)
+    res = await m.scan_and_compress_history([_msg(i) for i in range(1, 4)], cancel=cancel,
+                                            on_progress=progress.append)
+    assert res.status == "cancelled" and res.processed == 1
+    assert progress[-1].phase == "done"
+
+
+async def test_max_batches_limits_the_run():
+    m, _ = _mgr(_echo_llm([]), batch_size=1)
+    res = await m.scan_and_compress_history([_msg(i) for i in range(1, 6)], max_batches=2)
+    assert res.status == "limit" and res.batches == 2
+
+
+async def test_progress_reports_totals_and_line():
+    progress = []
+    m, _ = _mgr(_echo_llm([]), batch_size=2)
+    await m.scan_and_compress_history([_msg(i) for i in range(1, 6)], on_progress=progress.append)
+    merges = [p for p in progress if p.phase == "merge"]
+    assert [p.processed for p in merges] == [0, 2, 4, 5]
+    assert all(p.total == 5 for p in merges)
+    assert merges[-1].line().startswith("[Обработано 5/5 сообщений | Сжато до ")
+
+
+class _ConflictingSource:
+    """Источник, чей первый commit отвергается: кусок менялся, пока модель считала."""
+    def __init__(self, msgs, conflicts):
+        self.msgs, self.conflicts, self.pos = msgs, conflicts, 0
+
+    async def pending(self):
+        return len(self.msgs) - self.pos
+
+    async def current_state(self, state):
+        return state
+
+    async def next_messages(self, limit):
+        return self.msgs[self.pos:self.pos + limit]
+
+    async def commit(self, batch, new_state):
+        if self.conflicts:
+            self.conflicts -= 1
+            return False
+        self.pos += len(batch.messages)
+        return True
+
+
+async def test_conflict_stops_incremental_run_but_job_retries():
+    m, _ = _mgr(_echo_llm([]), batch_size=5)
+    res = await m.scan_and_compress_history(_ConflictingSource([_msg(1)], 1), retry_conflicts=False)
+    assert res.status == "conflict" and res.processed == 0
+    res = await m.scan_and_compress_history(_ConflictingSource([_msg(1)], 1))
+    assert res.status == "done" and res.processed == 1
+    with pytest.raises(hm.SourceConflictError):
+        await m.scan_and_compress_history(_ConflictingSource([_msg(1)], 10))
+
+
+async def test_empty_batch_needs_no_model_call():
+    # Пакет из одних пустых сообщений: вливать нечего, но указатель обязан их пройти.
+    async def llm(messages):
+        raise AssertionError("модель не должна вызываться")
+
+    m, _ = _mgr(llm)
+    res = await m.scan_and_compress_history([_msg(1, " "), _msg(2, "")], _snap())
+    assert res.status == "done" and res.processed == 2 and res.state == _snap()
+
+
+async def test_retry_wait_is_never_shorter_than_the_delay():
+    # Повтор — тоже запрос: бэкофф 2 с не должен обходить паузу 5 с.
+    attempts = []
+
+    async def flaky(messages):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise _Err(503)
+        return _wrap(_snap())
+
+    m, sleeps = _mgr(flaky, delay_ms=5000)
+    await m.call([{"role": "user", "content": "x"}])
+    assert sleeps == [5.0]
+
+
+def test_classify_prefers_the_most_specific_class_name():
+    # Ядро не импортирует litellm: признак — имя класса в MRO, и самый точный класс
+    # важнее и родителя, и status_code (у litellm.APIConnectionError он 500).
+    class APIConnectionError(Exception):
+        status_code = 500
+
+    class Timeout(APIConnectionError):
+        pass
+
+    class BadRequestError(Exception):
+        status_code = 400
+
+    class ContentPolicyViolationError(BadRequestError):
+        pass
+
+    kinds = [hm.classify_error(e).kind for e in (
+        APIConnectionError("c"), Timeout("t"), ContentPolicyViolationError("p"), BadRequestError("b"))]
+    assert kinds == ["network", "timeout", "blocked", "bad_request"]
+
+
+async def test_failed_compaction_keeps_snapshot_and_warns_about_budget():
+    long_chron = "\n".join(f"- [#{i}–#{i}] событие {i}" for i in range(1, 80))
+
+    async def llm(messages):
+        if messages[0]["content"] == hm.MASTER_STATE_PROMPT:
+            return _wrap(_snap(chron=long_chron))
+        return "ерунда"  # сжатие так и не дало снимка по схеме
+
+    m, _ = _mgr(llm, snapshot_tokens=600)
+    batch = hm.plan_batch([_msg(80)], batch_size=20, max_chars=10**6)
+    state = await m.merge_block("", batch)
+    assert "событие 79" in state
+    assert any(w.startswith("снимок превышает бюджет:") for w in m.warnings)

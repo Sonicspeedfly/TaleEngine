@@ -14,15 +14,18 @@ _adopt_summary резал готовую сводку слайсом [:6000] с�
 детерминированно возвращает из предыдущего снимка.
 
 Ядро не знает ни про БД, ни про FastAPI, ни про litellm: сообщения приходят
-готовыми MemoryMessage, модель — колбэком.
+готовыми MemoryMessage (или через BatchSource), модель — колбэком, а паузы,
+повторы и цикл свёртки держит HierarchicalMemoryManager.
 Поэтому весь контракт проверяется тестами без сети и без базы
 (tests/test_hierarchical_memory.py), а backend/memory_service.py — лишь
 адаптер к хранилищу.
 """
+import asyncio
 import re
-from dataclasses import dataclass, field
+import time
+from dataclasses import dataclass, field, replace
 from datetime import datetime
-from typing import Callable
+from typing import Awaitable, Callable, Protocol, Sequence, runtime_checkable
 
 # ============================================================================
 # Константы схемы снимка
@@ -684,6 +687,485 @@ def guard_entries(prev, new) -> tuple[str, list[str]]:
 
 
 # ============================================================================
+# Вызов модели: классификация ошибок (§4.4)
+# ============================================================================
+# Колбэк модели: сообщения чата → текст ответа. Сервис заворачивает в него
+# llm_gateway.complete, тесты — подставную корутину.
+LLMCall = Callable[[list[dict]], Awaitable[str]]
+
+# Вид ошибки по имени класса. ПОЧЕМУ по имени, а не isinstance: ядро не
+# импортирует litellm, а имя класса в MRO — единственный общий с ним язык.
+# MRO обходится от самого производного класса, поэтому спорные случаи
+# решаются сами: litellm.Timeout — потомок APIConnectionError,
+# ContextWindowExceededError и ContentPolicyViolationError — потомки
+# BadRequestError, и первым находится самый точный признак. По этой же
+# причине класс важнее status_code: у litellm.APIConnectionError он 500, и
+# обрыв связи иначе выглядел бы сбоем сервера.
+_KIND_BY_CLASS = {
+    "RateLimitError": "rate_limit",
+    "Timeout": "timeout",
+    "APITimeoutError": "timeout",
+    "TimeoutError": "timeout",           # и asyncio.TimeoutError
+    "InternalServerError": "server",
+    "ServiceUnavailableError": "server",
+    "BadGatewayError": "server",
+    "APIConnectionError": "network",
+    "ConnectionError": "network",
+    "OSError": "network",
+    "AuthenticationError": "auth",
+    "PermissionDeniedError": "auth",
+    "BadRequestError": "bad_request",
+    "NotFoundError": "bad_request",
+    "UnprocessableEntityError": "bad_request",
+    "ContextWindowExceededError": "bad_request",
+    "ContentPolicyViolationError": "blocked",
+}
+# Пустой стрим llm_gateway превращает в RuntimeError с текстом
+# censorship.explain_block, где последняя строка — «Технически: ПУСТОЙ ответ,
+# finish_reason=…». Список блокировок — как _CONFIGURABLE/_NON_CONFIGURABLE в
+# censorship: повторять заблокированный запрос бессмысленно, фильтр ответит
+# тем же.
+_FINISH_REASON_RE = re.compile(r"finish_reason=([A-Za-z_]+)")
+_BLOCK_REASONS = frozenset({
+    "SAFETY", "CONTENT_FILTER", "CONTENT_POLICY_VIOLATION", "PROHIBITED_CONTENT",
+    "BLOCKLIST", "SPII", "RECITATION", "IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT",
+})
+_LENGTH_REASONS = frozenset({"LENGTH", "MAX_TOKENS"})
+_EMPTY_MARK = "ПУСТОЙ ответ"
+# Что есть смысл повторить. auth/bad_request/blocked ответят тем же на любой
+# попытке; length лечится не повтором, а сжатием снимка (merge_block).
+_RETRYABLE_KINDS = frozenset({"rate_limit", "timeout", "server", "network", "empty", "unknown"})
+# Начало сообщения для статуса задания; хвост — сокращённый текст исходной
+# ошибки, по нему ищут причину в логах прокси.
+_KIND_TEXT = {
+    "rate_limit": "Провайдер ограничил частоту запросов",
+    "timeout": "Модель не ответила вовремя",
+    "server": "Сбой на стороне провайдера",
+    "network": "Нет связи с провайдером или прокси",
+    "auth": "Доступ к модели отклонён — проверьте ключ API и права",
+    "bad_request": "Провайдер отклонил запрос (параметры, имя модели или длина контекста)",
+    "blocked": "Фильтр провайдера заблокировал ответ",
+    "length": "Ответ модели упёрся в лимит длины вывода",
+    "empty": "Модель вернула пустой ответ",
+    "unknown": "Ошибка вызова модели",
+}
+_ERROR_DETAIL_CHARS = 300
+# Потолок ожидания по Retry-After: заведомо огромный заголовок (суточная
+# квота) иначе подвесил бы задание без движения и без объяснений.
+_MAX_RETRY_AFTER_S = 300.0
+
+
+def _status_code(exc) -> int | None:
+    for obj in (exc, getattr(exc, "response", None)):
+        try:
+            code = int(getattr(obj, "status_code", None))
+        except (TypeError, ValueError):
+            continue
+        if 100 <= code <= 599:
+            return code
+    return None
+
+
+def _kind_by_status(code: int) -> str | None:
+    if code == 429:
+        return "rate_limit"
+    if code == 408:
+        return "timeout"
+    if code in (401, 403):
+        return "auth"
+    if code in (400, 404, 422):
+        return "bad_request"
+    if 500 <= code <= 599:
+        return "server"
+    return None
+
+
+def _kind_by_text(text: str) -> str | None:
+    m = _FINISH_REASON_RE.search(text)
+    reason = m.group(1).upper() if m else ""
+    if reason in _LENGTH_REASONS:
+        return "length"
+    if reason in _BLOCK_REASONS:
+        return "blocked"
+    if _EMPTY_MARK in text:
+        return "empty"
+    return None
+
+
+def _retry_after(exc) -> float | None:
+    """Секунды из заголовка Retry-After ответа провайдера (HTTP-дата не разбирается)."""
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    if not headers:
+        return None
+    value = headers.get("retry-after") or headers.get("Retry-After")
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds > 0 else None
+
+
+def classify_error(exc) -> MemoryLLMError:
+    """
+    Любое исключение вызова модели → MemoryLLMError с видом, признаком повтора
+    и русским текстом для статуса задания (таблица §4.4).
+
+    Порядок признаков: имя класса (по MRO) → HTTP-статус (у исключения или у
+    его response) → текст RuntimeError от llm_gateway (finish_reason /
+    «ПУСТОЙ ответ») → unknown, который повторяется: неизвестный сбой чаще
+    временный, а число попыток всё равно ограничено.
+    """
+    if isinstance(exc, MemoryLLMError):
+        return exc
+    kind = next((k for cls in type(exc).__mro__
+                 if (k := _KIND_BY_CLASS.get(cls.__name__))), None)
+    if kind is None:
+        code = _status_code(exc)
+        kind = _kind_by_status(code) if code else None
+    if kind is None and isinstance(exc, RuntimeError):
+        kind = _kind_by_text(str(exc))
+    kind = kind or "unknown"
+    detail = " ".join(str(exc).split())
+    if len(detail) > _ERROR_DETAIL_CHARS:
+        detail = detail[:_ERROR_DETAIL_CHARS].rstrip() + "…"
+    message = f"{_KIND_TEXT[kind]}: {detail}" if detail else _KIND_TEXT[kind]
+    return MemoryLLMError(kind, message, retryable=kind in _RETRYABLE_KINDS,
+                          retry_after=_retry_after(exc))
+
+
+# ============================================================================
+# Источник пакетов (§4.8)
+# ============================================================================
+@runtime_checkable
+class BatchSource(Protocol):
+    """
+    Откуда цикл свёртки берёт сообщения и куда отдаёт результат пакета.
+
+    Ядро не знает про БД: memory_service.DbBatchSource читает чат и пишет
+    HoraeEntry, ListSource — просто список. commit → False значит «кусок
+    истории изменился, пока модель его сворачивала» (правка, удаление, свайп):
+    такой снимок писать нельзя, пакет собирается заново.
+    """
+
+    async def pending(self) -> int: ...                          # сколько сообщений ждут
+
+    async def current_state(self, state: str) -> str: ...        # свежий снимок перед пакетом
+
+    async def next_messages(self, limit: int) -> list[MemoryMessage]: ...  # [] — нечего
+
+    async def commit(self, batch: Batch, new_state: str) -> bool: ...     # False — кусок изменился
+
+
+class ListSource:
+    """Готовый список сообщений как BatchSource: снимок никто не правит, сверять не с чем."""
+
+    def __init__(self, messages: Sequence[MemoryMessage]):
+        self._messages = list(messages or ())
+        self._pos = 0
+
+    async def pending(self) -> int:
+        return len(self._messages) - self._pos
+
+    async def current_state(self, state: str) -> str:
+        return state
+
+    async def next_messages(self, limit: int) -> list[MemoryMessage]:
+        return self._messages[self._pos:self._pos + max(1, int(limit or 1))]
+
+    async def commit(self, batch: Batch, new_state: str) -> bool:
+        self._pos += len(batch.messages)
+        return True
+
+
+# Сколько раз подряд задание пересобирает пакет, чей кусок истории менялся
+# под моделью. Дальше — SourceConflictError: кто-то правит этот кусок прямо
+# сейчас, и крутить модель вхолостую бессмысленно.
+_MAX_CONFLICTS = 3
+
+
+# ============================================================================
+# Менеджер: слияние, сжатие, цикл свёртки (§4.4–§4.8)
+# ============================================================================
+class HierarchicalMemoryManager:
+    """
+    Свёртка истории в мастер-снимок: State_N = merge(State_{N-1}, Block_N).
+
+    Экземпляр обслуживает один чат (сервис строит его на прогон).
+    Пауза-ограничитель считается от конца ПРЕДЫДУЩЕГО вызова этого менеджера,
+    поэтому слияния, сжатия и факты (сервис зовёт call() и для них) проходят
+    через одну «дверь» и не превышают лимит частоты провайдера. sleep и clock
+    внедряются ради тестов без реального ожидания.
+    """
+
+    def __init__(self, llm: LLMCall, config: MemoryConfig | None = None, *,
+                 sleep: Callable[[float], Awaitable] = asyncio.sleep,
+                 clock: Callable[[], float] = time.monotonic,
+                 estimate_tokens: Callable[[str], int] | None = None):
+        self._llm = llm
+        self.config = config or MemoryConfig()
+        self._sleep = sleep
+        self._clock = clock
+        self._est = estimate_tokens or default_estimate_tokens
+        # Предупреждения для UI (страж вернул записи, сжатие не удалось, снимок
+        # сверх бюджета). Копятся за всю жизнь менеджера; прогон отдаёт свои.
+        self.warnings: list[str] = []
+        self._last_end: float | None = None
+        # Прогресс идущего прогона scan_and_compress_history. Вне прогона None,
+        # и события пауз, повторов и сжатия никуда не уходят.
+        self._progress: ScanProgress | None = None
+        self._on_progress: Callable[[ScanProgress], None] | None = None
+
+    # ---------------------------------------------------------------- пакеты
+    def plan_batch(self, messages) -> Batch | None:
+        """Модульный plan_batch с размером пакета и бюджетом символов из config."""
+        return plan_batch(messages, self.config.batch_size, self.config.batch_max_chars)
+
+    def plan_batches(self, messages) -> list[Batch]:
+        return plan_batches(messages, self.config.batch_size, self.config.batch_max_chars)
+
+    def _tokens(self, text: str) -> int:
+        return self._est(text) if text else 0
+
+    def _emit(self, **fields) -> None:
+        """Событие прогресса: текущее состояние прогона + изменённые поля (фаза и т. п.)."""
+        if self._on_progress is None or self._progress is None:
+            return
+        self._on_progress(replace(self._progress, **fields))
+
+    def _guard(self, prev: str, new: str) -> str:
+        """Страж записей (§4.6) + предупреждение, если модель что-то выронила."""
+        new, restored = guard_entries(prev, new)
+        if restored:
+            self.warnings.append(f"модель потеряла {len(restored)} записей — "
+                                 "возвращены из предыдущего снимка")
+        return new
+
+    # ------------------------------------------------------------ вызов модели
+    async def call(self, messages: list[dict]) -> str:
+        """
+        Один запрос к модели: пауза-ограничитель + повтор с бэкоффом (§4.4).
+
+        Пауза стоит между ЛЮБЫМИ запросами менеджера: провайдер режет частоту
+        по всем запросам ключа, а не отдельно по слияниям или фактам.
+        """
+        delay = max(0.0, self.config.delay_ms / 1000)
+        if self._last_end is not None:
+            wait = delay - (self._clock() - self._last_end)
+            if wait > 0:
+                self._emit(phase="wait", retry_in_s=round(wait, 1))
+                await self._sleep(wait)
+        attempt = 0
+        while True:
+            try:
+                out = await self._llm(messages)
+                self._last_end = self._clock()
+                return out
+            except asyncio.CancelledError:
+                # Отмена задания или остановка сервера — не сбой провайдера:
+                # её нельзя ни повторять, ни глотать.
+                raise
+            except MemoryLLMError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — классифицируем любую ошибку провайдера
+                self._last_end = self._clock()
+                err = classify_error(exc)
+                if not err.retryable or attempt >= self.config.max_retries:
+                    raise err from exc
+                wait = min(self.config.backoff_max_s, self.config.backoff_base_s * 2 ** attempt)
+                if err.retry_after:
+                    wait = min(_MAX_RETRY_AFTER_S, max(wait, err.retry_after))
+                # Повтор — тоже запрос: короткий бэкофф не должен обходить паузу.
+                wait = max(wait, delay)
+                self._emit(phase="retry", retry_in_s=wait)
+                await self._sleep(wait)
+                attempt += 1
+
+    async def _ask_snapshot(self, messages: list[dict], *, prev: str,
+                            check_shrink: bool) -> str:
+        """
+        Запросить снимок и проверить его; брак вернуть модели корректирующим
+        ходом, до validation_retries раз, затем SnapshotValidationError.
+
+        В повторный запрос идёт только ПОСЛЕДНИЙ брак (исходный запрос + сырой
+        ответ + «Ответ отклонён: …»): каждая попытка размером со снимок, и
+        копить их все — раздувать вход с каждой неудачей.
+        """
+        convo = messages
+        problems: list[str] = []
+        for _ in range(max(0, self.config.validation_retries) + 1):
+            raw = await self.call(convo)
+            text, problems = validate_snapshot(raw, prev, config=self.config,
+                                               estimate_tokens=self._est,
+                                               check_shrink=check_shrink)
+            if not problems:
+                return text
+            convo = [*messages,
+                     {"role": "assistant", "content": str(raw or "")},
+                     {"role": "user",
+                      "content": CORRECTION_PROMPT.format(problems="; ".join(problems))}]
+        raise SnapshotValidationError(problems)
+
+    # ---------------------------------------------------------------- слияние
+    async def _merge(self, state: str, batch: Batch) -> str:
+        user = (f"[Текущая память]\n{state.strip() or EMPTY_STATE}\n\n"
+                f"[Новые события #{batch.first_id}–#{batch.last_id}]\n{batch.transcript}")
+        return await self._ask_snapshot(
+            [{"role": "system", "content": MASTER_STATE_PROMPT},
+             {"role": "user", "content": user}],
+            prev=state, check_shrink=True)
+
+    async def merge_block(self, state: str, batch: Batch) -> str:
+        """
+        Влить пакет в снимок (§4.5) → новый снимок в каноническом виде.
+
+        Брак ответа уходит модели корректирующим ходом; не исправила —
+        SnapshotValidationError, и вызывающий ничего не пишет. После
+        валидного ответа страж возвращает потерянные записи, а снимок сверх
+        бюджета сжимается в арки.
+        """
+        state = state or ""
+        if not batch.transcript.strip():
+            # В пакете одни пустые сообщения: вливать нечего, а указатель всё
+            # равно должен их пройти (см. Batch) — вызов модели был бы впустую.
+            return state
+        try:
+            new = await self._merge(state, batch)
+        except MemoryLLMError as err:
+            if err.kind != "length":
+                raise
+            # Модель упёрлась в лимит вывода: она переписывает снимок целиком,
+            # и большой снимок сам съедает бюджет ответа. Сжимаем хронику и
+            # пробуем ещё раз; повторная length уходит наверх.
+            state = await self.compact(state)
+            new = await self._merge(state, batch)
+        if is_structured(state):
+            new = self._guard(state, new)
+        if self._tokens(new) > self.config.snapshot_tokens:
+            new = await self.compact(new)
+        return new
+
+    # ----------------------------------------------------------------- сжатие
+    async def compact(self, state: str) -> str:
+        """
+        Сжать хронику снимка в арки (§4.7) → снимок.
+
+        Разделы 2–4 не сжимаются никогда: промпт требует перенести их дословно,
+        а страж возвращает то, что модель всё же выронила. Любая неудача
+        (брак после корректирующих ходов, ошибка API, хроника не стала
+        короче) — не повод терять готовый снимок: предупреждение и прежний
+        текст.
+        """
+        if not is_structured(state):
+            # Пустая память или пересказ старой схемы: хроники-раздела нет,
+            # сжимать нечего.
+            return state
+        self._emit(phase="compact")
+        budget = self.config.snapshot_tokens
+        system = COMPACT_PROMPT.format(budget=budget, keep=self.config.keep_recent_chronicle)
+        result = state
+        try:
+            compacted = await self._ask_snapshot(
+                [{"role": "system", "content": system},
+                 {"role": "user", "content": "[Текущая память]\n" + state}],
+                prev=state, check_shrink=False)
+        except (SnapshotValidationError, MemoryLLMError) as err:
+            self.warnings.append(f"сжатие хроники не удалось ({err}) — оставлен прежний снимок")
+        else:
+            before = self._tokens(parse_sections(state).get(SEC_CHRONICLE, ""))
+            after = self._tokens(parse_sections(compacted).get(SEC_CHRONICLE, ""))
+            if after < before:
+                result = self._guard(state, compacted)
+            else:
+                self.warnings.append("сжатие не сократило хронику — оставлен прежний снимок")
+        tokens = self._tokens(result)
+        if tokens > budget:
+            self.warnings.append(f"снимок превышает бюджет: {_fmt_int(tokens)} "
+                                 f"из {_fmt_int(budget)} токенов")
+        return result
+
+    # ------------------------------------------------------------ цикл свёртки
+    async def scan_and_compress_history(
+            self, source: Sequence[MemoryMessage] | BatchSource, state: str = "", *,
+            on_progress: Callable[[ScanProgress], None] | None = None,
+            cancel: asyncio.Event | None = None,
+            max_batches: int | None = None,
+            retry_conflicts: bool = True) -> ScanResult:
+        """
+        Свернуть всё, что ждёт в source, в снимок (§4.8).
+
+        Пакеты идут строго по очереди: запрос пакета N несёт снимок после
+        пакета N-1 — в этом вся свёртка. Готовый пакет сразу уходит в
+        source.commit, поэтому отмена, лимит или ошибка не теряют сделанного.
+
+        :param source: BatchSource или просто список MemoryMessage.
+        :param cancel: проверяется МЕЖДУ пакетами — начатый пакет доводится и
+            сохраняется.
+        :param max_batches: сколько попыток, дошедших до commit (принятых и
+            отвергнутых), сделать за прогон; ежеходный проход так не занимает
+            модель надолго.
+        :param retry_conflicts: False — отвергнутый commit завершает прогон
+            статусом "conflict" (ежеходный проход: следующий ход начнёт
+            заново); True — пакет собирается заново, но не больше
+            _MAX_CONFLICTS отказов подряд (задание).
+
+        Исключения merge_block пробрасываются: что они значат, решает
+        вызывающий (задание → статус error, ежеходный проход → лог).
+        """
+        if not isinstance(source, BatchSource):
+            source = ListSource(source)
+        # Прогон отдаёт только свои предупреждения, даже если менеджер уже
+        # поработал раньше.
+        warn_from = len(self.warnings)
+        processed = batches = attempts = conflicts = 0
+        self._on_progress = on_progress
+        self._progress = ScanProgress(processed=0, total=await source.pending(), batches=0,
+                                      state_tokens=self._tokens(state), phase="merge")
+        try:
+            self._emit()
+            while True:
+                if cancel is not None and cancel.is_set():
+                    status = "cancelled"
+                    break
+                if max_batches is not None and attempts >= max_batches:
+                    status = "limit"
+                    break
+                state = await source.current_state(state)
+                batch = self.plan_batch(await source.next_messages(self.config.batch_size))
+                if batch is None:
+                    status = "done"
+                    break
+                new = await self.merge_block(state, batch)
+                attempts += 1
+                if not await source.commit(batch, new):
+                    if not retry_conflicts:
+                        status = "conflict"
+                        break
+                    conflicts += 1
+                    if conflicts > _MAX_CONFLICTS:
+                        raise SourceConflictError(
+                            f"кусок истории #{batch.first_id}–#{batch.last_id} менялся "
+                            f"{conflicts} раза подряд, пока модель его сворачивала")
+                    continue
+                conflicts = 0
+                state = new
+                processed += len(batch.messages)
+                batches += 1
+                self._progress = replace(
+                    self._progress, processed=processed,
+                    total=processed + await source.pending(), batches=batches,
+                    state_tokens=self._tokens(state), last_range=(batch.first_id, batch.last_id))
+                self._emit()
+            tokens = self._tokens(state)
+            self._progress = replace(self._progress, state_tokens=tokens)
+            self._emit(phase="done")
+            return ScanResult(state=state, processed=processed, batches=batches, status=status,
+                              state_tokens=tokens, warnings=self.warnings[warn_from:])
+        finally:
+            self._on_progress = None
+            self._progress = None
+
+
+# ============================================================================
 # Скользящее окно (Tier 3)
 # ============================================================================
 def window_start(history_ids, covered, window, step: int = WINDOW_STEP) -> int:
@@ -866,3 +1348,9 @@ COMPACT_PROMPT = f"""Снимок памяти превышает бюджет {
 Последние {{keep}} записей хроники оставь без изменений. Диапазоны арок должны покрывать объединённые записи без пропусков; имена, числа, цитаты, решения и договорённости из объединяемых записей не теряй, ничего не выдумывай.
 Разделы [{SEC_CHARACTERS}], [{SEC_REGISTRY}] и [{SEC_LISTS}] перенеси ДОСЛОВНО, символ в символ: ничего не удаляй, не сокращай и не переупорядочивай.
 Ответ — полный снимок из всех четырёх разделов в обёртке {ENVELOPE_OPEN}…{ENVELOPE_CLOSE}, без пояснений."""
+
+# Корректирующий ход после брака (§4.5): модель видит свой сырой ответ и
+# список проблем. {problems} подставляет менеджер через str.format — других
+# фигурных скобок в тексте быть не должно.
+CORRECTION_PROMPT = (f"Ответ отклонён: {{problems}}. Верни ПОЛНЫЙ снимок заново строго по "
+                     f"схеме, в обёртке {ENVELOPE_OPEN}…{ENVELOPE_CLOSE}, без пояснений.")
