@@ -98,6 +98,7 @@ from backend.schemas import (
     GroupCreate,
     HoraeEntryUpdate,
     ImagePrompt,
+    MemoryRebuildIn,
     MessageEdit,
     PersonaBase,
     PersonaRead,
@@ -1045,6 +1046,95 @@ async def inspect_context(
     report["character"] = character.name
     report["model"] = (params.model if params else "") or ""
     return report
+
+
+# ==================== МАСТЕР-ПАМЯТЬ ЧАТА (вкладка «Память») ====================
+# Статус, задания «Пересобрать»/«Догнать», сброс и экспорт снимка. Логика —
+# в memory_service; здесь только доступ и HTTP-обёртка.
+async def _memory_session(db, session_id: int, user):
+    """
+    Чат для эндпоинтов памяти: нет чата — 404, чужой — 403.
+
+    Существование проверяется ДО доступа: _can_access_session(None) даёт False,
+    и удалённый чат иначе выглядел бы для интерфейса как чужой.
+    """
+    sess = await db.get(models.ChatSession, session_id)
+    if sess is None:
+        raise HTTPException(404, "Чат не найден")
+    if not await _can_access_session(db, sess, user):
+        raise HTTPException(403, "Нет доступа к этому чату")
+    return sess
+
+
+@app.get("/api/sessions/{session_id}/memory")
+async def memory_status(
+    session_id: int, user=Depends(current_user), db: AsyncSession = Depends(get_session)
+):
+    """Снимок, буфер пересборки, бэклог, факты и последнее задание памяти чата."""
+    await _memory_session(db, session_id, user)
+    return await memory_service.status(db, session_id)
+
+
+@app.post("/api/sessions/{session_id}/memory/rebuild", status_code=202)
+async def memory_rebuild(
+    session_id: int,
+    payload: MemoryRebuildIn,
+    user=Depends(current_user),
+    db: AsyncSession = Depends(get_session),
+):
+    """
+    Запустить задание памяти. Ответ — сразу (202): пересборка большого чата —
+    это сотни платных запросов, прогресс интерфейс опрашивает через GET /memory.
+    """
+    await _memory_session(db, session_id, user)
+    try:
+        job = await memory_service.start_job(
+            session_id, _memory_deps(), mode=payload.mode, resume=payload.resume,
+            batch_size=payload.batch_size, delay_ms=payload.delay_ms)
+    except memory_service.JobConflict:
+        raise HTTPException(409, "Память этого чата уже пересобирается")
+    return {"job": job.to_dict()}
+
+
+@app.post("/api/sessions/{session_id}/memory/cancel")
+async def memory_cancel(
+    session_id: int, user=Depends(current_user), db: AsyncSession = Depends(get_session)
+):
+    """Остановить задание между пакетами. ok=False — останавливать было нечего."""
+    await _memory_session(db, session_id, user)
+    job = memory_service.cancel_job(session_id)
+    shown = job or memory_service.get_job(session_id)
+    return {"ok": job is not None, "job": shown.to_dict() if shown else None}
+
+
+@app.delete("/api/sessions/{session_id}/memory")
+async def memory_purge(
+    session_id: int, user=Depends(current_user), db: AsyncSession = Depends(get_session)
+):
+    """Сбросить мастер-снимок и атомарные факты чата; сообщения остаются."""
+    await _memory_session(db, session_id, user)
+    return await memory_service.purge(db, session_id)
+
+
+@app.get("/api/sessions/{session_id}/memory/export")
+async def memory_export(
+    session_id: int,
+    facts: bool = False,
+    user=Depends(current_user),
+    db: AsyncSession = Depends(get_session),
+):
+    """Мастер-снимок .md-файлом (facts=1 — с приложением атомарных фактов)."""
+    await _memory_session(db, session_id, user)
+    exported = await memory_service.export_markdown(db, session_id, include_facts=facts)
+    if exported is None:
+        raise HTTPException(404, "Снимка памяти у этого чата ещё нет")
+    filename, text = exported
+    # Имя с кириллицей: HTTP-заголовки — только latin-1, поэтому ASCII-запасное
+    # имя + RFC 5987 (filename*) с процент-кодированием UTF-8, как в export_canvas.
+    disposition = (f'attachment; filename="memory-{session_id}.md"; '
+                   f"filename*=UTF-8''{urllib.parse.quote(filename)}")
+    return Response(text, media_type="text/markdown; charset=utf-8",
+                    headers={"Content-Disposition": disposition})
 
 
 @app.post("/api/sessions/{session_id}/fork")

@@ -252,3 +252,288 @@ async def test_batch_without_readable_text_still_moves_the_pointer():
     assert seen == []
     assert (await _entry(sid)).meta["last_message_id"] == ids[11]
     await engine.dispose()
+
+
+# ============================================================================
+# Задания «Пересобрать»/«Догнать», статус, сброс, экспорт (§6.5–§6.6, §7)
+# ============================================================================
+async def _run_rebuild(sid, **kw):
+    from backend import main, memory_service
+    job = await memory_service.start_job(sid, main._memory_deps(), mode=kw.pop("mode", "rebuild"), **kw)
+    await memory_service.wait_job(sid)
+    return job
+
+
+async def test_rebuild_keeps_old_snapshot_until_atomic_swap():
+    from backend import models
+    from backend.database import AsyncSessionLocal, engine
+    await _fresh_db()
+    _, sid, ids = await _make_chat(40 + hr.DEFAULT_WINDOW)
+    async with AsyncSessionLocal() as db:
+        db.add(models.HoraeEntry(session_id=sid, category="summary", title="t",
+                                 content="СТАРЫЙ СНИМОК", always_on=True, enabled=True,
+                                 meta={"last_message_id": ids[39], "v": 2}))
+        await db.commit()
+    during = []
+
+    async def fake_complete(messages, params=None, connection=None, kind="service"):
+        during.append((await _entry(sid)).content)
+        return await _snapshot_llm([])(messages, params, connection, kind)
+
+    with patch("backend.main.complete", new=fake_complete):
+        job = await _run_rebuild(sid, batch_size=10)
+    assert job.status == "done" and job.processed == 40
+    assert all(c == "СТАРЫЙ СНИМОК" for c in during)       # до подмены работает старый
+    entry = await _entry(sid)
+    assert "СТАРЫЙ СНИМОК" not in entry.content and "rebuild" not in entry.meta
+    assert entry.meta["updated_by"] == "rebuild" and entry.meta["last_message_id"] == ids[39]
+    assert "[Обработано 40/40 сообщений" in job.line
+    await engine.dispose()
+
+
+async def test_rebuild_resumes_from_checkpoint():
+    from backend import models
+    from backend.database import AsyncSessionLocal, engine
+    await _fresh_db()
+    _, sid, ids = await _make_chat(30 + hr.DEFAULT_WINDOW)
+    async with AsyncSessionLocal() as db:
+        db.add(models.HoraeEntry(
+            session_id=sid, category="summary", title="t", content="СТАРЫЙ", always_on=True,
+            enabled=True, meta={"last_message_id": ids[29], "v": 2, "rebuild": {
+                "content": hm.render_snapshot({hm.SEC_CHRONICLE: "- [#a–#b] уже сделано"}),
+                "last_message_id": ids[19], "manual": True}}))
+        await db.commit()
+    seen = []
+    with patch("backend.main.complete", new=_snapshot_llm(seen)):
+        job = await _run_rebuild(sid, resume=True, batch_size=20)
+    merges = [m for m in seen if m[0]["content"] == hm.MASTER_STATE_PROMPT]
+    assert len(merges) == 1 and "уже сделано" in merges[0][1]["content"]
+    assert f"#{ids[20]}–#{ids[29]}" in merges[0][1]["content"]
+    assert job.processed == 10
+    await engine.dispose()
+
+
+async def test_cancelled_rebuild_keeps_buffer_shows_staging_and_resumes():
+    """
+    Остановка идущей пересборки: начатый пакет доводится и остаётся в буфере,
+    старый снимок работает дальше, статус показывает прерванную пересборку и
+    бэклог от её указателя. «Продолжить» доделывает остаток и подменяет снимок.
+    """
+    from backend import memory_service, models
+    from backend.database import AsyncSessionLocal, engine
+    await _fresh_db()
+    _, sid, ids = await _make_chat(30 + hr.DEFAULT_WINDOW)
+    async with AsyncSessionLocal() as db:
+        db.add(models.HoraeEntry(session_id=sid, category="summary", title="t",
+                                 content="СТАРЫЙ", always_on=True, enabled=True,
+                                 meta={"last_message_id": ids[29], "v": 2}))
+        await db.commit()
+
+    async def cancel_on_first_merge(messages, params=None, connection=None, kind="service"):
+        if messages[0]["content"] == hm.MASTER_STATE_PROMPT:
+            assert memory_service.cancel_job(sid) is not None   # задание идёт — отмена принята
+        return await _snapshot_llm([])(messages, params, connection, kind)
+
+    with patch("backend.main.complete", new=cancel_on_first_merge):
+        job = await _run_rebuild(sid, batch_size=10)
+    assert job.status == "cancelled" and job.processed == 10 and job.finished_at
+    entry = await _entry(sid)
+    assert entry.content == "СТАРЫЙ" and entry.meta["rebuild"]["last_message_id"] == ids[9]
+    async with AsyncSessionLocal() as db:
+        st = await memory_service.status(db, sid)
+    assert st["staging"]["last_message_id"] == ids[9] and st["staging"]["manual"] is True
+    assert st["backlog"]["pending"] == 20 and st["snapshot"]["covered_upto"] == ids[29]
+    assert st["job"]["status"] == "cancelled"
+
+    with patch("backend.main.complete", new=_snapshot_llm([])):
+        job = await _run_rebuild(sid, resume=True, batch_size=10)
+    assert job.status == "done" and job.processed == 20
+    entry = await _entry(sid)
+    assert entry.content != "СТАРЫЙ" and "rebuild" not in entry.meta
+    await engine.dispose()
+
+
+async def test_catchup_folds_backlog_into_live_snapshot():
+    from backend.database import engine
+    await _fresh_db()
+    _, sid, ids = await _make_chat(45 + hr.DEFAULT_WINDOW)
+    with patch("backend.main.complete", new=_snapshot_llm([])):
+        job = await _run_rebuild(sid, mode="catchup", batch_size=20)
+    assert job.status == "done" and job.processed == 45 and job.batches == 3
+    assert (await _entry(sid)).meta["last_message_id"] == ids[44]
+    await engine.dispose()
+
+
+async def test_api_error_marks_job_failed_and_keeps_pointer():
+    from backend.database import engine
+    await _fresh_db()
+    _, sid, _ = await _make_chat(30 + hr.DEFAULT_WINDOW)
+
+    class Denied(Exception):
+        status_code = 401
+
+    async def denied(messages, params=None, connection=None, kind="service"):
+        raise Denied("no key")
+
+    with patch("backend.main.complete", new=denied):
+        job = await _run_rebuild(sid, mode="catchup")
+    assert job.status == "error" and job.error
+    assert await _entry(sid) is None
+    await engine.dispose()
+
+
+async def test_job_ends_with_error_when_chat_is_deleted_mid_run():
+    """
+    Чат удалили, пока модель сворачивала пакет: задание не падает и не
+    отчитывается «готово» (памяти больше некуда писать), а завершается ошибкой;
+    записи памяти удалённого чата не воскресают.
+    """
+    from sqlalchemy import delete
+
+    from backend import models
+    from backend.database import AsyncSessionLocal, engine
+    await _fresh_db()
+    _, sid, _ = await _make_chat(30 + hr.DEFAULT_WINDOW)
+
+    async def delete_chat_then_answer(messages, params=None, connection=None, kind="service"):
+        async with AsyncSessionLocal() as db:
+            for model in (models.Message, models.HoraeEntry, models.HoraeFact):
+                await db.execute(delete(model).where(model.session_id == sid))
+            await db.execute(delete(models.ChatSession).where(models.ChatSession.id == sid))
+            await db.commit()
+        return await _snapshot_llm([])(messages, params, connection, kind)
+
+    with patch("backend.main.complete", new=delete_chat_then_answer):
+        job = await _run_rebuild(sid, mode="catchup")
+    assert job.status == "error" and "удал" in job.error and job.finished_at
+    assert await _entry(sid) is None
+    await engine.dispose()
+
+
+async def test_export_markdown_names_file_by_title_and_appends_facts():
+    """
+    Имя файла — «memory-<название>-<id>.md»: буквы и цифры (латиница и
+    кириллица) остаются, всё прочее — «_». Факты — приложением, только по просьбе.
+    """
+    from backend import memory_service, models
+    from backend.database import AsyncSessionLocal, engine
+    await _fresh_db()
+    _, sid, ids = await _make_chat(3)
+    async with AsyncSessionLocal() as db:
+        (await db.get(models.ChatSession, sid)).title = "Замок / Tower #1"
+        db.add(models.HoraeEntry(
+            session_id=sid, category="summary", title="t", always_on=True, enabled=True,
+            content=hm.render_snapshot({hm.SEC_CHRONICLE: "- [#1–#2] ворота открыты"}),
+            meta={"last_message_id": ids[1], "v": 2, "schema": hm.SNAPSHOT_SCHEMA, "tokens": 42}))
+        db.add(models.HoraeFact(session_id=sid, content="ключ у стража", source_message_id=ids[1]))
+        await db.commit()
+        name, text = await memory_service.export_markdown(db, sid, include_facts=True)
+        _, plain = await memory_service.export_markdown(db, sid)
+    assert name == f"memory-Замок_Tower_1-{sid}.md"
+    assert text.startswith("# Мастер-снимок памяти — «Замок / Tower #1»")
+    assert "Персонаж: Эльвира" in text and f"Учтено до: #{ids[1]}" in text
+    assert "ворота открыты" in text and "## Приложение: атомарные факты (1)\n- ключ у стража" in text
+    assert "Приложение" not in plain
+    await engine.dispose()
+
+
+def test_memory_api_status_conflict_purge_export(client):
+    from backend import memory_service, models
+    from backend.database import AsyncSessionLocal
+    cid = client.post("/api/characters", json={"name": "Хранитель"}).json()["id"]
+    sid = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]
+
+    async def seed():
+        async with AsyncSessionLocal() as db:
+            for i in range(80):
+                db.add(models.Message(session_id=sid, role="user" if i % 2 == 0 else "assistant",
+                                      content=f"реплика {i}"))
+            await db.commit()
+    client.portal.call(seed)
+
+    st = client.get(f"/api/sessions/{sid}/memory").json()
+    assert st["snapshot"]["exists"] is False and st["backlog"]["pending"] == 80 - hr.DEFAULT_WINDOW
+    assert st["backlog"]["window"] == hr.DEFAULT_WINDOW and st["job"] is None
+    assert client.get(f"/api/sessions/{sid}/memory/export").status_code == 404
+
+    with patch("backend.main.complete", new=_snapshot_llm([])):
+        r = client.post(f"/api/sessions/{sid}/memory/rebuild", json={"mode": "rebuild", "batch_size": 10})
+        assert r.status_code == 202
+        client.portal.call(memory_service.wait_job, sid)
+    st = client.get(f"/api/sessions/{sid}/memory").json()
+    assert st["job"]["status"] == "done" and st["snapshot"]["exists"] and st["snapshot"]["schema"] == "hms-1"
+
+    exp = client.get(f"/api/sessions/{sid}/memory/export?facts=1")
+    assert exp.status_code == 200 and exp.headers["content-type"].startswith("text/markdown")
+    assert "attachment" in exp.headers["content-disposition"]
+    assert exp.text.startswith("# Мастер-снимок памяти") and f"## [{hm.SEC_CHRONICLE}]" in exp.text
+
+    async def add_fact():
+        async with AsyncSessionLocal() as db:
+            db.add(models.HoraeFact(session_id=sid, content="факт", source_message_id=1))
+            await db.commit()
+    client.portal.call(add_fact)
+    gone = client.delete(f"/api/sessions/{sid}/memory").json()
+    assert gone["snapshot_deleted"] is True and gone["facts_deleted"] >= 1
+    st = client.get(f"/api/sessions/{sid}/memory").json()
+    assert st["snapshot"]["exists"] is False and st["facts"]["count"] == 0
+    assert st["backlog"]["messages_total"] == 80                # сообщения на месте
+
+
+def test_second_job_is_rejected_with_409(client):
+    from backend import memory_service
+    cid = client.post("/api/characters", json={"name": "Очередь"}).json()["id"]
+    sid = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]
+    lock = memory_service.session_lock(sid)
+
+    async def hold():
+        await lock.acquire()
+    client.portal.call(hold)
+    try:
+        assert client.post(f"/api/sessions/{sid}/memory/rebuild", json={"mode": "catchup"}).status_code == 202
+        assert client.post(f"/api/sessions/{sid}/memory/rebuild", json={"mode": "catchup"}).status_code == 409
+        assert client.get(f"/api/sessions/{sid}/memory").json()["job"]["status"] == "queued"
+        assert client.post(f"/api/sessions/{sid}/memory/cancel").json()["ok"] is True
+    finally:
+        async def release():
+            lock.release()  # asyncio.Lock отпускаем в его же цикле событий
+        client.portal.call(release)
+        client.portal.call(memory_service.wait_job, sid)
+    assert memory_service.get_job(sid).status == "cancelled"
+
+
+def test_memory_endpoints_answer_404_for_missing_chat(client):
+    """Нет чата — 404, а не 403: интерфейс отличает удалённый чат от чужого."""
+    for method, path in (("get", ""), ("post", "/rebuild"), ("post", "/cancel"),
+                         ("delete", ""), ("get", "/export")):
+        kw = {"json": {"mode": "catchup"}} if path == "/rebuild" else {}
+        r = getattr(client, method)(f"/api/sessions/987654321/memory{path}", **kw)
+        assert r.status_code == 404, (method, path, r.status_code)
+
+
+def test_memory_endpoints_respect_access(client):
+    """
+    Чужой чат в режиме аккаунтов — 403 на всех эндпоинтах памяти.
+
+    Порядок — как в tests/test_horae_privacy.py: B регистрируется после A и
+    потому точно не админ; режим аккаунтов выключается своим admin_password, а
+    не правами глобального админа, личность которого в общей БД тесту неизвестна.
+    """
+    a = client.post("/api/auth/register", json={"username": "hms_a", "password": "pw"}).json()
+    b = client.post("/api/auth/register", json={"username": "hms_b", "password": "pw"}).json()
+    ha, hb = {"X-User-Token": a["token"]}, {"X-User-Token": b["token"]}
+    client.put("/api/admin/security", json={"accounts_enabled": True, "admin_password": "hms_pw"})
+    try:
+        cid = client.post("/api/characters", json={"name": "Чужой"}, headers=ha).json()["id"]
+        sid = client.post(f"/api/sessions?character_id={cid}", headers=ha).json()["session_id"]
+        for method, path in (("get", ""), ("post", "/rebuild"), ("post", "/cancel"),
+                             ("delete", ""), ("get", "/export")):
+            kw = {"json": {"mode": "catchup"}} if path == "/rebuild" else {}
+            r = getattr(client, method)(f"/api/sessions/{sid}/memory{path}", headers=hb, **kw)
+            assert r.status_code == 403, (method, path, r.status_code)
+    finally:
+        client.put(
+            "/api/admin/security",
+            json={"accounts_enabled": False, "admin_password": ""},
+            headers={**ha, "X-Admin-Password": "hms_pw"},
+        )
