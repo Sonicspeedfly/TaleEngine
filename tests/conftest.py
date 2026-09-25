@@ -20,6 +20,11 @@ if _test_db.exists():
 
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///" + _test_db.as_posix()
 
+# Тесты не ждут паузу между запросами памяти; тесты паузы задают её явно
+# (и подменяют sleep/clock) — иначе весь набор незаметно тормозился бы на
+# 1500 мс за каждый пакет сжатия по дефолту из .env.
+os.environ.setdefault("MEMORY_DELAY_MS", "0")
+
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 

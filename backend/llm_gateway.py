@@ -12,6 +12,8 @@
 """
 import asyncio
 import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import AsyncGenerator, Optional
 
 import litellm
@@ -252,6 +254,31 @@ def _merge_params(params: Optional[GenerationParams]) -> dict:
     return merged
 
 
+# Переопределение сэмплинга для служебного вызова (память) без протаскивания
+# params через complete/stream_completion: params=None у памяти держит фильтры
+# безопасности выключенными (см. main._summary_pass), а нужны СВОИ температура
+# и длинный вывод под снимок. ContextVar, а не аргумент функции — так сигнатуры
+# complete/stream_completion не меняются (подмены в тестах на них рассчитаны).
+_SAMPLING_OVERRIDES: ContextVar[Optional[dict]] = ContextVar("sampling_overrides", default=None)
+# Только сэмплинг-параметры litellm — не даём протащить сюда что-то ещё по ошибке.
+_OVERRIDABLE = ("max_tokens", "temperature", "top_p")
+
+
+@contextmanager
+def sampling_overrides(**kw):
+    """
+    Контекстный менеджер: пока активен, stream_completion добавляет переданные
+    max_tokens/temperature/top_p ПОВЕРХ обычных дефолтов (_merge_params), не
+    трогая ничего вне блока `with`. token/reset — чтобы вложенные и повторные
+    вызовы (в т.ч. из разных asyncio-задач) не путали друг друга значениями.
+    """
+    token = _SAMPLING_OVERRIDES.set({k: v for k, v in kw.items() if k in _OVERRIDABLE and v is not None})
+    try:
+        yield
+    finally:
+        _SAMPLING_OVERRIDES.reset(token)
+
+
 # Просить ли у провайдера отчёт о потраченных токенах (usage в конце стрима).
 # Без него расход не посчитать: длина текста не учитывает ни файлы, ни кэш, ни
 # размышления. Параметр стандартный (OpenAI-совместимый), но если чей-то прокси
@@ -347,6 +374,9 @@ async def stream_completion(
         "num_retries": settings.LLM_NUM_RETRIES,
         **_merge_params(params),
     }
+    # Служебные вызовы (память) кладут свою температуру/max_tokens поверх
+    # обычных дефолтов — см. sampling_overrides выше.
+    call_kwargs.update(_SAMPLING_OVERRIDES.get() or {})
     _apply_connection(call_kwargs, params, connection)
 
     # Рассуждения (thinking): уровень пользователя или авто-включение при файлах.
