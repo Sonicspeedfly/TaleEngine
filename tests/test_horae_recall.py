@@ -580,7 +580,8 @@ async def test_active_window_drops_only_summarised_history():
     from backend.database import engine
 
     await _fresh_db()
-    char_id, sid, ids = await _make_chat(60, prefix="старая реплика")
+    # 40 старых сообщений сверх окна: их и только их окно вправе выбросить.
+    char_id, sid, ids = await _make_chat(40 + hr.DEFAULT_WINDOW, prefix="старая реплика")
     await _set_summary(sid, ids[39])  # сводка учла первые 40 сообщений
 
     messages, report = await _build(sid, char_id)
@@ -601,14 +602,16 @@ async def test_passed_history_without_ids_is_never_trimmed():
     from backend.database import engine
 
     await _fresh_db()
-    char_id, sid, ids = await _make_chat(60)
+    char_id, sid, ids = await _make_chat(40 + hr.DEFAULT_WINDOW)
     await _set_summary(sid, ids[-1])
-    history = [{"role": "user", "content": f"чужая {i}"} for i in range(50)]
+    # Длиннее окна — иначе окну нечего выбрасывать и при известных id.
+    n = 30 + hr.DEFAULT_WINDOW
+    history = [{"role": "user", "content": f"чужая {i}"} for i in range(n)]
 
     _, report = await _build(sid, char_id, history=history)
     assert report["memory"]["dropped"] == 0
 
-    _, report = await _build(sid, char_id, history=history, history_ids=ids[:50])
+    _, report = await _build(sid, char_id, history=history, history_ids=ids[:n])
     assert report["memory"]["dropped"] > 0
     await engine.dispose()
 
@@ -617,7 +620,7 @@ async def test_recalled_facts_reach_the_model_and_the_inspector():
     from backend.database import engine
 
     await _fresh_db()
-    char_id, sid, ids = await _make_chat(60)
+    char_id, sid, ids = await _make_chat(40 + hr.DEFAULT_WINDOW)
     await _set_summary(sid, ids[-1])
     await _add_facts(sid, [("Эльвира пообещала вернуть Артуру кинжал", ids[3])])
 
@@ -636,7 +639,7 @@ async def test_long_memory_failure_does_not_break_the_turn():
     from backend.database import engine
 
     await _fresh_db()
-    char_id, sid, ids = await _make_chat(60, prefix="реплика")
+    char_id, sid, ids = await _make_chat(40 + hr.DEFAULT_WINDOW, prefix="реплика")
     await _set_summary(sid, ids[-1])
 
     with patch("backend.horae_recall.window_start", side_effect=RuntimeError("сломалось")):
@@ -954,7 +957,7 @@ async def test_window_ignores_summary_that_is_not_injected():
     from backend.database import AsyncSessionLocal, engine
 
     await _fresh_db()
-    char_id, sid, ids = await _make_chat(60, prefix="старая реплика")
+    char_id, sid, ids = await _make_chat(40 + hr.DEFAULT_WINDOW, prefix="старая реплика")
     await _set_summary(sid, ids[-1])
     async with AsyncSessionLocal() as db:
         entry = (await db.execute(select(models.HoraeEntry).where(
@@ -1143,7 +1146,7 @@ async def test_legacy_summary_pointer_does_not_trim_history():
     from backend.database import engine
 
     await _fresh_db()
-    char_id, sid, ids = await _make_chat(60, prefix="давняя реплика")
+    char_id, sid, ids = await _make_chat(40 + hr.DEFAULT_WINDOW, prefix="давняя реплика")
     await _set_legacy_summary(sid, ids[-1])
 
     messages, report = await _build(sid, char_id)
