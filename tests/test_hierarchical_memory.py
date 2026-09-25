@@ -194,6 +194,19 @@ def test_guard_does_not_tear_off_merged_continuation():
     assert restored == [] and fixed.count("психологический вектор") == 1
 
 
+def test_guard_keeps_nested_list_under_bold_name_before_any_marker():
+    # «Жирное имя + вложенный список»: у строк группы верхнего маркера нет вовсе.
+    # Строка с отступом до первого маркера — всё равно продолжение: иначе
+    # «  - здоровье: …» становится записью с ключом «здоровье», совпадает с
+    # атрибутом другого персонажа, и при потере персонажа атрибут пропадает.
+    prev = _snap(chars="**Эльвира**\n  - здоровье: цела\n**Артур**\n  - здоровье: ранен в плечо")
+    new = _snap(chars="**Эльвира**\n  - здоровье: цела")
+    fixed, restored = hm.guard_entries(prev, new)
+    assert restored == ["артур"]
+    assert hm.parse_sections(fixed)[hm.SEC_CHARACTERS].endswith(
+        "**Артур**\n  - здоровье: ранен в плечо")
+
+
 def test_guard_splits_markerless_section_by_line():
     # Без единого маркера делить не по чему — каждая строка остаётся записью.
     prev = _snap(chars="Эльвира: цела\nАртур: ранен")
