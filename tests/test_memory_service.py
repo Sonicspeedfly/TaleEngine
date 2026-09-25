@@ -5,10 +5,25 @@ backend.main.complete — как во всех тестах памяти.
 """
 from unittest.mock import patch
 
+import pytest
 from sqlalchemy import select
 
 from backend import hierarchical_memory as hm
 from backend import horae_recall as hr
+
+
+@pytest.fixture(autouse=True)
+def _no_jobs_from_other_tests():
+    """
+    Реестр заданий живёт в процессе, а тестовая БД общая: SQLite отдаёт id
+    удалённого последнего чата новому, и завершённое задание чужого теста
+    всплывало бы в статусе чата этого. Исход тогда зависел бы от порядка
+    тестов (подмножество падало, полный файл — нет).
+    """
+    from backend import memory_service
+    memory_service._jobs.clear()
+    yield
+    memory_service._jobs.clear()
 
 
 async def _fresh_db():
@@ -410,6 +425,45 @@ async def test_job_ends_with_error_when_chat_is_deleted_mid_run():
     await engine.dispose()
 
 
+async def test_job_of_deleted_chat_never_writes_into_new_chat_with_same_id():
+    """
+    Чат удалили посреди задания и сразу завели новый — SQLite отдал ему тот же
+    id, а сообщениям те же id и тот же текст (чат удалили и загрузили заново).
+    Сверка куска такое пропускает. Старое задание всё равно не пишет в новый
+    чат ни пакета и не берёт из него следующий, завершается ошибкой, а в
+    реестре нового чата его нет: «Догнать» у нового чата запускается.
+    """
+    from backend import main, memory_service
+    from backend.database import AsyncSessionLocal, engine
+    await _fresh_db()
+    _, sid, ids = await _make_chat(30 + hr.DEFAULT_WINDOW)
+    merges = []
+
+    async def delete_and_recreate(messages, params=None, connection=None, kind="service"):
+        if messages[0]["content"] == hm.MASTER_STATE_PROMPT:
+            merges.append(messages)
+            if len(merges) == 1:
+                async with AsyncSessionLocal() as db:
+                    await main.delete_session(sid, user=None, db=db)
+                _, new_sid, new_ids = await _make_chat(30 + hr.DEFAULT_WINDOW)
+                assert (new_sid, new_ids) == (sid, ids)      # id достались новому чату
+        return await _snapshot_llm([])(messages, params, connection, kind)
+
+    with patch("backend.main.complete", new=delete_and_recreate):
+        job = await _run_rebuild(sid, mode="catchup", batch_size=10)
+    assert job.status == "error" and "удал" in job.error
+    assert len(merges) == 1                   # следующий пакет из нового чата не взят
+    assert await _entry(sid) is None          # и в его память ничего не записано
+    assert memory_service.get_job(sid) is None
+    async with AsyncSessionLocal() as db:
+        assert (await memory_service.status(db, sid))["job"] is None
+
+    with patch("backend.main.complete", new=_snapshot_llm([])):
+        fresh = await _run_rebuild(sid, mode="catchup", batch_size=10)
+    assert fresh is not job and fresh.status == "done" and fresh.processed == 30
+    await engine.dispose()
+
+
 async def test_export_markdown_names_file_by_title_and_appends_facts():
     """
     Имя файла — «memory-<название>-<id>.md»: буквы и цифры (латиница и
@@ -500,6 +554,36 @@ def test_second_job_is_rejected_with_409(client):
         client.portal.call(release)
         client.portal.call(memory_service.wait_job, sid)
     assert memory_service.get_job(sid).status == "cancelled"
+
+
+def test_deleting_chat_forgets_its_job_for_next_chat_with_same_id(client):
+    """
+    Удаление чата снимает и забывает его задание памяти. SQLite отдаёт id
+    удалённого последнего чата новому: иначе новый чат показывал бы во вкладке
+    «Память» чужое задание, а пока то в очереди — получал бы 409 на «Пересобрать».
+    """
+    from backend import memory_service
+    cid = client.post("/api/characters", json={"name": "Наследник"}).json()["id"]
+    sid = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]
+    lock = memory_service.session_lock(sid)
+
+    async def hold():
+        await lock.acquire()  # ежеходный проход «идёт» — задание ждёт в очереди
+    client.portal.call(hold)
+    try:
+        assert client.post(f"/api/sessions/{sid}/memory/rebuild", json={"mode": "catchup"}).status_code == 202
+        old = memory_service.get_job(sid)
+        assert client.delete(f"/api/sessions/{sid}").json()["ok"] is True
+        assert old.status == "cancelled" and memory_service.get_job(sid) is None
+        assert client.post(f"/api/sessions?character_id={cid}").json()["session_id"] == sid
+        assert client.get(f"/api/sessions/{sid}/memory").json()["job"] is None
+        assert client.post(f"/api/sessions/{sid}/memory/rebuild", json={"mode": "catchup"}).status_code == 202
+    finally:
+        async def release():
+            lock.release()  # asyncio.Lock отпускаем в его же цикле событий
+        client.portal.call(release)
+        client.portal.call(memory_service.wait_job, sid)
+    assert memory_service.get_job(sid) is not old and memory_service.get_job(sid).status == "done"
 
 
 def test_memory_endpoints_answer_404_for_missing_chat(client):

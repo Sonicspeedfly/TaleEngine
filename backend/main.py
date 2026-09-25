@@ -1268,6 +1268,10 @@ async def delete_session(
     sess = await db.get(models.ChatSession, session_id)
     if not await _can_access_session(db, sess, user):
         raise HTTPException(403, "Нет доступа к этому чату")
+    # Задание памяти (пересборка/догонялка) снимается и забывается ДО удаления
+    # строк: id этого чата достанется следующему новому, и тот не должен ни
+    # видеть чужое задание, ни получать в память его работу (см. forget_job).
+    memory_service.forget_job(session_id)
     # Данные вложений сообщений этого чата (blob-таблица) — до удаления сообщений.
     await delete_message_blobs(
         db, select(models.Message.id).where(models.Message.session_id == session_id)

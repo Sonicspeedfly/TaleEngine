@@ -471,11 +471,17 @@ class DbBatchSource:
     mode: "incremental" — ежеходный проход (порог summary_every); "catchup" —
     задание «Догнать»; "rebuild" — задание «Пересобрать»: буфер создан заранее,
     каждый пакет пишется в него, подмена снимка — в конце задания.
+
+    alive: False — чат, для которого источник создан, удалён (задание забыто,
+    см. forget_job). Чат ищется по id, а SQLite отдаёт id удалённого чата
+    следующему новому: без этой проверки задание брало бы пакеты нового чата
+    и писало бы в его память.
     """
 
     def __init__(self, session_id: int, *, mode: str, threshold: int,
                  manager: hm.HierarchicalMemoryManager, want_facts: bool, connection: dict,
-                 window: int, estimate_tokens: Callable[[str], int] = estimate_tokens):
+                 window: int, estimate_tokens: Callable[[str], int] = estimate_tokens,
+                 alive: Callable[[], bool] | None = None):
         if mode not in _MODES:
             raise ValueError(f"неизвестный режим памяти: {mode!r}")
         self.session_id = session_id
@@ -486,6 +492,7 @@ class DbBatchSource:
         self.connection = connection
         self.window = window
         self._est = estimate_tokens
+        self._alive = alive or (lambda: True)
 
     # ------------------------------------------------------ протокол ядра
     async def pending(self) -> int:
@@ -517,6 +524,8 @@ class DbBatchSource:
             return _read_target(entry).state
 
     async def next_messages(self, limit: int) -> list[hm.MemoryMessage]:
+        if not self._alive():
+            return []  # чат удалён: с тем же id может жить уже другой чат
         async with AsyncSessionLocal() as db:
             session = await db.get(models.ChatSession, self.session_id)
             if session is None:
@@ -589,6 +598,12 @@ class DbBatchSource:
                 adopt_summary(entry, new_state, batch.last_id,
                               tokens=self._est(new_state) if new_state else 0,
                               updated_by=self.mode, warnings=self.manager.warnings)
+            if not self._alive():
+                # Чат удалили, пока модель считала, и его id мог уже достаться
+                # новому чату — с той же перепиской под теми же id, если чат
+                # загрузили заново: сверка куска выше это пропускает. Выход без
+                # commit откатывает всё, что сессия успела сбросить в БД.
+                return False
             await db.commit()
             # Факты — только из сообщений новее уже разобранных. Снимок можно
             # начать заново (удалили запись «Память чата (авто)», пересборка), а
@@ -603,6 +618,10 @@ class DbBatchSource:
 
         # Вызов модели — вне сессии БД (может занять десятки секунд).
         facts = await self._extract_facts(batch, facts_upto) if self.want_facts else []
+        if not self._alive():
+            # Чат удалили, пока модель искала факты: снимок уже записан (и
+            # удалён вместе с чатом), а факты под его id унаследовал бы новый чат.
+            return True
         async with AsyncSessionLocal() as db:
             # Факты — после коммита снимка и не бросают исключений: их сбой не
             # должен откатить уже посчитанный (и оплаченный) снимок.
@@ -775,11 +794,21 @@ class MemoryJob:
 
 # Последнее задание каждого чата. Завершённое остаётся здесь до следующего
 # старта: вкладка «Память» показывает, чем кончилось (готово, ошибка, отмена).
+# Удаление чата убирает его задание сразу (forget_job): id достанется новому чату.
 _jobs: dict[int, MemoryJob] = {}
 
 
 def get_job(session_id: int) -> MemoryJob | None:
     return _jobs.get(session_id)
+
+
+def _owns_chat(job: MemoryJob) -> bool:
+    """
+    Задание всё ещё отвечает за свой чат. Проверка «чат с таким id есть» тут
+    не годится: SQLite отдаёт id удалённого последнего чата следующему новому.
+    Сравнивается сам объект в реестре — его убирает forget_job при удалении чата.
+    """
+    return _jobs.get(job.session_id) is job
 
 
 async def start_job(session_id: int, deps: MemoryDeps, *, mode: str, resume: bool = False,
@@ -829,6 +858,22 @@ def cancel_job(session_id: int) -> MemoryJob | None:
     return job
 
 
+def forget_job(session_id: int) -> MemoryJob | None:
+    """
+    Чат удаляют: остановить его задание и убрать из реестра → это задание
+    (None — заданий у чата не было).
+
+    SQLite отдаёт id удалённого последнего чата следующему новому. Останься
+    задание в реестре, новый чат с тем же id показывал бы во вкладке «Память»
+    чужое «чат удалён» или «готово», а пока старое задание в очереди или в
+    работе — получал бы 409 на «Пересобрать». Идущее задание доводит начатый
+    пакет на своём объекте MemoryJob, но записать его уже не может (источник
+    сверяется с реестром через _owns_chat) и завершается ошибкой «чат удалён».
+    """
+    cancel_job(session_id)
+    return _jobs.pop(session_id, None)
+
+
 async def wait_job(session_id: int) -> None:
     """Дождаться конца задания чата (тесты, сброс памяти). Исключений задачи не бросает."""
     job = _jobs.get(session_id)
@@ -875,7 +920,7 @@ async def _execute_job(job: MemoryJob, deps: MemoryDeps, *, resume: bool) -> Non
     """
     sid = job.session_id
     async with AsyncSessionLocal() as db:
-        if await db.get(models.ChatSession, sid) is None:
+        if await db.get(models.ChatSession, sid) is None or not _owns_chat(job):
             raise _ChatGone
         ui = await db.get(models.AppSetting, "ui")
         connection = await deps.get_connection(db)
@@ -888,7 +933,7 @@ async def _execute_job(job: MemoryJob, deps: MemoryDeps, *, resume: bool) -> Non
     source = DbBatchSource(
         sid, mode=job.mode, threshold=1, manager=manager,
         want_facts=ui_flag(ui, "horae_facts"), connection=connection,
-        window=_memory_window(ui_value),
+        window=_memory_window(ui_value), alive=lambda: _owns_chat(job),
     )
     try:
         result = await manager.scan_and_compress_history(
@@ -897,14 +942,17 @@ async def _execute_job(job: MemoryJob, deps: MemoryDeps, *, resume: bool) -> Non
         job.warnings = list(manager.warnings)
     job.processed, job.batches, job.state_tokens = (
         result.processed, result.batches, result.state_tokens)
-    if result.status == "cancelled":
-        job.finish("cancelled")  # буфер пересборки остаётся — её можно продолжить
-        return
     async with AsyncSessionLocal() as db:
         # Чат удалили посреди задания: источник просто перестал отдавать
-        # пакеты, и без этой проверки задание отчиталось бы «готово».
-        if await db.get(models.ChatSession, sid) is None:
+        # пакеты, и без этой проверки задание отчиталось бы «готово». Одного
+        # «чата с таким id нет» мало — id мог уже достаться новому чату, и
+        # тогда пересборка подменила бы ЕГО снимок. Удаление важнее отмены:
+        # удаление чата само останавливает задание (forget_job).
+        if await db.get(models.ChatSession, sid) is None or not _owns_chat(job):
             raise _ChatGone
+        if result.status == "cancelled":
+            job.finish("cancelled")  # буфер пересборки остаётся — её можно продолжить
+            return
         if job.mode == "rebuild":
             await _adopt_rebuild_buffer(db, sid, manager.warnings)
     job.finish("done")
