@@ -622,6 +622,115 @@ async def test_compaction_is_skipped_when_only_guarded_sections_are_over_budget(
         "(хроника уже сжата; реестр и списки не сжимаются автоматически)"]
 
 
+def _over_budget(tokens, budget):
+    """Предупреждение о бюджете, когда хронику сворачивать уже нечего."""
+    return (f"снимок превышает бюджет: {_nbsp_int(tokens)} из {_nbsp_int(budget)} токенов "
+            "(хроника уже сжата; реестр и списки не сжимаются автоматически)")
+
+
+_BIG_LIST = "### Треки\n" + "\n".join(f"- «Трек {i}» — тема (#{i})" for i in range(1, 40))
+
+
+async def test_compaction_with_arcs_waits_until_entries_pile_up():
+    # Длинный чат: хроника уже «арка + 12 последних», бюджет держат списки.
+    # Арка — тоже запись списка, и пропуск «записей ≤ keep» тут не срабатывал
+    # никогда, а каждый пакет добавляет запись: сжатие (полный снимок на входе и
+    # на выходе) снова шло на КАЖДОМ пакете. Теперь модель зовут, только когда
+    # сверх keep набралось max(2, keep // 2) = 6 записей, которые ещё не арки.
+    arc = "- [#1–#50] Арка «Дорога»: всё важное"
+    recent = [f"- [#{i}–#{i}] событие {i}" for i in range(51, 63)]
+    systems = []
+    echo = _echo_llm([], lists=_BIG_LIST)
+
+    async def llm(messages):
+        if messages[0]["content"] == hm.MASTER_STATE_PROMPT:
+            systems.append("merge")
+            return await echo(messages)
+        systems.append("compact")
+        chron = hm.parse_sections(messages[1]["content"].split("\n", 1)[1])[hm.SEC_CHRONICLE]
+        # Как велит COMPACT_PROMPT: всё старше последних 12 записей — в арку.
+        return _wrap(_snap(chron="\n".join([arc, *chron.splitlines()[-12:]]), lists=_BIG_LIST))
+
+    m, _ = _mgr(llm, batch_size=1, snapshot_tokens=600)
+    res = await m.scan_and_compress_history([_msg(i) for i in range(100, 110)],
+                                            _snap(chron="\n".join([arc, *recent]), lists=_BIG_LIST))
+    assert res.batches == 10
+    assert systems.count("compact") <= 10 // 6
+    # Сжатие — на 6-м пакете, когда сверх keep набралось 6 записей; потом снова копятся.
+    assert systems == ["merge"] * 6 + ["compact"] + ["merge"] * 4
+    assert res.warnings == [_over_budget(len(res.state), 600)]
+
+
+async def test_arcs_in_any_format_are_not_entries_to_fold():
+    # Арки модель пишет по-разному: жирным, строчными, с диапазоном в конце.
+    # Уже свёрнутое — не повод звать модель: семь арок сверх keep ничего не меняют.
+    arcs = ["- [#1–#10] Арка «Дорога»: суть",
+            "- [#11–#20] **Арка «Лес»**: суть",
+            "- **[#21–#30] Арка «Башня»:** суть",
+            "* [#31–#40] арка «Мост» — суть",
+            "1. Арка «Море» (#41–#50): суть",
+            "- [#51–#60] АРКА «Горы»: суть",
+            "- [#61–#70] Арки «Долина» и «Река»: суть"]
+    recent = [f"- [#{i}–#{i}] событие {i}" for i in range(71, 83)]
+    calls = []
+
+    async def llm(messages):
+        calls.append(messages)
+        return _wrap(_snap(chron=_ARC))
+
+    m, _ = _mgr(llm, snapshot_tokens=100)
+    state = _snap(chron="\n".join(arcs + recent))
+    assert await m.compact(state) == state
+    assert calls == []
+    assert m.warnings == [_over_budget(len(state), 100)]
+
+
+@pytest.mark.parametrize("extra, called", [(5, False), (6, True)])
+async def test_compaction_waits_for_enough_entries_beyond_keep(extra, called):
+    chron = "\n".join(f"- [#{i}–#{i}] событие {i}" for i in range(1, 13 + extra))  # 12 + extra
+    calls = []
+
+    async def llm(messages):
+        calls.append(messages[0]["content"])
+        return _wrap(_snap(chron=_ARC))
+
+    m, _ = _mgr(llm, snapshot_tokens=100)
+    await m.compact(_snap(chron=chron))
+    assert len(calls) == int(called)
+
+
+async def test_length_error_compacts_even_one_entry_beyond_keep():
+    # После length гистерезис по записям не действует: без сжатия повтор почти
+    # наверняка снова упрётся в лимит вывода — сворачивается хоть одна запись.
+    calls = []
+
+    async def llm(messages):
+        calls.append(messages[0]["content"])
+        if len(calls) == 1:
+            raise RuntimeError("Технически: ПУСТОЙ ответ, finish_reason=LENGTH.")
+        return _wrap(_snap(chron=_ARC))
+
+    m, _ = _mgr(llm)
+    chron = "\n".join(f"- [#{i}–#{i}] событие {i}" for i in range(1, 14))  # keep + 1
+    await m.merge_block(_snap(chron=chron),
+                        hm.plan_batch([_msg(14)], batch_size=20, max_chars=10**6))
+    assert len(calls) == 3
+    assert calls[0] == calls[2] == hm.MASTER_STATE_PROMPT
+    assert calls[1].startswith(hm.COMPACT_PROMPT.split("{", 1)[0])
+
+
+async def test_budget_warning_after_compaction_names_the_cause():
+    # Хронику свернули, а снимок всё ещё сверх бюджета — держат его списки.
+    # Голое «X из Y» не объясняло, почему и что с этим делать.
+    async def llm(messages):
+        return _wrap(_snap(chron=_ARC, lists=_BIG_LIST))
+
+    m, _ = _mgr(llm, snapshot_tokens=300)
+    out = await m.compact(_snap(chron=_LONG_CHRON, lists=_BIG_LIST))
+    assert "Арка «Дорога»" in out
+    assert m.warnings == [_over_budget(len(out), 300)]
+
+
 async def test_compaction_aims_below_the_budget():
     # Гистерезис: цель сжатия — 80 % бюджета, иначе снимок, сжатый ровно до
     # бюджета, снова превысит его на следующем пакете, и сжатие пойдёт каждый раз.

@@ -938,6 +938,29 @@ _COMPACT_TARGET = 0.8
 # Начало предупреждения о бюджете. X в «X из Y токенов» растёт с каждым
 # пакетом, поэтому новое такое предупреждение заменяет прежнее (см. _warn).
 _OVER_BUDGET = "снимок превышает бюджет:"
+# Арка — запись хроники, в которую compact() уже свернул старые записи:
+# «- [#a–#b] Арка «название»: …» (формат задаёт COMPACT_PROMPT). Модель
+# выделяет её жирным, пишет строчными или ставит диапазон в конец — узнаём и
+# так. Проверяется текст после маркера записи. Ошибки узнавания безвредны для
+# данных: арка без слова «Арка» сойдёт за обычную запись (сжатие позовут
+# раньше), а сюжетная запись «Арка ворот рухнула» — за арку (позовут позже).
+_ARC_RE = re.compile(r"[*_\s]*(?:\[[^\]\n]*\][*_\s]*)?арк[аи]\b", re.IGNORECASE)
+
+
+def _fold_threshold(keep: int) -> int:
+    """
+    Сколько записей для свёртки (старше keep и ещё не арок) нужно, чтобы
+    compact() позвал модель, — гистерезис по записям, в пару к _COMPACT_TARGET
+    по токенам.
+
+    ПОЧЕМУ: в длинном чате хроника — «арки + keep последних», и каждый пакет
+    добавляет по записи. Если бюджет держат разделы 2–4 (их сжатие не трогает),
+    снимок сверх бюджета и после сжатия, и гистерезис по токенам не помогает:
+    модель переписывала весь снимок ради одной записи на КАЖДОМ пакете (пропуск
+    «записей ≤ keep» не срабатывал — арка тоже запись). С порогом — раз в
+    keep // 2 пакетов.
+    """
+    return max(2, max(0, keep) // 2)
 
 
 # ============================================================================
@@ -1016,6 +1039,36 @@ class HierarchicalMemoryManager:
         if supersedes:
             self.warnings[self._warn_from:] = [w for w in run if not w.startswith(supersedes)]
         self.warnings.append(text)
+
+    def _foldable(self, state: str) -> int:
+        """
+        Сколько записей хроники compact() может свернуть: старше последних
+        keep_recent_chronicle и ещё не арки. Арки не считаются: иначе после
+        первого же сжатия хроника «арка + keep» всегда длиннее keep, и порог
+        _fold_threshold ничего бы не сдерживал.
+        """
+        chronicle = parse_sections(state).get(SEC_CHRONICLE, "")
+        entries = _parse_entries(chronicle.splitlines())
+        older = entries[:max(0, len(entries) - max(0, self.config.keep_recent_chronicle))]
+        return sum(1 for e in older
+                   if not _ARC_RE.match(_ENTRY_MARKER_RE.sub("", e[0].strip(), count=1)))
+
+    def _warn_over_budget(self, state: str) -> None:
+        """
+        «снимок превышает бюджет: X из Y токенов», если превышает.
+
+        Если сворачивать в хронике уже нечего (меньше порога _fold_threshold),
+        превышение держат разделы 2–4 — это и пишется в скобках: голое «X из Y»
+        не объясняло ни причины, ни того, что автоматически это не пройдёт.
+        """
+        budget = self.config.snapshot_tokens
+        tokens = self._tokens(state)
+        if tokens <= budget:
+            return
+        text = f"{_OVER_BUDGET} {_fmt_int(tokens)} из {_fmt_int(budget)} токенов"
+        if self._foldable(state) < _fold_threshold(self.config.keep_recent_chronicle):
+            text += " (хроника уже сжата; реестр и списки не сжимаются автоматически)"
+        self._warn(text, supersedes=_OVER_BUDGET)
 
     def _guard(self, prev: str, new: str) -> str:
         """Страж записей (§4.6) + предупреждение, если модель что-то выронила."""
@@ -1134,8 +1187,10 @@ class HierarchicalMemoryManager:
                 raise
             # Модель упёрлась в лимит вывода: она переписывает снимок целиком,
             # и большой снимок сам съедает бюджет ответа. Сжимаем хронику и
-            # пробуем ещё раз; повторная length уходит наверх.
-            state = await self.compact(state)
+            # пробуем ещё раз; повторная length уходит наверх. Гистерезис по
+            # записям тут не к месту: без сжатия повтор почти наверняка снова
+            # упрётся в лимит, так что сворачиваем хоть одну запись.
+            state = await self.compact(state, min_fold=1)
             new = await self._merge(state, batch)
         if is_structured(state):
             new = self._guard(state, new)
@@ -1144,7 +1199,7 @@ class HierarchicalMemoryManager:
         return new
 
     # ----------------------------------------------------------------- сжатие
-    async def compact(self, state: str) -> str:
+    async def compact(self, state: str, *, min_fold: int | None = None) -> str:
         """
         Сжать хронику снимка в арки (§4.7) → снимок.
 
@@ -1152,27 +1207,31 @@ class HierarchicalMemoryManager:
         а страж возвращает то, что модель всё же выронила. Любая неудача
         (брак после корректирующих ходов, ошибка API, хроника не стала
         короче) — не повод терять готовый снимок: предупреждение и прежний
-        текст. Цель в промпте — _COMPACT_TARGET от бюджета (гистерезис).
+        текст. Гистерезис двойной: цель в промпте — _COMPACT_TARGET от бюджета,
+        а модель зовётся, только когда накопилось что сворачивать.
+
+        :param min_fold: сколько записей для свёртки (старше keep и не арок)
+            нужно, чтобы звать модель; None — _fold_threshold(keep). Меньше —
+            снимок возвращается как есть.
         """
         if not is_structured(state):
             # Пустая память или пересказ старой схемы: хроники-раздела нет,
             # сжимать нечего.
             return state
-        budget = self.config.snapshot_tokens
-        chronicle = parse_sections(state).get(SEC_CHRONICLE, "")
-        if len(_parse_entries(chronicle.splitlines())) <= self.config.keep_recent_chronicle:
-            # Сокращать нечего: последние keep записей промпт велит оставить как
-            # есть, а раздуты разделы 2–4, которые не сжимаются никогда. Раньше
-            # модель и тут получала запрос сжатия — на КАЖДОМ пакете: полный
-            # снимок сверх бюджета на входе и на выходе, ответ «не короче»,
-            # вдвое больше вызовов и пара предупреждений на пакет.
-            tokens = self._tokens(state)
-            if tokens > budget:
-                self._warn(f"{_OVER_BUDGET} {_fmt_int(tokens)} из {_fmt_int(budget)} токенов "
-                           "(хроника уже сжата; реестр и списки не сжимаются автоматически)",
-                           supersedes=_OVER_BUDGET)
+        if min_fold is None:
+            min_fold = _fold_threshold(self.config.keep_recent_chronicle)
+        if self._foldable(state) < max(1, min_fold):
+            # Сокращать нечего или почти нечего: последние keep записей промпт
+            # велит оставить как есть, арки уже свёрнуты, а раздуты разделы 2–4,
+            # которые не сжимаются никогда. Раньше модель и тут получала запрос
+            # сжатия — на КАЖДОМ пакете: полный снимок сверх бюджета на входе и
+            # на выходе ради одной записи (или ответ «не короче»), вдвое больше
+            # вызовов. Накопившиеся записи свернёт следующее сжатие.
+            self._warn_over_budget(state)
             return state
         self._emit(phase="compact")
+        budget = self.config.snapshot_tokens
+        chronicle = parse_sections(state).get(SEC_CHRONICLE, "")
         system = COMPACT_PROMPT.format(budget=int(budget * _COMPACT_TARGET),
                                        keep=self.config.keep_recent_chronicle)
         result = state
@@ -1190,10 +1249,7 @@ class HierarchicalMemoryManager:
                 result = self._guard(state, compacted)
             else:
                 self._warn("сжатие не сократило хронику — оставлен прежний снимок")
-        tokens = self._tokens(result)
-        if tokens > budget:
-            self._warn(f"{_OVER_BUDGET} {_fmt_int(tokens)} из {_fmt_int(budget)} токенов",
-                       supersedes=_OVER_BUDGET)
+        self._warn_over_budget(result)
         return result
 
     # ------------------------------------------------------------ цикл свёртки
