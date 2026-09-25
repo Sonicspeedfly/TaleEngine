@@ -1046,30 +1046,53 @@ def assemble_context(
 _RU_WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 
 
+# Смещение вида «+03:00», «UTC+3», «GMT-5:30».
+_TZ_OFFSET_RE = _re.compile(r"(?:UTC|GMT)?\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?")
+
+
+def chat_tzinfo(name):
+    """
+    Часовой пояс чата (ChatSession.timezone) как tzinfo: IANA-имя
+    (Europe/Moscow) или смещение ("+03:00", "UTC+3"). Пусто, неизвестное имя
+    или невозможное смещение -> None.
+
+    Единственный разборщик пояса: им пользуются и блок «время пользователя»
+    (session_user_time), и строки пакета памяти (memory_service). Раньше
+    разбор жил в двух копиях, и обе падали на смещении от 24 часов («UTC+25»,
+    «+24», «+23:99»): timezone() бросает ValueError, а try охватывал только
+    ZoneInfo. Пояс — свободный ввод в настройках чата, так что опечатка
+    роняла сборку контекста на каждом ходу, а память чата замирала.
+    """
+    from datetime import timedelta, timezone as _tz
+
+    name = (name or "").strip()
+    if not name:
+        return None
+    m = _TZ_OFFSET_RE.fullmatch(name)
+    try:
+        if m:
+            sign = -1 if m.group(1) == "-" else 1
+            return _tz(sign * timedelta(hours=int(m.group(2)), minutes=int(m.group(3) or 0)))
+        from zoneinfo import ZoneInfo
+
+        return ZoneInfo(name)
+    except Exception:  # noqa: BLE001 — смещение от 24 ч, нет такого пояса или базы tzdata
+        return None
+
+
 def session_user_time(session) -> str:
     """
     Текущее время пользователя по часовому поясу чата (session.timezone).
     Поддерживаются IANA-имена (Europe/Moscow) и смещения ("+03:00", "UTC+3").
-    Пустая настройка или неизвестный пояс -> "" (блок времени не добавляется).
+    Пустая настройка или неизвестный пояс -> "" (блок времени не добавляется):
+    опечатка в поясе не должна ронять ход.
     """
-    import re as _re
-    from datetime import datetime, timedelta, timezone as _tz
+    from datetime import datetime
 
     tz_name = (getattr(session, "timezone", "") or "").strip()
-    if not tz_name:
+    tzinfo = chat_tzinfo(tz_name)
+    if tzinfo is None:
         return ""
-    tzinfo = None
-    m = _re.fullmatch(r"(?:UTC|GMT)?\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?", tz_name)
-    if m:
-        sign = -1 if m.group(1) == "-" else 1
-        tzinfo = _tz(sign * timedelta(hours=int(m.group(2)), minutes=int(m.group(3) or 0)))
-    else:
-        try:
-            from zoneinfo import ZoneInfo
-
-            tzinfo = ZoneInfo(tz_name)
-        except Exception:  # noqa: BLE001 — опечатка в имени пояса не должна ронять ход
-            return ""
     now = datetime.now(tzinfo)
     return f"{now.strftime('%H:%M')}, {_RU_WEEKDAYS[now.weekday()]} {now.strftime('%d.%m.%Y')} ({tz_name})"
 

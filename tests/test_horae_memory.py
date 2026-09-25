@@ -386,6 +386,25 @@ def test_session_user_time_offset_iana_and_bad():
         assert "Europe/Moscow" in session_user_time(SimpleNamespace(timezone="Europe/Moscow"))
 
 
+def test_chat_tzinfo_parses_offsets_and_rejects_impossible_ones():
+    """
+    chat_tzinfo — единственный разборщик пояса чата (блок времени и строки
+    пакета памяти). Смещение от 24 часов («UTC+25», «+24», «+23:99») — не
+    пояс, а опечатка: None, и session_user_time даёт "" вместо ValueError,
+    который ронял сборку контекста на каждом ходу чата.
+    """
+    from datetime import timedelta
+
+    from backend.horae_memory import chat_tzinfo, session_user_time
+
+    assert chat_tzinfo("+03:00").utcoffset(None) == timedelta(hours=3)
+    assert chat_tzinfo(" UTC+3 ").utcoffset(None) == timedelta(hours=3)
+    assert chat_tzinfo("GMT-5:30").utcoffset(None) == -timedelta(hours=5, minutes=30)
+    for bad in (None, "", "   ", "Nope/Nowhere", "UTC+25", "+24", "+23:99"):
+        assert chat_tzinfo(bad) is None, bad
+        assert session_user_time(SimpleNamespace(timezone=bad)) == "", bad
+
+
 def test_video_attachment_label_in_history_note():
     """Видео, не влезшее в лимит вложений истории, помечается как [видео: имя]."""
     big = "data:video/mp4;base64," + "A" * 6_000_000  # больше _MAX_HISTORY_ATT_BYTES

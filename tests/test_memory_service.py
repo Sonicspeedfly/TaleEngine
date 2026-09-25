@@ -151,6 +151,34 @@ async def test_incremental_batch_carries_files_time_and_skips_blank_messages():
     await engine.dispose()
 
 
+async def test_batch_time_honours_offset_and_survives_impossible_one():
+    """
+    Пояс чата — свободный ввод в настройках. Смещение «+03:00» переводит время
+    строки пакета, а невозможное «UTC+25» оставляет его в UTC. Раньше
+    timezone() бросал ValueError на смещении от 24 часов: загрузка пакета
+    падала на каждом ходу, и память чата переставала обновляться.
+    """
+    from datetime import datetime
+
+    from backend import main, models
+    from backend.database import AsyncSessionLocal, engine
+    await _fresh_db()
+    for tz, shown in (("+03:00", "14:03"), ("UTC+25", "11:03")):
+        _, sid, ids = await _make_chat(12 + hr.DEFAULT_WINDOW)
+        async with AsyncSessionLocal() as db:
+            (await db.get(models.ChatSession, sid)).timezone = tz
+            (await db.get(models.Message, ids[0])).created_at = datetime(2026, 9, 20, 11, 3)  # naive UTC
+            await db.commit()
+        seen = []
+        with patch("backend.main.complete", new=_snapshot_llm(seen)):
+            await main._maybe_update_summary(sid)
+        merges = [m[1]["content"] for m in seen if m[0]["content"] == hm.MASTER_STATE_PROMPT]
+        assert merges, f"{tz}: пакет не ушёл модели"
+        assert f"[#{ids[0]} · 2026-09-20 {shown} · Пользователь] событие 0" in merges[0], tz
+        assert (await _entry(sid)).meta["last_message_id"] == ids[11], tz
+    await engine.dispose()
+
+
 async def test_rebuild_mode_writes_every_batch_to_the_buffer():
     """
     Режим задания «Пересобрать»: каждый пакет — в буфер (и последний тоже:

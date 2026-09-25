@@ -19,9 +19,8 @@ MemoryDeps с поздним связыванием: main передаёт ля�
 """
 import asyncio
 import logging
-import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
 from sqlalchemy import String, cast, func, or_, select
@@ -32,7 +31,7 @@ from backend import hierarchical_memory as hm
 from backend import horae_recall, llm_gateway, models
 from backend.config import settings
 from backend.database import AsyncSessionLocal
-from backend.horae_memory import estimate_tokens
+from backend.horae_memory import chat_tzinfo, estimate_tokens
 
 logger = logging.getLogger("aichat.summary")
 
@@ -306,33 +305,12 @@ def _has_content():
     )
 
 
-# Смещение вида «+03:00», «UTC+3», «GMT-5:30» — как в horae_memory.session_user_time.
-_OFFSET_RE = re.compile(r"(?:UTC|GMT)?\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?")
-
-
-def _chat_tz(name):
-    """
-    Часовой пояс чата (ChatSession.timezone): IANA-имя или смещение. Пусто или
-    неизвестный пояс — None, время остаётся в UTC: опечатка в настройке чата не
-    должна останавливать память.
-    """
-    name = (name or "").strip()
-    if not name:
-        return None
-    m = _OFFSET_RE.fullmatch(name)
-    if m:
-        sign = -1 if m.group(1) == "-" else 1
-        return timezone(sign * timedelta(hours=int(m.group(2)), minutes=int(m.group(3) or 0)))
-    try:
-        from zoneinfo import ZoneInfo
-
-        return ZoneInfo(name)
-    except Exception:  # noqa: BLE001 — нет такого пояса или базы tzdata
-        return None
-
-
 def _local_time(stamp, tz):
-    """created_at в поясе чата. В БД время naive UTC (server_default=now())."""
+    """
+    created_at в поясе чата. В БД время naive UTC (server_default=now()).
+    Пояс не разобрался (tz is None) — время остаётся в UTC: опечатка в
+    настройке чата не должна останавливать память (см. chat_tzinfo).
+    """
     if not isinstance(stamp, datetime) or tz is None:
         return stamp
     if stamp.tzinfo is None:
@@ -365,7 +343,7 @@ async def load_memory_messages(db, session, after_id: int, before_id: int | None
     character = await db.get(models.Character, session.character_id)
     user_name = ((persona.name if persona else "") or "").strip() or "Пользователь"
     char_name = ((character.name if character else "") or "").strip() or "Персонаж"
-    tz = _chat_tz(session.timezone)
+    tz = chat_tzinfo(session.timezone)
 
     q = select(models.Message).where(
         models.Message.session_id == session.id,
