@@ -170,6 +170,39 @@ def test_guard_recreates_a_lost_sublist():
     assert hm.parse_sections(fixed)[hm.SEC_LISTS].endswith("### Книги\n- «Дюна» — книга (#3)")
 
 
+def test_guard_keeps_unindented_attribute_with_its_entry():
+    # Модель пишет атрибут персонажа отдельной строкой без отступа. Раньше такая
+    # строка сама была записью с ключом «здоровье», совпадала с атрибутом другого
+    # персонажа — и при потере персонажа возвращалась только его первая строка.
+    prev = _snap(chars="- Эльвира — цела\nздоровье: цела\n- Артур — ранен\nздоровье: ранен в плечо")
+    new = _snap(chars="- Эльвира — цела\nздоровье: цела")
+    fixed, restored = hm.guard_entries(prev, new)
+    assert restored == ["артур"]
+    assert hm.parse_sections(fixed)[hm.SEC_CHARACTERS].endswith(
+        "- Артур — ранен\nздоровье: ранен в плечо")
+
+
+def test_guard_does_not_tear_off_merged_continuation():
+    # Модель слила продолжение с первой строкой записи: запись та же, возвращать
+    # нечего. Раньше продолжение считалось своей записью и дописывалось в конец
+    # раздела оторванным фрагментом.
+    prev = _snap(chars="- Эльвира — здоровье: цела\nпсихологический вектор: доверяет Артуру\n"
+                       "- Артур — ранен")
+    new = _snap(chars="- Эльвира — здоровье: цела; психологический вектор: доверяет Артуру\n"
+                      "- Артур — ранен")
+    fixed, restored = hm.guard_entries(prev, new)
+    assert restored == [] and fixed.count("психологический вектор") == 1
+
+
+def test_guard_splits_markerless_section_by_line():
+    # Без единого маркера делить не по чему — каждая строка остаётся записью.
+    prev = _snap(chars="Эльвира: цела\nАртур: ранен")
+    new = _snap(chars="Эльвира: цела")
+    fixed, restored = hm.guard_entries(prev, new)
+    assert restored == ["артур"]
+    assert hm.parse_sections(fixed)[hm.SEC_CHARACTERS].endswith("Артур: ранен")
+
+
 def test_guard_ignores_chronicle():
     prev = _snap(chron="- [#1–#2] старое\n- [#3–#4] ещё")
     new = _snap(chron="- [#1–#4] Арка «Начало»: старое и ещё")
