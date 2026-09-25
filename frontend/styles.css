@@ -1120,6 +1120,23 @@ input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
 .check input { width: auto; }
 .danger-text { color: var(--danger); }
 
+/* Мастер-память чата (вкладка «Память»): статус, прогресс пересборки, кнопки
+   и монитор токенов. Новых цветов нет: полоса прогресса — от загрузки файлов,
+   полоса ярусов и точки сегментов — от инспектора хода. */
+.mem-master h4 { margin: 0; font-size: var(--fs-200); }
+.mem-master p { margin: var(--sp-2) 0; }
+.mem-progress { margin: var(--sp-2) 0; }
+.mem-progress .muted { margin-top: var(--sp-1); font-size: var(--fs-100); }
+.mem-progress .btn-danger { margin-top: var(--sp-1); }
+/* Четыре кнопки в ряд шире телефона: .row не переносит, и ряд выталкивал бы
+   панель в горизонтальную прокрутку. */
+.mem-actions { flex-wrap: wrap; gap: 6px; margin: var(--sp-2) 0 var(--sp-3); }
+/* Подписи ярусов: точка цвета сегмента и число — полоса над ними лишь
+   повторяет их цветом (она aria-hidden). Общие для вкладки и инспектора. */
+.mem-tiers { list-style: none; margin: 0 0 var(--sp-2); padding: 0; font-size: var(--fs-100); }
+.mem-tiers li { display: flex; align-items: center; gap: var(--sp-2); padding: 2px 0; }
+.mem-tier-note { font-size: var(--fs-100); }
+
 /* Баннер ошибки генерации над полем ввода */
 .error-banner {
   background: var(--danger-subtle);
