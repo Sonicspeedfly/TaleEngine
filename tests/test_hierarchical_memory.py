@@ -6,6 +6,8 @@ LLM здесь — подставная корутина, sleep и часы — 
 стража записей, из-за которых раньше тонули списки и атрибуты.
 """
 import asyncio
+import base64
+import random
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -24,6 +26,11 @@ def _snap(chron="- [#1–#2] Артур встретил Эльвиру в та�
 
 def _wrap(text):
     return f"{hm.ENVELOPE_OPEN}\n{text}\n{hm.ENVELOPE_CLOSE}"
+
+
+# Хроника длиннее keep_recent_chronicle (12) — есть что сжимать в арки.
+_LONG_CHRON = "\n".join(f"- [#{i}–#{i}] событие {i}" for i in range(1, 80))
+_ARC = "- [#1–#79] Арка «Дорога»: всё важное"
 
 
 def _msg(i, text="реплика", role="user", speaker=None, att=()):
@@ -300,15 +307,16 @@ class _Err(Exception):
                                         headers={"retry-after": str(retry_after)} if retry_after else {})
 
 
-def _echo_llm(record):
-    """Возвращает валидный снимок, чья хроника — диапазон пакета из запроса."""
+def _echo_llm(record, **sections):
+    """Возвращает валидный снимок, чья хроника — диапазон пакета из запроса;
+    прочие разделы — из sections (аргументы _snap)."""
     async def llm(messages):
         record.append(messages)
         user = messages[1]["content"]
         rng = user.split("[Новые события ", 1)[1].split("]", 1)[0]
         prev = user.split("[Текущая память]\n", 1)[1].split("\n\n[Новые события", 1)[0]
         chron = "" if prev == hm.EMPTY_STATE else hm.parse_sections(prev)[hm.SEC_CHRONICLE] + "\n"
-        return _wrap(_snap(chron=chron + f"- [{rng}] пакет"))
+        return _wrap(_snap(chron=chron + f"- [{rng}] пакет", **sections))
     return llm
 
 
@@ -455,7 +463,8 @@ async def test_length_error_compacts_state_then_retries_merge():
 
     m, _ = _mgr(llm)
     batch = hm.plan_batch([_msg(1)], batch_size=20, max_chars=10**6)
-    await m.merge_block(_snap(), batch)
+    # Хроника длинная: при короткой сжимать нечего, и модель не зовут вовсе.
+    await m.merge_block(_snap(chron=_LONG_CHRON), batch)
     assert calls[0] == hm.MASTER_STATE_PROMPT and calls[-1] == hm.MASTER_STATE_PROMPT
     assert any(c != hm.MASTER_STATE_PROMPT for c in calls[1:-1])  # было сжатие
 
@@ -581,3 +590,307 @@ async def test_failed_compaction_keeps_snapshot_and_warns_about_budget():
     state = await m.merge_block("", batch)
     assert "событие 79" in state
     assert any(w.startswith("снимок превышает бюджет:") for w in m.warnings)
+
+
+# ==================== Доработки по ревью (задача 3b) ====================
+
+def _nbsp_int(n):
+    return f"{n:,}".replace(",", "\u00a0")
+
+
+async def test_compaction_is_skipped_when_only_guarded_sections_are_over_budget():
+    # Бюджет превышают списки, а хроника короче keep_recent_chronicle: сокращать
+    # нечего. Раньше модель на КАЖДОМ пакете получала запрос сжатия, отвечала «не
+    # короче» — вызовов вдвое больше, и на каждый пакет по паре предупреждений.
+    big_list = "### Треки\n" + "\n".join(f"- «Трек {i}» — тема (#{i})" for i in range(1, 40))
+    systems = []
+    echo = _echo_llm([], lists=big_list)
+
+    async def llm(messages):
+        systems.append(messages[0]["content"])
+        if messages[0]["content"] != hm.MASTER_STATE_PROMPT:
+            return _wrap(messages[1]["content"].split("\n", 1)[1])
+        return await echo(messages)
+
+    m, _ = _mgr(llm, batch_size=1, snapshot_tokens=300)
+    res = await m.scan_and_compress_history([_msg(i) for i in range(1, 11)])
+    assert res.batches == 10
+    assert systems == [hm.MASTER_STATE_PROMPT] * 10  # ни одного COMPACT_PROMPT
+    # Одно предупреждение о бюджете на прогон — с числами последнего пакета.
+    assert res.warnings == [
+        f"снимок превышает бюджет: {_nbsp_int(len(res.state))} из 300 токенов "
+        "(хроника уже сжата; реестр и списки не сжимаются автоматически)"]
+
+
+async def test_compaction_aims_below_the_budget():
+    # Гистерезис: цель сжатия — 80 % бюджета, иначе снимок, сжатый ровно до
+    # бюджета, снова превысит его на следующем пакете, и сжатие пойдёт каждый раз.
+    systems = []
+    compacted = _snap(chron=_ARC)
+
+    async def llm(messages):
+        systems.append(messages[0]["content"])
+        return _wrap(compacted)
+
+    budget = len(compacted) + 10  # итог сжатия: выше цели 80 %, но в бюджете
+    m, _ = _mgr(llm, snapshot_tokens=budget)
+    out = await m.compact(_snap(chron=_LONG_CHRON))
+    assert out == compacted
+    assert systems == [hm.COMPACT_PROMPT.format(budget=int(budget * 0.8), keep=12)]
+    assert m.warnings == []  # «превышает бюджет» — по полному бюджету, не по цели
+
+
+async def test_repeated_warnings_are_kept_once_per_run():
+    # Модель на каждом пакете роняет одну и ту же запись, а сжатие не сокращает
+    # хронику: одинаковый текст — одно предупреждение за прогон, но в каждом прогоне.
+    lists = "### Треки\n- «A» — тема (#1)"
+    state = _snap(chron=_LONG_CHRON, lists=lists + "\n- «B» — тема (#2)")
+
+    async def llm(messages):
+        return _wrap(_snap(chron=_LONG_CHRON, lists=lists))  # «B» потерян, хроника та же
+
+    m, _ = _mgr(llm, batch_size=1, snapshot_tokens=600)
+    expected = ["модель потеряла 1 запись — возвращены из предыдущего снимка",
+                "сжатие не сократило хронику — оставлен прежний снимок",
+                f"снимок превышает бюджет: {_nbsp_int(len(state))} из 600 токенов"]
+    first = await m.scan_and_compress_history([_msg(i) for i in range(1, 4)], state)
+    assert first.batches == 3 and first.warnings == expected
+    second = await m.scan_and_compress_history([_msg(i) for i in range(4, 6)], first.state)
+    assert second.warnings == expected
+    assert m.warnings == expected * 2
+
+
+@pytest.mark.parametrize("lost, words", [
+    (1, "1 запись"), (2, "2 записи"), (4, "4 записи"), (5, "5 записей"), (11, "11 записей"),
+    (12, "12 записей"), (14, "14 записей"), (21, "21 запись"), (22, "22 записи"),
+])
+async def test_restored_warning_agrees_with_the_number(lost, words):
+    prev = _snap(lists="### Треки\n" + "\n".join(f"- т{i}" for i in range(1, lost + 1)))
+
+    async def forgetful(messages):
+        return _wrap(_snap(lists="—"))
+
+    m, _ = _mgr(forgetful, shrink_min_tokens=10**6)
+    await m.merge_block(prev, hm.plan_batch([_msg(100)], batch_size=20, max_chars=10**6))
+    assert m.warnings == [f"модель потеряла {words} — возвращены из предыдущего снимка"]
+
+
+async def test_memory_error_from_the_callback_still_counts_for_the_delay():
+    # Сервис может сам классифицировать ошибку (например, length). Раньше такой
+    # исход не двигал «конец предыдущего вызова», и следующий запрос уходил без паузы.
+    err = hm.MemoryLLMError("length", "упёрлись в лимит", retryable=False)
+
+    async def llm(messages):
+        raise err
+
+    m, sleeps = _mgr(llm, delay_ms=1000)
+    for _ in range(2):
+        with pytest.raises(hm.MemoryLLMError) as e:
+            await m.call([{"role": "user", "content": "x"}])
+        assert e.value is err
+    assert sleeps == [1.0]
+
+
+async def test_retryable_memory_error_from_the_callback_is_retried():
+    attempts = []
+
+    async def llm(messages):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise hm.MemoryLLMError("server", "сбой", retryable=True, retry_after=5)
+        return "ok"
+
+    m, sleeps = _mgr(llm)
+    assert await m.call([{"role": "user", "content": "x"}]) == "ok"
+    assert len(attempts) == 2 and sleeps == [5.0]
+
+
+def test_only_known_html_tags_are_stripped():
+    # Угловые скобки в ролевом чате — не только HTML: OOC-ремарки и «x <y and z>»
+    # раньше пропадали целиком вместе с «тегом».
+    for text in ("<OOC: давай завтра продолжим>", "x <y and z> w", "<bold> и <b-side>",
+                 "<i думаю, что он врёт>"):
+        assert hm.normalize_message(_msg(1, text)).endswith(f"] {text}")
+    for html, plain in (("<b>жирный</b>", "жирный"),
+                        ("<SPAN Style=\"color:red\">красный</SPAN>", "красный"),
+                        ("<font color=#ff0000 size=+1>цвет</font>", "цвет"),
+                        ("<details open><summary>Итог</summary></details>", "Итог"),
+                        ("<a href=https://x.test/?a=1&b=2>ссылка</a>", "ссылка"),
+                        ("<img src='map.png' alt=\"карта\" /><H3>Глава</H3>", "Глава")):
+        assert hm.normalize_message(_msg(1, html)).endswith(f"] {plain}")
+
+
+def test_extract_takes_the_last_envelope():
+    # Модель начала с «Вот снимок в формате <master_state>…</master_state>:» —
+    # раньше бралось упоминание, и платный корректирующий ход уходил впустую.
+    raw = f"Вот снимок в формате {hm.ENVELOPE_OPEN}…{hm.ENVELOPE_CLOSE}:\n" + _wrap(_snap())
+    assert hm.extract_snapshot(raw) == (_snap(), False)
+
+
+def test_export_counts_only_non_empty_facts():
+    md = hm.render_export_markdown(
+        title="t", character="c", snapshot=_snap(), covered_upto=1, messages_total=1,
+        tokens=1, budget=1, schema="hms-1", exported_at="x", facts=["a", "", " "])
+    assert "атомарные факты (1)" in md and md.rstrip().endswith("- a")
+
+
+def test_header_survives_any_max_chars():
+    text = "НАЧАЛО " + "x" * 5000 + " КОНЕЦ"
+    tiny = hm.normalize_message(_msg(1, text), max_chars=30)
+    assert tiny.startswith("[#1 · 2026-09-20 14:03 · Артур]")
+    assert "середина длинного сообщения пропущена" in tiny
+    small = hm.normalize_message(_msg(1, text), max_chars=200)
+    assert small.startswith("[#1 · 2026-09-20 14:03 · Артур] НАЧАЛО")
+    assert small.endswith("КОНЕЦ") and len(small) <= 200
+
+
+def test_batch_chars_has_a_floor():
+    assert hm.MemoryConfig(batch_max_chars=30).batch_max_chars == 2000
+    assert hm.MemoryConfig(batch_max_chars=0).batch_max_chars == 2000
+    assert hm.MemoryConfig(batch_max_chars=5000).batch_max_chars == 5000
+
+
+def test_window_helpers_coerce_settings_the_same_way():
+    ids = list(range(1, 101))
+    w = hm.SlidingWindow("мусор")  # не число → окно по умолчанию (50)
+    assert w.pending_for_summary(ids, covered=None) == ids[:50]
+    assert w.pending_for_summary(ids, covered="40") == list(range(41, 51))
+    assert hm.window_start(ids, covered="100", window="мусор") == 48
+    assert hm.window_start(ids, covered="мусор", window="50") == 0
+
+
+async def test_parallel_calls_are_serialized_through_the_delay():
+    # Задача 5 зовёт факты через call() из commit — «дверь» должна быть одна
+    # и при одновременных вызовах: второй ждёт конца первого и паузу.
+    order = []
+
+    async def llm(messages):
+        order.append(("start", messages[0]["content"]))
+        await asyncio.sleep(0)  # отдать управление: второй call() успевает войти
+        order.append(("end", messages[0]["content"]))
+        return "ok"
+
+    m, sleeps = _mgr(llm, delay_ms=1000)
+    await asyncio.gather(m.call([{"role": "user", "content": "a"}]),
+                         m.call([{"role": "user", "content": "b"}]))
+    assert order == [("start", "a"), ("end", "a"), ("start", "b"), ("end", "b")]
+    assert sleeps == [1.0]
+
+
+async def test_progress_reports_retry_compact_and_wait_phases():
+    attempts = []
+
+    async def llm(messages):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise _Err(503)
+        if messages[0]["content"] == hm.MASTER_STATE_PROMPT:
+            return _wrap(_snap(chron=_LONG_CHRON))
+        return _wrap(_snap(chron=_ARC))
+
+    progress = []
+    m, _ = _mgr(llm, delay_ms=1000, snapshot_tokens=600)
+    await m.scan_and_compress_history([_msg(80)], on_progress=progress.append)
+    phases = [(p.phase, p.retry_in_s) for p in progress]
+    # Повтор слияния (бэкофф 2 с не короче паузы 1 с) → сжатие → пауза перед ним.
+    assert phases.index(("retry", 2.0)) < phases.index(("compact", None)) \
+        < phases.index(("wait", 1.0)) < phases.index(("done", None))
+
+
+async def test_max_batches_counts_rejected_commits():
+    calls = []
+    m, _ = _mgr(_echo_llm(calls), batch_size=5)
+    res = await m.scan_and_compress_history(_ConflictingSource([_msg(1), _msg(2)], 1),
+                                            max_batches=1)
+    assert (res.status, res.batches, res.processed, len(calls)) == ("limit", 0, 0, 1)
+
+
+async def test_repeated_length_error_goes_up():
+    systems = []
+
+    async def llm(messages):
+        systems.append(messages[0]["content"])
+        raise RuntimeError("…\nТехнически: ПУСТОЙ ответ, finish_reason=LENGTH.")
+
+    m, _ = _mgr(llm)
+    batch = hm.plan_batch([_msg(80)], batch_size=20, max_chars=10**6)
+    with pytest.raises(hm.MemoryLLMError) as e:
+        await m.merge_block(_snap(chron=_LONG_CHRON), batch)
+    assert e.value.kind == "length" and not e.value.retryable
+    # слияние → сжатие (тоже length, снимок прежний) → повтор слияния → наверх
+    assert len(systems) == 3 and systems[0] == systems[2] == hm.MASTER_STATE_PROMPT
+
+
+async def test_compaction_that_does_not_shorten_keeps_the_snapshot():
+    state = _snap(chron=_LONG_CHRON)
+
+    async def llm(messages):
+        return _wrap(_snap(chron=_LONG_CHRON + "\n- [#80–#80] ещё одно"))
+
+    m, _ = _mgr(llm, snapshot_tokens=600)
+    assert await m.compact(state) == state
+    assert "сжатие не сократило хронику — оставлен прежний снимок" in m.warnings
+
+
+async def test_guard_restores_entries_lost_by_compaction():
+    state = _snap(chron=_LONG_CHRON, lists="### Треки\n- «A» — тема (#1)\n- «B» — тема (#2)")
+
+    async def llm(messages):
+        return _wrap(_snap(chron=_ARC, lists="### Треки\n- «A» — тема (#1)"))
+
+    m, _ = _mgr(llm, snapshot_tokens=10**6)
+    out = await m.compact(state)
+    assert "Арка «Дорога»" in out and "- «B» — тема (#2)" in out
+    assert m.warnings == ["модель потеряла 1 запись — возвращены из предыдущего снимка"]
+
+
+async def test_retry_after_is_capped():
+    # Суточная квота в Retry-After не должна подвешивать задание без движения.
+    attempts = []
+
+    async def llm(messages):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise _Err(429, retry_after=86400)
+        return "ok"
+
+    m, sleeps = _mgr(llm)
+    assert await m.call([{"role": "user", "content": "x"}]) == "ok"
+    assert sleeps == [300.0]
+
+
+def test_implausibly_long_and_empty_answers_are_problems():
+    huge = _wrap(_snap(chron="- " + "событие " * 30_000))
+    _, problems = hm.validate_snapshot(huge, None)
+    assert "снимок неправдоподобно длинный" in problems
+    for raw in ("", "   ", _wrap(""), "<think>только мысли</think>"):
+        assert hm.validate_snapshot(raw, None)[1] == ["пустой ответ"]
+
+
+def test_small_structured_prev_skips_the_shrink_check():
+    # У маленького снимка шум оценки велик: «сдувание» ловим только от shrink_min_tokens.
+    prev = _snap(chron="\n".join(f"- [#{i}–#{i}] событие {i}" for i in range(1, 15)))
+    tiny = hm.render_snapshot({hm.SEC_CHRONICLE: "- x"})
+    assert len(prev) < 800 and len(tiny) < 0.5 * len(prev)
+    assert hm.validate_snapshot(_wrap(tiny), prev, estimate_tokens=len)[1] == []
+    _, problems = hm.validate_snapshot(_wrap(tiny), prev, estimate_tokens=len,
+                                       config=hm.MemoryConfig(shrink_min_tokens=100))
+    assert any("полов" in p for p in problems)
+
+
+def test_unclosed_think_at_the_end_is_cut():
+    # Модель оборвалась посреди рассуждений после снимка без обёртки.
+    raw = _snap() + "\n<think>а вдруг стоило добавить ещё"
+    assert hm.extract_snapshot(raw) == (_snap(), False)
+
+
+def test_real_base64_is_cut_but_long_text_is_kept():
+    # Случайные байты с фиксированным зерном — тот же os.urandom, но тест детерминирован.
+    blob = base64.b64encode(random.Random(2026).randbytes(600)).decode()
+    line = hm.normalize_message(_msg(1, f"вот файл {blob} конец"))
+    assert line.endswith("] вот файл  конец")
+    mime = "\n".join(blob[i:i + 76] for i in range(0, len(blob), 76))  # перенос MIME
+    assert hm.normalize_message(_msg(2, f"{mime}\nконец")).endswith("] конец")
+    for text in ("x" * 5000,
+                 "Эльвира долго смотрела на море и вспоминала обещание Артура. " * 40):
+        assert hm.normalize_message(_msg(3, text)).endswith(f"] {text.strip()}")

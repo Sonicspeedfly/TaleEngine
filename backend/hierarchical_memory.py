@@ -70,6 +70,11 @@ WINDOW_STEP = 4
 # Порог «неправдоподобно длинного» снимка. При бюджете 12 000 токенов нормальный
 # снимок — десятки тысяч символов; 200 000 — скорее зацикленная генерация.
 MAX_SNAPSHOT_CHARS = 200_000
+# Нижняя граница бюджета пакета (MemoryConfig.batch_max_chars). Шапка строки
+# «[#id · время · автор]» и маркер вырезанной середины вместе занимают около
+# сотни символов, а MEMORY_BATCH_CHARS в настройках снизу не ограничен: при
+# бюджете в пару сотен символов от реплики не осталось бы ничего.
+_MIN_BATCH_CHARS = 2000
 
 
 # ============================================================================
@@ -116,6 +121,10 @@ class MemoryConfig:
     shrink_min_tokens: int = 800       # проверку «сдувания» включаем от этого размера
     keep_recent_chronicle: int = 12    # сколько последних записей хроники не сжимать в арки
 
+    def __post_init__(self):
+        if self.batch_max_chars < _MIN_BATCH_CHARS:
+            self.batch_max_chars = _MIN_BATCH_CHARS
+
 
 def _fmt_int(n) -> str:
     """Число с разделителем тысяч — неразрывным пробелом, чтобы «4 200» не
@@ -124,6 +133,16 @@ def _fmt_int(n) -> str:
         return f"{int(n):,}".replace(",", "\u00a0")
     except (TypeError, ValueError):
         return str(n)
+
+
+def _plural_ru(n: int, one: str, few: str, many: str) -> str:
+    """Форма слова после числа: 1 запись, 2–4 записи, 5+ записей; 11–14 — «записей»."""
+    n = abs(int(n))
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
 
 
 @dataclass
@@ -210,10 +229,27 @@ _STYLE_SCRIPT_RE = re.compile(r"<(style|script)\b[^>]*>[\s\S]*?</\1\s*>|<!--[\s\
                               re.IGNORECASE)
 # Теги, после которых в отображаемом тексте был бы перенос строки.
 _BREAK_RE = re.compile(r"<br\s*/?>|</(?:p|div|li|tr|h[1-6]|blockquote)\s*>", re.IGNORECASE)
-# Прочие HTML-теги (оформление карточек SillyTavern, <span style=…>): снимаем
-# сам тег, внутренний текст остаётся. Имя тега обязано начинаться с буквы,
-# поэтому «<3» и «a < b» не задеваются.
-_TAG_RE = re.compile(r"</?[A-Za-z][\w:-]*(?:\s[^<>]*)?/?>")
+# Известные HTML-теги (оформление карточек SillyTavern, <span style=…>):
+# снимаем сам тег, внутренний текст остаётся. ПОЧЕМУ только известные имена:
+# в ролевом чате угловые скобки — не только HTML. Прежнее правило «любое
+# <слово …>» съедало вместе с «тегом» OOC-ремарки («<OOC: давай завтра
+# продолжим>») и текст вроде «x <y and z> w». Атрибуты — по синтаксису HTML
+# (имя латиницей, значение в кавычках или без пробелов), поэтому и
+# «<i думаю, что он врёт>» остаётся текстом. style и script вырезаются вместе
+# с содержимым раньше, в _STYLE_SCRIPT_RE.
+_HTML_TAG_NAMES = (
+    "a", "b", "i", "u", "s", "em", "strong", "span", "div", "p", "br", "hr", "font",
+    "center", "small", "big", "sub", "sup", "code", "pre", "blockquote", "ul", "ol",
+    "li", "table", "thead", "tbody", "tr", "td", "th", "img", "details", "summary",
+    "h[1-6]", "section", "article", "header", "footer", "mark", "ruby", "rt", "rp",
+    "del", "ins", "q", "cite", "abbr", "time", "figure", "figcaption", "label",
+    "button", "input", "select", "option", "textarea", "iframe", "video", "audio",
+    "source", "svg", "path", "g",
+)
+_TAG_ATTR = r"""\s+[A-Za-z_:][\w:.-]*(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'<>`]+))?"""
+# (?![\w:-]) после имени: «<bold>» и «<b-side>» — не <b>.
+_TAG_RE = re.compile(r"</?(?:" + "|".join(_HTML_TAG_NAMES) + r")(?![\w:-])"
+                     r"(?:" + _TAG_ATTR + r")*\s*/?>", re.IGNORECASE)
 _ZERO_WIDTH_RE = re.compile("[\u200b-\u200f\u2060\ufeff]")
 # Три и больше переводов строки (две и больше пустых строк) — до одной пустой:
 # после снятия <p>/<br> их остаются десятки.
@@ -295,12 +331,15 @@ def _cut_middle(line: str, max_chars: int) -> str:
     """Оставить начало и конец строки по половине, середину заменить маркером.
 
     Итог не длиннее max_chars вместе с маркером: пакет считает бюджет по длине
-    строк, и одно гигантское сообщение не должно его переполнять.
+    строк, и одно гигантское сообщение не должно его переполнять. Бюджет
+    меньше маркера — остаётся один маркер (без висящего перевода строки).
     """
     keep = max(0, max_chars - len(LONG_MESSAGE_MARK))
     head = keep // 2
     tail = keep - head
-    return line[:head] + LONG_MESSAGE_MARK + (line[len(line) - tail:] if tail else "")
+    if not tail:
+        return (line[:head] + LONG_MESSAGE_MARK).rstrip("\n")
+    return line[:head] + LONG_MESSAGE_MARK + line[len(line) - tail:]
 
 
 def normalize_message(msg: MemoryMessage, max_chars: int = 80_000) -> str:
@@ -323,12 +362,16 @@ def normalize_message(msg: MemoryMessage, max_chars: int = 80_000) -> str:
     if stamp is not None and hasattr(stamp, "strftime"):
         head.append(stamp.strftime("%Y-%m-%d %H:%M"))
     head.append(str(msg.speaker or msg.role or "?"))
-    line = f"[{' · '.join(head)}]" + (f" {body}" if body else "")
-    if files:
-        line += f"\n📎 {files}"
-    if max_chars and max_chars > 0 and len(line) > max_chars:
-        line = _cut_middle(line, max_chars)
-    return line
+    header = f"[{' · '.join(head)}]"
+    rest = (f" {body}" if body else "") + (f"\n📎 {files}" if files else "")
+    if max_chars and max_chars > 0 and len(header) + len(rest) > max_chars:
+        # Режется только текст, шапка остаётся целиком: без id и автора
+        # строка в пакете ничья, а «#id» и имя модель переносит в снимок
+        # именно из шапки. Поэтому при крошечном max_chars строка может выйти
+        # длиннее бюджета — шапка и маркер важнее (MemoryConfig не даёт
+        # бюджету опуститься ниже _MIN_BATCH_CHARS).
+        rest = _cut_middle(rest, max_chars - len(header))
+    return header + rest
 
 
 # ============================================================================
@@ -450,16 +493,21 @@ def extract_snapshot(raw) -> tuple[str, bool]:
     """
     Текст снимка из сырого ответа → (текст, обрезан ли).
 
-    Мысли (<think>) и ограждения ``` вырезаются. Есть обёртка — берём её
-    содержимое; открыта, но не закрыта — ответ упёрся в лимит вывода, текст
-    после открытия возвращается с флагом True. Обёртки нет вовсе — мягкий
-    режим: весь текст (разделы потом проверит parse_sections).
+    Мысли (<think>) и ограждения ``` вырезаются. Есть обёртка — берём
+    содержимое последней; открыта, но не закрыта — ответ упёрся в лимит
+    вывода, текст после открытия возвращается с флагом True. Обёртки нет
+    вовсе — мягкий режим: весь текст (разделы потом проверит parse_sections).
     """
     text = _THINK_RE.sub("", str(raw or ""))
     # Незакрытый <think> — модель оборвалась посреди рассуждений: всё после него мысли.
     text = _UNCLOSED_THINK_RE.sub("", text)
     text = _FENCE_LINE_RE.sub("", text)
-    opened = _OPEN_RE.search(text)
+    # ПОСЛЕДНЯЯ открывающая обёртка, а не первая: модель иногда начинает с
+    # «Вот снимок в формате <master_state>…</master_state>:», и первая пара —
+    # лишь упоминание. Её «содержимое» дало бы четыре «нет раздела» и платный
+    # корректирующий ход при полностью годном снимке ниже.
+    opens = list(_OPEN_RE.finditer(text))
+    opened = opens[-1] if opens else None
     if opened:
         closed = _CLOSE_RE.search(text, opened.end())
         if not closed:
@@ -881,6 +929,15 @@ class ListSource:
 # под моделью. Дальше — SourceConflictError: кто-то правит этот кусок прямо
 # сейчас, и крутить модель вхолостую бессмысленно.
 _MAX_CONFLICTS = 3
+# Цель сжатия — доля бюджета снимка (гистерезис). ПОЧЕМУ ниже бюджета: снимок,
+# сжатый ровно до бюджета, превысит его уже на следующем пакете, и сжатие —
+# полный переписанный моделью снимок — шло бы на каждом пакете. Запас в 20 %
+# отодвигает следующее сжатие на несколько пакетов. Превышение бюджета при
+# этом по-прежнему считается от полного snapshot_tokens.
+_COMPACT_TARGET = 0.8
+# Начало предупреждения о бюджете. X в «X из Y токенов» растёт с каждым
+# пакетом, поэтому новое такое предупреждение заменяет прежнее (см. _warn).
+_OVER_BUDGET = "снимок превышает бюджет:"
 
 
 # ============================================================================
@@ -895,6 +952,13 @@ class HierarchicalMemoryManager:
     поэтому слияния, сжатия и факты (сервис зовёт call() и для них) проходят
     через одну «дверь» и не превышают лимит частоты провайдера. sleep и clock
     внедряются ради тестов без реального ожидания.
+
+    Экземпляр рассчитан на ОДИН прогон scan_and_compress_history за раз:
+    прогресс и отсчёт предупреждений прогона — поля экземпляра, и второй
+    параллельный прогон перепутал бы их. А вот параллельные call() допустимы
+    (сервис зовёт факты через call() из commit, посреди прогона): они
+    сериализуются asyncio.Lock вокруг «пауза + вызов». Замок не реентерабелен —
+    колбэк модели не должен сам звать call().
     """
 
     def __init__(self, llm: LLMCall, config: MemoryConfig | None = None, *,
@@ -907,9 +971,12 @@ class HierarchicalMemoryManager:
         self._clock = clock
         self._est = estimate_tokens or default_estimate_tokens
         # Предупреждения для UI (страж вернул записи, сжатие не удалось, снимок
-        # сверх бюджета). Копятся за всю жизнь менеджера; прогон отдаёт свои.
+        # сверх бюджета). Копятся за всю жизнь менеджера, без повторов внутри
+        # прогона; прогон отдаёт свои — те, что после _warn_from.
         self.warnings: list[str] = []
+        self._warn_from = 0
         self._last_end: float | None = None
+        self._lock = asyncio.Lock()
         # Прогресс идущего прогона scan_and_compress_history. Вне прогона None,
         # и события пауз, повторов и сжатия никуда не уходят.
         self._progress: ScanProgress | None = None
@@ -932,12 +999,31 @@ class HierarchicalMemoryManager:
             return
         self._on_progress(replace(self._progress, **fields))
 
+    def _warn(self, text: str, *, supersedes: str | None = None) -> None:
+        """
+        Предупреждение для UI — без повторов в пределах прогона.
+
+        ПОЧЕМУ: одна и та же беда повторяется на каждом пакете (модель снова
+        роняет ту же запись, сжатие снова не сокращает хронику), и десятки
+        копий вытеснили бы из meta.warnings (там последние ≤ 5) всё остальное.
+        supersedes — начало предупреждения, которое новое заменяет: у «снимок
+        превышает бюджет: X из Y» X меняется с каждым пакетом, а UI нужна одна
+        строка — с последними числами.
+        """
+        run = self.warnings[self._warn_from:]
+        if text in run:
+            return
+        if supersedes:
+            self.warnings[self._warn_from:] = [w for w in run if not w.startswith(supersedes)]
+        self.warnings.append(text)
+
     def _guard(self, prev: str, new: str) -> str:
         """Страж записей (§4.6) + предупреждение, если модель что-то выронила."""
         new, restored = guard_entries(prev, new)
         if restored:
-            self.warnings.append(f"модель потеряла {len(restored)} записей — "
-                                 "возвращены из предыдущего снимка")
+            n = len(restored)
+            self._warn(f"модель потеряла {n} {_plural_ru(n, 'запись', 'записи', 'записей')} — "
+                       "возвращены из предыдущего снимка")
         return new
 
     # ------------------------------------------------------------ вызов модели
@@ -946,39 +1032,52 @@ class HierarchicalMemoryManager:
         Один запрос к модели: пауза-ограничитель + повтор с бэкоффом (§4.4).
 
         Пауза стоит между ЛЮБЫМИ запросами менеджера: провайдер режет частоту
-        по всем запросам ключа, а не отдельно по слияниям или фактам.
+        по всем запросам ключа, а не отдельно по слияниям или фактам. Замок
+        держится на всём вызове, включая повторы: без него два одновременных
+        call() прочли бы один _last_end, выждали одинаково и ушли к провайдеру
+        разом, а бэкофф одного пропускал бы вперёд запрос другого.
         """
-        delay = max(0.0, self.config.delay_ms / 1000)
-        if self._last_end is not None:
-            wait = delay - (self._clock() - self._last_end)
-            if wait > 0:
-                self._emit(phase="wait", retry_in_s=round(wait, 1))
-                await self._sleep(wait)
-        attempt = 0
-        while True:
-            try:
-                out = await self._llm(messages)
-                self._last_end = self._clock()
-                return out
-            except asyncio.CancelledError:
-                # Отмена задания или остановка сервера — не сбой провайдера:
-                # её нельзя ни повторять, ни глотать.
-                raise
-            except MemoryLLMError:
-                raise
-            except Exception as exc:  # noqa: BLE001 — классифицируем любую ошибку провайдера
-                self._last_end = self._clock()
-                err = classify_error(exc)
-                if not err.retryable or attempt >= self.config.max_retries:
-                    raise err from exc
-                wait = min(self.config.backoff_max_s, self.config.backoff_base_s * 2 ** attempt)
-                if err.retry_after:
-                    wait = min(_MAX_RETRY_AFTER_S, max(wait, err.retry_after))
-                # Повтор — тоже запрос: короткий бэкофф не должен обходить паузу.
-                wait = max(wait, delay)
-                self._emit(phase="retry", retry_in_s=wait)
-                await self._sleep(wait)
-                attempt += 1
+        async with self._lock:
+            delay = max(0.0, self.config.delay_ms / 1000)
+            if self._last_end is not None:
+                wait = delay - (self._clock() - self._last_end)
+                if wait > 0:
+                    self._emit(phase="wait", retry_in_s=round(wait, 1))
+                    await self._sleep(wait)
+            attempt = 0
+            while True:
+                try:
+                    out = await self._llm(messages)
+                except asyncio.CancelledError:
+                    # Отмена задания или остановка сервера — не сбой провайдера:
+                    # её нельзя ни повторять, ни глотать.
+                    raise
+                except Exception as exc:  # noqa: BLE001 — классифицируем любую ошибку провайдера
+                    # Конец вызова отмечается при любом исходе, кроме отмены. В том
+                    # числе когда колбэк сам бросил MemoryLLMError (сервис мог
+                    # классифицировать ошибку заранее): это тоже был запрос к
+                    # провайдеру, и следующий обязан выдержать паузу. Раньше такой
+                    # исход проскакивал мимо, и сжатие после length уходило без паузы.
+                    self._last_end = self._clock()
+                    # MemoryLLMError возвращается как есть: retryable=True от
+                    # колбэка повторяется так же, как классифицированная ошибка.
+                    err = classify_error(exc)
+                    if not err.retryable or attempt >= self.config.max_retries:
+                        if err is exc:
+                            raise
+                        raise err from exc
+                    wait = min(self.config.backoff_max_s,
+                               self.config.backoff_base_s * 2 ** attempt)
+                    if err.retry_after:
+                        wait = min(_MAX_RETRY_AFTER_S, max(wait, err.retry_after))
+                    # Повтор — тоже запрос: короткий бэкофф не должен обходить паузу.
+                    wait = max(wait, delay)
+                    self._emit(phase="retry", retry_in_s=wait)
+                    await self._sleep(wait)
+                    attempt += 1
+                else:
+                    self._last_end = self._clock()
+                    return out
 
     async def _ask_snapshot(self, messages: list[dict], *, prev: str,
                             check_shrink: bool) -> str:
@@ -1053,15 +1152,29 @@ class HierarchicalMemoryManager:
         а страж возвращает то, что модель всё же выронила. Любая неудача
         (брак после корректирующих ходов, ошибка API, хроника не стала
         короче) — не повод терять готовый снимок: предупреждение и прежний
-        текст.
+        текст. Цель в промпте — _COMPACT_TARGET от бюджета (гистерезис).
         """
         if not is_structured(state):
             # Пустая память или пересказ старой схемы: хроники-раздела нет,
             # сжимать нечего.
             return state
-        self._emit(phase="compact")
         budget = self.config.snapshot_tokens
-        system = COMPACT_PROMPT.format(budget=budget, keep=self.config.keep_recent_chronicle)
+        chronicle = parse_sections(state).get(SEC_CHRONICLE, "")
+        if len(_parse_entries(chronicle.splitlines())) <= self.config.keep_recent_chronicle:
+            # Сокращать нечего: последние keep записей промпт велит оставить как
+            # есть, а раздуты разделы 2–4, которые не сжимаются никогда. Раньше
+            # модель и тут получала запрос сжатия — на КАЖДОМ пакете: полный
+            # снимок сверх бюджета на входе и на выходе, ответ «не короче»,
+            # вдвое больше вызовов и пара предупреждений на пакет.
+            tokens = self._tokens(state)
+            if tokens > budget:
+                self._warn(f"{_OVER_BUDGET} {_fmt_int(tokens)} из {_fmt_int(budget)} токенов "
+                           "(хроника уже сжата; реестр и списки не сжимаются автоматически)",
+                           supersedes=_OVER_BUDGET)
+            return state
+        self._emit(phase="compact")
+        system = COMPACT_PROMPT.format(budget=int(budget * _COMPACT_TARGET),
+                                       keep=self.config.keep_recent_chronicle)
         result = state
         try:
             compacted = await self._ask_snapshot(
@@ -1069,18 +1182,18 @@ class HierarchicalMemoryManager:
                  {"role": "user", "content": "[Текущая память]\n" + state}],
                 prev=state, check_shrink=False)
         except (SnapshotValidationError, MemoryLLMError) as err:
-            self.warnings.append(f"сжатие хроники не удалось ({err}) — оставлен прежний снимок")
+            self._warn(f"сжатие хроники не удалось ({err}) — оставлен прежний снимок")
         else:
-            before = self._tokens(parse_sections(state).get(SEC_CHRONICLE, ""))
+            before = self._tokens(chronicle)
             after = self._tokens(parse_sections(compacted).get(SEC_CHRONICLE, ""))
             if after < before:
                 result = self._guard(state, compacted)
             else:
-                self.warnings.append("сжатие не сократило хронику — оставлен прежний снимок")
+                self._warn("сжатие не сократило хронику — оставлен прежний снимок")
         tokens = self._tokens(result)
         if tokens > budget:
-            self.warnings.append(f"снимок превышает бюджет: {_fmt_int(tokens)} "
-                                 f"из {_fmt_int(budget)} токенов")
+            self._warn(f"{_OVER_BUDGET} {_fmt_int(tokens)} из {_fmt_int(budget)} токенов",
+                       supersedes=_OVER_BUDGET)
         return result
 
     # ------------------------------------------------------------ цикл свёртки
@@ -1114,8 +1227,8 @@ class HierarchicalMemoryManager:
         if not isinstance(source, BatchSource):
             source = ListSource(source)
         # Прогон отдаёт только свои предупреждения, даже если менеджер уже
-        # поработал раньше.
-        warn_from = len(self.warnings)
+        # поработал раньше; повторы _warn тоже ищет только среди них.
+        warn_from = self._warn_from = len(self.warnings)
         processed = batches = attempts = conflicts = 0
         self._on_progress = on_progress
         self._progress = ScanProgress(processed=0, total=await source.pending(), batches=0,
@@ -1168,6 +1281,24 @@ class HierarchicalMemoryManager:
 # ============================================================================
 # Скользящее окно (Tier 3)
 # ============================================================================
+def _window_args(window, covered) -> tuple[int, int]:
+    """
+    Окно и указатель «учтено до» из настроек и БД → int: окно не число —
+    DEFAULT_WINDOW, указатель не число — 0 («сводки нет»). Один помощник на
+    window_start и SlidingWindow.pending_for_summary: пойми они мусор
+    по-разному, дословное окно и «что ждёт сжатия» разошлись бы.
+    """
+    try:
+        window = int(window)
+    except (TypeError, ValueError):
+        window = DEFAULT_WINDOW
+    try:
+        covered = int(covered or 0)
+    except (TypeError, ValueError):
+        covered = 0
+    return window, covered
+
+
 def window_start(history_ids, covered, window, step: int = WINDOW_STEP) -> int:
     """
     Индекс первого элемента истории, который уходит в модель дословно.
@@ -1182,20 +1313,14 @@ def window_start(history_ids, covered, window, step: int = WINDOW_STEP) -> int:
     Сообщение с неизвестным id считаем неучтённым — на нём отбрасывание
     останавливается.
 
-    Перенесено из horae_recall без изменений; horae_recall.window_start —
-    реэкспорт (тесты подменяют именно его).
+    Перенесено из horae_recall без изменений поведения (приведение аргументов
+    вынесено в _window_args); horae_recall.window_start — реэкспорт (тесты
+    подменяют именно его).
     """
     n = len(history_ids or [])
-    try:
-        window = int(window)
-    except (TypeError, ValueError):
-        window = DEFAULT_WINDOW
+    window, covered = _window_args(window, covered)
     if window <= 0 or n <= window:
         return 0
-    try:
-        covered = int(covered or 0)
-    except (TypeError, ValueError):
-        covered = 0
     limit = n - window
     drop = 0
     while drop < limit:
@@ -1231,16 +1356,9 @@ class SlidingWindow:
     def pending_for_summary(self, ids, covered) -> list:
         """Что старше окна и ещё не учтено снимком — работа для сжатия."""
         ids = list(ids or ())
-        try:
-            window = int(self.window)
-        except (TypeError, ValueError):
-            window = DEFAULT_WINDOW
+        window, covered = _window_args(self.window, covered)
         if window <= 0:
             return []
-        try:
-            covered = int(covered or 0)
-        except (TypeError, ValueError):
-            covered = 0
         return [i for i in ids[:max(0, len(ids) - window)] if i is not None and i > covered]
 
 
@@ -1288,9 +1406,11 @@ def render_export_markdown(*, title, character, snapshot, covered_upto, messages
         str(snapshot or "").strip() or EMPTY_STATE,
     ]
     if facts is not None:
-        facts = [" ".join(str(f).split()) for f in facts]
+        # Пустые строки отбрасываются ДО подсчёта: иначе заголовок обещал бы
+        # «(3)», а под ним стоял бы один пункт.
+        facts = [f for f in (" ".join(str(f).split()) for f in facts) if f]
         lines += ["", "---", "", f"## Приложение: атомарные факты ({len(facts)})"]
-        lines += [f"- {f}" for f in facts if f] or ["—"]
+        lines += [f"- {f}" for f in facts] or ["—"]
     return "\n".join(lines) + "\n"
 
 
@@ -1343,6 +1463,7 @@ MASTER_STATE_PROMPT = f"""Ты — компрессор долговременн
 
 # Сжатие снимка сверх бюджета. Плейсхолдеры {budget} и {keep} подставляет
 # менеджер через str.format — других фигурных скобок в тексте быть не должно.
+# {budget} — цель сжатия (_COMPACT_TARGET от snapshot_tokens), а не сам бюджет.
 COMPACT_PROMPT = f"""Снимок памяти превышает бюджет {{budget}} токенов. Сократи ТОЛЬКО раздел [{SEC_CHRONICLE}]: объедини старые записи в арки вида
 - [#a–#b] Арка «название»: суть, ключевые решения, последствия
 Последние {{keep}} записей хроники оставь без изменений. Диапазоны арок должны покрывать объединённые записи без пропусков; имена, числа, цитаты, решения и договорённости из объединяемых записей не теряй, ничего не выдумывай.
