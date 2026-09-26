@@ -36,17 +36,14 @@ if not exist "%PY%" (
   exit /b 1
 )
 
-REM 3) Dependencies - install once (marker file .venv\.installed).
-if not exist ".venv\.installed" (
-  echo [setup] Installing dependencies. First time takes a couple of minutes...
-  "%PY%" -m pip install --upgrade pip
-  "%PY%" -m pip install -r backend\requirements.txt
-  if errorlevel 1 (
-    echo [error] Dependency install failed. Check internet and retry.
-    pause
-    exit /b 1
-  )
-  echo installed> ".venv\.installed"
+REM 3) Dependencies and database (scripts\prestart.py). After "git pull" it
+REM    installs changed dependencies, backs the database up to data\backups\
+REM    and upgrades its schema - before the server starts.
+"%PY%" scripts\prestart.py
+if errorlevel 1 (
+  echo [error] Preparation failed - see the messages above.
+  pause
+  exit /b 1
 )
 
 REM 4) Pick a free port via a small Python helper (avoids fragile batch parsing).
@@ -92,6 +89,6 @@ start "" "%URL%"
 echo.
 echo Done.  Local: %URL%   Network: http://%LANIP%:%PORT%
 echo To stop: close the "AiChat backend" window (and the Telegram bot window).
-echo (Changed dependencies? Delete .venv\.installed to reinstall.)
+echo (After "git pull" just run start.bat again: dependencies and database update themselves.)
 pause
 endlocal

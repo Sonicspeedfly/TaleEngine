@@ -5,6 +5,9 @@
 # База данных и данные среды выполнения
 data/*.db
 data/*.db-*
+# Копии базы перед обновлением схемы (scripts/prestart.py) и отпечаток схемы
+data/backups/
+data/.schema-fingerprint
 *.sqlite3
 
 # Python

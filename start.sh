@@ -3,9 +3,11 @@
 #  AiChat SSF — запуск на Linux-сервере БЕЗ Docker.
 #
 #  Использование:
-#     chmod +x start.sh          # один раз
 #     ./start.sh                 # хост 0.0.0.0, порт 8000
 #     HOST=0.0.0.0 PORT=8080 ./start.sh   # свой адрес/порт
+#
+#  Обновление: `git pull` и снова ./start.sh — зависимости доставятся, база
+#  скопируется в data/backups/ и обновится сама (scripts/prestart.py).
 #
 #  Сервер слушает 0.0.0.0 -> доступен снаружи (не забудьте открыть порт в фаерволе).
 #  Для продакшена удобнее systemd-сервис или Docker (см. README).
@@ -25,13 +27,10 @@ if [ ! -x .venv/bin/python ]; then
   python3 -m venv .venv
 fi
 
-# 3) Зависимости — один раз (маркер .venv/.installed).
-if [ ! -f .venv/.installed ]; then
-  echo "[setup] Ставлю зависимости ..."
-  .venv/bin/python -m pip install --upgrade pip
-  .venv/bin/python -m pip install -r backend/requirements.txt
-  touch .venv/.installed
-fi
+# 3) Зависимости и база данных (scripts/prestart.py): после `git pull` доставит
+#    изменившиеся зависимости, сделает копию базы в data/backups/ и обновит схему —
+#    до старта бота и сервера. Ошибка -> set -e останавливает запуск.
+.venv/bin/python scripts/prestart.py
 
 # 4) Telegram-бот — в фоне, если задан токен.
 if grep -Eq '^TELEGRAM_BOT_TOKEN=.' .env; then
