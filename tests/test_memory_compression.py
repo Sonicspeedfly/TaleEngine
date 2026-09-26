@@ -112,16 +112,16 @@ async def _set_snapshot(sid: int, last_id: int) -> None:
         await db.commit()
 
 
-async def _chronicle_compresses(sid: int, lo: int, hi: int) -> None:
-    """Свёртки Хроники включены на уровне чата, одна свёртка покрывает [lo, hi]."""
+async def _chronicle_compresses(sid: int, lo: int, hi: int,
+                                text: str = "Свёртка: герои собрались в путь.") -> None:
+    """Свёртки Хроники включены на уровне чата, ещё одна свёртка покрывает [lo, hi]."""
     from backend.database import AsyncSessionLocal
 
     async with AsyncSessionLocal() as db:
         data = await he.load_chat_data(db, sid)
         data["settings"] = {"summary_enabled": True}
         data["summaries"] = he.place_summary(data.get("summaries") or [], he._new_summary(
-            data, lo=lo, hi=hi, text="Свёртка: герои собрались в путь.", kind="auto",
-            depth=0, children=None, state=None))
+            data, lo=lo, hi=hi, text=text, kind="auto", depth=0, children=None, state=None))
         await he.save_chat_data(db, sid, data)
         await db.commit()
 
@@ -162,23 +162,30 @@ async def test_snapshot_chat_gets_history_once_and_state_wins():
     await engine.dispose()
 
 
-async def test_chronicle_summaries_replace_the_snapshot_in_a_turn():
+async def test_switching_to_chronicle_keeps_the_snapshot_history():
+    """
+    Регрессия 2.7.0: перешли на свёртки Хроники посреди длинного чата — снимок
+    выпадал из хода, окно выбрасывало только покрытое свёртками, и почти вся
+    переписка уходила модели дословно, до потолка бюджета. Теперь снимок несёт
+    историю до своей отметки, свёртки — после, и окно выбрасывает покрытое обоими.
+    """
     from backend.database import engine
 
     await _fresh_db()
-    char_id, sid, ids = await _make_chat(40 + hr.DEFAULT_WINDOW)
+    char_id, sid, ids = await _make_chat(80 + hr.DEFAULT_WINDOW)
     await _set_snapshot(sid, ids[39])
-    await _chronicle_compresses(sid, ids[0], ids[19])
+    await _chronicle_compresses(sid, ids[0], ids[19], text="Старая свёртка из SillyTavern.")
+    await _chronicle_compresses(sid, ids[40], ids[59], text="Свёртка после снимка.")
 
     text, report = await _build(sid, char_id)
     mem = report["memory"]
     assert mem["engine"] == "horae"
-    # Окно выбрасывает только покрытое свёрткой Хроники, а не снимком.
-    assert mem["covered_upto"] == ids[19] and mem["dropped"] == 20
-    assert "реплика 20" in text and "реплика 19" not in text
-    # Снимок — та же история второй раз и уже устаревшая: в ход не идёт.
-    assert "Герои пришли в Дольн." not in text and "мастер-снимок" not in text
-    assert "Свёртка: герои собрались в путь." in text
+    assert mem["covered_upto"] == ids[59] and mem["dropped"] == 60
+    assert "реплика 60" in text and "реплика 59" not in text and "реплика 5\n" not in text
+    # Снимок — история до #39, свёртка — после; то, что уже в снимке, не повторяется.
+    assert "Герои пришли в Дольн." in text
+    assert "Свёртка после снимка." in text
+    assert "Старая свёртка из SillyTavern." not in text
     await engine.dispose()
 
 

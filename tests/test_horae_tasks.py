@@ -179,6 +179,33 @@ async def _summary_chat(n_ai=12, settings=None):
         "summary_batch_messages": 5, "resummary_threshold": 0})
 
 
+async def test_auto_summary_starts_after_the_master_snapshot():
+    """Историю до отметки снимка несёт он — свёртки не пересказывают её заново."""
+    from backend import models
+    from backend.database import AsyncSessionLocal
+
+    sid, ids = await _summary_chat()
+    async with AsyncSessionLocal() as db:
+        db.add(models.HoraeEntry(session_id=sid, category="summary", title="Память чата (авто)",
+                                 content="Снимок первых пяти ответов.", always_on=True, enabled=True,
+                                 meta={"last_message_id": ids[9], "v": 2}))
+        await db.commit()
+    prompts = []
+
+    async def fake(messages, params=None, connection=None, kind="service"):
+        prompts.append(messages[-1]["content"])
+        return "<horaesummary>Ответы 5–9.</horaesummary>"
+
+    # После снимка в буфере 4 ответа (5–8) — меньше порога, поэтому «Свернуть сейчас».
+    with patch("backend.llm_gateway.complete", new=fake):
+        result = await horae_tasks.run_auto_summary(sid, max_batches=1, force=True)
+    assert result["created"] == 1
+    async with AsyncSessionLocal() as db:
+        data = await he.load_chat_data(db, sid)
+    assert data["summaries"][0]["range"] == [ids[10], ids[17]]
+    assert "Событие 5" in prompts[0] and "Событие 4" not in prompts[0]
+
+
 async def test_auto_summary_folds_oldest_buffer_batch():
     sid, ids = await _summary_chat()
     prompts = []

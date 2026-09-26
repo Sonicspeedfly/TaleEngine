@@ -299,10 +299,7 @@ async def build_group_messages(
         )
     ).scalars().all()
 
-    records = await _load_horae_records(
-        db, session.id, target_character.id,
-        skip_chat_summary=await _horae_compresses(db, session, target_character),
-    )
+    records = await _load_horae_records(db, session.id, target_character.id)
     persona, author_note = await _load_persona_and_note(db, session)
     persona_name = persona["name"] if persona and persona.get("name") else "Пользователь"
 
@@ -412,17 +409,6 @@ async def build_group_messages(
     return messages
 
 
-async def _horae_compresses(db, session, target_character) -> bool:
-    """Историю группы сжимают свёртки Хроники — мастер-снимок в ход не идёт."""
-    try:
-        from backend import horae_engine
-
-        info = await horae_engine.chat_compression(db, session, target_character)
-        return info["engine"] == "horae"
-    except Exception:  # noqa: BLE001 — сбой: как раньше, со снимком
-        return False
-
-
 async def _group_horae(db, session, target_character, msgs):
     """
     Блоки Horae для реплики персонажа группы. Вспоминание событий здесь не
@@ -438,6 +424,7 @@ async def _group_horae(db, session, target_character, msgs):
         return await horae_engine.context_parts(
             db, session, target_character, user_message=last_user,
             connection=await get_connection(db), history_ids=[m.id for m in msgs],
+            snapshot_upto=await horae_engine.snapshot_pointer(db, session.id),
         )
     except Exception:  # noqa: BLE001
         import logging

@@ -769,7 +769,7 @@ createApp({
         : "Окно";
       return [
         { cls: "seg-guides", label: "Системный промпт и якоря", tokens: t.system },
-        { cls: "seg-horae", label: "Мастер-снимок и факты", tokens: t.memory },
+        { cls: "seg-horae", label: "Память: снимок, Хроника, факты", tokens: t.memory },
         { cls: "seg-history", label: win, tokens: t.window },
       ].map((r) => ({ ...r, pct: this.sharePct(r.tokens, t.total) }));
     },
@@ -1655,22 +1655,53 @@ createApp({
       if (mem.facts_mode === "lexical") return "по совпадению слов";
       return "включены";
     },
-    // Что стало с репликами старше активного окна. Раньше решал один признак
-    // dropped, и при dropped = 0 инспектор писал «вся история помещается в
-    // окно». Но сервер не выбрасывает реплики, пока сводка их не учла (выключенная
-    // авто-сводка, свежий импорт длинного чата), и тогда триста реплик при окне
-    // в двадцать тоже давали dropped = 0 — отчёт врал ровно в том случае, ради
-    // которого его смотрят. history.total — сколько реплик ушло в обрезку уже
-    // ПОСЛЕ окна: больше окна при dropped = 0 значит «окно не сжато».
-    memWindowLabel(stats) {
-      const mem = (stats && stats.memory) || {};
-      if (!mem.window) return "Окно выключено — история идёт целиком";
-      if (mem.dropped) return "Старше окна, идут хроникой из сводки";
-      const total = stats.history && typeof stats.history.total === "number" ? stats.history.total : 0;
-      // Причину («сводка не догнала» или «не набран шаг сжатия») клиент не
-      // различит — у него нет id реплик; говорим то, что верно в обоих случаях.
-      if (total > mem.window) return "Окно ещё не сжато — история идёт целиком";
-      return "Вся история помещается в окно";
+    // Сводка памяти хода для инспектора — несколько строк вместо таблицы.
+    // Главное в ней — сколько реплик идёт дословно и почему. Окно — это
+    // МИНИМУМ дословных реплик: старше него уходит только уже сжатое (снимком
+    // или свёртками Хроники). Не догнало сжатие — остальное идёт дословно до
+    // потолка бюджета, и тогда здесь строка-предупреждение с тем, что нажать,
+    // а не молчаливые «1 040к из 1 049к».
+    insMemoryRows(stats) {
+      const mem = stats && stats.memory;
+      const h = (stats && stats.history) || {};
+      if (!mem) return [];
+      if (mem.error) return [{ text: "Память не собралась на этом ходу — история идёт целиком", warn: true }];
+      const n = (x) => this.fmtNum(x || 0);
+      const all = (mem.dropped || 0) + (h.total || 0);
+      const rows = [{
+        text: "Дословно " + n(h.included) + " из " + n(all) + " " + this.plural(all, "реплики", "реплик", "реплик")
+          + (mem.window ? " · окно " + mem.window : " · окно выключено"),
+      }];
+      const who = { snapshot: "мастер-снимок", horae: "свёртки Хроники", off: "никто — сжатие выключено" }[mem.engine];
+      if (mem.covered_upto) {
+        const parts = mem.snapshot_upto && mem.covered_upto > mem.snapshot_upto
+          ? " (снимок до #" + mem.snapshot_upto + ", дальше свёртки)" : "";
+        rows.push({ text: "Сжато до #" + mem.covered_upto + parts + (who ? " · обновляет " + who : "") });
+      } else if (who) {
+        rows.push({ text: "Сжатого ещё нет · обновляет " + who });
+      }
+      // Сверх окна идёт дословно то, что сжатие ещё не учло. Несколько реплик —
+      // норма (окно шагает по 4, снимок обновляется раз в N сообщений);
+      // десятки — сжатие отстало, и ход оплачивается дословной перепиской.
+      const backlog = mem.window ? (h.total || 0) - mem.window : 0;
+      if (backlog > 20) {
+        const fix = mem.engine === "horae" ? "«Хронология» → «Свернуть сейчас»"
+          : mem.engine === "snapshot" ? "«Сжатие истории» → «Догнать»"
+          : "включите сжатие в «Сжатие истории»";
+        rows.push({ text: "Не сжато " + n(backlog) + " " + this.plural(backlog, "реплика", "реплики", "реплик")
+          + " сверх окна — идут дословно. " + fix + ".", warn: true });
+      }
+      if (h.trimmed) {
+        rows.push({ text: "Обрезано бюджетом: " + n(h.trimmed) + " " + this.plural(h.trimmed, "реплика", "реплики", "реплик")
+          + " (−" + n(h.tokens_trimmed) + " ток.)", warn: true });
+      }
+      const found = (stats.recalled || []).length;
+      const factsOff = mem.facts_enabled === false || mem.facts_mode === "off";
+      const extra = ["Факты: " + (factsOff ? "выключены"
+        : found ? found + " (" + this.memFactsLabel(mem) + ")" : "не нашлось")];
+      if (stats.horae_recall && stats.horae_recall.length) extra.push("воспоминаний Хроники: " + stats.horae_recall.length);
+      rows.push({ text: extra.join(" · "), muted: true });
+      return rows;
     },
     // «⋯» под сообщением. На телефоне лента действий уже экрана, а её полоса
     // прокрутки спрятана, и раскрытые вторичные кнопки уходили за правый край
@@ -6103,10 +6134,10 @@ createApp({
                        @change="setMemoryEngine('off')" />
                   <span><b>Не сжимать</b> — собранный снимок остаётся, но больше не обновляется.</span></label>
               </fieldset>
-              <p class="muted" style="margin:2px 0 10px">Работает что-то одно: второй механизм в чате стоит
-                и в ход не идёт — история не дублируется, и вы не платите дважды. Состояние Хроники идёт в
-                ход при любом выборе. Обновление снимка или свёртка — <b>отдельный платный запрос</b>
-                (📊: <code>summary</code>, <code>horae</code>).</p>
+              <p class="muted" style="margin:2px 0 10px">Обновляется что-то одно — за одну переписку вы не
+                платите дважды. Что уже сжато, остаётся в ходе без повторов: снимок несёт историю до своей
+                отметки, свёртки Хроники — после неё. Обновление снимка или свёртка — <b>отдельный платный
+                запрос</b> (📊: <code>summary</code>, <code>horae</code>).</p>
               <p v-if="!isAdmin" class="field-hint">Свёртки Хроники для всех чатов включает администратор;
                 для своего чата — «Настройки» → уровень «Чат» → «Авто-свёртка хронологии».</p>
               <p v-if="chatEngineNote" class="field-hint mem-engine-note">{{ chatEngineNote }}</p>
@@ -6146,8 +6177,8 @@ createApp({
                      сообщений даёт запись с пустым текстом, is_structured("") на
                      сервере ложно, но пересобирать там нечего. Пробел между метками
                      Vue при сборке шаблона убирает — промежуток даёт CSS (.mem-status). -->
-                <p v-if="chatEngine === 'horae'" class="field-hint mem-idle-note">Сейчас не используется: историю этого чата
-                  сжимают свёртки Хроники. Снимок хранится и снова заработает, если выбрать мастер-снимок.</p>
+                <p v-if="chatEngine === 'horae'" class="field-hint mem-idle-note">Не обновляется: дальше историю этого
+                  чата сжимают свёртки Хроники. Собранное снимком остаётся в ходе и несёт историю до своей отметки.</p>
                 <p class="muted mem-status" v-if="memStatus && memStatus.snapshot.exists">
                   Снимок {{ fmtNum(memStatus.snapshot.tokens) }} / {{ fmtNum(memStatus.snapshot.budget) }} ток.
                   · учтено до #{{ memStatus.snapshot.covered_upto }}
@@ -6786,10 +6817,9 @@ createApp({
             {{ ctxStats.budget.toLocaleString('ru') }} · {{ ctxFill }}% окна
             <span v-if="ctxStats.model" class="tag">{{ ctxStats.model }}</span>
           </div>
-          <!-- Три яруса хода — та же разбивка, что в мониторе вкладки «Память»
+          <!-- Три яруса хода — та же разбивка, что в мониторе «Сжатия истории»
                (строки из memTierRows). Старый сервер tiers не присылает: тогда
-               блока нет, остальной инспектор работает как раньше. У группы
-               ярусов нет по сути — говорим об этом, как во вкладке. -->
+               блока нет. У группы ярусов нет по сути — говорим об этом. -->
           <template v-if="memTiers">
             <div class="ins-bar" aria-hidden="true">
               <i v-for="r in memTierRows" :key="'it' + r.cls" :class="r.cls" :style="{ width: r.pct + '%' }"></i>
@@ -6800,96 +6830,71 @@ createApp({
                 <span>{{ r.label }} — {{ fmtNum(r.tokens) }}</span></li>
             </ul>
           </template>
-          <p v-else-if="memTiersGroup" class="muted ins-note">В групповых чатах монитор уровней не считается: память собирается иначе, окна нет.</p>
-          <!-- Полоса весов: видно, что именно занимает контекст, до чтения списка. -->
-          <div class="ins-bar" aria-hidden="true">
-            <i v-for="b in ctxStats.blocks" :key="'bar'+b.key" :class="'seg-' + b.key"
-               :style="{ width: (b.tokens / ctxStats.total_tokens * 100) + '%' }"></i>
-            <i class="seg-history" :style="{ width: (ctxStats.history.tokens / ctxStats.total_tokens * 100) + '%' }"></i>
-            <i class="seg-tail" :style="{ width: (ctxStats.tail_tokens / ctxStats.total_tokens * 100) + '%' }"></i>
+          <p v-else-if="memTiersGroup" class="muted ins-note">В групповых чатах уровни не считаются: память собирается иначе, окна нет.</p>
+
+          <!-- Память хода — несколько строк (insMemoryRows): сколько реплик идёт
+               дословно и почему, докуда сжато и кем, что отстало. Подробности —
+               ниже, в свёрнутых разделах: раньше всё было раскрыто сразу, и
+               главное терялось между фактами и блоками. -->
+          <div v-if="insMemoryRows(ctxStats).length" class="ins-mem">
+            <h4 class="ins-sub">Память хода</h4>
+            <p v-for="(r, i) in insMemoryRows(ctxStats)" :key="'im' + i"
+               :class="['ins-mem-row', { 'ins-warn': r.warn, muted: r.muted }]">{{ r.warn ? '⚠ ' : '' }}{{ r.text }}</p>
           </div>
 
-          <details v-for="b in ctxStats.blocks" :key="b.key" class="ins-block">
-            <summary>
-              <span class="ins-dot" :class="'seg-' + b.key" aria-hidden="true"></span>
-              <span class="grow">{{ b.label }}</span>
-              <span class="ins-w">{{ b.tokens }}</span>
-            </summary>
-            <pre class="ins-text">{{ b.text || '— пусто —' }}</pre>
-          </details>
-
-          <div class="ins-block ins-static">
-            <span class="ins-dot seg-history" aria-hidden="true"></span>
-            <span class="grow">История · {{ ctxStats.history.included }} из {{ ctxStats.history.total }}</span>
-            <span class="ins-w">{{ ctxStats.history.tokens }}</span>
-          </div>
-          <div v-if="ctxStats.history.trimmed" class="ins-block ins-cut">
-            <span class="ins-dot" aria-hidden="true"></span>
-            <span class="grow">Обрезано бюджетом · {{ ctxStats.history.trimmed }} реплик</span>
-            <span class="ins-w">−{{ ctxStats.history.tokens_trimmed }}</span>
-          </div>
-          <div class="ins-block ins-static">
-            <span class="ins-dot seg-tail" aria-hidden="true"></span>
-            <span class="grow">Хвост: сводка, заметка автора, якорь характера</span>
-            <span class="ins-w">{{ ctxStats.tail_tokens }}</span>
-          </div>
-
-          <h4 class="ins-sub">Лорбук: сработало {{ ctxStats.horae.length }} из {{ ctxStats.horae_total }}</h4>
-          <p v-if="!ctxStats.horae.length" class="muted">Ни одна запись не сработала на этом ходу.</p>
-          <div v-for="(h, i) in ctxStats.horae" :key="'h'+i" class="ins-horae">
-            <span class="grow">{{ h.title }}</span>
-            <span class="tag">{{ h.always_on ? 'always' : (h.keywords.join(', ') || h.category) }}</span>
-            <span class="ins-w">{{ h.tokens }}</span>
-          </div>
-
-          <!-- Долгая память чата: активное окно, хроника и отобранные факты.
-               Без этого раздела трёхслойная память была чёрным ящиком: ни сколько
-               реплик ушло в сводку, ни какие факты модель получила на этом ходу,
-               ни каким способом их искали, узнать было неоткуда. Каждое поле
-               отчёта необязательно: старый сервер их не присылает, и тогда
-               раздел просто не рисуется, а не падает на undefined. -->
-          <template v-if="ctxStats.memory || (ctxStats.recalled && ctxStats.recalled.length)">
-            <h4 class="ins-sub">Память: окно, сжатие, факты</h4>
-            <template v-if="ctxStats.memory">
-              <!-- Сбой памяти показываем прямо: сервер в этом случае шлёт окно 0 и
-                   факты «off», и без этой строки инспектор уверял бы, что факты
-                   выключены настройкой, а история просто помещается в окно. -->
-              <div v-if="ctxStats.memory.error" class="ins-block ins-cut">
-                <span class="ins-dot" aria-hidden="true"></span>
-                <span class="grow">Память не собралась на этом ходу — история идёт целиком</span>
-              </div>
-              <div class="ins-block ins-static">
-                <span class="grow">Активное окно</span>
-                <span class="ins-w">{{ ctxStats.memory.window ? ctxStats.memory.window + ' сообщ.' : (ctxStats.memory.error ? '—' : 'выключено') }}</span>
-              </div>
-              <div v-if="!ctxStats.memory.error" class="ins-block ins-static">
-                <span class="grow">{{ memWindowLabel(ctxStats) }}</span>
-                <span class="ins-w" v-if="ctxStats.memory.dropped">{{ ctxStats.memory.dropped }} реплик</span>
-              </div>
-              <div v-if="ctxStats.memory.engine" class="ins-block ins-static">
-                <span class="grow">Историю сжимает</span>
-                <span class="ins-w">{{ ({ snapshot: 'мастер-снимок', horae: 'свёртки Хроники', off: 'никто' })[ctxStats.memory.engine] || ctxStats.memory.engine }}</span>
-              </div>
-              <div v-if="ctxStats.memory.covered_upto" class="ins-block ins-static">
-                <span class="grow">{{ ctxStats.memory.engine === 'horae' ? 'Свёртки учли' : 'Снимок учёл' }} реплики до</span>
-                <span class="ins-w">#{{ ctxStats.memory.covered_upto }}</span>
-              </div>
-              <div class="ins-block ins-static">
-                <span class="grow">Факты</span>
-                <span class="ins-w">{{ memFactsLabel(ctxStats.memory) }}</span>
-              </div>
-            </template>
-            <p v-if="ctxStats.recalled && ctxStats.recalled.length" class="muted ins-note">
-              Отобрано {{ ctxStats.recalled.length }} {{ plural(ctxStats.recalled.length, 'факт', 'факта', 'фактов') }} для следующего хода:</p>
-            <p v-else-if="ctxStats.memory && !ctxStats.memory.error && ctxStats.memory.facts_enabled !== false" class="muted ins-note">
-              Связанных с разговором фактов не нашлось — блок фактов в ход не добавлен.</p>
-            <div v-for="(f, i) in (ctxStats.recalled || [])" :key="'rf'+i" class="ins-fact">
+          <details v-if="ctxStats.recalled && ctxStats.recalled.length" class="ins-more">
+            <summary>Отобранные факты ({{ ctxStats.recalled.length }})</summary>
+            <div v-for="(f, i) in ctxStats.recalled" :key="'rf'+i" class="ins-fact">
               <span class="ins-fact-text">{{ f.content }}</span>
               <span v-if="typeof f.similarity === 'number'" class="tag ins-w"
                     :title="'Сходство с репликой: ' + f.similarity.toFixed(2) + (typeof f.score === 'number' ? ', итоговый вес с учётом свежести: ' + f.score.toFixed(2) : '')">
                 {{ f.similarity.toFixed(2) }}</span>
             </div>
-          </template>
+          </details>
+
+          <details v-if="ctxStats.horae_total" class="ins-more">
+            <summary>Лорбук: сработало {{ ctxStats.horae.length }} из {{ ctxStats.horae_total }}</summary>
+            <p v-if="!ctxStats.horae.length" class="muted ins-note">Ни одна запись не сработала на этом ходу.</p>
+            <div v-for="(h, i) in ctxStats.horae" :key="'h'+i" class="ins-horae">
+              <span class="grow">{{ h.title }}</span>
+              <span class="tag">{{ h.always_on ? 'always' : (h.keywords.join(', ') || h.category) }}</span>
+              <span class="ins-w">{{ h.tokens }}</span>
+            </div>
+          </details>
+
+          <!-- Из чего собран ход: блоки с текстом, история, обрезка, хвост. -->
+          <details class="ins-more">
+            <summary>Из чего собран ход</summary>
+            <div class="ins-bar" aria-hidden="true">
+              <i v-for="b in ctxStats.blocks" :key="'bar'+b.key" :class="'seg-' + b.key"
+                 :style="{ width: (b.tokens / ctxStats.total_tokens * 100) + '%' }"></i>
+              <i class="seg-history" :style="{ width: (ctxStats.history.tokens / ctxStats.total_tokens * 100) + '%' }"></i>
+              <i class="seg-tail" :style="{ width: (ctxStats.tail_tokens / ctxStats.total_tokens * 100) + '%' }"></i>
+            </div>
+            <details v-for="b in ctxStats.blocks" :key="b.key" class="ins-block">
+              <summary>
+                <span class="ins-dot" :class="'seg-' + b.key" aria-hidden="true"></span>
+                <span class="grow">{{ b.label }}</span>
+                <span class="ins-w">{{ b.tokens }}</span>
+              </summary>
+              <pre class="ins-text">{{ b.text || '— пусто —' }}</pre>
+            </details>
+            <div class="ins-block ins-static">
+              <span class="ins-dot seg-history" aria-hidden="true"></span>
+              <span class="grow">История · {{ ctxStats.history.included }} из {{ ctxStats.history.total }}</span>
+              <span class="ins-w">{{ ctxStats.history.tokens }}</span>
+            </div>
+            <div v-if="ctxStats.history.trimmed" class="ins-block ins-cut">
+              <span class="ins-dot" aria-hidden="true"></span>
+              <span class="grow">Обрезано бюджетом · {{ ctxStats.history.trimmed }} реплик</span>
+              <span class="ins-w">−{{ ctxStats.history.tokens_trimmed }}</span>
+            </div>
+            <div class="ins-block ins-static">
+              <span class="ins-dot seg-tail" aria-hidden="true"></span>
+              <span class="grow">Хвост: память, заметка автора, якорь характера</span>
+              <span class="ins-w">{{ ctxStats.tail_tokens }}</span>
+            </div>
+          </details>
         </template>
       </div>
     </div>

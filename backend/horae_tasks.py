@@ -554,7 +554,8 @@ async def run_auto_summary(session_id: int, *, max_batches: int = 1, force: bool
                            job: HoraeJob | None = None) -> dict:
     """
     Порт checkAutoSummary. Ответы ИИ старше последних summary_keep_recent,
-    не покрытые свёртками, копятся в «буфер»; когда их (или их токенов)
+    не покрытые свёртками и мастер-снимком (после его отметки — там историю
+    уже несёт он), копятся в «буфер»; когда их (или их токенов)
     больше порога — самый старый пакет сворачивается моделью в свёртку
     (📋 в хронологии), а покрытые сообщения окно может выбросить из промпта
     (summary_hides). Перед этим — свёртка свёрток, если их набралось.
@@ -583,6 +584,10 @@ async def run_auto_summary(session_id: int, *, max_batches: int = 1, force: bool
                     return result
                 cutoff = ai[-keep]
                 summaries = data.get("summaries") or []
+                # Историю до отметки мастер-снимка уже несёт он (см.
+                # horae_engine.compression_engine): свёртки начинают после неё,
+                # иначе переход на них пересказывал бы — за деньги — весь чат заново.
+                floor = await he.snapshot_pointer(db, session_id)
                 plan = resummary_plan(summaries, cutoff, int(settings.get("resummary_threshold") or 0))
                 if plan and rounds < RESUMMARY_ROUNDS:
                     rounds += 1
@@ -593,7 +598,7 @@ async def run_auto_summary(session_id: int, *, max_batches: int = 1, force: bool
                 # Буфер: ответы ИИ перед зоной последних, не покрытые ничем
                 # (ни активной, ни развёрнутой свёрткой), — от самого нового назад.
                 region = []
-                for mid in reversed([m for m in ai if m < cutoff]):
+                for mid in reversed([m for m in ai if floor < m < cutoff]):
                     if any(s.get("kind") != "carry" and he._range(s)[0] <= mid <= he._range(s)[1]
                            for s in summaries):
                         break
@@ -602,8 +607,8 @@ async def run_auto_summary(session_id: int, *, max_batches: int = 1, force: bool
                 if not region:
                     result["reason"] = result["reason"] or "сворачивать нечего"
                     return result
-                prev_end = max([he._range(s)[1] for s in summaries
-                                if s.get("kind") != "carry" and he._range(s)[1] < region[0]] or [0])
+                prev_end = max([floor] + [he._range(s)[1] for s in summaries
+                                          if s.get("kind") != "carry" and he._range(s)[1] < region[0]])
                 lo = next((mid for mid, *_ in entries if mid > prev_end), region[0])
                 _, buffer_tokens = await _messages_text(db, session_id, lo, cutoff - 1, metas)
                 mode = settings.get("summary_buffer_mode")

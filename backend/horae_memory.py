@@ -1277,16 +1277,12 @@ def session_user_time(session) -> str:
 # DB-обёртка: тянет персонажа, записи Horae и историю из БД, затем зовёт
 # чистую assemble_context(). Используется и веб-сервером, и Telegram-ботом.
 # ----------------------------------------------------------------------------
-async def _load_horae_records(session_db, session_id: int, character_id=None, *,
-                              skip_chat_summary: bool = False) -> list[HoraeRecord]:
+async def _load_horae_records(session_db, session_id: int, character_id=None) -> list[HoraeRecord]:
     """
     Активные записи памяти:
       * привязанные к этой сессии (session_id);
       * лорбук персонажа (character_id) — из карточки SillyTavern;
       * глобальные (session_id и character_id оба NULL).
-
-    skip_chat_summary — без записей категории summary этого чата (мастер-снимок):
-    когда историю сжимают свёртки Хроники, снимок в ход не идёт.
     """
     from sqlalchemy import and_, or_, select
 
@@ -1304,8 +1300,6 @@ async def _load_horae_records(session_db, session_id: int, character_id=None, *,
         or_(*conds),
     )
     rows = (await session_db.execute(q)).scalars().all()
-    if skip_chat_summary:
-        rows = [r for r in rows if not (r.session_id == session_id and r.category == "summary")]
     return [
         HoraeRecord(
             category=r.category,
@@ -1450,11 +1444,8 @@ async def build_context_from_db(
     history, history_ids, recalled, squeeze = await _long_memory(
         session_db, session, history, history_ids, user_message, report
     )
-    # Сжимают свёртки Хроники — мастер-снимок чата в ход не идёт: та же
-    # история второй раз, да ещё и устаревшая (он не обновляется).
     records = await _load_horae_records(
-        session_db, session.id, getattr(character, "id", None),
-        skip_chat_summary=squeeze["engine"] == "horae",
+        session_db, session.id, getattr(character, "id", None)
     )
     horae_parts = await _horae_parts(
         session_db, session, character, until=horae_until, ooc=ooc, tags=horae_tags,
@@ -1524,8 +1515,8 @@ async def _horae_parts(session_db, session, character, *, until, ooc, tags, user
 
 async def _compression(session_db, session) -> dict | None:
     """
-    Кто сжимает историю этого чата (horae_engine.chat_compression) и свёртки
-    Хроники. Сбой — None: ход идёт как с мастер-снимком, как было до Хроники.
+    Кто обновляет сжатие этого чата (horae_engine.chat_compression) и свёртки
+    Хроники. Сбой — None: ход идёт только со снимком, как было до Хроники.
     """
     try:
         from backend import horae_engine
@@ -1538,18 +1529,19 @@ async def _compression(session_db, session) -> dict | None:
         return None
 
 
-def _horae_covered(history_ids, info: dict) -> int:
+def _horae_covered(history_ids, info: dict, snapshot: int) -> int:
     """
-    Указатель «учтено до» по свёрткам Хроники (настройка summary_hides):
-    сообщение под активной свёрткой окно может выбросить так же, как покрытое
-    мастер-снимком, — это «/hide» плагина. Только когда сжимают свёртки.
+    Указатель «учтено до»: всё до отметки мастер-снимка плюс то, что подряд
+    за ней покрыто активными свёртками Хроники (настройка summary_hides —
+    «/hide» плагина). Снимок и свёртки делят историю по времени, поэтому окно
+    выбрасывает покрытое хоть кем-то из них.
     """
     from backend import horae_engine
 
     if not (info.get("summaries") and info.get("summary_hides")):
-        return 0
+        return snapshot
     entries = [(i, None, None, False) for i in history_ids or [] if i]
-    return horae_engine.covered_pointer(entries, info["summaries"], 0)
+    return horae_engine.covered_pointer(entries, info["summaries"], snapshot)
 
 
 async def _long_memory(session_db, session, history, history_ids, user_message, report):
@@ -1559,8 +1551,8 @@ async def _long_memory(session_db, session, history, history_ids, user_message, 
     Возвращает (история, id её сообщений, факты-кандидаты, сжатие). Кандидаты —
     все факты выше порога; какие из них в контексте лишние, решает
     assemble_context после обрезки по бюджету. Сжатие — {"engine", "snapshot_upto"}:
-    кто в чате сжимает историю (horae_engine.compression_engine) и до какого
-    сообщения её несёт мастер-снимок этого хода (0 — снимка в ходе нет).
+    кто в чате обновляет сжатие (horae_engine.compression_engine) и до какого
+    сообщения историю несёт мастер-снимок этого хода (0 — снимка в ходе нет).
     Любой сбой здесь не мешает ходу — тогда история идёт целиком, а фактов нет,
     то есть поведение как до памяти.
     Импорты тоже внутри try: сломанный или недостающий модуль памяти раньше
@@ -1610,16 +1602,14 @@ async def _long_memory(session_db, session, history, history_ids, user_message, 
         # покрытии (см. horae_recall.SUMMARY_FORMAT). Легаси-метку «last:N» из
         # keywords здесь тоже намеренно НЕ читаем — по той же причине.
         covered = horae_recall.trusted_pointer(entry.meta if entry is not None else None)
-        # Историю сжимает ровно один механизм. Свёртки Хроники — снимок в ход
-        # не идёт (build_context_from_db его убирает), окно выбрасывает только
-        # покрытое свёртками. Иначе — наоборот: окно по снимку, а свёртки
-        # Хроники (ручные) лишь заменяют события в ленте.
+        # Снимок несёт историю до своей отметки, свёртки Хроники — после неё
+        # (кто из них обновляется дальше, решает compression_engine). Окно
+        # выбрасывает покрытое хоть кем-то, лента Хроники не повторяет снимок.
+        squeeze["snapshot_upto"] = covered
         info = await _compression(session_db, session)
-        if info is not None and info["engine"] == "horae":
-            squeeze["engine"] = "horae"
-            covered = _horae_covered(history_ids, info)
-        else:
-            squeeze.update(engine=info["engine"] if info else "snapshot", snapshot_upto=covered)
+        if info is not None:
+            squeeze["engine"] = info["engine"]
+            covered = _horae_covered(history_ids, info, covered)
 
         start = horae_recall.window_start(history_ids, covered, window)
 
@@ -1646,7 +1636,7 @@ async def _long_memory(session_db, session, history, history_ids, user_message, 
             )
         memo.update(
             window=window, dropped=start, covered_upto=covered, facts_enabled=use_facts,
-            engine=squeeze["engine"],
+            engine=squeeze["engine"], snapshot_upto=squeeze["snapshot_upto"],
             facts_mode=stats.get("mode", "lexical") if use_facts else "off",
             facts_candidates=stats.get("candidates", 0),
             facts_backfilling=bool(stats.get("backfilling")),
