@@ -143,11 +143,20 @@ createApp({
       editingText: "",
 
       // --- Правая панель ---
-      drawerTab: null,         // generation | connection | character | memory | horae | persona | null (по умолчанию СКРЫТ)
-      // Счётчик для вкладки «Хроника» (frontend/horae.js): растёт, когда ход
-      // закончился или правили данные Horae под сообщением, — открытая панель
-      // по нему перечитывает состояние. Сама панель про ход ничего не знает.
+      drawerTab: null,         // generation | connection | character | memory | persona | null (по умолчанию СКРЫТ)
+      // Счётчик для вкладки «Память» (панель Хроники, frontend/horae.js): растёт,
+      // когда ход закончился или правили данные Horae под сообщением, — открытая
+      // панель по нему перечитывает состояние. Сама панель про ход ничего не знает.
       horaeTick: 0,
+      // Вкладка «Память» — панель Хроники из horae.js; свои разделы (сжатие
+      // истории, лорбук) app.js рисует в её слотах. memoryTabReq — переход на
+      // раздел извне ({ tab, n }, см. openMemory).
+      memoryExtraTabs: [["compress", "Сжатие истории"], ["lore", "Лорбук"]],
+      memoryTabReq: null,
+      // Глобальный summary_enabled Хроники (GET /horae/settings): вместе с
+      // autoSummary он задаёт, чем по умолчанию сжимается история (memoryEngine).
+      // null — ещё не загружен.
+      horaeGlobalSummary: null,
       // Грубый указатель (палец). Раскрытие действий строки по наведению на
       // таком устройстве не срабатывает НИКОГДА, поэтому там нужна не та же
       // разметка с другим оформлением, а другое раскрытие: одна кнопка вместо
@@ -198,10 +207,10 @@ createApp({
       // --- Редактор персонажа (вкладка Character) ---
       charEdit: null,
 
-      // --- Память Horae (вкладка Memory) ---
+      // --- Память: лорбук и сжатие истории (вкладка Memory) ---
       horae: [],
-      // Авто-сводка сюжета: каждые ~12 сообщений ИИ обновляет запись
-      // «Сводка сюжета (авто)» — старые события не выпадают из памяти.
+      // Мастер-снимок: каждые summaryEvery сообщений ИИ дописывает в него то,
+      // что вышло из окна. Ложь — снимок не обновляется (см. memoryEngine).
       autoSummary: true,
       summaryEvery: 10,         // каждые сколько сообщений обновлять сводку (это платный запрос)
       // Активное окно: столько последних сообщений идут в модель как есть
@@ -819,6 +828,33 @@ createApp({
     // Сброс памяти ОТКРЫТОГО чата ещё ждёт ответа сервера.
     memPurging() {
       return this.memPurgingId != null && this.memPurgingId === this.sessionId;
+    },
+    // Чем по умолчанию сжимается старая история (выбор в «Память» → «Сжатие
+    // истории»): свёртки Хроники, мастер-снимок или ничто. Работает ровно один
+    // механизм — сервер решает это для каждого чата (horae_engine.compression_engine).
+    memoryEngine() {
+      if (this.horaeGlobalSummary) return "horae";
+      return this.autoSummary ? "snapshot" : "off";
+    },
+    // Выбор меняет глобальные настройки Хроники, а их пишет только
+    // администратор: не-администратору свёртки Хроники недоступны, а если они
+    // уже включены — сменить выбор он не может вовсе.
+    memoryEngineLocked() { return !this.isAdmin && !!this.horaeGlobalSummary; },
+    // Кто сжимает историю ОТКРЫТОГО чата (статус памяти → compression) или null.
+    chatEngine() {
+      const c = this.memStatus && this.memStatus.compression;
+      return c ? c.engine : null;
+    },
+    // Чат живёт не по общему выбору (свои настройки Хроники у чата или
+    // персонажа, Хроника в чате выключена) — говорим прямо, иначе выбор выше
+    // выглядел бы несработавшим.
+    chatEngineNote() {
+      const c = this.memStatus && this.memStatus.compression;
+      if (!c || this.horaeGlobalSummary === null || c.engine === this.memoryEngine) return "";
+      const name = { snapshot: "мастер-снимок", horae: "свёртки Хроники", off: "ничто — сжатие выключено" }[c.engine] || c.engine;
+      const why = c.summary_layer === "chat" ? " — так выбрано в настройках Хроники этого чата"
+        : c.summary_layer === "character" ? " — так выбрано в профиле Хроники персонажа" : "";
+      return "В этом чате историю сжимает " + name + why + ".";
     },
     // Предупреждения памяти под строкой статуса: снимка (snapshot.warnings —
     // «превышает бюджет», «лимит вывода модели меньше бюджета») и
@@ -3559,8 +3595,8 @@ createApp({
       let msg = (data.native ? "Чат AiChat импортирован. " : "") + "Сообщений: " + data.count + ".";
       if (data.native) {
         if (data.horae_saved) {
-          msg += "\n🧠 Память Horae восстановлена (записей: " + data.horae_saved + ").";
-          this.drawerTab = "memory";
+          msg += "\n🧠 Записи памяти восстановлены (записей: " + data.horae_saved + ") — «Память» → «Лорбук».";
+          this.openMemory("lore");
         }
       } else if (data.horae_structured > 0) {
         // Разобранные данные Horae (время, место, персонажи…) легли в сами
@@ -3568,11 +3604,11 @@ createApp({
         // без этой ветки тост ниже соврал бы «данных Horae не найдено».
         const n = data.horae_structured;
         msg += "\n🕰 Horae: перенесены данные " + n + " " + this.plural(n, "ответа", "ответов", "ответов")
-          + " (время, место, персонажи, предметы, события) — вкладка «Хроника».";
-        this.drawerTab = "horae";
+          + " (время, место, персонажи, предметы, события) — вкладка «Память».";
+        this.openMemory("state");
       } else if (data.horae_saved) {
-        msg += "\n🧠 Память Horae подхвачена: снимок состояния сохранён как always_on-запись этого чата (вкладка «Память Horae»).";
-        this.drawerTab = "memory"; // сразу показываем, что сохранилось
+        msg += "\n🧠 Память Horae подхвачена: снимок состояния сохранён как always_on-запись этого чата («Память» → «Лорбук»).";
+        this.openMemory("lore"); // сразу показываем, что сохранилось
       } else {
         msg += "\nДанных Horae в файле не найдено — снимок состояния не сохранён.";
       }
@@ -3713,6 +3749,8 @@ createApp({
         // читает из «ui», и пересчёт до сохранения показал бы старые числа.
         const refreshCtx = this._ctxAfterSave;
         this._ctxAfterSave = false;
+        const refreshMem = this._memAfterSave;
+        this._memAfterSave = false;
         this.api("/settings/ui", {
           method: "PUT",
           body: JSON.stringify({
@@ -3735,7 +3773,10 @@ createApp({
             ctx_budget_v: this._ctxBudgetV,
             jailbreak: this.jailbreak,
           }),
-        }).then(() => { if (refreshCtx) this.loadCtxStats(); }).catch(() => {});
+        }).then(() => {
+          if (refreshCtx) this.loadCtxStats();
+          if (refreshMem) this.loadMemStatus();
+        }).catch(() => {});
       }, 600);
     },
     // Поле «Размер пакета», «Пауза» или «Бюджет снимка» изменил человек: с
@@ -3814,7 +3855,7 @@ createApp({
       }
     },
 
-    // ---------- Память Horae ----------
+    // ---------- Лорбук (записи памяти, таблица horae_entries) ----------
     blankHorae() {
       return { id: null, category: "lore", title: "", content: "", keywords: "", always_on: false, enabled: true, priority: 0, scope: "global" };
     },
@@ -3844,6 +3885,53 @@ createApp({
       await this.loadHorae();
     },
     async deleteHorae(h) { await this.api("/horae/" + h.id, { method: "DELETE" }); await this.loadHorae(); },
+
+    // ---------- Вкладка «Память»: раздел и чем сжимать историю ----------
+    // Открыть «Память» на разделе: импорт чата показывает, что легло в Хронику
+    // («state») или в лорбук («lore»). n растёт — тот же раздел дважды тоже.
+    openMemory(sub) {
+      this.drawerTab = "memory";
+      this.memoryTabReq = { tab: sub, n: ((this.memoryTabReq && this.memoryTabReq.n) || 0) + 1 };
+    },
+    async loadHoraeGlobal() {
+      try {
+        const r = await this.api("/horae/settings");
+        this.horaeGlobalSummary = !!(r && r.effective && r.effective.summary_enabled);
+      } catch (e) {
+        // Старый сервер без Хроники: выбор сводится к снимку и «не сжимать».
+        this.horaeGlobalSummary = false;
+      }
+    },
+    // Выбор по умолчанию для всех чатов (memoryEngine). Свёртки Хроники —
+    // summary_enabled в глобальном слое её настроек (пишет только
+    // администратор); снимок при этом остаётся включённым как запасной — для
+    // чатов, где Хроника выключена. «Не сжимать» — снимок не обновляется.
+    async setMemoryEngine(engine) {
+      if (engine === this.memoryEngine) return;
+      const wantHorae = engine === "horae";
+      if (wantHorae !== !!this.horaeGlobalSummary) {
+        try {
+          const r = await this.api("/horae/settings", {
+            method: "PUT", body: JSON.stringify({ summary_enabled: wantHorae ? true : null }),
+          });
+          this.horaeGlobalSummary = !!(r && r.effective && r.effective.summary_enabled);
+        } catch (e) {
+          this.showToast("⚠ " + e.message);
+          return;
+        }
+      }
+      const auto = engine !== "off";
+      if (auto !== this.autoSummary) {
+        this.autoSummary = auto;
+        // Статус чата («кто сжимает») сервер считает по «ui» — перечитываем
+        // после сохранения, а не до него.
+        this._memAfterSave = true;
+        this.saveUiPrefs();
+      } else {
+        this.loadMemStatus();
+      }
+      this.horaeTick += 1;
+    },
 
     // ---------- Мастер-память чата (иерархическая пакетная) ----------
     // Статус открытого чата: снимок, буфер пересборки, бэклог, задание.
@@ -4705,9 +4793,15 @@ createApp({
     // токенов — тоже: отчёт снят после прошлого хода, а с тех пор могли
     // смениться окно, бюджет или снимок.
     drawerTab(tab) {
+      // «Хроники» отдельной вкладкой больше нет — она внутри «Памяти».
+      if (tab === "horae") {
+        this.openMemory("state");
+        return;
+      }
       if (tab === "memory") {
         this.loadMemStatus();
         this.loadCtxStats();
+        this.loadHoraeGlobal();
       }
     },
     // Ввод в палитре: поиск по репликам идёт на сервер с дебаунсом, чтобы не
@@ -5682,7 +5776,7 @@ createApp({
     <div v-if="drawerTab" class="drawer-backdrop" @click="drawerTab=null"></div>
     <!-- Хронике нужна ширина: таблицы, карточки персонажей и редактор
          правил в 380px не помещаются. На узком экране ящик и так во всю ширину. -->
-    <div class="drawer" :class="{ 'drawer-wide': drawerTab === 'horae' }" v-if="drawerTab" role="dialog" aria-modal="true" aria-label="Настройки">
+    <div class="drawer" :class="{ 'drawer-wide': drawerTab === 'memory' }" v-if="drawerTab" role="dialog" aria-modal="true" aria-label="Настройки">
       <!-- Полоса вкладок объявлена вкладками. Ролей tab/tablist в файле не было
            вообще: скринридер читал пять обычных кнопок и не сообщал ни какая из
            них открыта, ни сколько их всего — состояние несла только заливка. -->
@@ -5699,9 +5793,6 @@ createApp({
         <button id="drawer-tab-memory" role="tab" aria-controls="drawer-panel-memory"
                 :aria-selected="drawerTab==='memory' ? 'true' : 'false'"
                 :class="['tab-btn', drawerTab==='memory'?'active':'']" @click="drawerTab='memory'">Память</button>
-        <button id="drawer-tab-horae" role="tab" aria-controls="drawer-panel-horae"
-                :aria-selected="drawerTab==='horae' ? 'true' : 'false'"
-                :class="['tab-btn', drawerTab==='horae'?'active':'']" @click="drawerTab='horae'">Хроника</button>
         <button id="drawer-tab-persona" role="tab" aria-controls="drawer-panel-persona"
                 :aria-selected="drawerTab==='persona' ? 'true' : 'false'"
                 :class="['tab-btn', drawerTab==='persona'?'active':'']" @click="drawerTab='persona'">Персона</button>
@@ -5985,205 +6076,233 @@ createApp({
           <p v-else class="muted">Выберите персонажа слева.</p>
         </div>
 
-        <!-- ВКЛАДКА: Память Horae -->
+        <!-- ВКЛАДКА: Память — панель Хроники (frontend/horae.js) и два раздела
+             app.js в её слотах: «Сжатие истории» (чем сжимать, окно,
+             мастер-снимок) и «Лорбук» (записи памяти). Персонаж — только у
+             личного чата: у группы и чужого чата профиля персонажа нет, и
+             уровень «Персонаж» в настройках Хроники выключен. -->
         <div v-if="drawerTab==='memory'" id="drawer-panel-memory" role="tabpanel" aria-labelledby="drawer-tab-memory">
-          <h3>Память Horae 🧠</h3>
-          <!-- Мастер-память ОТКРЫТОГО чата: статус снимка, ручная пересборка с
-               прогрессом, экспорт и сброс, параметры пакетов и монитор токенов.
-               Эндпоинтов может не быть (старый сервер) — тогда memStatus = null,
-               блок показывает пустое состояние, а кнопки заданий выключены. -->
-          <section v-if="sessionId" ref="memSection" class="card mem-master" aria-labelledby="mem-master-h">
-            <!-- Пока сброс ждёт сервера (memPurging), выключены ВСЕ кнопки блока:
-                 запуск, остановка, экспорт и перечитка статуса наперегонки со
-                 сбросом показали бы память, которой через миг не станет.
-                 tabindex -1 у заголовка — чтобы было куда вернуть фокус, когда
-                 кнопка под ним выключилась или исчезла (_memFocus). -->
-            <div class="row-between"><h4 id="mem-master-h" ref="memHeading" tabindex="-1">🧠 Мастер-память этого чата</h4>
-              <button class="btn-icon" :disabled="memPurging" @click="loadMemStatus" aria-label="Обновить статус памяти">↻</button></div>
-            <!-- «Старая схема» — только у непустого снимка: пакет из одних пустых
-                 сообщений даёт запись с пустым текстом, is_structured("") на
-                 сервере ложно, но пересобирать там нечего. Пробел между метками
-                 Vue при сборке шаблона убирает — промежуток даёт CSS (.mem-status). -->
-            <p class="muted mem-status" v-if="memStatus && memStatus.snapshot.exists">
-              Снимок {{ fmtNum(memStatus.snapshot.tokens) }} / {{ fmtNum(memStatus.snapshot.budget) }} ток.
-              · учтено до #{{ memStatus.snapshot.covered_upto }}
-              · ждут сжатия {{ memStatus.backlog.pending }}
-              <span v-if="!memStatus.snapshot.structured && memStatus.snapshot.tokens" class="tag">старая схема — пересоберите</span>
-              <span v-if="memStatus.snapshot.over_budget" class="tag">больше бюджета</span></p>
-            <p class="muted" v-else-if="memStatus">Снимка нет: окно пропускает историю целиком.
-              Ждут сжатия {{ memStatus.backlog.pending }}.</p>
-            <p class="muted" v-else>{{ memBusy ? 'Загружаю статус памяти…' : 'Статус памяти недоступен.' }}</p>
-            <!-- Сбой ежеходного обновления и предупреждения снимка/задания.
-                 Сбой — цветом предупреждения: память стоит, пока его не
-                 исправят; предупреждения — серым, как подсказки полей. -->
-            <p v-if="memLastError" class="muted mem-failed">{{ memLastError }}</p>
-            <ul v-if="memWarnings.length" class="mem-warnings">
-              <li v-for="(w, i) in memWarnings" :key="'mw' + i" class="field-hint">{{ w }}</li>
-            </ul>
-            <!-- Буфер пересборки без задания. manual — ручную «Пересобрать»
-                 прервали (остановка, ошибка, перезапуск сервера): продолжаем с
-                 места. Не manual — старую сводку (до 2.4.0) сервер переводит в
-                 новую схему сам, ежеходными проходами: «прервана» тут неправда.
-                 И «Продолжить» тут не к месту: буфера может ещё не быть
-                 (указатель 0), и кнопка молча начала бы пересборку всего чата.
-                 Доделать сразу умеет «Догнать» — сколько это, видно по «ждут
-                 сжатия» в строке выше. -->
-            <p class="muted" v-if="memStatus && memStatus.staging && !memJobActive">
-              <template v-if="memStatus.staging.manual">Пересборка прервана на #{{ memStatus.staging.last_message_id }}.
-                <button class="btn-primary" :disabled="memBusy || memPurging" @click="startMemJob('rebuild', true)">Продолжить</button></template>
-              <template v-else>Старая сводка переводится в новую схему<template v-if="memStatus.staging.last_message_id">: готово до #{{ memStatus.staging.last_message_id }}</template>.<template v-if="memStatus.backlog.pending"> «Догнать» доделает это сразу.</template></template></p>
-            <!-- Прогресс не только цветом: рядом с полосой строка сервера с
-                 числами «Обработано 140/800 | Сжато до 4 200 токенов» и время
-                 начала, под ней — номер пакета и фаза (спека §9). Живой регион
-                 стоит в DOM всегда, а без задания пуст: регион, вставленный уже
-                 с текстом, многие скринридеры пропускают, и первое «В очереди»
-                 терялось. «Остановить» — вне региона, иначе подпись кнопки
-                 зачитывалась бы с каждой строкой прогресса. -->
-            <div class="mem-progress" :class="{ 'mem-idle': !memJobActive }">
-              <span v-if="memJobActive" class="upload-track"><span class="upload-fill"
-                :style="{ width: (memStatus.job.total ? Math.round(memStatus.job.processed / memStatus.job.total * 100) : 0) + '%' }"></span></span>
-              <div role="status" aria-live="polite"><template v-if="memJobActive">
-                <div class="muted">{{ memJobLine }}</div>
-                <div class="muted" v-if="memJobPhase">{{ memJobPhase }}</div>
-                <!-- Опрос третий раз подряд не дозвался сервера: полоса стоит не
-                     потому, что пакет долгий, — говорим об этом прямо. -->
-                <div class="muted mem-offline" v-if="memPollFails >= 3">Нет связи с сервером, повторяю…</div>
-              </template></div>
-              <button v-if="memJobActive" ref="memStopBtn" class="btn-danger" :disabled="memPurging" @click="cancelMemJob">Остановить</button>
-            </div>
-            <p v-if="memStatus && memStatus.job && memStatus.job.status === 'error'" class="danger-text">⚠ {{ memStatus.job.error }}</p>
-            <div class="row mem-actions">
-              <button class="btn-primary" :disabled="memBusy || memJobActive || !memStatus || memPurging" @click="startMemJob('rebuild')">Пересобрать с нуля</button>
-              <button :disabled="memBusy || memJobActive || !memStatus || !memStatus.backlog.pending || memPurging" @click="startMemJob('catchup')">Догнать</button>
-              <button :disabled="!memStatus || !memStatus.snapshot.exists || memPurging" @click="exportMemory">Экспорт .md</button>
-              <button class="btn-danger" :disabled="memBusy || memJobActive || !memStatus || memPurging" @click="purgeMemory">{{ memPurging ? 'Сбрасываю…' : 'Сбросить память' }}</button>
-            </div>
-            <!-- Поля пишут значение по change, а не по вводу, через numFromInput:
-                 стёртое поле или «2,5» не должны улететь на сервер (422).
-                 setMemPref помечает ключ выбранным человеком: пока поле не
-                 трогали, оно показывает умолчание сервера и в «ui» не пишется. -->
-            <label>Размер пакета
-              <input type="number" min="1" max="200" step="1" inputmode="numeric"
-                     :value="memoryBatch" aria-describedby="mem-batch-hint"
-                     @change="setMemPref('memory_batch', numFromInput($event, 200, memoryBatch, 1))" />
-              <span id="mem-batch-hint" class="field-hint">Сообщений в одном запросе к модели сводки, 1–200. Больше — меньше запросов, но каждый тяжелее.</span></label>
-            <label>Пауза между запросами, мс
-              <input type="number" min="0" max="60000" step="100" inputmode="numeric"
-                     :value="memoryDelayMs" aria-describedby="mem-delay-hint"
-                     @change="setMemPref('memory_delay_ms', numFromInput($event, 60000, memoryDelayMs))" />
-              <span id="mem-delay-hint" class="field-hint">0–60000. Пауза бережёт лимит запросов провайдера при длинной пересборке.</span></label>
-            <!-- Потолок поля 40 000, хотя сервер примет и 200 000: снимок модель
-                 переписывает ЦЕЛИКОМ в одном ответе, и бюджет выше лимита вывода
-                 модели памяти обрывал бы каждое обновление. Какой лимит у
-                 выбранной модели, сервер знает сам (max_snapshot_tokens). -->
-            <label>Бюджет снимка, токенов
-              <input type="number" min="1000" max="40000" step="1000" inputmode="numeric"
-                     :value="memorySnapshotTokens" aria-describedby="mem-snap-hint mem-snap-cap"
-                     @change="setMemPref('memory_snapshot_tokens', numFromInput($event, 40000, memorySnapshotTokens, 1000))" />
-              <span id="mem-snap-hint" class="field-hint">1000–40000, не больше лимита вывода модели памяти. Столько снимок занимает в каждом ходе: больше — подробнее память, но дороже ход.</span>
-              <span v-if="memSnapCap" id="mem-snap-cap" class="field-hint">{{ memSnapCap }}</span></label>
-            <!-- Монитор токенов: из чего складывается ход — системный промпт с
-                 якорями, мастер-снимок с фактами и дословное окно. Числа стоят
-                 в подписях, полоса лишь повторяет их цветом. -->
-            <template v-if="memTiers">
-              <div class="ins-bar" aria-hidden="true">
-                <i v-for="r in memTierRows" :key="'mt' + r.cls" :class="r.cls" :style="{ width: r.pct + '%' }"></i>
-              </div>
-              <ul class="mem-tiers">
-                <li v-for="r in memTierRows" :key="'ml' + r.cls">
-                  <span class="ins-dot" :class="r.cls" aria-hidden="true"></span>
-                  <span>{{ r.label }} — {{ fmtNum(r.tokens) }}</span></li>
-              </ul>
-              <p class="muted mem-tier-note">Итого {{ fmtNum(memTiers.total) }} ток.<br>
-                из бюджета хода {{ fmtNum(memTiers.budget) }} ({{ Math.round(sharePct(memTiers.total, memTiers.budget)) }}%)<br>
-                из лимита модели {{ fmtNum(memTiers.model_limit || 1000000) }} ({{ Math.round(sharePct(memTiers.total, memTiers.model_limit || 1000000)) }}%)</p>
-            </template>
-            <!-- Блок виден только при открытом чате, поэтому «Откройте чат» тут
-                 неправда: отчёт ещё считается или сервер его не собрал (группа
-                 без участников, чат без персонажа). -->
-            <p v-else-if="memTiersGroup" class="muted">В групповых чатах монитор уровней не считается: память собирается иначе, окна нет.</p>
-            <p v-else-if="ctxBusy" class="muted">Считаю бюджет хода…</p>
-            <p v-else-if="!ctxStats" class="muted">Бюджет хода недоступен: контекст этого чата не собирается.</p>
-          </section>
-          <label class="check"><input type="checkbox" v-model="autoSummary" @change="saveUiPrefs" />
-            📜 Авто-сводка сюжета: ИИ обновляет запись «Память чата (авто)» — события, выпавшие из окна контекста, остаются в памяти модели.</label>
-          <label v-if="autoSummary">Как часто обновлять сводку
-            <select v-model.number="summaryEvery" @change="saveUiPrefs">
-              <option :value="6">каждые 6 сообщений (точнее, дороже)</option>
-              <option :value="10">каждые 10 сообщений (по умолчанию)</option>
-              <option :value="20">каждые 20 сообщений (экономно)</option>
-            </select>
-          </label>
-          <p class="muted" style="margin:2px 0 10px">Каждое обновление сводки — <b>отдельный платный запрос</b> к модели, помимо самого ответа в чате. Реже = дешевле, но память чуть грубее. Расход видно в 📊 (строка <code>summary</code>).</p>
-          <label v-if="autoSummary">Активное окно (сколько последних сообщений модель видит дословно) <span class="range-val">{{ memoryWindow ? memoryWindow + ' сообщ.' : 'вся история' }}</span>
-            <input type="number" min="0" max="1000" step="1" inputmode="numeric"
-                   :value="memoryWindow"
-                   @change="setMemoryWindow(numFromInput($event, 1000, memoryWindow))" /></label>
-          <div v-if="autoSummary" class="row" style="gap:6px; margin:-4px 0 6px; flex-wrap:wrap">
-            <button v-for="p in [[20,'20'],[50,'50'],[80,'80'],[150,'150'],[0,'вся история']]" :key="'win' + p[0]"
-                    :class="memoryWindow === p[0] ? 'btn-primary' : ''"
-                    :aria-pressed="memoryWindow === p[0] ? 'true' : 'false'"
-                    @click="setMemoryWindow(p[0])">{{ p[1] }}</button>
-          </div>
-          <p v-if="autoSummary" class="muted" style="margin:2px 0 10px">Всё старше окна модель получает сжатым: хроникой и состоянием чата из сводки. В очень длинных чатах так ответы точнее, а ход дешевле. Из окна уходит только то, что сводка уже учла: пока она догоняет длинный чат, модель видит историю целиком.</p>
-          <label v-if="autoSummary" class="check"><input type="checkbox" v-model="horaeFacts" @change="saveUiPrefs" />
-            🧩 Факты: вместе со сводкой ИИ выписывает из переписки отдельные факты (имена, обещания, предметы), а на каждом ходу в контекст попадают только те, что связаны с вашей репликой.</label>
-          <div class="hr"></div>
-          <p class="muted">Долговременная память ролей. <b>always_on</b> — подмешивается в КАЖДЫЙ запрос (состояние, инвентарь, факты); иначе срабатывает по ключевым словам, как World Info. Области:
-            <span class="scope-tag global">🌐 глоб.</span> во всех чатах,
-            <span class="scope-tag session">💬 чат</span> только в этом,
-            <span class="scope-tag character">🎭 перс.</span> из карточки персонажа.
-            Записи сохраняются автоматически в БД. При импорте чата из SillyTavern сюда попадает снимок состояния (💬, always_on).</p>
-          <div class="card">
-            <input v-model="horaeEdit.title" placeholder="Заголовок" style="margin-bottom:6px" />
-            <textarea v-model="horaeEdit.content" rows="3" placeholder="Содержимое" style="margin-bottom:6px"></textarea>
-            <input v-model="horaeEdit.keywords" placeholder="ключевые слова через запятую" style="margin-bottom:2px" />
-            <p class="muted" style="margin:0 0 6px; font-size:12px">Срабатывают по слову целиком и его склонениям: <code>меч</code> поймает «мечи», «мечом», «мечами», а <code>король</code> — «короля», «королём». На другие слова с тем же началом (<code>кот</code> → «который», «котёл») <b>не</b> срабатывает. Нужно шире — поставьте звёздочку: <code>замк*</code> поймает «замка», «замком», «замковый». Фраза с пробелом (<code>тёмный лес</code>) ищется как есть.</p>
-            <div class="row" style="margin-bottom:6px">
-              <!-- Оба выпадающих списка стояли без подписи: ни label, ни
-                   aria-label — вслух они читались как «список, lore» и «список,
-                   глобально», без единого слова о том, что именно выбирают. -->
-              <select v-model="horaeEdit.category" aria-label="Категория записи памяти"><option>lore</option><option>state</option><option>inventory</option><option>character</option><option>hidden</option></select>
-              <input type="number" v-model.number="horaeEdit.priority" placeholder="приоритет" style="width:90px" />
-            </div>
-            <label class="check"><input type="checkbox" v-model="horaeEdit.always_on" /> always_on</label>
-            <label class="check"><input type="checkbox" v-model="horaeEdit.enabled" /> включено</label>
-            <div class="row" v-if="!horaeEdit.id">
-              <select v-model="horaeEdit.scope" aria-label="Область видимости записи"><option value="global">глобально</option><option value="session">только этот чат</option></select>
-            </div>
-            <div class="row">
-              <button class="btn-primary" @click="saveHorae">{{ horaeEdit.id ? 'Обновить' : 'Добавить' }}</button>
-              <button v-if="horaeEdit.id" @click="horaeEdit = blankHorae()">Отмена</button>
-            </div>
-          </div>
-          <div class="card" v-for="h in horae" :key="h.id">
-            <div class="row-between">
-              <b>{{ h.title || h.category }}</b>
-              <span style="display:inline-flex; align-items:center; gap:4px">
-                <span class="scope-tag" :class="h.session_id ? 'session' : (h.character_id ? 'character' : 'global')">{{ h.session_id ? '💬 чат' : (h.character_id ? '🎭 перс.' : '🌐 глоб.') }}</span>
-                <span class="tag">{{ h.always_on ? 'always' : ((h.keywords || []).join(',') || h.category) }}</span>
-                <button class="btn-icon" @click="editHorae(h)" :aria-label="'Изменить запись памяти: ' + (h.title || h.category)">✎</button>
-                <button class="btn-danger" @click="deleteHorae(h)" :aria-label="'Удалить запись памяти: ' + (h.title || h.category)">🗑</button>
-              </span>
-            </div>
-            <!-- Мастер-снимок (категория summary) — до 12 000 токенов с разделами
-                 и списками: одним абзацем он растягивал карточку на десяток
-                 экранов телефона под настройками, а структура пропадала.
-                 Свёрнут, переводы строк сохранены; полный вид — «Экспорт .md». -->
-            <details v-if="h.category === 'summary'" class="mem-snapshot">
-              <summary>Показать снимок ({{ textLines(h.content) }} {{ plural(textLines(h.content), 'строка', 'строки', 'строк') }})</summary>
-              <div class="muted mem-snapshot-text">{{ h.content }}</div>
-            </details>
-            <div v-else class="muted">{{ h.content }}</div>
-          </div>
-        </div>
-
-        <!-- ВКЛАДКА: Хроника (Horae State Engine) — компонент из horae.js.
-             Персонаж — только у личного чата: у группы и чужого чата профиля
-             персонажа нет, и уровень «Персонаж» в настройках выключен. -->
-        <div v-if="drawerTab==='horae'" id="drawer-panel-horae" role="tabpanel" aria-labelledby="drawer-tab-horae">
           <horae-panel :session-id="sessionId" :tick="horaeTick"
-                       :character-id="currentIsGroup || sharedView ? null : ((currentSession && currentSession.character_id) || selectedCharacterId)"></horae-panel>
+                       :extra-tabs="memoryExtraTabs" :request="memoryTabReq"
+                       :character-id="currentIsGroup || sharedView ? null : ((currentSession && currentSession.character_id) || selectedCharacterId)">
+            <template #compress>
+              <fieldset class="mem-engine">
+                <legend>Чем сжимать старую историю</legend>
+                <label class="check"><input type="radio" name="mem-engine" value="snapshot"
+                       :checked="memoryEngine === 'snapshot'" :disabled="memoryEngineLocked"
+                       @change="setMemoryEngine('snapshot')" />
+                  <span><b>Мастер-снимок</b> — рекомендуется. Подробный пересказ старой части чата:
+                    хроника, персонажи, факты и лор, списки.</span></label>
+                <label class="check"><input type="radio" name="mem-engine" value="horae"
+                       :checked="memoryEngine === 'horae'" :disabled="!isAdmin"
+                       @change="setMemoryEngine('horae')" />
+                  <span><b>Свёртки Хроники</b> — короткие свёртки событий в ленте Хроники, как в плагине
+                    Horae. Пороги — «Настройки» → «Авто-свёртка хронологии».</span></label>
+                <label class="check"><input type="radio" name="mem-engine" value="off"
+                       :checked="memoryEngine === 'off'" :disabled="memoryEngineLocked"
+                       @change="setMemoryEngine('off')" />
+                  <span><b>Не сжимать</b> — собранный снимок остаётся, но больше не обновляется.</span></label>
+              </fieldset>
+              <p class="muted" style="margin:2px 0 10px">Работает что-то одно: второй механизм в чате стоит
+                и в ход не идёт — история не дублируется, и вы не платите дважды. Состояние Хроники идёт в
+                ход при любом выборе. Обновление снимка или свёртка — <b>отдельный платный запрос</b>
+                (📊: <code>summary</code>, <code>horae</code>).</p>
+              <p v-if="!isAdmin" class="field-hint">Свёртки Хроники для всех чатов включает администратор;
+                для своего чата — «Настройки» → уровень «Чат» → «Авто-свёртка хронологии».</p>
+              <p v-if="chatEngineNote" class="field-hint mem-engine-note">{{ chatEngineNote }}</p>
+              <label v-if="memoryEngine === 'snapshot'">Как часто обновлять снимок
+                <select v-model.number="summaryEvery" @change="saveUiPrefs">
+                  <option :value="6">каждые 6 сообщений (точнее, дороже)</option>
+                  <option :value="10">каждые 10 сообщений (по умолчанию)</option>
+                  <option :value="20">каждые 20 сообщений (экономно)</option>
+                </select>
+              </label>
+              <label v-if="memoryEngine === 'snapshot'" class="check"><input type="checkbox" v-model="horaeFacts" @change="saveUiPrefs" />
+                🧩 Факты: вместе со снимком ИИ выписывает из переписки отдельные факты (имена, обещания,
+                предметы), а на каждом ходу в контекст попадают только те, что связаны с вашей репликой.</label>
+              <label>Активное окно (сколько последних сообщений модель видит дословно) <span class="range-val">{{ memoryWindow ? memoryWindow + ' сообщ.' : 'вся история' }}</span>
+                <input type="number" min="0" max="1000" step="1" inputmode="numeric"
+                       :value="memoryWindow"
+                       @change="setMemoryWindow(numFromInput($event, 1000, memoryWindow))" /></label>
+              <div class="row" style="gap:6px; margin:-4px 0 6px; flex-wrap:wrap">
+                <button v-for="p in [[20,'20'],[50,'50'],[80,'80'],[150,'150'],[0,'вся история']]" :key="'win' + p[0]"
+                        :class="memoryWindow === p[0] ? 'btn-primary' : ''"
+                        :aria-pressed="memoryWindow === p[0] ? 'true' : 'false'"
+                        @click="setMemoryWindow(p[0])">{{ p[1] }}</button>
+              </div>
+              <p class="muted" style="margin:2px 0 10px">Всё старше окна модель получает сжатым — снимком
+                или свёртками Хроники. Из окна уходит только то, что уже сжато: пока сжатие догоняет
+                длинный чат, модель видит историю целиком.</p>
+
+              <section v-if="sessionId" ref="memSection" class="card mem-master" aria-labelledby="mem-master-h">
+                <!-- Пока сброс ждёт сервера (memPurging), выключены ВСЕ кнопки блока:
+                     запуск, остановка, экспорт и перечитка статуса наперегонки со
+                     сбросом показали бы память, которой через миг не станет.
+                     tabindex -1 у заголовка — чтобы было куда вернуть фокус, когда
+                     кнопка под ним выключилась или исчезла (_memFocus). -->
+                <div class="row-between"><h4 id="mem-master-h" ref="memHeading" tabindex="-1">🧠 Мастер-снимок этого чата</h4>
+                  <button class="btn-icon" :disabled="memPurging" @click="loadMemStatus" aria-label="Обновить статус памяти">↻</button></div>
+                <!-- «Старая схема» — только у непустого снимка: пакет из одних пустых
+                     сообщений даёт запись с пустым текстом, is_structured("") на
+                     сервере ложно, но пересобирать там нечего. Пробел между метками
+                     Vue при сборке шаблона убирает — промежуток даёт CSS (.mem-status). -->
+                <p v-if="chatEngine === 'horae'" class="field-hint mem-idle-note">Сейчас не используется: историю этого чата
+                  сжимают свёртки Хроники. Снимок хранится и снова заработает, если выбрать мастер-снимок.</p>
+                <p class="muted mem-status" v-if="memStatus && memStatus.snapshot.exists">
+                  Снимок {{ fmtNum(memStatus.snapshot.tokens) }} / {{ fmtNum(memStatus.snapshot.budget) }} ток.
+                  · учтено до #{{ memStatus.snapshot.covered_upto }}
+                  · ждут сжатия {{ memStatus.backlog.pending }}
+                  <span v-if="!memStatus.snapshot.structured && memStatus.snapshot.tokens" class="tag">старая схема — пересоберите</span>
+                  <span v-if="memStatus.snapshot.over_budget" class="tag">больше бюджета</span></p>
+                <p class="muted" v-else-if="memStatus">Снимка нет: окно пропускает историю целиком.
+                  Ждут сжатия {{ memStatus.backlog.pending }}.</p>
+                <p class="muted" v-else>{{ memBusy ? 'Загружаю статус памяти…' : 'Статус памяти недоступен.' }}</p>
+                <!-- Сбой ежеходного обновления и предупреждения снимка/задания.
+                     Сбой — цветом предупреждения: память стоит, пока его не
+                     исправят; предупреждения — серым, как подсказки полей. -->
+                <p v-if="memLastError" class="muted mem-failed">{{ memLastError }}</p>
+                <ul v-if="memWarnings.length" class="mem-warnings">
+                  <li v-for="(w, i) in memWarnings" :key="'mw' + i" class="field-hint">{{ w }}</li>
+                </ul>
+                <!-- Буфер пересборки без задания. manual — ручную «Пересобрать»
+                     прервали (остановка, ошибка, перезапуск сервера): продолжаем с
+                     места. Не manual — старую сводку (до 2.4.0) сервер переводит в
+                     новую схему сам, ежеходными проходами: «прервана» тут неправда.
+                     И «Продолжить» тут не к месту: буфера может ещё не быть
+                     (указатель 0), и кнопка молча начала бы пересборку всего чата.
+                     Доделать сразу умеет «Догнать» — сколько это, видно по «ждут
+                     сжатия» в строке выше. -->
+                <p class="muted" v-if="memStatus && memStatus.staging && !memJobActive">
+                  <template v-if="memStatus.staging.manual">Пересборка прервана на #{{ memStatus.staging.last_message_id }}.
+                    <button class="btn-primary" :disabled="memBusy || memPurging" @click="startMemJob('rebuild', true)">Продолжить</button></template>
+                  <template v-else>Старая сводка переводится в новую схему<template v-if="memStatus.staging.last_message_id">: готово до #{{ memStatus.staging.last_message_id }}</template>.<template v-if="memStatus.backlog.pending"> «Догнать» доделает это сразу.</template></template></p>
+                <!-- Прогресс не только цветом: рядом с полосой строка сервера с
+                     числами «Обработано 140/800 | Сжато до 4 200 токенов» и время
+                     начала, под ней — номер пакета и фаза (спека §9). Живой регион
+                     стоит в DOM всегда, а без задания пуст: регион, вставленный уже
+                     с текстом, многие скринридеры пропускают, и первое «В очереди»
+                     терялось. «Остановить» — вне региона, иначе подпись кнопки
+                     зачитывалась бы с каждой строкой прогресса. -->
+                <div class="mem-progress" :class="{ 'mem-idle': !memJobActive }">
+                  <span v-if="memJobActive" class="upload-track"><span class="upload-fill"
+                    :style="{ width: (memStatus.job.total ? Math.round(memStatus.job.processed / memStatus.job.total * 100) : 0) + '%' }"></span></span>
+                  <div role="status" aria-live="polite"><template v-if="memJobActive">
+                    <div class="muted">{{ memJobLine }}</div>
+                    <div class="muted" v-if="memJobPhase">{{ memJobPhase }}</div>
+                    <!-- Опрос третий раз подряд не дозвался сервера: полоса стоит не
+                         потому, что пакет долгий, — говорим об этом прямо. -->
+                    <div class="muted mem-offline" v-if="memPollFails >= 3">Нет связи с сервером, повторяю…</div>
+                  </template></div>
+                  <button v-if="memJobActive" ref="memStopBtn" class="btn-danger" :disabled="memPurging" @click="cancelMemJob">Остановить</button>
+                </div>
+                <p v-if="memStatus && memStatus.job && memStatus.job.status === 'error'" class="danger-text">⚠ {{ memStatus.job.error }}</p>
+                <div class="row mem-actions">
+                  <button class="btn-primary" :disabled="memBusy || memJobActive || !memStatus || memPurging" @click="startMemJob('rebuild')">Пересобрать с нуля</button>
+                  <button :disabled="memBusy || memJobActive || !memStatus || !memStatus.backlog.pending || memPurging" @click="startMemJob('catchup')">Догнать</button>
+                  <button :disabled="!memStatus || !memStatus.snapshot.exists || memPurging" @click="exportMemory">Экспорт .md</button>
+                  <button class="btn-danger" :disabled="memBusy || memJobActive || !memStatus || memPurging" @click="purgeMemory">{{ memPurging ? 'Сбрасываю…' : 'Сбросить снимок и факты' }}</button>
+                </div>
+                <!-- Поля пишут значение по change, а не по вводу, через numFromInput:
+                     стёртое поле или «2,5» не должны улететь на сервер (422).
+                     setMemPref помечает ключ выбранным человеком: пока поле не
+                     трогали, оно показывает умолчание сервера и в «ui» не пишется. -->
+                <label>Размер пакета
+                  <input type="number" min="1" max="200" step="1" inputmode="numeric"
+                         :value="memoryBatch" aria-describedby="mem-batch-hint"
+                         @change="setMemPref('memory_batch', numFromInput($event, 200, memoryBatch, 1))" />
+                  <span id="mem-batch-hint" class="field-hint">Сообщений в одном запросе к модели сводки, 1–200. Больше — меньше запросов, но каждый тяжелее.</span></label>
+                <label>Пауза между запросами, мс
+                  <input type="number" min="0" max="60000" step="100" inputmode="numeric"
+                         :value="memoryDelayMs" aria-describedby="mem-delay-hint"
+                         @change="setMemPref('memory_delay_ms', numFromInput($event, 60000, memoryDelayMs))" />
+                  <span id="mem-delay-hint" class="field-hint">0–60000. Пауза бережёт лимит запросов провайдера при длинной пересборке.</span></label>
+                <!-- Потолок поля 40 000, хотя сервер примет и 200 000: снимок модель
+                     переписывает ЦЕЛИКОМ в одном ответе, и бюджет выше лимита вывода
+                     модели памяти обрывал бы каждое обновление. Какой лимит у
+                     выбранной модели, сервер знает сам (max_snapshot_tokens). -->
+                <label>Бюджет снимка, токенов
+                  <input type="number" min="1000" max="40000" step="1000" inputmode="numeric"
+                         :value="memorySnapshotTokens" aria-describedby="mem-snap-hint mem-snap-cap"
+                         @change="setMemPref('memory_snapshot_tokens', numFromInput($event, 40000, memorySnapshotTokens, 1000))" />
+                  <span id="mem-snap-hint" class="field-hint">1000–40000, не больше лимита вывода модели памяти. Столько снимок занимает в каждом ходе: больше — подробнее память, но дороже ход.</span>
+                  <span v-if="memSnapCap" id="mem-snap-cap" class="field-hint">{{ memSnapCap }}</span></label>
+                <!-- Монитор токенов: из чего складывается ход — системный промпт с
+                     якорями, мастер-снимок с фактами и дословное окно. Числа стоят
+                     в подписях, полоса лишь повторяет их цветом. -->
+                <template v-if="memTiers">
+                  <div class="ins-bar" aria-hidden="true">
+                    <i v-for="r in memTierRows" :key="'mt' + r.cls" :class="r.cls" :style="{ width: r.pct + '%' }"></i>
+                  </div>
+                  <ul class="mem-tiers">
+                    <li v-for="r in memTierRows" :key="'ml' + r.cls">
+                      <span class="ins-dot" :class="r.cls" aria-hidden="true"></span>
+                      <span>{{ r.label }} — {{ fmtNum(r.tokens) }}</span></li>
+                  </ul>
+                  <p class="muted mem-tier-note">Итого {{ fmtNum(memTiers.total) }} ток.<br>
+                    из бюджета хода {{ fmtNum(memTiers.budget) }} ({{ Math.round(sharePct(memTiers.total, memTiers.budget)) }}%)<br>
+                    из лимита модели {{ fmtNum(memTiers.model_limit || 1000000) }} ({{ Math.round(sharePct(memTiers.total, memTiers.model_limit || 1000000)) }}%)</p>
+                </template>
+                <!-- Блок виден только при открытом чате, поэтому «Откройте чат» тут
+                     неправда: отчёт ещё считается или сервер его не собрал (группа
+                     без участников, чат без персонажа). -->
+                <p v-else-if="memTiersGroup" class="muted">В групповых чатах монитор уровней не считается: память собирается иначе, окна нет.</p>
+                <p v-else-if="ctxBusy" class="muted">Считаю бюджет хода…</p>
+                <p v-else-if="!ctxStats" class="muted">Бюджет хода недоступен: контекст этого чата не собирается.</p>
+              </section>
+
+            </template>
+            <template #lore>
+              <p class="muted">Лорбук — записи, которые вы ведёте сами. <b>always_on</b> — подмешивается в КАЖДЫЙ запрос (состояние, инвентарь, факты); иначе срабатывает по ключевым словам, как World Info. Области:
+                <span class="scope-tag global">🌐 глоб.</span> во всех чатах,
+                <span class="scope-tag session">💬 чат</span> только в этом,
+                <span class="scope-tag character">🎭 перс.</span> из карточки персонажа.
+                Записи сохраняются автоматически в БД. При импорте чата из SillyTavern сюда попадает снимок состояния (💬, always_on).</p>
+              <div class="card">
+                <input v-model="horaeEdit.title" placeholder="Заголовок" style="margin-bottom:6px" />
+                <textarea v-model="horaeEdit.content" rows="3" placeholder="Содержимое" style="margin-bottom:6px"></textarea>
+                <input v-model="horaeEdit.keywords" placeholder="ключевые слова через запятую" style="margin-bottom:2px" />
+                <p class="muted" style="margin:0 0 6px; font-size:12px">Срабатывают по слову целиком и его склонениям: <code>меч</code> поймает «мечи», «мечом», «мечами», а <code>король</code> — «короля», «королём». На другие слова с тем же началом (<code>кот</code> → «который», «котёл») <b>не</b> срабатывает. Нужно шире — поставьте звёздочку: <code>замк*</code> поймает «замка», «замком», «замковый». Фраза с пробелом (<code>тёмный лес</code>) ищется как есть.</p>
+                <div class="row" style="margin-bottom:6px">
+                  <!-- Оба выпадающих списка стояли без подписи: ни label, ни
+                       aria-label — вслух они читались как «список, lore» и «список,
+                       глобально», без единого слова о том, что именно выбирают. -->
+                  <select v-model="horaeEdit.category" aria-label="Категория записи памяти"><option>lore</option><option>state</option><option>inventory</option><option>character</option><option>hidden</option></select>
+                  <input type="number" v-model.number="horaeEdit.priority" placeholder="приоритет" style="width:90px" />
+                </div>
+                <label class="check"><input type="checkbox" v-model="horaeEdit.always_on" /> always_on</label>
+                <label class="check"><input type="checkbox" v-model="horaeEdit.enabled" /> включено</label>
+                <div class="row" v-if="!horaeEdit.id">
+                  <select v-model="horaeEdit.scope" aria-label="Область видимости записи"><option value="global">глобально</option><option value="session">только этот чат</option></select>
+                </div>
+                <div class="row">
+                  <button class="btn-primary" @click="saveHorae">{{ horaeEdit.id ? 'Обновить' : 'Добавить' }}</button>
+                  <button v-if="horaeEdit.id" @click="horaeEdit = blankHorae()">Отмена</button>
+                </div>
+              </div>
+              <div class="card" v-for="h in horae" :key="h.id">
+                <div class="row-between">
+                  <b>{{ h.title || h.category }}</b>
+                  <span style="display:inline-flex; align-items:center; gap:4px">
+                    <span class="scope-tag" :class="h.session_id ? 'session' : (h.character_id ? 'character' : 'global')">{{ h.session_id ? '💬 чат' : (h.character_id ? '🎭 перс.' : '🌐 глоб.') }}</span>
+                    <span class="tag">{{ h.always_on ? 'always' : ((h.keywords || []).join(',') || h.category) }}</span>
+                    <button class="btn-icon" @click="editHorae(h)" :aria-label="'Изменить запись памяти: ' + (h.title || h.category)">✎</button>
+                    <button class="btn-danger" @click="deleteHorae(h)" :aria-label="'Удалить запись памяти: ' + (h.title || h.category)">🗑</button>
+                  </span>
+                </div>
+                <!-- Мастер-снимок (категория summary) — до 12 000 токенов с разделами
+                     и списками: одним абзацем он растягивал карточку на десяток
+                     экранов телефона под настройками, а структура пропадала.
+                     Свёрнут, переводы строк сохранены; полный вид — «Экспорт .md». -->
+                <p v-if="h.category === 'summary' && h.session_id" class="field-hint">Мастер-снимок чата: обновляется
+                  сам, управление — в «Сжатие истории».</p>
+                <details v-if="h.category === 'summary'" class="mem-snapshot">
+                  <summary>Показать снимок ({{ textLines(h.content) }} {{ plural(textLines(h.content), 'строка', 'строки', 'строк') }})</summary>
+                  <div class="muted mem-snapshot-text">{{ h.content }}</div>
+                </details>
+                <div v-else class="muted">{{ h.content }}</div>
+              </div>
+            </template>
+          </horae-panel>
         </div>
 
         <!-- ВКЛАДКА: Персона + Author's Note -->
@@ -6715,7 +6834,7 @@ createApp({
             <span class="ins-w">{{ ctxStats.tail_tokens }}</span>
           </div>
 
-          <h4 class="ins-sub">Память Horae: сработало {{ ctxStats.horae.length }} из {{ ctxStats.horae_total }}</h4>
+          <h4 class="ins-sub">Лорбук: сработало {{ ctxStats.horae.length }} из {{ ctxStats.horae_total }}</h4>
           <p v-if="!ctxStats.horae.length" class="muted">Ни одна запись не сработала на этом ходу.</p>
           <div v-for="(h, i) in ctxStats.horae" :key="'h'+i" class="ins-horae">
             <span class="grow">{{ h.title }}</span>
@@ -6730,7 +6849,7 @@ createApp({
                отчёта необязательно: старый сервер их не присылает, и тогда
                раздел просто не рисуется, а не падает на undefined. -->
           <template v-if="ctxStats.memory || (ctxStats.recalled && ctxStats.recalled.length)">
-            <h4 class="ins-sub">Память Horae: окно, хроника, факты</h4>
+            <h4 class="ins-sub">Память: окно, сжатие, факты</h4>
             <template v-if="ctxStats.memory">
               <!-- Сбой памяти показываем прямо: сервер в этом случае шлёт окно 0 и
                    факты «off», и без этой строки инспектор уверял бы, что факты
@@ -6747,8 +6866,12 @@ createApp({
                 <span class="grow">{{ memWindowLabel(ctxStats) }}</span>
                 <span class="ins-w" v-if="ctxStats.memory.dropped">{{ ctxStats.memory.dropped }} реплик</span>
               </div>
+              <div v-if="ctxStats.memory.engine" class="ins-block ins-static">
+                <span class="grow">Историю сжимает</span>
+                <span class="ins-w">{{ ({ snapshot: 'мастер-снимок', horae: 'свёртки Хроники', off: 'никто' })[ctxStats.memory.engine] || ctxStats.memory.engine }}</span>
+              </div>
               <div v-if="ctxStats.memory.covered_upto" class="ins-block ins-static">
-                <span class="grow">Сводка учла реплики до</span>
+                <span class="grow">{{ ctxStats.memory.engine === 'horae' ? 'Свёртки учли' : 'Снимок учёл' }} реплики до</span>
                 <span class="ins-w">#{{ ctxStats.memory.covered_upto }}</span>
               </div>
               <div class="ins-block ins-static">
@@ -6851,6 +6974,7 @@ createApp({
   // загрузился — заглушки: без них Vue отрисовал бы <horae-panel> пустым
   // неизвестным тегом, и вкладка молча пустовала бы.
   .component("horae-panel", (window.HoraeUI && window.HoraeUI.components.HoraePanel)
-    || { template: '<p class="muted">Хроника не загрузилась — обновите страницу.</p>' })
+    || { template: '<div><p class="muted">Хроника не загрузилась — обновите страницу.</p>'
+      + '<slot name="compress"></slot><slot name="lore"></slot></div>' })
   .component("horae-msg", (window.HoraeUI && window.HoraeUI.components.HoraeMsg) || { render: () => null })
   .mount("#app");

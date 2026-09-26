@@ -1410,16 +1410,25 @@ def timeline(state: dict, summaries, *, calendar=None) -> list[dict]:
     return items
 
 
-def render_timeline(state: dict, summaries, settings: dict, *, calendar=None) -> str:
+def render_timeline(state: dict, summaries, settings: dict, *, calendar=None,
+                    snapshot_upto: int = 0) -> str:
     """
     Раздел «[Сюжетная линия]» блока состояния (порт generateCompactPrompt):
     все ключевые и важные события и активные свёртки + последние
     context_depth обычных; покрытое активной свёрткой не идёт.
+
+    :param snapshot_upto: до какого сообщения историю в этом ходе уже несёт
+        мастер-снимок (0 — снимка в ходе нет). События до него снимок уже
+        пересказал — в ленте остаются только ключевые (точки отсчёта времени),
+        остальное заменяет одна строка-ссылка на снимок. Так же уходят свёртки
+        этого чата, целиком лежащие до него (ручные, импортированные из
+        SillyTavern); свёртки «Ранее» — из прошлого чата, снимок их не знает.
     """
     depth = int(settings.get("context_depth", 15) or 0)
     cur = state["time"].get("date") or ""
     rows: list[tuple[tuple, str]] = []
     normal: list[tuple[tuple, str]] = []
+    in_snapshot = 0
 
     def rel(date: str) -> str:
         label = horae_time.relative_label(date, cur, calendar) if (cur and date) else ""
@@ -1427,6 +1436,10 @@ def render_timeline(state: dict, summaries, settings: dict, *, calendar=None) ->
 
     for s in summaries or []:
         if not s.get("active", True):
+            continue
+        if (snapshot_upto and s.get("kind") != "carry"
+                and int((s.get("range") or [0, 0])[-1] or 0) <= snapshot_upto):
+            in_snapshot += 1
             continue
         dates = [d for d in (s.get("date_from"), s.get("date_to")) if d]
         span = ""
@@ -1438,6 +1451,9 @@ def render_timeline(state: dict, summaries, settings: dict, *, calendar=None) ->
     for ev in state.get("events") or []:
         if covering_summary(summaries, ev["mid"]):
             continue
+        if snapshot_upto and ev["mid"] <= snapshot_upto and ev["level"] != "critical":
+            in_snapshot += 1
+            continue
         date = ev.get("date") or ""
         line = (f"{LEVEL_MARK.get(ev['level'], '○')} #{ev['mid']} {date or '?'}"
                 f"{(' ' + ev['time']) if ev.get('time') else ''}{rel(date)}: {ev['text']}")
@@ -1448,6 +1464,8 @@ def render_timeline(state: dict, summaries, settings: dict, *, calendar=None) ->
             normal.append((key, line))
     if depth > 0:
         rows.extend(normal[-depth:])
+    if in_snapshot:
+        rows.append(((-1, 1), f"📜 [До #{snapshot_upto}] Остальные события — в мастер-снимке выше."))
     if not rows:
         return ""
     rows.sort(key=lambda x: x[0])
@@ -1506,10 +1524,12 @@ def is_main_npc(name: str, npc: dict, names: Names, pinned) -> bool:
 
 
 def render_state_block(state: dict, settings: dict, *, names: Names, summaries=(),
-                       tables_block: str = "", rpg_block: str = "", pinned=(), calendar=None) -> str:
+                       tables_block: str = "", rpg_block: str = "", pinned=(), calendar=None,
+                       snapshot_upto: int = 0) -> str:
     """
     Блок «[Снимок текущего состояния …]» для хвоста промпта (порт
     generateCompactPrompt, русские подписи). Пустое состояние — "".
+    snapshot_upto — см. render_timeline.
     """
     s = settings or {}
     lines = ["[Снимок текущего состояния — сравните с сюжетом этого раунда, выводите в <horae> "
@@ -1614,7 +1634,7 @@ def render_state_block(state: dict, settings: dict, *, names: Names, summaries=(
         has_content = True
         lines.append(rpg_block.rstrip())
     if s.get("send_timeline", True):
-        tl = render_timeline(state, summaries, s, calendar=calendar)
+        tl = render_timeline(state, summaries, s, calendar=calendar, snapshot_upto=snapshot_upto)
         if tl:
             has_content = True
             lines.append(tl)

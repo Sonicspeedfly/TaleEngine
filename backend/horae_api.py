@@ -68,9 +68,12 @@ def build_router(current_user, can_access_session) -> APIRouter:
             injection = (he.rules_text(comp) if comp.settings.get("parse_tags") else "") + "\n" + (
                 he.state_block(comp) if comp.settings.get("inject_state") else "")
         job = horae_tasks.get_job(sess.id)
+        squeeze = await he.chat_compression(db, sess, data=data)
         return {
             "enabled": bool(comp.settings.get("enabled")),
             "settings": comp.settings,
+            # Кто сжимает историю чата: snapshot / horae / off (he.compression_engine).
+            "compression": {"engine": squeeze["engine"], "summary_layer": squeeze["summary_layer"]},
             "state": api_state,
             "timeline": timeline,
             "tables": tables,

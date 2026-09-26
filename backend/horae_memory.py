@@ -772,7 +772,7 @@ def _context_tiers(report: dict, *, avatar_msgs, knowledge_msgs, window_tokens: 
     return tiers
 
 
-def _summary_tail(summary_recs) -> list[tuple[str, str]]:
+def _summary_tail(summary_recs, *, state_follows: bool = False) -> list[tuple[str, str]]:
     """
     Блок хвоста «Что было в истории» (мастер-снимок и прочие записи категории
     summary) → [("snapshot", текст)] или [] — записей нет.
@@ -786,6 +786,13 @@ def _summary_tail(summary_recs) -> list[tuple[str, str]]:
     if not summary_recs:
         return []
     head = "[ХРОНИКА И СОСТОЯНИЕ ЧАТА] Что было в истории — помни это.\n"
+    if state_follows:
+        # Ниже идёт блок состояния Хроники: он обновляется каждым ответом, а
+        # снимок — раз в несколько сообщений. Статусы персонажей из снимка
+        # могли устареть, и без явного правила модель выбирала бы наугад.
+        head = ("[ИСТОРИЯ ЧАТА — мастер-снимок] Что было раньше — помни это. Текущие время, "
+                "место, кто где и в чём, предметы и отношения — в блоке «Снимок текущего "
+                "состояния» ниже: он свежее снимка, при расхождении верь ему.\n")
     # Рендер — по записям. Мастер-снимок новой схемы (первая
     # структурированная запись) — многострочный текст с разделами
     # «## […]». Префикс «- 📜 Память чата (авто): » приклеился бы к
@@ -1056,7 +1063,10 @@ def assemble_context(
     knowledge_msgs = knowledge_block(knowledge_text, knowledge_media)
     # Хвост — в два приёма: блок снимка первым, статичные блоки последними, а
     # между ними после обрезки встанут факты и манифест (порядок хвоста прежний).
-    snapshot_tail = _summary_tail(summary_recs)
+    snapshot_tail = _summary_tail(
+        summary_recs,
+        state_follows=horae is not None and bool((getattr(horae, "state_block", "") or "").strip()),
+    )
     static_tail = _static_tail(
         character, character_avatar=character_avatar, persona_avatar=persona_avatar,
         send_avatars=send_avatars, web_access=web_access, user_time=user_time,
@@ -1267,12 +1277,16 @@ def session_user_time(session) -> str:
 # DB-обёртка: тянет персонажа, записи Horae и историю из БД, затем зовёт
 # чистую assemble_context(). Используется и веб-сервером, и Telegram-ботом.
 # ----------------------------------------------------------------------------
-async def _load_horae_records(session_db, session_id: int, character_id=None) -> list[HoraeRecord]:
+async def _load_horae_records(session_db, session_id: int, character_id=None, *,
+                              skip_chat_summary: bool = False) -> list[HoraeRecord]:
     """
     Активные записи памяти:
       * привязанные к этой сессии (session_id);
       * лорбук персонажа (character_id) — из карточки SillyTavern;
       * глобальные (session_id и character_id оба NULL).
+
+    skip_chat_summary — без записей категории summary этого чата (мастер-снимок):
+    когда историю сжимают свёртки Хроники, снимок в ход не идёт.
     """
     from sqlalchemy import and_, or_, select
 
@@ -1290,6 +1304,8 @@ async def _load_horae_records(session_db, session_id: int, character_id=None) ->
         or_(*conds),
     )
     rows = (await session_db.execute(q)).scalars().all()
+    if skip_chat_summary:
+        rows = [r for r in rows if not (r.session_id == session_id and r.category == "summary")]
     return [
         HoraeRecord(
             category=r.category,
@@ -1390,9 +1406,6 @@ async def build_context_from_db(
         )
         user_message = clean_message
 
-    records = await _load_horae_records(
-        session_db, session.id, getattr(character, "id", None)
-    )
     persona, author_note = await _load_persona_and_note(session_db, session)
     # База знаний чата (справочные файлы) — доступна модели в каждом ходе.
     from backend.knowledge import build_knowledge
@@ -1434,12 +1447,19 @@ async def build_context_from_db(
         known = [i for i in history_ids if i]
         horae_until = max(known) if known else None
 
-    history, history_ids, recalled = await _long_memory(
+    history, history_ids, recalled, squeeze = await _long_memory(
         session_db, session, history, history_ids, user_message, report
+    )
+    # Сжимают свёртки Хроники — мастер-снимок чата в ход не идёт: та же
+    # история второй раз, да ещё и устаревшая (он не обновляется).
+    records = await _load_horae_records(
+        session_db, session.id, getattr(character, "id", None),
+        skip_chat_summary=squeeze["engine"] == "horae",
     )
     horae_parts = await _horae_parts(
         session_db, session, character, until=horae_until, ooc=ooc, tags=horae_tags,
         user_message=user_message, history_ids=history_ids, report=report,
+        snapshot_upto=squeeze["snapshot_upto"],
     )
 
     char_dict = {
@@ -1478,7 +1498,7 @@ async def build_context_from_db(
 
 
 async def _horae_parts(session_db, session, character, *, until, ooc, tags, user_message,
-                       history_ids, report):
+                       history_ids, report, snapshot_upto: int = 0):
     """
     Блоки Horae State Engine для хода (horae_engine.context_parts) или None.
     Как и долгая память, Horae не имеет права ронять ход: любой сбой — ход
@@ -1493,7 +1513,7 @@ async def _horae_parts(session_db, session, character, *, until, ooc, tags, user
         return await horae_engine.context_parts(
             session_db, session, character, until=until, ooc=ooc, tags=tags,
             user_message=user_message, connection=await get_connection(session_db),
-            history_ids=history_ids,
+            history_ids=history_ids, snapshot_upto=snapshot_upto,
         )
     except Exception:  # noqa: BLE001
         logging.getLogger("aichat.horae").exception("Horae чата %s не собрался", session.id)
@@ -1502,37 +1522,47 @@ async def _horae_parts(session_db, session, character, *, until, ooc, tags, user
         return None
 
 
-async def _horae_covered(session_db, session, history_ids, covered: int) -> int:
+async def _compression(session_db, session) -> dict | None:
     """
-    Указатель «учтено до» с учётом активных свёрток хронологии Horae
-    (настройка summary_hides): сообщение, покрытое свёрткой, окно может
-    выбросить так же, как покрытое мастер-снимком — это «/hide» плагина.
-    Сбой — прежний указатель: окно просто выбросит меньше.
+    Кто сжимает историю этого чата (horae_engine.chat_compression) и свёртки
+    Хроники. Сбой — None: ход идёт как с мастер-снимком, как было до Хроники.
     """
     try:
         from backend import horae_engine
 
         data = await horae_engine.load_chat_data(session_db, session.id)
-        summaries = data.get("summaries") or []
-        if not summaries:
-            return covered
-        settings = await horae_engine.effective_settings(session_db, session, None, data)
-        if not (settings.get("enabled") and settings.get("summary_hides")):
-            return covered
-        entries = [(i, None, None, False) for i in history_ids or [] if i]
-        return horae_engine.covered_pointer(entries, summaries, covered)
+        info = await horae_engine.chat_compression(session_db, session, data=data)
+        info["summaries"] = data.get("summaries") or []
+        return info
     except Exception:  # noqa: BLE001
-        return covered
+        return None
+
+
+def _horae_covered(history_ids, info: dict) -> int:
+    """
+    Указатель «учтено до» по свёрткам Хроники (настройка summary_hides):
+    сообщение под активной свёрткой окно может выбросить так же, как покрытое
+    мастер-снимком, — это «/hide» плагина. Только когда сжимают свёртки.
+    """
+    from backend import horae_engine
+
+    if not (info.get("summaries") and info.get("summary_hides")):
+        return 0
+    entries = [(i, None, None, False) for i in history_ids or [] if i]
+    return horae_engine.covered_pointer(entries, info["summaries"], 0)
 
 
 async def _long_memory(session_db, session, history, history_ids, user_message, report):
     """
     Слои 1 и 3 долгой памяти (см. horae_recall): активное окно и отбор фактов.
 
-    Возвращает (история, id её сообщений, факты-кандидаты). Кандидаты — все
-    факты выше порога; какие из них в контексте лишние, решает assemble_context
-    после обрезки по бюджету. Любой сбой здесь не мешает ходу — тогда история
-    идёт целиком, а фактов нет, то есть поведение как до памяти.
+    Возвращает (история, id её сообщений, факты-кандидаты, сжатие). Кандидаты —
+    все факты выше порога; какие из них в контексте лишние, решает
+    assemble_context после обрезки по бюджету. Сжатие — {"engine", "snapshot_upto"}:
+    кто в чате сжимает историю (horae_engine.compression_engine) и до какого
+    сообщения её несёт мастер-снимок этого хода (0 — снимка в ходе нет).
+    Любой сбой здесь не мешает ходу — тогда история идёт целиком, а фактов нет,
+    то есть поведение как до памяти.
     Импорты тоже внутри try: сломанный или недостающий модуль памяти раньше
     ронял КАЖДЫЙ ход чата вместо того, чтобы просто выключить память.
     """
@@ -1546,6 +1576,7 @@ async def _long_memory(session_db, session, history, history_ids, user_message, 
     }
     if report is not None:
         report["memory"] = memo
+    squeeze = {"engine": "snapshot", "snapshot_upto": 0}
     try:
         from sqlalchemy import select
 
@@ -1579,7 +1610,16 @@ async def _long_memory(session_db, session, history, history_ids, user_message, 
         # покрытии (см. horae_recall.SUMMARY_FORMAT). Легаси-метку «last:N» из
         # keywords здесь тоже намеренно НЕ читаем — по той же причине.
         covered = horae_recall.trusted_pointer(entry.meta if entry is not None else None)
-        covered = await _horae_covered(session_db, session, history_ids, covered)
+        # Историю сжимает ровно один механизм. Свёртки Хроники — снимок в ход
+        # не идёт (build_context_from_db его убирает), окно выбрасывает только
+        # покрытое свёртками. Иначе — наоборот: окно по снимку, а свёртки
+        # Хроники (ручные) лишь заменяют события в ленте.
+        info = await _compression(session_db, session)
+        if info is not None and info["engine"] == "horae":
+            squeeze["engine"] = "horae"
+            covered = _horae_covered(history_ids, info)
+        else:
+            squeeze.update(engine=info["engine"] if info else "snapshot", snapshot_upto=covered)
 
         start = horae_recall.window_start(history_ids, covered, window)
 
@@ -1606,12 +1646,13 @@ async def _long_memory(session_db, session, history, history_ids, user_message, 
             )
         memo.update(
             window=window, dropped=start, covered_upto=covered, facts_enabled=use_facts,
+            engine=squeeze["engine"],
             facts_mode=stats.get("mode", "lexical") if use_facts else "off",
             facts_candidates=stats.get("candidates", 0),
             facts_backfilling=bool(stats.get("backfilling")),
         )
-        return history[start:], history_ids[start:], recalled
+        return history[start:], history_ids[start:], recalled, squeeze
     except Exception:  # noqa: BLE001 — память не должна ронять ход
         logging.getLogger("aichat.horae").exception("Долгая память чата %s не собралась", session.id)
         memo.update(dropped=0, facts_mode="off", error=True)
-        return history, history_ids, []
+        return history, history_ids, [], squeeze

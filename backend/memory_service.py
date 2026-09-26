@@ -91,6 +91,25 @@ def int_or_zero(value) -> int:
         return 0
 
 
+async def chat_compression(db, session_id: int) -> dict:
+    """
+    Кто сжимает историю чата: мастер-снимок, свёртки Хроники или никто
+    (horae_engine.chat_compression). Сбой — как до Хроники: снимок по «ui».
+    """
+    try:
+        from backend import horae_engine
+
+        session = await db.get(models.ChatSession, session_id)
+        if session is not None:
+            info = await horae_engine.chat_compression(db, session)
+            return {"engine": info["engine"], "summary_layer": info["summary_layer"]}
+    except Exception:  # noqa: BLE001
+        logger.exception("Не удалось узнать, кто сжимает историю чата %s", session_id)
+    ui, _ = await _ui_setting(db)
+    return {"engine": "snapshot" if ui_flag(ui, "auto_summary") else "off",
+            "summary_layer": "default"}
+
+
 async def _summary_entry(db, session_id: int):
     return (await db.execute(
         select(models.HoraeEntry).where(
@@ -1082,6 +1101,10 @@ async def run_incremental(session_id: int, deps: MemoryDeps, *, max_batches: int
                 ui, ui_value = await _ui_setting(db)
                 if not ui_flag(ui, "auto_summary"):
                     return None
+                # Историю этого чата сжимают свёртки Хроники: снимок стоит, чтобы
+                # не платить за второе сжатие той же переписки.
+                if (await chat_compression(db, session_id))["engine"] != "snapshot":
+                    return None
                 failed = _turn_error(await _summary_entry(db, session_id), session_id)
                 retry_at = turn_retry_after(failed)
                 if retry_at is not None and datetime.now(timezone.utc) < retry_at:
@@ -1528,6 +1551,8 @@ async def status(db, session_id: int, connection: dict | None = None) -> dict:
     job = _jobs.get(session_id)
     return {
         "job": job.to_dict() if job else None,
+        # Кто сжимает историю этого чата: snapshot / horae / off (см. chat_compression).
+        "compression": await chat_compression(db, session_id),
         "snapshot": {
             "exists": entry is not None,
             "tokens": tokens,

@@ -94,7 +94,7 @@ HTTP Basic Auth поверх всего нужен ещё заголовок `Au
 | POST | `/api/horae` | Создать запись (session_id / character_id / глобально) |
 | PATCH | `/api/horae/{id}` | Обновить |
 | DELETE | `/api/horae/{id}` | Удалить |
-| GET | `/api/sessions/{id}/memory` | Статус мастер-памяти чата: `job` (последнее задание или `null`), `snapshot` (`exists`, `tokens`, `budget`, `covered_upto`, `schema`, `structured`, `updated_at`, `over_budget`, `warnings`, `last_error`, `retry_after`), `staging` (буфер пересборки или `null`: `last_message_id`, `tokens`, `manual`, `started_at`, `paused`), `backlog` (`pending`, `window`, `messages_total`), `facts.count`, `settings` (`batch_size`, `delay_ms`, `snapshot_tokens`, `max_snapshot_tokens`) |
+| GET | `/api/sessions/{id}/memory` | Статус мастер-памяти чата: `compression` (кто сжимает историю чата: `engine` — `snapshot` / `horae` / `off`, `summary_layer` — где задан `summary_enabled` Хроники: `chat` / `character` / `global` / `default`; см. [HORAE.md](HORAE.md#кто-сжимает-историю-мастер-снимок-или-свёртки-хроники)), `job` (последнее задание или `null`), `snapshot` (`exists`, `tokens`, `budget`, `covered_upto`, `schema`, `structured`, `updated_at`, `over_budget`, `warnings`, `last_error`, `retry_after`), `staging` (буфер пересборки или `null`: `last_message_id`, `tokens`, `manual`, `started_at`, `paused`), `backlog` (`pending`, `window`, `messages_total`), `facts.count`, `settings` (`batch_size`, `delay_ms`, `snapshot_tokens`, `max_snapshot_tokens`) |
 | POST | `/api/sessions/{id}/memory/rebuild` | Задание памяти `{mode: "rebuild" \| "catchup", resume?, batch_size? 1–200, delay_ms? 0–60000}` → 202 `{job}`. `rebuild` — собрать снимок с нуля в буфер (`resume: true` — продолжить прерванную или остановленную пересборку), `catchup` — свернуть бэклог в цель записи: живой снимок, а при незаконченной (не остановленной) пересборке или сводке до 2.4.0 — её буфер с подменой в конце. 409 — у чата уже есть задание в очереди или в работе. Заданий в работе на процесс — одно, остальные ждут в `queued` |
 | POST | `/api/sessions/{id}/memory/cancel` | Остановить задание: начатый запрос к модели доводится, паузы (между запросами и перед повтором) обрываются сразу, слитый пакет сохраняется; из очереди — сразу. Буфер остановленной пересборки помечается `paused` и ждёт `resume: true` → `{ok, job}`; `ok: false` — останавливать нечего |
 | DELETE | `/api/sessions/{id}/memory` | Сброс: остановить задание и идущий ежеходный проход (после текущего запроса к модели), удалить снимок (с буфером) и все атомарные факты чата; сообщения остаются → `{snapshot_deleted, facts_deleted}` |
@@ -157,7 +157,7 @@ HTTP Basic Auth поверх всего нужен ещё заголовок `Au
 
 | Метод и путь | Что |
 |---|---|
-| `GET /api/sessions/{id}/horae/state?at=<mid>` | состояние сюжета, хронология, таблицы, настройки RPG, журнал правок, статистика (`injection_tokens`…), задание |
+| `GET /api/sessions/{id}/horae/state?at=<mid>` | состояние сюжета, хронология, таблицы, настройки RPG, журнал правок, статистика (`injection_tokens`…), задание, `compression` (как в `GET …/memory`) |
 | `GET/PUT /api/messages/{id}/horae` | мета активного свайпа ответа (`{meta}`; `null` — стереть) |
 | `POST /api/messages/{id}/horae/analyze` | ИИ-анализ ответа сейчас |
 | `POST /api/messages/{id}/horae/side` | `{side}` — побочная сцена |
