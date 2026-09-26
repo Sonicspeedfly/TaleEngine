@@ -147,7 +147,8 @@ def _cleanup_orphans(sync_conn) -> None:
     if "chat_sessions" not in tables:
         return
     # 1. Осиротевшие дочерние строки (чат, на который они ссылаются, уже удалён).
-    for tbl in ("messages", "group_members", "canvases", "session_shares", "horae_facts"):
+    for tbl in ("messages", "group_members", "canvases", "session_shares", "horae_facts",
+                "horae_chat_state", "horae_memory_docs"):
         if tbl in tables:
             sync_conn.execute(text(
                 f"DELETE FROM {tbl} WHERE session_id NOT IN (SELECT id FROM chat_sessions)"
@@ -198,6 +199,7 @@ def _sqlite_add_missing_columns(sync_conn) -> None:
             "speaker_name": "VARCHAR(200)",
             "reply_to_id": "INTEGER",
             "canvas_id": "INTEGER",
+            "horae": "JSON",
         },
         "horae_entries": {
             "character_id": "INTEGER",
@@ -212,6 +214,7 @@ def _sqlite_add_missing_columns(sync_conn) -> None:
             "mes_example": "TEXT DEFAULT ''",
             "post_history_instructions": "TEXT DEFAULT ''",
             "pinned_at": "DATETIME",
+            "horae_profile": "JSON",
         },
         "personas": {
             "owner_id": "INTEGER",

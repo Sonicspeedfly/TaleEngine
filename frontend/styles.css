@@ -1810,3 +1810,378 @@ input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
   .chat-id-pill { max-width: 34vw; }
   .msg-ava { width: 28px; height: 28px; font-size: var(--fs-200); }
 }
+
+/* ============================================================
+   ===== Horae =====
+   Хроника Horae State Engine (frontend/horae.js): вкладка «Хроника» в ящике
+   и строка Horae под ответом ИИ. Новых цветов нет — только токены: уровень
+   события несёт глиф (★ ● ○), а цвет лишь повторяет его; полоса прогресса —
+   от загрузки файлов, чипы фильтра и область видимости — существующие.
+   Правило раздела: ничто не шире экрана в 375px. Широкое (таблицы) крутится
+   внутри своей обёртки, длинные слова переносятся где угодно.
+   ============================================================ */
+
+/* Ящик для «Хроники» шире: таблицы, карточки и редактор правил в 380px не
+   помещаются. На узком экране он и так во всю ширину — там только высота:
+   у шторки height: auto, и она прыгала бы при каждой смене подвкладки. */
+.drawer.drawer-wide { width: min(760px, 96vw); max-width: 96vw; }
+
+.horae { min-width: 0; }
+.horae .h-grow, .h-grow { flex: 1 1 auto; }
+.h-meta { font-size: var(--fs-100); color: var(--text-secondary); }
+.h-count { font-size: var(--fs-100); font-weight: 400; color: var(--text-secondary); margin-left: var(--sp-1); }
+.h-warn { color: var(--warn); overflow-wrap: anywhere; margin: var(--sp-2) 0; }
+
+/* Подвкладки: на широком экране переносятся, на узком — одна лента с
+   прокруткой вбок (девять вкладок в три ряда съели бы треть шторки). */
+.h-tabs {
+  display: flex; flex-wrap: wrap; gap: var(--sp-1);
+  padding-bottom: var(--sp-2); margin-bottom: var(--sp-2); border-bottom: 1px solid var(--border-subtle);
+}
+.h-tabs .tab-btn { flex: none; white-space: nowrap; }
+
+/* Полоса задания (скан, свёртка) над любой подвкладкой. */
+.h-job {
+  margin: 0 0 var(--sp-2); padding: var(--sp-2) 10px;
+  background: var(--surface-2); border: 1px solid var(--border-subtle); border-radius: var(--r-md);
+}
+.h-job.h-job-idle { margin: 0; padding: 0; border: none; background: none; }
+.h-job-head { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
+.h-job .h-meta { margin-top: var(--sp-1); overflow-wrap: anywhere; }
+.h-job .h-offline { color: var(--warn); }
+.h-panel-bar { display: flex; align-items: center; gap: var(--sp-2); margin: -4px 0 var(--sp-1); }
+
+/* ---- Общие блоки вкладок ---- */
+.h-tab { min-width: 0; }
+.h-h { font-size: var(--fs-200); font-weight: 600; margin: var(--sp-3) 0 var(--sp-2); }
+.h-sub {
+  font-size: var(--fs-100); font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
+  color: var(--text-secondary); margin: var(--sp-3) 0 6px;
+}
+.h-block { margin: var(--sp-4) 0; }
+.h-block:first-child { margin-top: 0; }
+.h-block-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 6px; }
+.h-block-head .h-h { margin: 0; flex: 1 1 auto; }
+.h-block-head .h-h + .h-grow { flex: 0 0 0; }
+.h-list { list-style: none; margin: 0; padding: 0; }
+.h-row {
+  display: flex; align-items: flex-start; gap: var(--sp-2);
+  padding: 6px 0; border-bottom: 1px solid var(--border-subtle);
+}
+.h-row:last-child { border-bottom: none; }
+.h-row-main { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.h-acts { flex: none; display: flex; align-items: center; gap: 2px; }
+.h-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: var(--sp-1) 0 var(--sp-2); }
+.h-chips .chip { max-width: 100%; overflow-wrap: anywhere; }
+.h-filters { display: flex; flex-wrap: wrap; gap: var(--sp-1); margin: 6px 0; }
+.h-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin: 6px 0; }
+.h-toolbar .h-search { flex: 1 1 180px; width: auto; min-width: 0; }
+.h-search { margin: 6px 0; }
+.h-toolbar .h-search { margin: 0; }
+.horae label.h-inline, .horae .h-inline-select { margin: 0; }
+.h-inline-select { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.h-inline-select select { width: auto; max-width: 180px; }
+.h-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: var(--sp-2) 0; }
+.h-add { margin-top: var(--sp-1); }
+.h-small { font-size: var(--fs-100); padding: 3px 8px; }
+.h-src { flex: none; width: 1.4em; text-align: center; }
+/* Выбранные для группового действия: полоса липнет к верху шторки, чтобы
+   «Сжать» и «Удалить» были под рукой в списке на сотню событий. Заливка
+   плотная: из-под полупрозрачной просвечивал бы прокручиваемый список. */
+.h-selbar {
+  position: sticky; top: 0; z-index: var(--z-nav);
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  margin: 6px 0; padding: 6px var(--sp-2);
+  background: var(--surface-selected); border: 1px solid var(--accent-border); border-radius: var(--r-md);
+}
+.h-sel { flex: none; display: flex; align-items: center; margin: 0; }
+.h-sel input { width: 18px; height: 18px; }
+/* Живой регион работы (сжатие, свёртка) стоит в DOM всегда: пустым он
+   занимает ноль, а вставленный уже с текстом регион скринридеры пропускают. */
+.h-work { margin: 0; color: var(--text-secondary); font-size: var(--fs-100); }
+.h-work:not(:empty) { margin: var(--sp-1) 0; }
+/* Кнопка, которая выглядит ссылкой: «сообщение #N», числа шкал. Скин кнопки
+   погашен целиком, включая просадку — иначе строка дёргалась бы при нажатии. */
+.h-link {
+  background: none; border: none; border-radius: var(--r-xs); padding: 0;
+  color: var(--accent); font: inherit; text-decoration: underline; text-underline-offset: 2px; cursor: pointer;
+}
+.h-link:hover { background: none; border: none; text-decoration-thickness: 2px; }
+.h-link:active { transform: none; }
+.h-notice {
+  margin-bottom: var(--sp-3); padding: 10px var(--sp-3);
+  background: var(--warn-subtle); border: 1px solid var(--warn); border-radius: var(--r-md);
+}
+.h-notice p { margin: 0 0 var(--sp-2); }
+.h-det { margin: 6px 0; }
+.h-det > summary { cursor: pointer; padding: 6px 0; font-weight: 600; color: var(--text-primary); }
+.h-det > summary:focus-visible { outline: var(--focus-ring); outline-offset: 2px; border-radius: var(--r-xs); }
+.h-det > summary .tag { font-weight: 400; margin-left: 6px; }
+
+/* ---- «Состояние» ---- */
+.h-kv { display: grid; grid-template-columns: auto 1fr; gap: var(--sp-1) var(--sp-3); margin: 0 0 var(--sp-2); }
+.h-kv > div { display: contents; }
+.h-kv dt { font-size: var(--fs-100); color: var(--text-secondary); padding-top: 2px; }
+.h-kv dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.h-atm { margin-left: 6px; }
+.h-desc { margin: var(--sp-1) 0 var(--sp-2); white-space: pre-wrap; overflow-wrap: anywhere; }
+.h-desc-sub { color: var(--text-secondary); }
+.h-present { list-style: none; margin: 0; padding: 0; }
+.h-present li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; padding: var(--sp-1) 0; overflow-wrap: anywhere; }
+.h-stats {
+  margin: var(--sp-3) 0; padding: var(--sp-2) 10px;
+  background: var(--surface-2); border: 1px solid var(--border-subtle); border-radius: var(--r-md);
+}
+.h-stats p { margin: 0; }
+.h-stats p + p { margin-top: var(--sp-1); }
+
+/* ---- «Хронология» ---- */
+.h-lvmark { flex: none; width: 1.2em; text-align: center; line-height: 1.5; }
+.h-lv-critical .h-lvmark { color: var(--warn); }
+.h-lv-important .h-lvmark { color: var(--accent); }
+.h-lv-normal .h-lvmark { color: var(--text-tertiary); }
+.h-lv-critical .h-ev-text { font-weight: 600; }
+.h-ev-text { white-space: pre-wrap; }
+.h-ev-covered .h-ev-text { color: var(--text-secondary); }
+/* Свёртка — цитата хронологии: та же акцентная полоса слева, что у цитаты в
+   ответе. Раскрытая свёртка — пунктиром: она есть, но в промпт идут события. */
+.h-row.h-sum {
+  margin: 6px 0; padding: var(--sp-2) 10px; border: 1px solid var(--border-subtle);
+  border-left: 3px solid var(--accent); border-radius: var(--r-md); background: var(--surface-2);
+}
+.h-row.h-sum.h-sum-off { border-left-style: dashed; }
+.h-sum-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: var(--sp-1); }
+.h-sum-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* ---- «Персонажи» ---- */
+.h-aff { font-variant-numeric: tabular-nums; margin: 0 6px; }
+.h-npc { padding: var(--sp-2) 10px; }
+/* Шапка карточки: название переносится внутри себя, кнопки всегда справа.
+   Одним flex с переносом три кнопки по 44px на телефоне уезжали на свою
+   строку, и «✎» стоял под именем в одиночестве. */
+.h-card-head { display: flex; align-items: flex-start; gap: 6px; }
+.h-card-title { flex: 1 1 auto; min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; padding-top: 3px; }
+.h-npc-name { min-width: 0; overflow-wrap: anywhere; }
+.h-gicon { flex: none; width: 1.2em; text-align: center; color: var(--text-secondary); }
+.h-dl { display: grid; grid-template-columns: minmax(84px, max-content) minmax(0, 1fr); gap: 2px 10px; margin: 6px 0 0; }
+.h-dl > div { display: contents; }
+.h-dl dt { font-size: var(--fs-100); color: var(--text-secondary); padding-top: 2px; }
+.h-dl dd { margin: 0; min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.h-npc > .h-meta { margin: var(--sp-1) 0 0; overflow-wrap: anywhere; }
+.h-enrich { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin: 0 0 10px; }
+.h-enrich .field-hint { flex: 1 1 200px; margin: 0; }
+
+/* ---- «Предметы» ---- */
+.h-icon { flex: none; width: 1.6em; text-align: center; font-size: var(--fs-300); line-height: 1.4; }
+.tag.h-imp { color: var(--accent); }
+.tag.h-imp-crit { color: var(--warn); }
+.h-item-desc { font-size: var(--fs-100); color: var(--text-secondary); white-space: pre-wrap; margin-top: 2px; }
+
+/* ---- «Сцены» ---- */
+.h-card-title b { min-width: 0; overflow-wrap: anywhere; }
+.tag.h-cur { color: var(--accent); }
+.h-loc-kids { margin-top: 6px; padding-left: var(--sp-2); border-left: 1px solid var(--border-subtle); }
+.h-loc > p { margin: var(--sp-1) 0; }
+
+/* ---- «Таблицы» ---- */
+.h-table { padding: 10px; }
+.h-table-head { display: flex; align-items: center; gap: var(--sp-2); margin-bottom: var(--sp-2); }
+.h-table-name { flex: 1 1 auto; min-width: 0; font-weight: 600; }
+.h-table-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: var(--sp-2); }
+/* Действия строки/столбца — полосой над таблицей, а не всплывающим меню:
+   его координаты внутри прокручиваемой таблицы пришлось бы считать, а
+   долгое нажатие плагина на пальце никто не находил. */
+.h-tmenu {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  margin: 6px 0; padding: 6px var(--sp-2);
+  background: var(--surface-selected); border: 1px solid var(--accent-border); border-radius: var(--r-md);
+}
+/* Прокрутка вбок — только здесь: таблица на 10 столбцов шире телефона, и
+   без обёртки она растягивала бы всю шторку. */
+.h-table-wrap {
+  max-width: 100%; overflow-x: auto; overscroll-behavior-x: contain;
+  margin-top: var(--sp-2); border: 1px solid var(--border-subtle); border-radius: var(--r-md);
+}
+.h-table-wrap:focus-visible { outline: var(--focus-ring); outline-offset: 2px; }
+.h-grid { border-collapse: collapse; }
+.h-grid th, .h-grid td { border: 1px solid var(--border-subtle); padding: 0; vertical-align: top; }
+.h-grid th { background: var(--surface-3); }
+.h-grid td { background: var(--surface-0); }
+.h-grid input {
+  width: 100%; min-width: 108px; border: none; border-radius: 0; background: transparent;
+  padding: 6px var(--sp-2); font-size: var(--fs-200);
+}
+.h-grid input:focus-visible { outline: var(--focus-ring); outline-offset: -2px; }
+.h-grid th input { font-weight: 600; min-width: 96px; }
+.h-th, .h-td { display: flex; align-items: stretch; }
+.h-th input, .h-td input { flex: 1 1 auto; }
+.h-th-more {
+  flex: none; border: none; border-left: 1px solid var(--border-subtle); border-radius: 0;
+  background: transparent; color: var(--text-secondary); padding: 0 var(--sp-2);
+}
+.h-th-more:hover { background: var(--surface-hover); color: var(--text-primary); border-color: var(--border-subtle); }
+.h-lockmark { flex: none; align-self: center; padding: 0 var(--sp-1); font-size: var(--fs-100); }
+/* Защищённая ячейка: замок (признак не цветом) и штриховка поверх. */
+.h-grid td.h-locked { background: var(--surface-2); }
+.h-grid th.h-locked { box-shadow: inset 0 -2px 0 var(--accent-border); }
+.h-cell-lock {
+  width: 100%; min-width: 108px; min-height: 34px; text-align: left;
+  border: none; border-radius: 0; background: transparent; padding: 6px var(--sp-2);
+}
+.h-cell-lock[aria-pressed="true"] { background: var(--surface-3); }
+.h-cell-lock:active { transform: none; }
+
+/* ---- «RPG» ---- */
+.h-rpg-card { padding: 10px; }
+.h-rpg-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 6px; }
+.h-bar-row, .h-row.h-attr {
+  display: grid; grid-template-columns: minmax(56px, 30%) minmax(0, 1fr) auto;
+  align-items: center; gap: var(--sp-2); padding: 2px 0; border-bottom: none;
+}
+.h-bar-l { font-size: var(--fs-100); color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Полоса заполнения — пилюля, как полоса окна контекста: это состояние. */
+.h-bar { display: block; height: 8px; border-radius: var(--r-pill); background: var(--surface-3); overflow: hidden; }
+.h-bar-fill { display: block; height: 100%; border-radius: inherit; background: var(--accent); transition: width var(--dur-3) var(--ease); }
+.h-bar-v { font-size: var(--fs-100); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.h-status { margin-top: 6px; }
+.h-radar { display: block; width: 100%; max-width: 340px; height: auto; margin: var(--sp-1) auto; overflow: visible; }
+.h-radar-grid { fill: none; stroke: var(--border-strong); stroke-width: 1; }
+.h-radar-axis { stroke: var(--border-subtle); stroke-width: 1; }
+.h-radar-data { fill: var(--accent-subtle); stroke: var(--accent); stroke-width: 2; }
+.h-radar-label { fill: var(--text-secondary); font-size: 12px; }
+.chip.h-eq { display: inline-flex; align-items: center; gap: var(--sp-1); margin: 2px var(--sp-1) 2px 0; }
+.h-chip-x { padding: 0 var(--sp-1); }
+.h-money { font-size: var(--fs-100); }
+.h-cfg { margin-top: var(--sp-4); }
+.h-dice { margin-top: var(--sp-5); padding-top: var(--sp-3); border-top: 1px solid var(--border-subtle); }
+.h-dice-row { display: flex; flex-wrap: wrap; align-items: flex-end; gap: var(--sp-2); }
+.h-dice-row label { flex: 1 1 160px; margin: 0; }
+.h-dice-out { margin: var(--sp-2) 0; font-size: var(--fs-300); overflow-wrap: anywhere; }
+
+/* ---- «Настройки» и «Промпты» ---- */
+.h-scope { display: flex; flex-wrap: wrap; gap: var(--sp-1); margin-bottom: var(--sp-1); }
+/* Обёртка-переключатель «можно ли править уровень» — без собственной рамки. */
+.h-fs-plain { min-width: 0; margin: 0; padding: 0; border: none; }
+.h-sgroup { margin: 0; border-bottom: 1px solid var(--border-subtle); }
+.h-sgroup > summary { padding: 10px 0; }
+/* Значение, заданное на выбранном уровне, отмечено полосой слева — тот же
+   признак, что у выбранной строки, — и словами «Задано здесь» в подсказке. */
+.h-field { padding: var(--sp-2) 0 var(--sp-2) 11px; border-left: 3px solid transparent; }
+.h-field.h-field-set { border-left-color: var(--accent); }
+.h-field label { margin-bottom: var(--sp-1); }
+.h-field-foot { display: flex; align-items: flex-start; gap: var(--sp-2); }
+.h-field-foot .field-hint { flex: 1 1 auto; margin-top: 0; min-width: 0; }
+.h-origin { color: var(--text-tertiary); }
+.h-reset { flex: none; padding: 2px var(--sp-2); font-size: var(--fs-100); }
+.h-checks { display: flex; flex-wrap: wrap; gap: var(--sp-1) 14px; }
+.horae .h-checks label.check { margin: 0; }
+.h-cfgblock { padding: var(--sp-1) 0; }
+.h-swatch { flex: none; width: 14px; height: 14px; margin-top: 4px; border-radius: var(--r-xs); border: 1px solid var(--border-strong); }
+.tag.h-tag-set { color: var(--accent); }
+.h-prompt-text {
+  min-height: 200px; font-family: "Cascadia Code", Consolas, "Courier New", monospace;
+  font-size: var(--fs-200); line-height: 1.45;
+}
+.h-prompt-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 6px 0 var(--sp-2); }
+.h-preset-select { width: auto; max-width: 100%; flex: 1 1 200px; }
+
+/* ---- Окна и формы ---- */
+/* Ширина — от окна, а не max-width: 100%: окно лежит в сетке .modal-backdrop,
+   и процент там считается от дорожки, которая сама растягивается под окно —
+   на телефоне 520px уезжали за правый край. 32px — паддинг подложки. */
+.h-modal { width: min(520px, calc(100vw - 32px)); }
+.h-modal.h-modal-wide { width: min(680px, calc(100vw - 32px)); }
+.h-modal-head { display: flex; align-items: center; gap: var(--sp-2); margin-bottom: var(--sp-2); }
+.h-modal-head h3 { flex: 1 1 auto; margin: 0; font-size: var(--fs-300); min-width: 0; overflow-wrap: anywhere; }
+.h-form-note { margin: 0 0 var(--sp-3); font-size: var(--fs-100); color: var(--text-secondary); }
+.h-form .h-form-hint { margin: -6px 0 10px; }
+.h-req { color: var(--text-secondary); }
+.h-color { width: 56px; height: 36px; padding: 2px; }
+/* Кнопки формы липнут к низу окна: длинная форма персонажа прокручивается,
+   а «Сохранить» остаётся видна. Отступ −18px — паддинг .modal. */
+.h-form-actions {
+  position: sticky; bottom: -18px; z-index: var(--z-nav);
+  display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2);
+  margin-top: var(--sp-3); padding: 10px 0 var(--sp-1);
+  background: var(--surface-2); border-top: 1px solid var(--border-subtle);
+}
+
+/* Строки-записи редактора меты: поля переносятся сами, узкие (иконка,
+   число) не растягиваются на всю ширину, длинные (описание) — всегда строкой. */
+.h-fs { min-width: 0; margin: 0 0 10px; padding: 6px 10px 10px; border: 1px solid var(--border-subtle); border-radius: var(--r-md); }
+.h-fs legend { padding: 0 var(--sp-1); font-size: var(--fs-100); font-weight: 600; color: var(--text-secondary); }
+.h-rrow { display: flex; align-items: flex-start; gap: 6px; padding: 6px 0; border-bottom: 1px dashed var(--border-subtle); }
+.h-rrow-fields { flex: 1 1 auto; min-width: 0; display: flex; flex-wrap: wrap; gap: var(--sp-1) var(--sp-2); }
+.horae .h-rf, .h-msg .h-rf, .h-rf { flex: 1 1 120px; min-width: 0; margin: 0; }
+.h-rf.h-rf-narrow { flex: 0 1 84px; }
+.h-rf.h-rf-wide { flex: 1 1 100%; }
+.h-rf-l { display: block; margin-bottom: 2px; font-size: var(--fs-100); color: var(--text-secondary); }
+.h-rrow-del { flex: none; margin-top: 18px; }
+.h-grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(150px, 100%), 1fr)); gap: 0 10px; }
+.h-span-all { grid-column: 1 / -1; }
+
+/* ---- Строка Horae под ответом ИИ ----
+   width: 0 при min-width: 100% — строка не распирает реплику: короткий ответ
+   с длинной сводкой остаётся коротким, сводка переносится по его ширине.
+   Открытый редактор, наоборот, забирает ширину, которая ему нужна. */
+.h-msg { width: 0; min-width: 100%; margin-top: var(--sp-1); }
+.h-msg.h-msg-open { width: auto; }
+.h-msg-line {
+  display: flex; align-items: baseline; gap: 6px; width: 100%;
+  padding: 3px 6px; text-align: left; line-height: 1.4;
+  background: transparent; border: 1px solid transparent; border-radius: var(--r-sm);
+  font-size: var(--fs-100); color: var(--text-secondary);
+}
+.h-msg-line:hover { background: var(--surface-hover); border-color: transparent; color: var(--text-primary); }
+.h-msg-line:active { transform: none; }
+.h-msg-line:focus-visible { outline: var(--focus-ring); outline-offset: 0; }
+/* Сводка — не больше двух строк: у короткой реплики строка узкая, и
+   длинная сводка вытягивалась бы в столбик на полэкрана. Полностью она
+   видна в редакторе (по нажатию) и в подсказке. */
+.h-msg-brief {
+  flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden;
+}
+.h-msg-empty { flex: 1 1 auto; color: var(--text-tertiary); }
+.h-msg-side { flex: none; }
+.h-msg-ed {
+  margin-top: 6px; padding: 10px var(--sp-3);
+  background: var(--surface-1); border: 1px solid var(--border-subtle); border-radius: var(--r-lg);
+  font-size: var(--fs-200);
+}
+.h-msg-form label { margin-bottom: var(--sp-2); }
+.h-npc-det { margin: 2px 0; }
+.h-npc-det > summary { cursor: pointer; padding: var(--sp-1) 0; font-size: var(--fs-100); color: var(--text-secondary); overflow-wrap: anywhere; }
+.h-raw {
+  max-height: 260px; overflow: auto; margin: var(--sp-1) 0; padding: var(--sp-2);
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  font-family: "Cascadia Code", Consolas, "Courier New", monospace; font-size: var(--fs-100);
+  background: var(--code-bg); border: 1px solid var(--border-subtle); border-radius: var(--r-md);
+}
+.h-msg-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: var(--sp-2); }
+/* Стрим: модель пишет служебный блок — тихая пометка вместо разметки. */
+.horae-writing { margin-top: 6px; font-size: var(--fs-100); font-style: italic; color: var(--text-secondary); }
+/* Зал: строка лежала бы прямо на фоне пользователя — своя подложка, как у
+   метаданных реплики (0.88 — порог, посчитанный для имени говорящего). */
+.view-scene .h-msg-line { background: rgba(14, 12, 15, 0.88); width: fit-content; max-width: 100%; }
+
+@media (max-width: 767.98px) {
+  .drawer.drawer-wide { width: 100%; max-width: 100%; height: 85vh; height: 85dvh; }
+  .h-tabs {
+    flex-wrap: nowrap; overflow-x: auto; overscroll-behavior-x: contain;
+    -webkit-overflow-scrolling: touch; scrollbar-width: none; padding-top: var(--sp-1);
+  }
+  .h-tabs::-webkit-scrollbar { display: none; }
+  /* Ссылка-кнопка и строка Horae визуально ниже 44px — зону нажатия добирает
+     псевдоэлемент (правило 44 пикселей), а не рост строки: иначе строка Horae
+     прибавляла бы по 20px высоты под каждым ответом. */
+  .h-link { min-height: 0; position: relative; }
+  .h-link::after { content: ""; position: absolute; left: 0; right: 0; top: 50%; height: 44px; transform: translateY(-50%); }
+  .h-msg-line { min-height: 32px; position: relative; }
+  .h-msg-line::after { content: ""; position: absolute; left: 0; right: 0; top: -6px; bottom: -6px; }
+  .h-sel { min-width: 44px; min-height: 44px; justify-content: center; }
+  .h-det > summary { padding: 12px 0; }
+  .h-inline-select select { max-width: 150px; }
+  .h-dl { grid-template-columns: minmax(72px, max-content) minmax(0, 1fr); }
+  .h-rrow-del { margin-top: 14px; }
+}

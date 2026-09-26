@@ -576,6 +576,13 @@ STYLE_GUIDE = (
 )
 
 
+# Дополнение к STYLE_GUIDE, когда модель должна писать теги Horae.
+HORAE_STYLE_NOTE = (
+    " Исключение — служебные блоки Horae (<horae>, <horaeevent> и другие по правилам "
+    "ниже) в самом конце ответа: это не HTML-разметка, пиши их обязательно."
+)
+
+
 # ==================== РЕЖИМ БЕЗ ОТЫГРЫША (OOC / ассистент) ====================
 # Зачем: обычный BEHAVIOR_GUIDE требует «оставайся в образе и не давай мета-
 # комментариев», а якорь роли переинъектируется в САМУЮ сильную позицию — прямо
@@ -714,7 +721,7 @@ def _visible_recalled(recalled_facts, history_ids, total: int, start: int) -> li
 # anchor, post_history, global, focus) — статичная часть хода, Tier 1. Делим
 # «память против остального», а не перечнем системных ключей: блок, добавленный
 # в хвост без правки монитора, так попадёт в систему, а не выпадет из суммы.
-_MEMORY_TAIL_KEYS = frozenset({"snapshot", "recalled"})
+_MEMORY_TAIL_KEYS = frozenset({"snapshot", "recalled", "horae_state", "horae_recall"})
 
 
 def _context_tiers(report: dict, *, avatar_msgs, knowledge_msgs, window_tokens: int,
@@ -920,6 +927,7 @@ def assemble_context(
     recalled_facts: list[dict] | None = None,
     history_ids: list | None = None,
     report: dict | None = None,
+    horae=None,
 ) -> list[dict]:
     """
     ЧИСТАЯ функция сборки контекста. Возвращает messages для LiteLLM:
@@ -947,6 +955,11 @@ def assemble_context(
         дословно — считая уже ПОСЛЕ обрезки истории по бюджету; остаётся не
         больше horae_recall.TOP_K.
 
+    :param horae: блоки Horae State Engine (horae_engine.HoraeParts) или None:
+        правила тегов (в системный промпт или хвост), блок состояния сюжета
+        (хвост, после мастер-снимка), кандидаты воспоминаний (отсев — после
+        обрезки истории, как у фактов) и напоминание формата (перед фокусом).
+
     :param report: если передан словарь, функция складывает в него разбор хода:
         вес каждого блока, сработавшие записи памяти и что срезал бюджет. Заполняется
         ПО ХОДУ сборки теми же значениями, что уходят в модель, поэтому инспектор
@@ -968,7 +981,15 @@ def assemble_context(
     part_horae = _render_horae_block(lore_recs)
     part_behaviour = ASSISTANT_GUIDE if ooc else BEHAVIOR_GUIDE
     part_style = ASSISTANT_STYLE_GUIDE if ooc else STYLE_GUIDE
-    system_parts = [part_character, part_persona, part_horae, part_behaviour, part_style]
+    horae_rules = (getattr(horae, "rules", "") or "") if horae is not None else ""
+    rules_in_tail = bool(horae_rules and getattr(horae, "rules_in_tail", False))
+    if horae_rules:
+        # STYLE_GUIDE запрещает HTML-разметку, и без оговорки модель читала
+        # служебные теги Horae как HTML и «послушно» их не писала.
+        part_style = part_style + HORAE_STYLE_NOTE
+    part_horae_rules = horae_rules if (horae_rules and not rules_in_tail) else ""
+    system_parts = [part_character, part_persona, part_horae, part_behaviour, part_style,
+                    part_horae_rules]
     system_prompt = "\n\n".join(p for p in system_parts if p)
 
     if report is not None:
@@ -988,6 +1009,8 @@ def assemble_context(
             {"key": "guides", "label": "Инструкции поведения и стиля",
              "tokens": _w(part_behaviour) + _w(part_style),
              "text": part_behaviour + "\n\n" + part_style},
+            {"key": "horae_rules", "label": "Правила тегов Horae",
+             "tokens": _w(part_horae_rules), "text": part_horae_rules},
         ]
         report["system_prompt"] = system_prompt
         report["system_tokens"] = estimate_tokens(system_prompt) if system_prompt.strip() else 0
@@ -1041,12 +1064,24 @@ def assemble_context(
         global_instructions=global_instructions, ooc=ooc,
         user_attachments_content=user_attachments_content,
     )
+    # Horae: блок состояния сюжета (и правила, если они в хвосте) — сразу
+    # после мастер-снимка; напоминание формата — последним перед фокусом, в
+    # сильнейшей позиции. От обрезки истории они не зависят — резервируются.
+    horae_tail: list[tuple[str, str]] = []
+    if horae is not None:
+        if (getattr(horae, "state_block", "") or "").strip():
+            horae_tail.append(("horae_state", horae.state_block.strip()))
+        if rules_in_tail:
+            horae_tail.append(("horae_rules", horae_rules))
+        reminder = (getattr(horae, "reminder", "") or "").strip()
+        if reminder:
+            static_tail.insert(max(0, len(static_tail) - 1), ("horae_reminder", reminder))
     current_content = (user_attachments_content if user_attachments_content is not None
                        else user_message)
     reserved = (
         (estimate_tokens(system_prompt) if system_prompt else 0)
         + sum(estimate_content_tokens(m.get("content")) for m in avatar_msgs + knowledge_msgs)
-        + sum(estimate_tokens(text) for _, text in snapshot_tail + static_tail)
+        + sum(estimate_tokens(text) for _, text in snapshot_tail + horae_tail + static_tail)
         + estimate_content_tokens(current_content)
     )
 
@@ -1061,6 +1096,12 @@ def assemble_context(
         {"role": m["role"], "content": m["content"]} for m in history[start:]
     ]
     recalled_facts = _visible_recalled(recalled_facts, history_ids, len(history), start)
+    horae_recalled: list[dict] = []
+    if horae is not None and getattr(horae, "recall", None):
+        from backend import horae_vector
+
+        top_k = int((getattr(horae, "recall_settings", None) or {}).get("recall_top_k") or 5)
+        horae_recalled = horae_vector.visible(horae.recall, history_ids, len(history), start, top_k)
 
     if report is not None:
         report["recalled"] = [
@@ -1068,6 +1109,13 @@ def assemble_context(
              "similarity": f.get("similarity")}
             for f in recalled_facts
         ]
+        report["horae_recall"] = [
+            {"mid": c.get("mid"), "similarity": c.get("similarity"), "score": c.get("score"),
+             "source": c.get("source"), "full": bool(c.get("full")), "carried": bool(c.get("carried"))}
+            for c in horae_recalled
+        ]
+        if horae is not None:
+            report["horae_state"] = dict(getattr(horae, "report", None) or {})
         report["history"] = {
             "total": len(history),
             "included": len(trimmed_history),
@@ -1093,7 +1141,7 @@ def assemble_context(
     # Блоки — парами (ключ, текст): в модель уходит текст, ключ (snapshot,
     # recalled, anchor, …) нужен только отчёту — монитор токенов делит хвост
     # по уровням памяти (§7 спеки).
-    tail_blocks: list[tuple[str, str]] = list(snapshot_tail)
+    tail_blocks: list[tuple[str, str]] = list(snapshot_tail) + horae_tail
 
     # Факты из давней части чата, похожие на текущую реплику. Нет таких — нет и
     # блока: пустой или натянутый блок памяти модель охотно «дополняет» выдумкой.
@@ -1103,6 +1151,15 @@ def assemble_context(
         recalled_block = render_recalled(recalled_facts)
         if recalled_block:
             tail_blocks.append(("recalled", recalled_block))
+    # Вспомнившиеся события Horae (из сообщений, которых модель уже не видит).
+    if horae_recalled:
+        from backend import horae_vector
+
+        recall_block = horae_vector.render(
+            horae_recalled, current_date=getattr(horae, "current_date", "") or "",
+            calendar=getattr(horae, "calendar", None))
+        if recall_block:
+            tail_blocks.append(("horae_recall", recall_block))
 
     # Манифест приложенных файлов + напоминание изучать их.
     manifest = _attachment_manifest(trimmed_history, user_attachments_content)
@@ -1294,10 +1351,14 @@ async def build_context_from_db(
     assistant_mode: bool = False,
     report: dict | None = None,
     history_ids: list[int | None] | None = None,
+    horae_tags: bool = True,
 ) -> list[dict]:
     """
     Достаёт из БД память Horae, персону, заметку автора и историю сообщений,
     после чего вызывает чистую assemble_context().
+
+    :param horae_tags: False — путь, где модель не должна писать теги Horae
+        (канвас): правила и напоминание не добавляются, блок состояния — да.
 
     :param assistant_mode: постоянный тумблер «без отыгрыша» из интерфейса. Работает
         вместе с разовой пометкой ((…)) / /ooc в самом сообщении — сработает любое
@@ -1346,6 +1407,10 @@ async def build_context_from_db(
 
         global_instructions = await load_global_instructions(session_db)
 
+    # Момент состояния Horae: история передана вызывающим (перегенерация,
+    # «Продолжить», retry) — состояние на её последнее сообщение, без меты
+    # ответа, который сейчас пишется заново (skipLast плагина).
+    horae_until = None
     if history is None:
         hq = (
             select(Message)
@@ -1365,9 +1430,16 @@ async def build_context_from_db(
         # сопоставилась бы со ЧУЖИМИ id, и окно молча выбросило бы сообщения,
         # которых нет в сводке. Неизвестный id окно не выбрасывает никогда.
         history_ids = [None] * len(history)
+    else:
+        known = [i for i in history_ids if i]
+        horae_until = max(known) if known else None
 
     history, history_ids, recalled = await _long_memory(
         session_db, session, history, history_ids, user_message, report
+    )
+    horae_parts = await _horae_parts(
+        session_db, session, character, until=horae_until, ooc=ooc, tags=horae_tags,
+        user_message=user_message, history_ids=history_ids, report=report,
     )
 
     char_dict = {
@@ -1401,7 +1473,56 @@ async def build_context_from_db(
         recalled_facts=recalled,
         history_ids=history_ids,
         report=report,
+        horae=horae_parts,
     )
+
+
+async def _horae_parts(session_db, session, character, *, until, ooc, tags, user_message,
+                       history_ids, report):
+    """
+    Блоки Horae State Engine для хода (horae_engine.context_parts) или None.
+    Как и долгая память, Horae не имеет права ронять ход: любой сбой — ход
+    без блоков Horae, а в отчёте инспектора — пометка об ошибке.
+    """
+    import logging
+
+    try:
+        from backend import horae_engine
+        from backend.settings_service import get_connection
+
+        return await horae_engine.context_parts(
+            session_db, session, character, until=until, ooc=ooc, tags=tags,
+            user_message=user_message, connection=await get_connection(session_db),
+            history_ids=history_ids,
+        )
+    except Exception:  # noqa: BLE001
+        logging.getLogger("aichat.horae").exception("Horae чата %s не собрался", session.id)
+        if report is not None:
+            report["horae_state"] = {"enabled": True, "error": True}
+        return None
+
+
+async def _horae_covered(session_db, session, history_ids, covered: int) -> int:
+    """
+    Указатель «учтено до» с учётом активных свёрток хронологии Horae
+    (настройка summary_hides): сообщение, покрытое свёрткой, окно может
+    выбросить так же, как покрытое мастер-снимком — это «/hide» плагина.
+    Сбой — прежний указатель: окно просто выбросит меньше.
+    """
+    try:
+        from backend import horae_engine
+
+        data = await horae_engine.load_chat_data(session_db, session.id)
+        summaries = data.get("summaries") or []
+        if not summaries:
+            return covered
+        settings = await horae_engine.effective_settings(session_db, session, None, data)
+        if not (settings.get("enabled") and settings.get("summary_hides")):
+            return covered
+        entries = [(i, None, None, False) for i in history_ids or [] if i]
+        return horae_engine.covered_pointer(entries, summaries, covered)
+    except Exception:  # noqa: BLE001
+        return covered
 
 
 async def _long_memory(session_db, session, history, history_ids, user_message, report):
@@ -1458,6 +1579,7 @@ async def _long_memory(session_db, session, history, history_ids, user_message, 
         # покрытии (см. horae_recall.SUMMARY_FORMAT). Легаси-метку «last:N» из
         # keywords здесь тоже намеренно НЕ читаем — по той же причине.
         covered = horae_recall.trusted_pointer(entry.meta if entry is not None else None)
+        covered = await _horae_covered(session_db, session, history_ids, covered)
 
         start = horae_recall.window_start(history_ids, covered, window)
 

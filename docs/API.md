@@ -150,6 +150,51 @@ HTTP Basic Auth поверх всего нужен ещё заголовок `Au
 "group"`: ход группы собирается иначе (окна нет, запрос на каждого отвечающего).
 Подробно — в [HORAE.md](HORAE.md).
 
+## Horae State Engine (состояние сюжета)
+
+Подробно — [HORAE_STATE.md](HORAE_STATE.md). Все эндпоинты чата проверяют
+доступ к чату (как `/messages`). Роутер — `backend/horae_api.py`.
+
+| Метод и путь | Что |
+|---|---|
+| `GET /api/sessions/{id}/horae/state?at=<mid>` | состояние сюжета, хронология, таблицы, настройки RPG, журнал правок, статистика (`injection_tokens`…), задание |
+| `GET/PUT /api/messages/{id}/horae` | мета активного свайпа ответа (`{meta}`; `null` — стереть) |
+| `POST /api/messages/{id}/horae/analyze` | ИИ-анализ ответа сейчас |
+| `POST /api/messages/{id}/horae/side` | `{side}` — побочная сцена |
+| `POST /api/sessions/{id}/horae/ops` | правка пользователя `{kind, …}` (виды — дизайн §6.2 и §9; `npc.pin`, `npc.favorite`) |
+| `DELETE /api/sessions/{id}/horae/ops/{op_id}` | откатить правку |
+| `POST /api/sessions/{id}/horae/events` | вставить событие `{mid, index?, level, text}` |
+| `PATCH /api/sessions/{id}/horae/events` | `{mid, i, level?, text?}` (пустой текст — удалить) |
+| `POST /api/sessions/{id}/horae/events/delete` | `{refs:[{mid, i}]}` |
+| `POST /api/sessions/{id}/horae/compress` | сжать события/свёртки в свёртку `{refs, summary_ids, mode: events\|fulltext}` |
+| `POST /api/sessions/{id}/horae/summaries` | своя свёртка `{from_mid, to_mid, text}` |
+| `PATCH/DELETE /api/sessions/{id}/horae/summaries/{sid}` | `{text?, active?}` / удалить (дети возвращаются) |
+| `POST /api/sessions/{id}/horae/summaries/run` | 202 — авто-свёртка сейчас (задание) |
+| `POST /api/sessions/{id}/horae/scan` | 202 — ИИ-скан истории `{batch_tokens, include:{npc, affection, scene, relationships}}` |
+| `GET /api/sessions/{id}/horae/job`, `POST …/job/cancel` | статус / остановка задания (`kind`, `status`, `processed/total`, `line`, `error`, `warnings`) |
+| `POST /api/sessions/{id}/horae/scan/undo` | отменить скан |
+| `POST /api/sessions/{id}/horae/tables` | таблица `{name, rows, cols, prompt, scope: local\|character\|global}` |
+| `PATCH /api/sessions/{id}/horae/tables/{tid}` | одно из `{name}`, `{prompt}`, `{cell:{r,c,value}}`, `{structure:{op,index}}`, `{lock:{type,r,c,locked}}`, `{clear:true}`, `{scope}` |
+| `DELETE …/horae/tables/{tid}`, `POST …/horae/tables/import` | удалить / импорт JSON |
+| `GET/PUT /api/horae/settings` | глобальные настройки (`{defaults, global, effective}`; менять — админ); `null` снимает ключ |
+| `GET/PUT /api/sessions/{id}/horae/settings` | переопределения чата (`{overrides, character, effective}`) |
+| `GET/PUT /api/characters/{id}/horae_profile` | профиль персонажа `{settings, tables}` |
+| `GET /api/horae/prompts`, `POST/DELETE …/prompts/presets` | промпты по умолчанию и наборы |
+| `GET/PUT /api/sessions/{id}/horae/rpg_config`, `GET/PUT /api/horae/equipment_templates` | настройки RPG чата / шаблоны снаряжения |
+| `GET /api/sessions/{id}/horae/export`, `POST …/horae/import` | данные Horae чата (`{data, mode: by_id\|initial}`) |
+| `DELETE /api/sessions/{id}/horae` | стереть данные Horae чата |
+| `POST /api/sessions/{id}/horae/carryover` | новый чат с памятью `{keep, vectors}` → `{session_id}` |
+| `POST /api/sessions/{id}/horae/npc_enrich` | ИИ-заполнение профиля NPC `{name, aliases}` → `{fields, hits}` |
+| `POST /api/sessions/{id}/horae/reindex`, `GET …/horae/recall?q=` | пересобрать документы поиска / отладка вспоминания |
+
+`GET /api/sessions/{id}/messages` отдаёт у каждого сообщения `horae_brief`
+(строка под ответом или `null`) и `horae_side`. Импорт SillyTavern отвечает
+ещё `horae_structured` (сколько ответов со структурными данными Horae) и
+`horae_chat_saved`. В инспекторе хода (`/context`) — `report.horae_state`,
+`report.horae_recall`, блоки хвоста `horae_state`, `horae_recall`,
+`horae_reminder` и блок системного промпта `horae_rules`; `horae_state` и
+`horae_recall` монитор относит к памяти (Tier 2).
+
 ## Персоны, пресеты, настройки
 
 | Метод | Путь | Назначение |

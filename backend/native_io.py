@@ -64,7 +64,8 @@ def _horae_to_dict(e, character_id) -> dict:
     }
 
 
-def build_chat_export(session, character, persona, messages, horae_entries, members) -> dict:
+def build_chat_export(session, character, persona, messages, horae_entries, members,
+                      horae_chat: dict | None = None) -> dict:
     """
     Собрать нативный экспорт чата из ORM-объектов в сериализуемый словарь.
 
@@ -86,6 +87,8 @@ def build_chat_export(session, character, persona, messages, horae_entries, memb
             "reply_to_idx": id_to_idx.get(m.reply_to_id) if m.reply_to_id else None,
             "attachments": m.attachments or [],
             "model_used": m.model_used,
+            # Данные Horae State Engine (мета по свайпам, «побочная сцена»).
+            "horae": getattr(m, "horae", None),
         })
 
     return {
@@ -105,7 +108,18 @@ def build_chat_export(session, character, persona, messages, horae_entries, memb
         "group_members": [character_to_dict(c) for c in (members or [])],
         "messages": msg_list,
         "horae": [_horae_to_dict(e, char_id) for e in horae_entries],
+        # Состояние Horae чата; id сообщений в нём заменены на idx + 1 (0 —
+        # «до всех сообщений»), как ссылки ответов — на индексы.
+        "horae_chat": _horae_chat_to_idx(horae_chat, messages),
     }
+
+
+def _horae_chat_to_idx(horae_chat, messages) -> dict | None:
+    if not isinstance(horae_chat, dict):
+        return None
+    from backend.horae_engine import remap_chat_data
+
+    return remap_chat_data(horae_chat, {m.id: i + 1 for i, m in enumerate(messages)})
 
 
 def is_native_chat(data) -> bool:

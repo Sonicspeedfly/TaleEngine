@@ -143,7 +143,11 @@ createApp({
       editingText: "",
 
       // --- Правая панель ---
-      drawerTab: null,         // generation | connection | character | memory | persona | null (по умолчанию СКРЫТ)
+      drawerTab: null,         // generation | connection | character | memory | horae | persona | null (по умолчанию СКРЫТ)
+      // Счётчик для вкладки «Хроника» (frontend/horae.js): растёт, когда ход
+      // закончился или правили данные Horae под сообщением, — открытая панель
+      // по нему перечитывает состояние. Сама панель про ход ничего не знает.
+      horaeTick: 0,
       // Грубый указатель (палец). Раскрытие действий строки по наведению на
       // таком устройстве не срабатывает НИКОГДА, поэтому там нужна не та же
       // разметка с другим оформлением, а другое раскрытие: одна кнопка вместо
@@ -999,6 +1003,48 @@ createApp({
       // Панель с кнопкой копирования навешиваем ПОСЛЕ санитайза — иначе DOMPurify
       // вырезал бы нашу же кнопку.
       return this._withCodeToolbar(DOMPurify.sanitize(html, { ADD_DATA_URI_TAGS: ["img"] }));
+    },
+
+    // ---------- Horae: теги в тексте и строка под ответом ----------
+    // Выражения шаблона не видят window, поэтому HoraeUI зовём через методы.
+    // Нет horae.js (не загрузился) — текст как есть: теги видны, но ответ цел.
+    // partial=true — режим стрима: отрезается и незакрытый хвостовой блок.
+    horaeStrip(text, partial = false) {
+      const H = window.HoraeUI;
+      return H ? H.stripTags(text || "", partial) : (text || "");
+    },
+    // Модель прямо сейчас пишет служебный блок — под пузырём пометка вместо него.
+    horaeWriting(text) {
+      const H = window.HoraeUI;
+      return !!(H && text && H.hasOpenTag(text));
+    },
+    // Модель забыла теги — сервер доизвлекает данные ответа фоновым ИИ-анализом
+    // (настройка auto_analyze). Чтобы строка под ответом и открытая «Хроника»
+    // не стояли пустыми до следующего хода, через несколько секунд
+    // перепроверяем мету именно этого сообщения — без перечитки всего списка.
+    _horaeRecheck() {
+      const sid = this.sessionId;
+      const last = [...this.messages].reverse().find((m) => m.role === "assistant");
+      if (!last || typeof last.id !== "number" || last.horae_brief || last.horae_side) return;
+      const mid = last.id;
+      [6000, 20000].forEach((delay) => setTimeout(async () => {
+        if (this.sessionId !== sid) return;
+        const m = this.messages.find((x) => x.id === mid);
+        if (!m || m.horae_brief) return;
+        try {
+          const view = await this.api("/messages/" + mid + "/horae");
+          if (view && view.brief && this.sessionId === sid) {
+            m.horae_brief = view.brief;
+            this.horaeTick += 1;
+          }
+        } catch (e) { /* сообщение удалили или нет доступа — строка останется как есть */ }
+      }, delay));
+    },
+    // Правка данных Horae под сообщением: сводка в строке берётся из списка
+    // сообщений (horae_brief), а открытая «Хроника» пересчитывает состояние.
+    onHoraeMsgChanged() {
+      this.horaeTick += 1;
+      this.loadMessages().catch(() => {});
     },
 
     // Оборачивает каждый <pre> в блок с шапкой: язык слева, «Копировать» справа.
@@ -2783,6 +2829,9 @@ createApp({
       this.groupWaiting = 0;
       // Сервер — источник истины: перечитываем сообщения (там уже новый ответ/свайп).
       await this.loadMessages();
+      // Ответ разобран на сервере — открытая «Хроника» перечитает состояние.
+      this.horaeTick += 1;
+      this._horaeRecheck();
       // Новая реплика двигает чат вверх (среди своих: пины не перепрыгивает)
       // и меняет превью в сайдбаре. Ошибка и остановка приходят сюда же, и
       // список нужен и им: реплика пользователя уже сохранена.
@@ -3513,6 +3562,14 @@ createApp({
           msg += "\n🧠 Память Horae восстановлена (записей: " + data.horae_saved + ").";
           this.drawerTab = "memory";
         }
+      } else if (data.horae_structured > 0) {
+        // Разобранные данные Horae (время, место, персонажи…) легли в сами
+        // сообщения, и снимок-запись сервер тогда не пишет (horae_saved = false):
+        // без этой ветки тост ниже соврал бы «данных Horae не найдено».
+        const n = data.horae_structured;
+        msg += "\n🕰 Horae: перенесены данные " + n + " " + this.plural(n, "ответа", "ответов", "ответов")
+          + " (время, место, персонажи, предметы, события) — вкладка «Хроника».";
+        this.drawerTab = "horae";
       } else if (data.horae_saved) {
         msg += "\n🧠 Память Horae подхвачена: снимок состояния сохранён как always_on-запись этого чата (вкладка «Память Horae»).";
         this.drawerTab = "memory"; // сразу показываем, что сохранилось
@@ -5182,7 +5239,7 @@ createApp({
             </div>
             <!-- ответ ИИ + плашка документа (ответ-Канвас) -->
             <div v-else-if="m.canvas_id">
-              <div v-if="m.content" v-html="renderMd(m.content)" style="margin-bottom:8px"></div>
+              <div v-if="m.content" v-html="renderMd(horaeStrip(m.content))" style="margin-bottom:8px"></div>
               <!-- Карточка документа была обычным div с @click: с клавиатуры на
                    неё нельзя ни встать, ни нажать — ответ-Канвас открывался
                    только мышью. Настоящей кнопкой её не делаем: пришлось бы
@@ -5201,7 +5258,7 @@ createApp({
               </div>
             </div>
             <!-- обычный режим: markdown; двойной клик — быстрое редактирование -->
-            <div v-else v-html="renderMd(m.content)" @dblclick="startEdit(m)"></div>
+            <div v-else v-html="renderMd(horaeStrip(m.content))" @dblclick="startEdit(m)"></div>
             <!-- предпросмотр вложений сообщения -->
             <div v-if="m.attachments && m.attachments.length" class="attachments">
               <template v-for="(a, ai) in m.attachments" :key="ai">
@@ -5225,6 +5282,12 @@ createApp({
               </template>
             </div>
           </div>
+
+          <!-- Строка Horae: сводка данных ответа, по нажатию — редактор меты.
+               Только у настоящих ответов ИИ: у оптимистичной «tmp» и плашки
+               Канваса данных нет и быть не может. -->
+          <horae-msg v-if="m.role === 'assistant' && !m.canvas_id && typeof m.id === 'number'"
+                     :message="m" :session-id="sessionId" @changed="onHoraeMsgChanged"></horae-msg>
 
           <div class="msg-meta">
             <!-- Две группы: сведения (варианты, время, модель) и действия. На
@@ -5318,7 +5381,8 @@ createApp({
           </div>
           <div class="msg-body">
             <div class="speaker">{{ b.name }}</div>
-            <div class="bubble"><div v-html="renderMd(b.content)"></div><span class="typing">▌</span></div>
+            <div class="bubble"><div v-html="renderMd(horaeStrip(b.content, true))"></div><span class="typing">▌</span>
+              <div v-if="horaeWriting(b.content)" class="horae-writing">🕰 Horae записывает…</div></div>
           </div>
         </div>
         <!-- пауза перед ответом следующего персонажа (защита от лимита провайдера) -->
@@ -5332,9 +5396,13 @@ createApp({
             <span v-else>{{ msgAvatarLetter({ role: 'assistant' }) }}</span>
           </div>
           <div class="msg-body">
+            <!-- Служебные теги Horae сервер вырезает при сохранении ответа, а
+                 в стриме они идут сырыми: их прячем здесь, незакрытый хвост
+                 тоже, и вместо «<horae>time:…» показываем тихую пометку. -->
             <div class="bubble">
-              <div v-html="renderMd(currentReply)"></div>
+              <div v-html="renderMd(horaeStrip(currentReply, true))"></div>
               <span class="typing">▌</span>
+              <div v-if="horaeWriting(currentReply)" class="horae-writing">🕰 Horae записывает…</div>
             </div>
           </div>
         </div>
@@ -5612,7 +5680,9 @@ createApp({
 
     <!-- ===== Правый drawer: настройки (выезжающий оверлей) ===== -->
     <div v-if="drawerTab" class="drawer-backdrop" @click="drawerTab=null"></div>
-    <div class="drawer" v-if="drawerTab" role="dialog" aria-modal="true" aria-label="Настройки">
+    <!-- Хронике нужна ширина: таблицы, карточки персонажей и редактор
+         правил в 380px не помещаются. На узком экране ящик и так во всю ширину. -->
+    <div class="drawer" :class="{ 'drawer-wide': drawerTab === 'horae' }" v-if="drawerTab" role="dialog" aria-modal="true" aria-label="Настройки">
       <!-- Полоса вкладок объявлена вкладками. Ролей tab/tablist в файле не было
            вообще: скринридер читал пять обычных кнопок и не сообщал ни какая из
            них открыта, ни сколько их всего — состояние несла только заливка. -->
@@ -5629,6 +5699,9 @@ createApp({
         <button id="drawer-tab-memory" role="tab" aria-controls="drawer-panel-memory"
                 :aria-selected="drawerTab==='memory' ? 'true' : 'false'"
                 :class="['tab-btn', drawerTab==='memory'?'active':'']" @click="drawerTab='memory'">Память</button>
+        <button id="drawer-tab-horae" role="tab" aria-controls="drawer-panel-horae"
+                :aria-selected="drawerTab==='horae' ? 'true' : 'false'"
+                :class="['tab-btn', drawerTab==='horae'?'active':'']" @click="drawerTab='horae'">Хроника</button>
         <button id="drawer-tab-persona" role="tab" aria-controls="drawer-panel-persona"
                 :aria-selected="drawerTab==='persona' ? 'true' : 'false'"
                 :class="['tab-btn', drawerTab==='persona'?'active':'']" @click="drawerTab='persona'">Персона</button>
@@ -6103,6 +6176,14 @@ createApp({
             </details>
             <div v-else class="muted">{{ h.content }}</div>
           </div>
+        </div>
+
+        <!-- ВКЛАДКА: Хроника (Horae State Engine) — компонент из horae.js.
+             Персонаж — только у личного чата: у группы и чужого чата профиля
+             персонажа нет, и уровень «Персонаж» в настройках выключен. -->
+        <div v-if="drawerTab==='horae'" id="drawer-panel-horae" role="tabpanel" aria-labelledby="drawer-tab-horae">
+          <horae-panel :session-id="sessionId" :tick="horaeTick"
+                       :character-id="currentIsGroup || sharedView ? null : ((currentSession && currentSession.character_id) || selectedCharacterId)"></horae-panel>
         </div>
 
         <!-- ВКЛАДКА: Персона + Author's Note -->
@@ -6765,4 +6846,11 @@ createApp({
   </div>
   </template>
   `,
-}).mount("#app");
+})
+  // Компоненты «Хроники» из horae.js (подключён раньше app.js). Файл не
+  // загрузился — заглушки: без них Vue отрисовал бы <horae-panel> пустым
+  // неизвестным тегом, и вкладка молча пустовала бы.
+  .component("horae-panel", (window.HoraeUI && window.HoraeUI.components.HoraePanel)
+    || { template: '<p class="muted">Хроника не загрузилась — обновите страницу.</p>' })
+  .component("horae-msg", (window.HoraeUI && window.HoraeUI.components.HoraeMsg) || { render: () => null })
+  .mount("#app");

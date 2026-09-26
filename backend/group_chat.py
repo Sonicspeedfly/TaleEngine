@@ -329,9 +329,11 @@ async def build_group_messages(
     scene = (session.scenario or "").strip()
     scene_block = f"[Сцена] {scene}" if scene else ""
     from backend.horae_memory import BEHAVIOR_GUIDE
+    horae_parts = await _group_horae(db, session, target_character, msgs)
+    horae_rules = horae_parts.rules if horae_parts is not None and not horae_parts.rules_in_tail else ""
     system = "\n\n".join(
         p for p in [char_block, _render_persona_block(persona), scene_block, group_instr,
-                    _render_horae_block(activated), BEHAVIOR_GUIDE] if p
+                    _render_horae_block(activated), BEHAVIOR_GUIDE, horae_rules] if p
     )
 
     lines = []
@@ -365,6 +367,12 @@ async def build_group_messages(
     recalled_block = await _group_recalled(db, session, msgs)
     if recalled_block:
         messages.append({"role": "system", "content": recalled_block})
+    # Horae State Engine: состояние сюжета (и правила, если они в хвосте).
+    if horae_parts is not None:
+        if horae_parts.state_block.strip():
+            messages.append({"role": "system", "content": horae_parts.state_block.strip()})
+        if horae_parts.rules and horae_parts.rules_in_tail:
+            messages.append({"role": "system", "content": horae_parts.rules})
     # Якорь характера + post-history перед ответом (личность не «плывёт»).
     from backend.horae_memory import _render_char_anchor
     messages.append({"role": "system", "content": _render_char_anchor(char_dict)})
@@ -377,6 +385,8 @@ async def build_group_messages(
     gi = await load_global_instructions(db)
     if gi:
         messages.append({"role": "system", "content": gi})
+    if horae_parts is not None and horae_parts.reminder:
+        messages.append({"role": "system", "content": horae_parts.reminder})
 
     # ВЛОЖЕНИЯ пользователя (аудио/фото/видео/документы). Раньше в групповом чате
     # транскрипт был ЧИСТО ТЕКСТОВЫМ — файлы в модель не уходили вовсе, и персонаж
@@ -397,6 +407,29 @@ async def build_group_messages(
         ]
     messages.append({"role": "user", "content": user_content})
     return messages
+
+
+async def _group_horae(db, session, target_character, msgs):
+    """
+    Блоки Horae для реплики персонажа группы. Вспоминание событий здесь не
+    ищет по своим сообщениям: транскрипт группы идёт целиком (режется только
+    бюджетом), и почти всё, что нашлось бы, модель и так видит, — остаются
+    перенесённые из прошлого чата воспоминания. Сбой — ход без Horae.
+    """
+    try:
+        from backend import horae_engine
+        from backend.settings_service import get_connection
+
+        last_user = next((m.content for m in reversed(msgs) if m.role == "user"), "") or ""
+        return await horae_engine.context_parts(
+            db, session, target_character, user_message=last_user,
+            connection=await get_connection(db), history_ids=[m.id for m in msgs],
+        )
+    except Exception:  # noqa: BLE001
+        import logging
+
+        logging.getLogger("aichat.horae").exception("Horae группы %s не собрался", session.id)
+        return None
 
 
 async def _group_recalled(db, session, msgs) -> str:
