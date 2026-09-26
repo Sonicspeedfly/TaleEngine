@@ -1426,3 +1426,39 @@ async def test_facts_pass_without_facts_is_not_sent_again():
     assert len(facts) == 2 and f"[#{ids[0]} · " not in facts[1]
     assert (await _entry(sid)).meta["facts_upto"] == ids[39]
     await engine.dispose()
+
+
+async def test_facts_of_a_batch_stopped_before_its_facts_call_come_with_the_next_run():
+    """
+    «Остановить» посреди слияния: запрос слияния доводится и пакет пишется, а
+    запрос фактов после него уже не делается (новых платных запросов после
+    отмены нет). Раньше факты такого пакета не извлекались уже никогда — у
+    следующего прогона отметка стояла бы на них. Теперь отметка facts_upto не
+    двигается, и следующий прогон доизвлекает их вместе со своим пакетом.
+    """
+    from backend import memory_service
+    from backend.database import engine
+    await _fresh_db()
+    _, sid, ids = await _make_chat(20 + hr.DEFAULT_WINDOW)
+    seen = []
+    plain = _snapshot_llm(seen)
+
+    async def stop_during_first_merge(messages, params=None, connection=None, kind="service"):
+        if messages[0]["content"] == hm.MASTER_STATE_PROMPT and not seen:
+            memory_service.cancel_job(sid)
+        return await plain(messages, params, connection, kind)
+
+    with patch("backend.main.complete", new=stop_during_first_merge):
+        job = await _run_rebuild(sid, mode="catchup", batch_size=10)
+    assert job.status == "cancelled" and job.processed == 10
+    assert not [m for m in seen if m[0]["content"] == hr.FACTS_PROMPT]
+    assert "facts_upto" not in (await _entry(sid)).meta
+
+    seen.clear()
+    with patch("backend.main.complete", new=_snapshot_llm(seen)):
+        job = await _run_rebuild(sid, mode="catchup", batch_size=10)
+    assert job.status == "done" and job.processed == 10
+    facts = [m[1]["content"] for m in seen if m[0]["content"] == hr.FACTS_PROMPT]
+    assert len(facts) == 1 and f"[#{ids[0]} · " in facts[0] and f"[#{ids[19]} · " in facts[0]
+    assert (await _entry(sid)).meta["facts_upto"] == ids[19]
+    await engine.dispose()
