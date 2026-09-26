@@ -110,7 +110,12 @@ Node.js, npm и шаг компиляции не нужны.
   При переполнении `msgStripEdge` ставит `data-more` — затухание у правого края.
 - **WebSocket/генерация:** `connectWs`, `onWsEvent`, `send`, `regenerate`, `stop`,
   `continueReply`, `finishStream`, `resumeSSE`; кросс-чат: `_handoffStreaming`,
-  `_trackBackgroundJob`, `showToast`.
+  `_trackBackgroundJob`, `showToast`. Прокрутка за ответом — `streamFollow` (меню «⋯»
+  → «Следовать за ответом», `localStorage.streamFollow`, по умолчанию выкл.):
+  выключено — лента во время генерации стоит на месте; включено — `_followStream`
+  едет за текстом, только пока лента у нижнего края. В конце дописанного ответа —
+  звук (`soundOn`) и плашка «✅ Ответ получен» (клик — к началу ответа,
+  `_scrollToLastReply`); на ошибке и ручной остановке плашки нет.
 - **Вложения:** `onAttach`/`onPaste`/`onDrop`→`addFiles` (📎, Ctrl+V, drag&drop),
   `toggleRecord` (запись голоса). **Голос → MP3:** MediaRecorder пишет webm/Opus (Chrome),
   а Gemini его НЕ принимает (только wav/mp3/ogg/flac/aac). Поэтому запись перекодируется:

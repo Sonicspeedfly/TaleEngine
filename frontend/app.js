@@ -321,6 +321,10 @@ createApp({
 
       // --- Звуковое уведомление ---
       soundOn: true,
+      // Прокручивать ленту за ответом, пока он пишется. По умолчанию нет: экран
+      // стоит, где вы читаете, а о конце ответа скажут звук и плашка. Включённое —
+      // едет за текстом, только пока вы у нижнего края (см. _followStream).
+      streamFollow: false,
 
       // --- Групповые чаты ---
       groups: [],
@@ -2865,11 +2869,11 @@ createApp({
         // Групповой чат: начинается реплика нового персонажа.
         this.groupWaiting = 0;
         this.liveBubbles.push({ name: ev.name, content: "" });
-        this.scrollDown();
+        this._followStream();
       } else if (ev.type === "token") {
         if (this.liveBubbles.length) this.liveBubbles[this.liveBubbles.length - 1].content += ev.content;
         else this.currentReply += ev.content;
-        this.scrollDown();
+        this._followStream();
       } else if (ev.type === "thought") {
         // Размышления модели: копятся отдельно от ответа, показываются свёрнуто.
         this.currentThought += ev.content;
@@ -2890,6 +2894,10 @@ createApp({
       }
     },
     async finishStream() {
+      // Ошибку показывает баннер, остановку человек нажал сам — «получен»
+      // только про ответ, который дописан.
+      const answered = !this.chatError && !this._userStopped;
+      this._userStopped = false;
       this.streaming = false;
       this.currentJobId = null;
       this.processingNote = false;
@@ -2907,6 +2915,26 @@ createApp({
       this.currentThought = "";
       this.liveBubbles = [];
       if (this.soundOn) this.playChime();
+      if (answered) this.showToast("✅ Ответ получен", () => this._scrollToLastReply());
+    },
+    // За ответом во время генерации — только если «Следовать за ответом»
+    // включено И вы у нижнего края. Отмотали вверх читать — экран не дёргается.
+    _followStream() {
+      if (!this.streamFollow) return;
+      const el = this.$refs.messages;
+      if (el && el.scrollHeight - el.scrollTop - el.clientHeight < 160) this.scrollDown();
+    },
+    // Клик по «Ответ получен»: к началу последнего ответа, а не в самый низ —
+    // длинный ответ читают сверху.
+    _scrollToLastReply() {
+      this.$nextTick(() => {
+        const box = this.$refs.messages;
+        if (!box) return;
+        const all = box.querySelectorAll(".msg.assistant");
+        const el = all[all.length - 1];
+        if (el) box.scrollTo({ top: el.offsetTop - box.offsetTop - 8, behavior: "smooth" });
+        else this.scrollToBottom();
+      });
     },
     playChime() {
       try {
@@ -3128,6 +3156,7 @@ createApp({
     },
     stop() {
       if (!this.streaming) return;
+      this._userStopped = true;
       // Отмена по id задачи (HTTP) работает и для WS-, и для HTTP-хода (SSE);
       // сервер отменит генерацию и пришлёт done. WS-стоп — как запасной путь.
       if (this.currentJobId) {
@@ -4776,6 +4805,7 @@ createApp({
     // «из бюджета хода» до следующего хода показывал бы прежнее число.
     "params.context_tokens"() { this._ctxAfterSave = true; },
     soundOn(v) { localStorage.setItem("soundOn", v ? "1" : "0"); },
+    streamFollow(v) { try { localStorage.setItem("streamFollow", v ? "1" : "0"); } catch (e) { /* приватный режим */ } },
 
     // Фокус при открытии оверлея уходит внутрь, при закрытии ВОЗВРАЩАЕТСЯ на
     // вызвавший элемент. Раньше клавиатурный путь после каждого закрытия
@@ -4896,6 +4926,7 @@ createApp({
     this.adminPassword = localStorage.getItem("adminPassword") || "";
     this.userToken = localStorage.getItem("userToken") || "";
     this.soundOn = localStorage.getItem("soundOn") !== "0";
+    this.streamFollow = localStorage.getItem("streamFollow") === "1";
     try {
       this.authStatus = await fetch("/api/auth/status").then((r) => r.json());
     } catch (e) {}
@@ -5271,6 +5302,7 @@ createApp({
             <button v-if="sessionId && !sharedView" @click="openMembers(); headerMenu=false">👥➕ {{ currentIsGroup ? 'Участники группы' : 'Добавить персонажа' }}</button>
             <button v-if="currentIsGroup" @click="toggleDirector(); headerMenu=false">🎬 ИИ-режиссёр: {{ currentGroup.director ? 'вкл' : 'выкл' }}</button>
             <button @click="soundOn=!soundOn; headerMenu=false">{{ soundOn ? '🔊 Звук вкл' : '🔇 Звук выкл' }}</button>
+            <button @click="streamFollow=!streamFollow; headerMenu=false">{{ streamFollow ? '⬇ Следовать за ответом: вкл' : '📌 Следовать за ответом: выкл' }}</button>
             <button v-if="currentUserObj" @click="openProfile(); headerMenu=false">👤 Профиль {{ currentUserObj.username }}</button>
             <button v-if="sessionId && authStatus.accounts_enabled && !sharedView" @click="openInvite({ id: sessionId }); headerMenu=false">👥 Пригласить в чат</button>
             <button v-if="sessionId" @click="bgPicker=!bgPicker; headerMenu=false">🖼 Фон чата</button>
