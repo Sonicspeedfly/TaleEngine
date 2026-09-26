@@ -84,10 +84,11 @@ def _tokens_heuristic(text: str) -> int:
     return max(1, int(heavy / 2 + (len(text) - heavy) / 4))
 
 
-@lru_cache(maxsize=4096)
-def estimate_tokens(text: str) -> int:
+def count_tokens(text: str) -> int:
     """
-    Сколько токенов займёт текст.
+    Сколько токенов займёт текст — БЕЗ кэша. Обычно нужен estimate_tokens (с
+    кэшем); этот — для текстов, которые повторно не считаются, но крупные:
+    сервис памяти считает им снимки (см. memory_service.snapshot_tokens).
 
     ПОЧЕМУ НЕ len/4: прежняя оценка «4 символа на токен» — правило для английского.
     На русском она занижает объём ПОЧТИ ВДВОЕ (замеры на реальных чатах: 47 706
@@ -96,9 +97,6 @@ def estimate_tokens(text: str) -> int:
     почти никогда не обрезалась (чат на 174 сообщения влезал «целиком»), а расход
     оказывался вдвое больше ожидаемого. Длинный контекст ещё и топит инструкцию
     пользователя — модель переставала слышать, чего от неё хотят.
-
-    Результат кэшируется: история пересчитывается на КАЖДОМ ходу, а сообщения в ней
-    не меняются, поэтому второй и последующие разы обходятся бесплатно.
     """
     enc = _encoder()
     if enc is None:
@@ -106,6 +104,43 @@ def estimate_tokens(text: str) -> int:
     # disallowed_special=() — иначе tiktoken падает, если пользователь напишет
     # в чате служебную последовательность вида <|endoftext|>.
     return max(1, len(enc.encode(text, disallowed_special=())))
+
+
+# Кэш оценки токенов — в два яруса по длине текста. ПОЧЕМУ: один lru_cache на
+# 4096 записей держал вместе с числом и САМ текст, а сервис памяти считал через
+# него каждый снимок — строку в десятки килобайт, уникальную на каждый пакет.
+# После большой пересборки или недель работы процесс держал сотни мегабайт
+# снимков, которые никто уже не пересчитает (финальное ревью, сервис M5).
+# Короткие тексты (сообщения истории — их пересчитывают на каждом ходу) живут
+# в большом кэше; длиннее _TOKEN_CACHE_MAX_CHARS — в маленьком: повтор в том
+# же ходу (блок снимка в хвосте, длинное сообщение в истории) ещё бесплатен, а
+# держит кэш не больше _LONG_CACHE_SIZE таких текстов. Пересчёт дёшев:
+# tiktoken — около 0,1 мс на тысячу символов.
+_TOKEN_CACHE_MAX_CHARS = 20_000
+_LONG_CACHE_SIZE = 16
+
+
+@lru_cache(maxsize=4096)
+def _estimate_short(text: str) -> int:
+    return count_tokens(text)
+
+
+@lru_cache(maxsize=_LONG_CACHE_SIZE)
+def _estimate_long(text: str) -> int:
+    return count_tokens(text)
+
+
+def estimate_tokens(text: str) -> int:
+    """
+    Сколько токенов займёт текст (см. count_tokens — как считается).
+
+    Результат кэшируется: история пересчитывается на КАЖДОМ ходу, а сообщения в ней
+    не меняются, поэтому второй и последующие разы обходятся бесплатно. Длинные
+    тексты — в отдельном маленьком кэше (см. _TOKEN_CACHE_MAX_CHARS).
+    """
+    if len(text) > _TOKEN_CACHE_MAX_CHARS:
+        return _estimate_long(text)
+    return _estimate_short(text)
 
 
 def estimate_content_tokens(content) -> int:
@@ -730,6 +765,138 @@ def _context_tiers(report: dict, *, avatar_msgs, knowledge_msgs, window_tokens: 
     return tiers
 
 
+def _summary_tail(summary_recs) -> list[tuple[str, str]]:
+    """
+    Блок хвоста «Что было в истории» (мастер-снимок и прочие записи категории
+    summary) → [("snapshot", текст)] или [] — записей нет.
+
+    Что было в диалоге раньше (авто-сводка Horae) — отдельный свежий блок у
+    конца: когда активное окно отрезает старую переписку, это единственное,
+    что от неё остаётся, поэтому он стоит там, где влияет сильнее. От обрезки
+    истории блок не зависит — assemble_context собирает его до неё и
+    резервирует его вес в бюджете хода.
+    """
+    if not summary_recs:
+        return []
+    head = "[ХРОНИКА И СОСТОЯНИЕ ЧАТА] Что было в истории — помни это.\n"
+    # Рендер — по записям. Мастер-снимок новой схемы (первая
+    # структурированная запись) — многострочный текст с разделами
+    # «## […]». Префикс «- 📜 Память чата (авто): » приклеился бы к
+    # первому заголовку и сломал бы разметку, по которой модель различает
+    # хронику, персонажей и реестр, поэтому снимок идёт телом блока как
+    # есть и первым, даже если ручная запись сработала раньше.
+    snapshot = next((r for r in summary_recs if hm.is_structured(r.content)), None)
+    # Старые свободные сводки и ручные записи категории summary — как
+    # раньше, списком «- заголовок: текст».
+    listed = "\n".join(
+        f"- {(r.title or 'Сводка')}: {r.content.strip()}"
+        for r in summary_recs if r is not snapshot
+    )
+    if snapshot is None:
+        body = listed
+    else:
+        body = (
+            "Мастер-снимок старой части чата; последние сообщения выше идут дословно.\n\n"
+            + snapshot.content.strip()
+        )
+        if listed:
+            # После снимка, отдельно от него — пустой строкой и своим
+            # подзаголовком. Раньше вторая запись summary уводила весь блок
+            # в старую ветку, и заметка оказывалась внутри последнего
+            # раздела снимка: модель читала её как часть списков.
+            body += "\n\nДополнительные записи памяти:\n" + listed
+    return [("snapshot", head + body)]
+
+
+def _static_tail(character: dict, *, character_avatar, persona_avatar, send_avatars: bool,
+                 web_access: bool, user_time: str, author_note: str,
+                 post_history_instructions: str, global_instructions: str, ooc: bool,
+                 user_attachments_content) -> list[tuple[str, str]]:
+    """
+    Конец хвоста — блоки, которые от обрезки истории не зависят: внешность,
+    веб, время, заметка автора, якорь, post-history, глобальные инструкции и
+    фокус → [(ключ, текст), …] в порядке, в котором они уходят в модель.
+    assemble_context собирает их до обрезки и резервирует их вес в бюджете хода.
+    """
+    blocks: list[tuple[str, str]] = []
+    # Напоминание об аватарах (внешности) — картинки приложены в начале, в длинном
+    # контексте про них легко забыть, поэтому освежаем ссылку на них у конца.
+    if send_avatars and (_is_image(character_avatar) or _is_image(persona_avatar)):
+        who = []
+        if _is_image(character_avatar):
+            who.append("персонажа")
+        if _is_image(persona_avatar):
+            who.append("собеседника")
+        blocks.append(("appearance", (
+            "[Внешность] Выше в диалоге приложены изображения-аватары " + " и ".join(who)
+            + ". Учитывай эту внешность, когда описываешь их вид."
+        )))
+
+    # Веб-поиск включён — прямо просим искать факты, а не выдумывать.
+    if web_access:
+        blocks.append(("web", (
+            "[Доступ в интернет включён] Если для ответа нужны актуальные или точные "
+            "факты, которых нет в контексте, — ВОСПОЛЬЗУЙСЯ веб-поиском и опирайся на "
+            "найденное, а не придумывай."
+        )))
+
+    # Текущее время пользователя (часовой пояс — настройка чата).
+    if user_time:
+        blocks.append(("time", f"[Время пользователя] Сейчас у пользователя {user_time}."))
+
+    # Author's Note (заметка автора) — у самого конца.
+    if author_note and author_note.strip():
+        blocks.append(("author_note", f"[Author's Note]\n{author_note.strip()}"))
+
+    # Якорь характера — чтобы личность не «плыла» в длинном окне. В режиме «вне роли»
+    # его НЕ добавляем: он стоит в сильнейшей позиции и перебивал бы прямую задачу.
+    if not ooc:
+        blocks.append(("anchor", _render_char_anchor(character)))
+
+    # Post-History Instructions (jailbreak/UJB) — САМЫЙ конец: максимальное влияние.
+    if post_history_instructions and post_history_instructions.strip():
+        blocks.append(("post_history", post_history_instructions.strip()))
+
+    # Глобальные инструкции обхода: то же место, но общее для ВСЕХ персонажей —
+    # чтобы один и тот же текст не приходилось дублировать в каждой карточке.
+    # Идут ПОСЛЕ инструкций персонажа: общее правило важнее частного.
+    if global_instructions and global_instructions.strip():
+        blocks.append(("global", global_instructions.strip()))
+
+    # Фокус на текущем ходе: в огромном контексте (вся история + все файлы) модель
+    # может «утопить» свежую реплику и начать выдумывать то, что уже прислано
+    # (например, сочинять текст песни, которая ЕСТЬ в сообщении). Явно велим
+    # опираться на само сообщение и приложенные к нему материалы.
+    has_current_media = isinstance(user_attachments_content, list) and any(
+        isinstance(b, dict) and b.get("type") in ("image_url", "input_audio")
+        for b in user_attachments_content
+    )
+    if ooc:
+        focus = (
+            "[Выполни эту задачу] Ниже — прямая просьба пользователя, обращённая к тебе "
+            "как к ассистенту, а НЕ реплика в ролевой сцене. Прочитай её целиком и сделай "
+            "ровно то, о чём просят. Не отвечай от лица персонажа и не переводи разговор "
+            "в отыгрыш. Если в просьбе уже есть нужный текст или данные — используй их "
+            "дословно, не подменяя выдумкой."
+        )
+    elif has_current_media:
+        focus = (
+            "[Отвечай на это сообщение] Ниже — АКТУАЛЬНАЯ реплика пользователя и "
+            "ПРИЛОЖЕННЫЕ ИМЕННО К НЕЙ файлы. Анализируй их напрямую и целиком: смотри, "
+            "что/кто РЕАЛЬНО в этом видео/на фото и что звучит в этом аудио. НЕ переноси "
+            "сюда персонажей, имена или выводы из ранее присланных файлов и не выдумывай — "
+            "опирайся только на то, что действительно видишь и слышишь в этих свежих файлах."
+        )
+    else:
+        focus = (
+            "[Отвечай на это сообщение] Ниже — АКТУАЛЬНАЯ реплика пользователя. Внимательно "
+            "прочитай весь её текст и отвечай именно по нему. Если нужный текст или данные "
+            "УЖЕ есть в сообщении — используй их дословно, НЕ придумывай и не заменяй выдумкой."
+        )
+    blocks.append(("focus", focus))
+    return blocks
+
+
 def assemble_context(
     *,
     character: dict,
@@ -835,8 +1002,53 @@ def assemble_context(
         ]
         report["horae_total"] = len(horae_records)
 
-    # 3. «Несжимаемый» бюджет: системный промпт + текущее сообщение пользователя.
-    used = estimate_tokens(system_prompt) + estimate_tokens(user_message)
+    # 3. Всё, что не зависит от обрезки истории, собирается ДО неё, и его вес —
+    # «несжимаемый» резерв бюджета: системный промпт, аватары, база знаний
+    # (текст и медиа), блок мастер-снимка, статичный хвост и текущее сообщение.
+    #
+    # ПОЧЕМУ: раньше резерв считал только системный промпт и реплику, и история
+    # резалась так, будто остального нет. Снимок (до 12 000 токенов, а разделы
+    # 2–4 растут без сжатия), база знаний с медиа и аватары шли СВЕРХ бюджета:
+    # при бюджете 30 000 в модель уходило 34–41 тыс. токенов, а бюджет,
+    # выставленный под лимит модели, давал «context length exceeded» на каждом
+    # ходу (финальное ревью, I-1). Кэш промпта резерв не сбивает: он меняется
+    # вместе со снимком, а на этом ходу граница окна и так сдвигается.
+    #
+    # Не резервируются два блока хвоста, которые зависят от самой обрезки:
+    # вспомненные факты (нужнее всего факты из срезанных сообщений, отбор — по
+    # границе обрезки и текущей реплике) и манифест файлов (считает вложения
+    # оставшейся истории). Манифест — одна строка. Факты — не больше TOP_K по
+    # MAX_FACT_CHARS символов (≈ 800 токенов русского текста), и блок есть лишь
+    # на ходах, где что-то вспомнилось: резерв по потолку отнимал бы у истории
+    # эти сотни токенов на КАЖДОМ ходу, а резерв по фактическому размеру двигал
+    # бы границу окна от реплики к реплике и сбивал кэш. Возможный перерасход
+    # бюджета — этот потолок.
+    # Аватары: показываем нейросети внешность персонажа и пользователя (если включено).
+    # Список держим отдельно — его вес идёт в Tier 1 монитора токенов.
+    avatar_msgs = (
+        _avatar_messages(character, character_avatar, persona_avatar) if send_avatars else []
+    )
+    # База знаний — ДО истории и явно ОТДЕЛЕНА от диалога (см. knowledge_block).
+    # Список тоже держим отдельно: в Tier 1 монитора он идёт целиком.
+    knowledge_msgs = knowledge_block(knowledge_text, knowledge_media)
+    # Хвост — в два приёма: блок снимка первым, статичные блоки последними, а
+    # между ними после обрезки встанут факты и манифест (порядок хвоста прежний).
+    snapshot_tail = _summary_tail(summary_recs)
+    static_tail = _static_tail(
+        character, character_avatar=character_avatar, persona_avatar=persona_avatar,
+        send_avatars=send_avatars, web_access=web_access, user_time=user_time,
+        author_note=author_note, post_history_instructions=post_history_instructions,
+        global_instructions=global_instructions, ooc=ooc,
+        user_attachments_content=user_attachments_content,
+    )
+    current_content = (user_attachments_content if user_attachments_content is not None
+                       else user_message)
+    reserved = (
+        (estimate_tokens(system_prompt) if system_prompt else 0)
+        + sum(estimate_content_tokens(m.get("content")) for m in avatar_msgs + knowledge_msgs)
+        + sum(estimate_tokens(text) for _, text in snapshot_tail + static_tail)
+        + estimate_content_tokens(current_content)
+    )
 
     # 4. Обрезаем историю под бюджет: свежие сообщения важнее старых.
     #
@@ -844,11 +1056,10 @@ def assemble_context(
     # тогда начало запроса не меняется от хода к ходу и попадает в кэш промпта
     # провайдера со скидкой 75–90%. Что выпало — держит авто-сводка сюжета.
     costs = [estimate_content_tokens(m.get("content")) for m in history]
-    start = stable_trim_start(costs, token_budget, reserved=used)
+    start = stable_trim_start(costs, token_budget, reserved=reserved)
     trimmed_history: list[dict] = [
         {"role": m["role"], "content": m["content"]} for m in history[start:]
     ]
-    used += sum(costs[start:])
     recalled_facts = _visible_recalled(recalled_facts, history_ids, len(history), start)
 
     if report is not None:
@@ -872,65 +1083,17 @@ def assemble_context(
     messages: list[dict] = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
-    # Аватары: показываем нейросети внешность персонажа и пользователя (если включено).
-    # Список держим отдельно — его вес идёт в Tier 1 монитора токенов.
-    avatar_msgs = (
-        _avatar_messages(character, character_avatar, persona_avatar) if send_avatars else []
-    )
     messages.extend(avatar_msgs)
-
-    # База знаний — ДО истории и явно ОТДЕЛЕНА от диалога (см. knowledge_block).
-    # Список тоже держим отдельно: в Tier 1 монитора он идёт целиком.
-    knowledge_msgs = knowledge_block(knowledge_text, knowledge_media)
     messages.extend(knowledge_msgs)
-
     messages.extend(trimmed_history)
 
     # ===== Переинъекция в КОНЕЦ (сильнейшая позиция — recency bias) =====
     # Здесь всё, что должно «весить» на ответ несмотря на длину истории: сводка
     # сюжета, якорь характера, post-history инструкции, заметка автора, файлы.
-    tail: list[dict] = []
-    # Ключ каждого блока хвоста (snapshot, recalled, anchor, …) — параллельным
-    # списком, а не полем сообщения: в модель блоки уходят как есть, ключ нужен
-    # только отчёту (монитор токенов делит хвост по уровням памяти, §7 спеки).
-    tail_keys: list[str] = []
-
-    def _to_tail(key: str, content: str) -> None:
-        tail.append({"role": "system", "content": content})
-        tail_keys.append(key)
-
-    # Что было в диалоге раньше (авто-сводка Horae) — как отдельный свежий блок.
-    # Когда активное окно отрезает старую переписку, это единственное, что от
-    # неё остаётся, поэтому блок стоит у конца, где влияет сильнее.
-    if summary_recs:
-        head = "[ХРОНИКА И СОСТОЯНИЕ ЧАТА] Что было в истории — помни это.\n"
-        # Рендер — по записям. Мастер-снимок новой схемы (первая
-        # структурированная запись) — многострочный текст с разделами
-        # «## […]». Префикс «- 📜 Память чата (авто): » приклеился бы к
-        # первому заголовку и сломал бы разметку, по которой модель различает
-        # хронику, персонажей и реестр, поэтому снимок идёт телом блока как
-        # есть и первым, даже если ручная запись сработала раньше.
-        snapshot = next((r for r in summary_recs if hm.is_structured(r.content)), None)
-        # Старые свободные сводки и ручные записи категории summary — как
-        # раньше, списком «- заголовок: текст».
-        listed = "\n".join(
-            f"- {(r.title or 'Сводка')}: {r.content.strip()}"
-            for r in summary_recs if r is not snapshot
-        )
-        if snapshot is None:
-            body = listed
-        else:
-            body = (
-                "Мастер-снимок старой части чата; последние сообщения выше идут дословно.\n\n"
-                + snapshot.content.strip()
-            )
-            if listed:
-                # После снимка, отдельно от него — пустой строкой и своим
-                # подзаголовком. Раньше вторая запись summary уводила весь блок
-                # в старую ветку, и заметка оказывалась внутри последнего
-                # раздела снимка: модель читала её как часть списков.
-                body += "\n\nДополнительные записи памяти:\n" + listed
-        _to_tail("snapshot", head + body)
+    # Блоки — парами (ключ, текст): в модель уходит текст, ключ (snapshot,
+    # recalled, anchor, …) нужен только отчёту — монитор токенов делит хвост
+    # по уровням памяти (§7 спеки).
+    tail_blocks: list[tuple[str, str]] = list(snapshot_tail)
 
     # Факты из давней части чата, похожие на текущую реплику. Нет таких — нет и
     # блока: пустой или натянутый блок памяти модель охотно «дополняет» выдумкой.
@@ -939,96 +1102,23 @@ def assemble_context(
 
         recalled_block = render_recalled(recalled_facts)
         if recalled_block:
-            _to_tail("recalled", recalled_block)
+            tail_blocks.append(("recalled", recalled_block))
 
     # Манифест приложенных файлов + напоминание изучать их.
     manifest = _attachment_manifest(trimmed_history, user_attachments_content)
     if manifest:
-        _to_tail("manifest", manifest)
+        tail_blocks.append(("manifest", manifest))
 
-    # Напоминание об аватарах (внешности) — картинки приложены в начале, в длинном
-    # контексте про них легко забыть, поэтому освежаем ссылку на них у конца.
-    if send_avatars and (_is_image(character_avatar) or _is_image(persona_avatar)):
-        who = []
-        if _is_image(character_avatar):
-            who.append("персонажа")
-        if _is_image(persona_avatar):
-            who.append("собеседника")
-        _to_tail("appearance", (
-            "[Внешность] Выше в диалоге приложены изображения-аватары " + " и ".join(who)
-            + ". Учитывай эту внешность, когда описываешь их вид."
-        ))
-
-    # Веб-поиск включён — прямо просим искать факты, а не выдумывать.
-    if web_access:
-        _to_tail("web", (
-            "[Доступ в интернет включён] Если для ответа нужны актуальные или точные "
-            "факты, которых нет в контексте, — ВОСПОЛЬЗУЙСЯ веб-поиском и опирайся на "
-            "найденное, а не придумывай."
-        ))
-
-    # Текущее время пользователя (часовой пояс — настройка чата).
-    if user_time:
-        _to_tail("time", f"[Время пользователя] Сейчас у пользователя {user_time}.")
-
-    # Author's Note (заметка автора) — у самого конца.
-    if author_note and author_note.strip():
-        _to_tail("author_note", f"[Author's Note]\n{author_note.strip()}")
-
-    # Якорь характера — чтобы личность не «плыла» в длинном окне. В режиме «вне роли»
-    # его НЕ добавляем: он стоит в сильнейшей позиции и перебивал бы прямую задачу.
-    if not ooc:
-        _to_tail("anchor", _render_char_anchor(character))
-
-    # Post-History Instructions (jailbreak/UJB) — САМЫЙ конец: максимальное влияние.
-    if post_history_instructions and post_history_instructions.strip():
-        _to_tail("post_history", post_history_instructions.strip())
-
-    # Глобальные инструкции обхода: то же место, но общее для ВСЕХ персонажей —
-    # чтобы один и тот же текст не приходилось дублировать в каждой карточке.
-    # Идут ПОСЛЕ инструкций персонажа: общее правило важнее частного.
-    if global_instructions and global_instructions.strip():
-        _to_tail("global", global_instructions.strip())
-
-    # Фокус на текущем ходе: в огромном контексте (вся история + все файлы) модель
-    # может «утопить» свежую реплику и начать выдумывать то, что уже прислано
-    # (например, сочинять текст песни, которая ЕСТЬ в сообщении). Явно велим
-    # опираться на само сообщение и приложенные к нему материалы.
-    has_current_media = isinstance(user_attachments_content, list) and any(
-        isinstance(b, dict) and b.get("type") in ("image_url", "input_audio")
-        for b in user_attachments_content
-    )
-    if ooc:
-        focus = (
-            "[Выполни эту задачу] Ниже — прямая просьба пользователя, обращённая к тебе "
-            "как к ассистенту, а НЕ реплика в ролевой сцене. Прочитай её целиком и сделай "
-            "ровно то, о чём просят. Не отвечай от лица персонажа и не переводи разговор "
-            "в отыгрыш. Если в просьбе уже есть нужный текст или данные — используй их "
-            "дословно, не подменяя выдумкой."
-        )
-    elif has_current_media:
-        focus = (
-            "[Отвечай на это сообщение] Ниже — АКТУАЛЬНАЯ реплика пользователя и "
-            "ПРИЛОЖЕННЫЕ ИМЕННО К НЕЙ файлы. Анализируй их напрямую и целиком: смотри, "
-            "что/кто РЕАЛЬНО в этом видео/на фото и что звучит в этом аудио. НЕ переноси "
-            "сюда персонажей, имена или выводы из ранее присланных файлов и не выдумывай — "
-            "опирайся только на то, что действительно видишь и слышишь в этих свежих файлах."
-        )
-    else:
-        focus = (
-            "[Отвечай на это сообщение] Ниже — АКТУАЛЬНАЯ реплика пользователя. Внимательно "
-            "прочитай весь её текст и отвечай именно по нему. Если нужный текст или данные "
-            "УЖЕ есть в сообщении — используй их дословно, НЕ придумывай и не заменяй выдумкой."
-        )
-    _to_tail("focus", focus)
-
+    tail_blocks.extend(static_tail)
+    tail = [{"role": "system", "content": text} for _, text in tail_blocks]
+    tail_keys = [key for key, _ in tail_blocks]
     messages.extend(tail)
 
     if report is not None:
         # Хвост — то, что переинъектируется в конец: сводка сюжета, заметка автора,
         # якорь характера, post-history. Именно он сильнее всего влияет на ответ,
         # поэтому в инспекторе он показан отдельно, а не растворён в системном блоке.
-        # strict: блок, добавленный в tail мимо _to_tail, без strict молча
+        # strict: блок, добавленный в tail мимо tail_blocks, без strict молча
         # сдвинул бы ключи всех следующих блоков и выронил бы последний из
         # отчёта (а с ним tail_tokens и tiers) — инспектор врал бы без ошибки.
         report["tail"] = [
