@@ -1,5 +1,6 @@
 /*
- * Horae State Engine — интерфейс: вкладка «Хроника» в ящике и строка Horae
+ * Horae State Engine — интерфейс: вкладка «Память» в ящике (разделы Хроники;
+ * «Сжатие истории» и «Лорбук» рисует app.js в слотах панели) и строка Horae
  * под каждым ответом ИИ.
  *
  * Отдельным файлом, а не ещё парой тысяч строк в app.js: хроника живёт своей
@@ -2396,7 +2397,7 @@
       { key: "send_mood", type: "bool", label: "Настроение", hint: "И правило mood." },
     ] },
     { id: "summary", title: "Авто-свёртка хронологии", fields: [
-      { key: "summary_enabled", type: "bool", label: "Сворачивать старые события сами", hint: "Каждая свёртка — платный запрос к служебной модели." },
+      { key: "summary_enabled", type: "bool", label: "Сворачивать старые события сами", hint: "Тогда историю сжимают свёртки Хроники, а мастер-снимок в этом чате не обновляется и в ход не идёт. Каждая свёртка — платный запрос к служебной модели." },
       { key: "summary_keep_recent", type: "int", label: "Не трогать последних ответов ИИ", min: 3, max: 500 },
       { key: "summary_source", type: "choice", label: "Из чего писать свёртку", options: [["fulltext", "Из полного текста сообщений — точнее"], ["events", "Из списка событий — дешевле"]] },
       { key: "summary_buffer_mode", type: "choice", label: "Когда сворачивать", options: [["messages", "Накопилось N ответов"], ["tokens", "Накопилось N токенов"]] },
@@ -2944,12 +2945,15 @@
   };
 
   // ==========================================================================
-  // Панель «Хроника»
+  // Панель «Память»: разделы Хроники + разделы, которые передаёт app.js
   // ==========================================================================
   const TABS = [
     ["state", "Состояние"], ["timeline", "Хронология"], ["chars", "Персонажи"], ["items", "Предметы"],
     ["scenes", "Сцены"], ["tables", "Таблицы"], ["rpg", "RPG"], ["settings", "Настройки"], ["prompts", "Промпты"],
   ];
+  // Разделы app.js (сжатие истории, лорбук) встают перед «Настройками»:
+  // сначала то, что модель помнит, потом — как это настраивать.
+  const EXTRA_AT = TABS.findIndex((t) => t[0] === "settings");
 
   const HoraePanel = {
     name: "HoraePanel",
@@ -2962,11 +2966,22 @@
       characterId: { type: [Number, String], default: null },
       // Растёт после каждого хода (app.js, finishStream): состояние перечитывается.
       tick: { type: Number, default: 0 },
+      // Разделы, которые рисует app.js через одноимённые слоты: [[id, подпись], …].
+      // Они не требуют открытого чата (глобальные настройки, общий лорбук).
+      extraTabs: { type: Array, default: () => [] },
+      // Переход на раздел извне ({ tab, n }): импорт чата открывает «Состояние»
+      // или «Лорбук». n меняется на каждый запрос — тот же раздел дважды тоже.
+      request: { type: Object, default: null },
     },
     provide() { return { hp: this }; },
     data() {
+      const known = TABS.concat(this.extraTabs || []);
       let tab = "state";
-      try { const t = localStorage.getItem("horaeTab"); if (TABS.some((x) => x[0] === t)) tab = t; } catch (e) { /* приватный режим */ }
+      try { const t = localStorage.getItem("horaeTab"); if (known.some((x) => x[0] === t)) tab = t; } catch (e) { /* приватный режим */ }
+      if (this.request && known.some((x) => x[0] === this.request.tab)) tab = this.request.tab;
+      if (!this.sessionId && this.extraTabs && this.extraTabs.length && !this.extraTabs.some((x) => x[0] === tab)) {
+        tab = this.extraTabs[0][0];
+      }
       return {
         tab, raw: null, loading: false, loadError: "", busy: false,
         job: null, jobFails: 0, live: "",
@@ -2974,7 +2989,13 @@
       };
     },
     computed: {
-      tabs() { return TABS; },
+      // Без чата Хроники нет — остаются только разделы app.js.
+      tabs() {
+        const extra = this.extraTabs || [];
+        if (!this.sessionId) return extra;
+        return TABS.slice(0, EXTRA_AT).concat(extra, TABS.slice(EXTRA_AT));
+      },
+      isExtra() { return (this.extraTabs || []).some((x) => x[0] === this.tab); },
       view() { return this.raw ? normalize(this.raw) : null; },
       // Глобальные настройки и глобальные таблицы сервер даёт менять только
       // администратору. Заглушка без isAdmin (стенд, старое приложение) — да.
@@ -3004,8 +3025,12 @@
         this.job = null;
         this.layers = null;
         this.loadError = "";
+        if (!this.tabs.some((x) => x[0] === this.tab) && this.tabs.length) this.tab = this.tabs[0][0];
         this.reload();
         if (this.tab === "settings" || this.tab === "prompts") this.loadLayers();
+      },
+      request(r) {
+        if (r && this.tabs.some((x) => x[0] === r.tab)) this.tab = r.tab;
       },
       characterId() {
         if (!this.characterId && this.scope === "character") this.scope = "chat";
@@ -3031,14 +3056,14 @@
       this.stopJob();
     },
     template: `
-      <section class="horae" aria-label="Хроника Horae">
+      <section class="horae" aria-label="Память">
         <p v-if="!sessionId" class="muted">Откройте чат — здесь появится его хроника: время, место, персонажи, предметы и события.</p>
-        <template v-else>
-          <div class="h-tabs" role="tablist" aria-label="Разделы хроники" @keydown="onTabKey">
-            <button v-for="t in tabs" :key="t[0]" :id="'horae-tab-' + t[0]" type="button" role="tab" class="tab-btn"
-                    :class="{ active: tab === t[0] }" :aria-selected="tab === t[0] ? 'true' : 'false'"
-                    :aria-controls="'horae-panel-' + t[0]" :tabindex="tab === t[0] ? 0 : -1" @click="tab = t[0]">{{ t[1] }}</button>
-          </div>
+        <div v-if="tabs.length" class="h-tabs" role="tablist" aria-label="Разделы памяти" @keydown="onTabKey">
+          <button v-for="t in tabs" :key="t[0]" :id="'horae-tab-' + t[0]" type="button" role="tab" class="tab-btn"
+                  :class="{ active: tab === t[0] }" :aria-selected="tab === t[0] ? 'true' : 'false'"
+                  :aria-controls="'horae-panel-' + t[0]" :tabindex="tab === t[0] ? 0 : -1" @click="tab = t[0]">{{ t[1] }}</button>
+        </div>
+        <template v-if="sessionId">
           <!-- Задание скана или свёртки — над любой подвкладкой: запускают его
                в «Настройках», а смотреть на полосу можно откуда угодно. Живой
                регион стоит в DOM всегда, «Остановить» — вне его. -->
@@ -3054,29 +3079,33 @@
             <p v-if="job && job.status === 'error'" class="h-warn">⚠ {{ jobTitle }}: {{ job.error || 'ошибка' }}</p>
           </div>
           <div class="sr-only" role="status" aria-live="polite">{{ live }}</div>
-          <div :id="'horae-panel-' + tab" role="tabpanel" :aria-labelledby="'horae-tab-' + tab" class="h-panel">
-            <div class="h-panel-bar">
-              <span v-if="loading" class="h-meta">Обновляю…</span>
-              <span class="h-grow"></span>
-              <button type="button" class="btn-icon" :disabled="loading" @click="reload" aria-label="Перечитать хронику" title="Перечитать">↻</button>
-            </div>
-            <p v-if="loadError" class="h-warn">⚠ Хроника не загрузилась: {{ loadError }}
-              <button type="button" @click="reload">Повторить</button></p>
-            <p v-if="!view && loading" class="muted">Загружаю хронику…</p>
-            <template v-if="view">
-              <h-state v-if="tab === 'state'" :view="view"></h-state>
-              <h-timeline v-else-if="tab === 'timeline'" :view="view"></h-timeline>
-              <h-chars v-else-if="tab === 'chars'" :view="view"></h-chars>
-              <h-items v-else-if="tab === 'items'" :view="view"></h-items>
-              <h-scenes v-else-if="tab === 'scenes'" :view="view"></h-scenes>
-              <h-tables v-else-if="tab === 'tables'" :view="view"></h-tables>
-              <h-rpg v-else-if="tab === 'rpg'" :view="view"></h-rpg>
-              <h-settings v-else-if="tab === 'settings'" :view="view"></h-settings>
-              <h-prompts v-else-if="tab === 'prompts'" :view="view"></h-prompts>
-            </template>
-          </div>
-          <datalist id="horae-models"><option v-for="m in models" :key="m" :value="m"></option></datalist>
         </template>
+        <!-- Раздел app.js — его слот; раздел Хроники — только при открытом чате. -->
+        <div v-if="isExtra" :id="'horae-panel-' + tab" role="tabpanel" :aria-labelledby="'horae-tab-' + tab" class="h-panel">
+          <slot :name="tab"></slot>
+        </div>
+        <div v-else-if="sessionId" :id="'horae-panel-' + tab" role="tabpanel" :aria-labelledby="'horae-tab-' + tab" class="h-panel">
+          <div class="h-panel-bar">
+            <span v-if="loading" class="h-meta">Обновляю…</span>
+            <span class="h-grow"></span>
+            <button type="button" class="btn-icon" :disabled="loading" @click="reload" aria-label="Перечитать хронику" title="Перечитать">↻</button>
+          </div>
+          <p v-if="loadError" class="h-warn">⚠ Хроника не загрузилась: {{ loadError }}
+            <button type="button" @click="reload">Повторить</button></p>
+          <p v-if="!view && loading" class="muted">Загружаю хронику…</p>
+          <template v-if="view">
+            <h-state v-if="tab === 'state'" :view="view"></h-state>
+            <h-timeline v-else-if="tab === 'timeline'" :view="view"></h-timeline>
+            <h-chars v-else-if="tab === 'chars'" :view="view"></h-chars>
+            <h-items v-else-if="tab === 'items'" :view="view"></h-items>
+            <h-scenes v-else-if="tab === 'scenes'" :view="view"></h-scenes>
+            <h-tables v-else-if="tab === 'tables'" :view="view"></h-tables>
+            <h-rpg v-else-if="tab === 'rpg'" :view="view"></h-rpg>
+            <h-settings v-else-if="tab === 'settings'" :view="view"></h-settings>
+            <h-prompts v-else-if="tab === 'prompts'" :view="view"></h-prompts>
+          </template>
+        </div>
+        <datalist id="horae-models"><option v-for="m in models" :key="m" :value="m"></option></datalist>
       </section>`,
     methods: {
       // --- Сеть ---
@@ -3187,7 +3216,7 @@
       onTabKey(e) {
         const k = e.key;
         if (k !== "ArrowRight" && k !== "ArrowLeft" && k !== "Home" && k !== "End") return;
-        const ids = TABS.map((t) => t[0]);
+        const ids = this.tabs.map((t) => t[0]);
         let i = ids.indexOf(this.tab);
         if (k === "ArrowRight") i = (i + 1) % ids.length;
         else if (k === "ArrowLeft") i = (i - 1 + ids.length) % ids.length;

@@ -299,7 +299,10 @@ async def build_group_messages(
         )
     ).scalars().all()
 
-    records = await _load_horae_records(db, session.id, target_character.id)
+    records = await _load_horae_records(
+        db, session.id, target_character.id,
+        skip_chat_summary=await _horae_compresses(db, session, target_character),
+    )
     persona, author_note = await _load_persona_and_note(db, session)
     persona_name = persona["name"] if persona and persona.get("name") else "Пользователь"
 
@@ -407,6 +410,17 @@ async def build_group_messages(
         ]
     messages.append({"role": "user", "content": user_content})
     return messages
+
+
+async def _horae_compresses(db, session, target_character) -> bool:
+    """Историю группы сжимают свёртки Хроники — мастер-снимок в ход не идёт."""
+    try:
+        from backend import horae_engine
+
+        info = await horae_engine.chat_compression(db, session, target_character)
+        return info["engine"] == "horae"
+    except Exception:  # noqa: BLE001 — сбой: как раньше, со снимком
+        return False
 
 
 async def _group_horae(db, session, target_character, msgs):

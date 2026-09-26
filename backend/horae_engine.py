@@ -126,6 +126,49 @@ async def effective_settings(db, session, character=None, chat_data: dict | None
 
 
 # ---------------------------------------------------------------------------
+# Сжатие старой истории: мастер-снимок или свёртки Хроники — ровно один
+# ---------------------------------------------------------------------------
+ENGINES = ("snapshot", "horae", "off")
+
+
+def compression_engine(settings: dict | None, ui: dict | None) -> str:
+    """
+    Кто в чате сжимает историю, вышедшую из окна:
+      * "horae" — свёртки Хроники (summary_enabled на любом уровне настроек);
+      * "snapshot" — мастер-снимок (авто-сводка в «ui» не выключена);
+      * "off" — никто: существующий снимок ещё идёт в ход, но не обновляется.
+    Второй механизм в чате не обновляется и в ход не идёт: иначе модель
+    получала бы одну историю дважды, а платили бы за оба сжатия.
+    """
+    s = settings or {}
+    if s.get("enabled") and s.get("summary_enabled"):
+        return "horae"
+    if (ui or {}).get("auto_summary") is not False:
+        return "snapshot"
+    return "off"
+
+
+async def chat_compression(db, session, character=None, data: dict | None = None) -> dict:
+    """
+    Механизм сжатия чата и откуда взялся выбор: summary_layer — уровень, на
+    котором задан summary_enabled (chat / character / global / default).
+    Интерфейс по нему объясняет, почему чат сжимается не так, как по умолчанию.
+    """
+    if character is None and session is not None:
+        character = await db.get(models.Character, session.character_id)
+    if data is None:
+        data = await load_chat_data(db, session.id)
+    ui = await _app_setting(db, "ui")
+    glob, char, chat = await global_layer(db), character_layer(character), \
+        horae_settings.sanitize(data.get("settings"))
+    settings = horae_settings.resolve(glob, char, chat)
+    layer = next((name for name, layer in (("chat", chat), ("character", char), ("global", glob))
+                  if "summary_enabled" in layer), "default")
+    return {"engine": compression_engine(settings, ui), "summary_layer": layer,
+            "summary_hides": bool(settings.get("summary_hides")), "settings": settings}
+
+
+# ---------------------------------------------------------------------------
 # Состояние чата (HoraeChatState.data)
 # ---------------------------------------------------------------------------
 def blank_chat_data() -> dict:
@@ -315,11 +358,12 @@ def rules_text(comp: Computed) -> str:
         rpg_prompt=rpg_prompt, calendar_line=calendar_line)
 
 
-def state_block(comp: Computed) -> str:
+def state_block(comp: Computed, *, snapshot_upto: int = 0) -> str:
     return hs.render_state_block(
         comp.state, comp.settings, names=comp.names, summaries=comp.data.get("summaries") or [],
         tables_block=tables_block(comp), rpg_block=rpg_block(comp),
-        pinned=comp.data.get("pinned_npcs") or [], calendar=comp.calendar)
+        pinned=comp.data.get("pinned_npcs") or [], calendar=comp.calendar,
+        snapshot_upto=snapshot_upto)
 
 
 # ---------------------------------------------------------------------------
@@ -341,7 +385,7 @@ class HoraeParts:
 
 async def context_parts(db, session, character, *, until: int | None = None, ooc: bool = False,
                         user_message: str = "", tags: bool = True, connection: dict | None = None,
-                        history_ids: list | None = None) -> HoraeParts | None:
+                        history_ids: list | None = None, snapshot_upto: int = 0) -> HoraeParts | None:
     """
     Блоки Horae для хода. None — слой выключен для этого чата.
 
@@ -349,6 +393,8 @@ async def context_parts(db, session, character, *, until: int | None = None, ooc
         перегенерируемого ответа, как skipLast плагина).
     :param ooc: реплика «вне роли» — теги не просим (ни правил, ни напоминания).
     :param tags: False — путь, где теги не нужны вовсе (канвас).
+    :param snapshot_upto: до какого сообщения в ходе есть мастер-снимок —
+        лента событий не повторяет то, что он уже пересказал.
     """
     from backend import horae_prompts
 
@@ -366,7 +412,7 @@ async def context_parts(db, session, character, *, until: int | None = None, ooc
         if settings.get("tag_reminder"):
             parts.reminder = horae_prompts.reminder(settings, user=comp.names.user, char=comp.names.char)
     if settings.get("inject_state"):
-        parts.state_block = state_block(comp)
+        parts.state_block = state_block(comp, snapshot_upto=snapshot_upto)
     if settings.get("recall_enabled") and user_message.strip():
         try:
             from backend import horae_vector

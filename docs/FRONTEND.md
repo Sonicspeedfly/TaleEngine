@@ -18,10 +18,14 @@ Node.js, npm и шаг компиляции не нужны.
   содержит контейнер `#app`.
 - **`app.js`** — всё приложение: один объект Vue с `data()`, `computed`, `methods` и
   **шаблоном-строкой** (HTML-вёрстка лежит как template прямо в этом файле).
-- **`horae.js`** — вкладка «Хроника» (Horae State Engine): `window.HoraeUI =
+- **`horae.js`** — вкладка «Память» (Horae State Engine): `window.HoraeUI =
   {stripTags, hasOpenTag, components: {HoraePanel, HoraeMsg}}`. `HoraePanel` —
-  подвкладки Состояние, Хронология, Персонажи, Предметы, Сцены, Таблицы, RPG,
-  Настройки, Промпты; `HoraeMsg` — строка Horae под ответом ИИ с редактором меты.
+  разделы Состояние, Хронология, Персонажи, Предметы, Сцены, Таблицы, RPG,
+  Настройки, Промпты и разделы, которые передаёт `app.js` (`extraTabs` +
+  одноимённые слоты: «Сжатие истории» и «Лорбук» перед «Настройками»; без
+  открытого чата остаются только они). `request: {tab, n}` — переход на раздел
+  извне (`openMemory(sub)` в `app.js`, например после импорта чата). `HoraeMsg` —
+  строка Horae под ответом ИИ с редактором меты.
   Подключается раньше `app.js`; `app.js` регистрирует компоненты (с заглушками,
   если файл не загрузился), прячет теги в стриме (`horaeStrip`, «🕰 Horae
   записывает…»), растит `horaeTick` в конце хода — открытая панель перечитывает
@@ -121,10 +125,18 @@ Node.js, npm и шаг компиляции не нужны.
   загруженного вложения — гонка с FileReader). `_dropBadAttachments` убирает битые,
   `_cleanAtts` шлёт на бэкенд только поля `AttachmentIn`. Пока грузятся — жёлтая плашка
   `.files-bar` и кнопка «⏳ файлы…».
-- **Память Horae:** `loadHorae`, `saveHorae`, `editHorae`, `deleteHorae`. Запись
-  категории `summary` (мастер-снимок) в списке свёрнута в `<details>` «Показать
-  снимок (N строк)» (`textLines`), развёрнутая — с `white-space: pre-wrap`.
-- **Мастер-память чата** (вкладка «Память», блок «🧠 Мастер-память этого чата»;
+- **Лорбук** («Память» → «Лорбук»): `loadHorae`, `saveHorae`, `editHorae`,
+  `deleteHorae`. Запись категории `summary` (мастер-снимок) в списке свёрнута в
+  `<details>` «Показать снимок (N строк)» (`textLines`), развёрнутая — с
+  `white-space: pre-wrap`.
+- **Чем сжимать историю** («Память» → «Сжатие истории»): `memoryEngine` (глобальный
+  выбор: `horaeGlobalSummary` — глобальный `summary_enabled` Хроники из
+  `loadHoraeGlobal`, иначе `autoSummary`), `setMemoryEngine` (пишет
+  `PUT /horae/settings` и/или `ui.auto_summary`; свёртки Хроники — только
+  администратор, `memoryEngineLocked`), `chatEngine`/`chatEngineNote` (кто сжимает
+  открытый чат — `memStatus.compression`; пояснение, если чат живёт по своим
+  настройкам).
+- **Мастер-снимок чата** («Память» → «Сжатие истории», блок «🧠 Мастер-снимок этого чата»;
   подробно — [HORAE.md](HORAE.md)): `loadMemStatus` (статус `GET …/memory`; пока
   задание `queued`/`running` — опрос раз в 1,5 с, `_memPollDelay`/`_stopMemPoll`,
   номер запроса отсекает обогнанные ответы), `startMemJob(mode, resume)`
