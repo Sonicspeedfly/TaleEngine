@@ -289,14 +289,35 @@ async def test_tiers_through_the_real_window():
         await engine.dispose()
 
 
+def test_group_chat_context_reports_no_tiers(client):
+    """
+    Финальное ревью (контекст, I-3): для группы монитор считал конвейер
+    личного чата (окно, снимок в хвосте), а ход группы собирает
+    group_chat.build_group_messages — окна нет, транскрипт идёт целиком, на
+    каждого отвечающего. Монитор занижал цену хода в разы и писал «выброшено
+    окном» про сообщения, которые уходят дословно. Теперь у группы уровней нет:
+    tiers: null и tiers_unavailable: "group"; у личного чата — как было.
+    """
+    a = client.post("/api/characters", json={"name": "Г1"}).json()
+    b = client.post("/api/characters", json={"name": "Г2"}).json()
+    gid = client.post("/api/groups", json={"name": "Сцена",
+                                           "character_ids": [a["id"], b["id"]]}).json()["session_id"]
+    group = client.get(f"/api/sessions/{gid}/context").json()
+    assert group["tiers"] is None and group["tiers_unavailable"] == "group"
+    sid = client.post(f"/api/sessions?character_id={a['id']}").json()["session_id"]
+    solo = client.get(f"/api/sessions/{sid}/context").json()
+    assert solo["tiers"]["total"] > 0 and "tiers_unavailable" not in solo
+
+
 def test_token_cache_does_not_keep_every_snapshot():
     """
     Финальное ревью (сервис, M5): lru_cache оценки токенов на 4096 записей
     держал каждый снимок — каждый пакет добавлял строку размером со снимок, и
     после большой пересборки процесс держал сотни мегабайт. Длинные тексты
-    (> 20 000 символов) идут в отдельный маленький кэш.
+    (> 20 000 символов) идут в отдельный маленький кэш, а снимки сервис памяти
+    считает вовсе без кэша: каждый снимок уникален, повторно его не считают.
     """
-    from backend import horae_memory
+    from backend import horae_memory, memory_service
 
     long_text = "Эльвира пообещала Артуру встретиться у старого маяка. " * 600
     assert len(long_text) > horae_memory._TOKEN_CACHE_MAX_CHARS
@@ -306,3 +327,14 @@ def test_token_cache_does_not_keep_every_snapshot():
     assert horae_memory._estimate_short.cache_info().currsize == short_before
     assert horae_memory._estimate_long.cache_info().currsize <= horae_memory._LONG_CACHE_SIZE
     assert horae_memory.estimate_tokens(long_text) == horae_memory.count_tokens(long_text)
+
+    # Снимки по ~10 000 символов — меньше порога длинного кэша: такие и копились.
+    snapshots = [hm.render_snapshot({hm.SEC_CHRONICLE: f"- [#{i}–#{i}] событие {i} " * 400})
+                 for i in range(30)]
+    deps = memory_service.MemoryDeps(complete=None, get_connection=None)
+    manager, _ = memory_service.build_manager({"default_model": "alias-x"}, {}, deps)
+    short_before = horae_memory._estimate_short.cache_info().currsize
+    for snap in snapshots:
+        assert memory_service.snapshot_tokens(snap) == manager._tokens(snap) \
+            == horae_memory.count_tokens(snap) > 0
+    assert horae_memory._estimate_short.cache_info().currsize == short_before

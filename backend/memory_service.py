@@ -24,7 +24,7 @@ import logging
 import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable
 
 from sqlalchemy import String, cast, func, or_, select
@@ -35,7 +35,7 @@ from backend import hierarchical_memory as hm
 from backend import horae_recall, llm_gateway, models
 from backend.config import settings
 from backend.database import AsyncSessionLocal
-from backend.horae_memory import chat_tzinfo, estimate_tokens
+from backend.horae_memory import chat_tzinfo, count_tokens
 
 logger = logging.getLogger("aichat.summary")
 
@@ -142,6 +142,10 @@ async def clamp_summary_pointer(db, session_id: int) -> int | None:
     if isinstance(rebuild, dict) and int_or_zero(rebuild.get("last_message_id")) > max_id:
         meta["rebuild"] = {**rebuild, "last_message_id": max_id}
         moved = True
+    if int_or_zero(meta.get("facts_upto")) > max_id:
+        # Отметка «факты разобраны до» (см. DbBatchSource.commit) — по тем же id.
+        meta["facts_upto"] = max_id
+        moved = True
     if not moved:
         return None
     entry.meta = meta
@@ -156,13 +160,19 @@ def snapshot_tokens(content) -> int:
     """
     Размер снимка в токенах — одна оценка на meta.tokens, статус и экспорт.
 
-    Тем же horae_memory.estimate_tokens, что у менеджера ядра (build_manager):
+    Тем же horae_memory.count_tokens, что у менеджера ядра (build_manager):
     раньше число считали в трёх местах, и одно из них брало внедрённый в
     источник оценщик, а другое — модульный, то есть две оценки на одно поле.
     Пустой снимок (или одни пробелы) весит ноль, как пустой блок в инспекторе.
+
+    Без кэша, в отличие от estimate_tokens: каждый снимок уникален (новый на
+    каждый пакет), повторно его не считают, а кэш держал бы вместе с числом и
+    сам текст в десятки килобайт — после большой пересборки сотни мегабайт
+    (финальное ревью, сервис M5). Порога длинного кэша estimate_tokens тут
+    мало: снимки короче 20 000 символов копились бы всё равно.
     """
     text = str(content or "")
-    return estimate_tokens(text) if text.strip() else 0
+    return count_tokens(text) if text.strip() else 0
 
 
 def adopt_summary(entry, content: str, last_id: int, *, tokens: int | None = None,
@@ -177,15 +187,20 @@ def adopt_summary(entry, content: str, last_id: int, *, tokens: int | None = Non
     Текст НЕ режется. Раньше здесь стоял слайс [:6000] символов, и хвостовые
     разделы снимка (списки, реестр) пропадали молча, а модель «забывала»
     договорённости из начала чата. От мусора защищает проверка ядра (снимок
-    длиннее hm.MAX_SNAPSHOT_CHARS не принимается), от раздувания — бюджет
-    снимка и сжатие хроники в арки.
+    длиннее max(hm.MAX_SNAPSHOT_CHARS, 8 × бюджет) символов не принимается),
+    от раздувания — бюджет снимка и сжатие хроники в арки.
 
     tokens — уже посчитанный размер: передан — не пересчитывается, иначе
     snapshot_tokens(content).
+
+    Ошибка прошлого ежеходного прохода (meta.last_error) уходит вместе с
+    буфером: снимок записан — пауза после сбоя и строка «Память не
+    обновилась» во вкладке больше не нужны.
     """
     content = content or ""
     meta = dict(entry.meta or {})
     meta.pop("rebuild", None)
+    meta.pop("last_error", None)
     # Указатель — в служебное meta, а не в keywords: keywords пользователь
     # редактирует руками, и правка ключевых слов ломала сводку.
     meta.update(
@@ -283,6 +298,52 @@ def memory_config(ui_value, **overrides) -> hm.MemoryConfig:
                            max_retries=settings.MEMORY_MAX_RETRIES, **values)
 
 
+def _background_connection(connection) -> dict:
+    """
+    Подключение фоновых вызовов памяти: быстрая модель (summary_model), если
+    задана, подставлена в default_model — см. build_manager, почему не в params.
+    """
+    connection = connection or {}
+    fast = (connection.get("summary_model") or "").strip()
+    return {**connection, "default_model": fast} if fast else connection
+
+
+# Длина вывода памяти от бюджета снимка: модель переписывает снимок целиком
+# (плюс события пакета) — 1,4 × бюджет, и ещё 1024 на обёртку и случайное
+# рассуждение вслух. 12 000 → 17 824.
+_OUT_PER_BUDGET = 1.4
+_OUT_EXTRA = 1024
+
+
+def memory_output_limit(connection) -> int | None:
+    """Лимит вывода модели памяти по карте LiteLLM; None — модель неизвестна."""
+    model = llm_gateway.effective_model(None, _background_connection(connection))
+    return llm_gateway.model_max_output_tokens(model)
+
+
+def max_snapshot_tokens(max_output: int | None) -> int | None:
+    """
+    Наибольший бюджет снимка, при котором 1,4 × бюджет + 1024 влезает в лимит
+    вывода модели памяти; None — лимит неизвестен.
+    """
+    if not max_output:
+        return None
+    return max(0, int((max_output - _OUT_EXTRA) / _OUT_PER_BUDGET))
+
+
+# Отказ провайдера именно из-за длины вывода: «max_tokens is too large»
+# (OpenAI), «maxOutputTokens … supported range» (Vertex), max_output_tokens,
+# max_completion_tokens.
+_MAX_TOKENS_REJECTED_RE = re.compile(r"max[\s_-]?(?:output[\s_-]?|completion[\s_-]?)?tokens",
+                                     re.IGNORECASE)
+
+
+def _rejects_max_tokens(exc: BaseException) -> bool:
+    """Провайдер отклонил запрос (400) из-за max_tokens, а не по сути."""
+    return (hm.classify_error(exc).kind == "bad_request"
+            and bool(_MAX_TOKENS_REJECTED_RE.search(str(exc))))
+
+
 def build_manager(connection, ui_value, deps: MemoryDeps,
                   **overrides) -> tuple[hm.HierarchicalMemoryManager, dict]:
     """
@@ -300,19 +361,64 @@ def build_manager(connection, ui_value, deps: MemoryDeps,
     Свои температура и длина вывода — через llm_gateway.sampling_overrides:
     снимок переписывается целиком, и стандартного max_tokens ответа чата на
     него не хватает (обрезанный снимок ядро не примет).
+
+    Длина вывода прижата к лимиту модели памяти, если его знает LiteLLM, а
+    рабочий бюджет снимка — к наибольшему, который модель успевает написать
+    (max_snapshot_tokens): иначе при модели по умолчанию gpt-4o (лимит вывода
+    16 384) каждый запрос с 17 824 получал 400, и снимок не собирался никогда.
+    Провайдер всё же отверг max_tokens (псевдоним прокси, неизвестный
+    LiteLLM) — один повтор с DEFAULT_MAX_TOKENS и предупреждение, дальше в
+    прогоне — сразу с ним.
     """
-    connection = connection or {}
-    fast = (connection.get("summary_model") or "").strip()
-    bg_conn = {**connection, "default_model": fast} if fast else connection
+    bg_conn = _background_connection(connection)
     config = memory_config(ui_value, **overrides)
-    out_tokens = max(settings.DEFAULT_MAX_TOKENS, round(config.snapshot_tokens * 1.4) + 1024)
+    out_tokens = max(settings.DEFAULT_MAX_TOKENS,
+                     round(config.snapshot_tokens * _OUT_PER_BUDGET) + _OUT_EXTRA)
+    max_out = memory_output_limit(bg_conn)
+    if max_out:
+        out_tokens = min(out_tokens, max_out)
+        fits = max_snapshot_tokens(max_out)
+        if fits and config.snapshot_tokens > fits:
+            config.snapshot_tokens = fits
+    config.output_tokens = out_tokens
+    limits = {"max_tokens": out_tokens}
+
+    async def ask(messages: list[dict], max_tokens: int) -> str:
+        with llm_gateway.sampling_overrides(max_tokens=max_tokens,
+                                            temperature=settings.MEMORY_TEMPERATURE), \
+                llm_gateway.finish_reason_probe() as probe:
+            text = await deps.complete(messages, None, bg_conn, kind="summary")
+        # Непустой ответ, оборванный лимитом вывода, шлюз отдаёт как успех.
+        # Для снимка это length: ядро сожмёт хронику и повторит слияние, а
+        # не будет слать корректирующие ходы с тем же лимитом (финальное
+        # ревью, I1). Факты — не снимок: обрывок списка фактов полезен как
+        # есть, и отказ от него лишь терял бы их.
+        if (llm_gateway.is_length_finish(probe["finish_reason"])
+                and messages and messages[0].get("content") != horae_recall.FACTS_PROMPT):
+            raise hm.MemoryLLMError(
+                "length", "Ответ модели упёрся в лимит длины вывода: снимок оборван на "
+                          f"{max_tokens} токенах (finish_reason={probe['finish_reason']})",
+                retryable=False)
+        return text
 
     async def llm(messages: list[dict]) -> str:
-        with llm_gateway.sampling_overrides(max_tokens=out_tokens,
-                                            temperature=settings.MEMORY_TEMPERATURE):
-            return await deps.complete(messages, None, bg_conn, kind="summary")
+        try:
+            return await ask(messages, limits["max_tokens"])
+        except Exception as exc:  # noqa: BLE001 — разбираем только отказ из-за max_tokens
+            if (limits["max_tokens"] <= settings.DEFAULT_MAX_TOKENS
+                    or not _rejects_max_tokens(exc)):
+                raise
+            rejected = limits["max_tokens"]
+            limits["max_tokens"] = manager.config.output_tokens = settings.DEFAULT_MAX_TOKENS
+            manager.warn(
+                f"модель памяти не приняла max_tokens={rejected} — запросы идут с "
+                f"{settings.DEFAULT_MAX_TOKENS}; большой снимок оборвётся: уменьшите "
+                "бюджет снимка или выберите модель памяти с длинным выводом")
+            return await ask(messages, limits["max_tokens"])
 
-    manager = hm.HierarchicalMemoryManager(llm, config, estimate_tokens=estimate_tokens)
+    # Оценщик без кэша — как у snapshot_tokens: ядро считает снимки и их разделы,
+    # каждый уникален, и кэш держал бы их тексты (см. snapshot_tokens).
+    manager = hm.HierarchicalMemoryManager(llm, config, estimate_tokens=count_tokens)
     return manager, bg_conn
 
 
@@ -416,6 +522,9 @@ class _Target:
     rebuilding: bool
     pointer: int     # «учтено до» цели
     state: str       # снимок цели
+    # Остановленный буфер ручной пересборки: прогон пишет в живой снимок, а
+    # буфер ждёт «Продолжить» (см. _read_target). None — такого буфера нет.
+    paused: dict | None = None
 
 
 def _read_target(entry) -> _Target:
@@ -430,10 +539,21 @@ def _read_target(entry) -> _Target:
     была бы ни в пересказе, ни дословно. Тот же буфер держит ручная пересборка
     (задание «Пересобрать»); пока он есть, ежеходные проходы продолжают его —
     так пересборка переживает перезапуск сервера.
+
+    Кроме буфера, который пользователь ОСТАНОВИЛ (meta.rebuild.paused, ставит
+    задание по «Остановить»): его продолжает только «Продолжить», а цель
+    остальных прогонов — живой снимок. Раньше «Остановить» было лишь паузой
+    за чужой счёт: ежеходные проходы продолжали буфер (до шести платных
+    слияний за ход), живой снимок не обновлялся, и в конце буфер сам
+    подменял его (финальное ревью, M2). У сводки старого формата буфер
+    остановленным не бывает: её указателю окно не верит, писать в неё нельзя.
     """
     meta = dict(entry.meta or {}) if entry is not None else {}
     buffer = meta.get("rebuild") if isinstance(meta.get("rebuild"), dict) else None
-    if entry is not None and (meta.get("v") != horae_recall.SUMMARY_FORMAT or buffer is not None):
+    legacy = entry is not None and meta.get("v") != horae_recall.SUMMARY_FORMAT
+    if entry is not None and buffer is not None and buffer.get("paused") and not legacy:
+        return _Target(entry, False, summary_last_id(entry), entry.content or "", paused=buffer)
+    if entry is not None and (legacy or buffer is not None):
         buffer = buffer or {}
         return _Target(entry, True, int_or_zero(buffer.get("last_message_id")),
                        str(buffer.get("content") or ""))
@@ -483,6 +603,9 @@ async def _pending_count(db, session_id: int, window: int) -> int:
 
 
 _MODES = ("incremental", "rebuild", "catchup")
+# Сколько пакетов неразобранных фактами сообщений до пакета берёт запрос
+# фактов (см. DbBatchSource._facts_gap): пропуск после одного-двух сбоев.
+_FACTS_GAP_BATCHES = 2
 
 
 class DbBatchSource:
@@ -623,10 +746,16 @@ class DbBatchSource:
                 meta = dict(entry.meta or {})
                 buffer = meta.get("rebuild") if isinstance(meta.get("rebuild"), dict) else {}
                 meta["rebuild"] = {**buffer, "content": new_state, "last_message_id": batch.last_id}
+                meta.pop("last_error", None)  # запись удалась — пауза после сбоя не нужна
                 entry.meta = meta
             else:
                 adopt_summary(entry, new_state, batch.last_id,
                               updated_by=self.mode, warnings=self.manager.warnings)
+                if target.paused is not None:
+                    # Остановленная пересборка ждёт «Продолжить»: живой снимок
+                    # обновлён, а её буфер остаётся как был (adopt_summary
+                    # убирает буфер — он считает, что снимок его заменил).
+                    entry.meta = {**entry.meta, "rebuild": target.paused}
             if not self._alive():
                 # Чат удалили, пока модель считала, и его id мог уже достаться
                 # новому чату — с той же перепиской под теми же id, если чат
@@ -634,19 +763,25 @@ class DbBatchSource:
                 # commit откатывает всё, что сессия успела сбросить в БД.
                 return False
             await db.commit()
+            _turn_errors.pop(self.session_id, None)
             # Факты — только из сообщений новее уже разобранных. Снимок можно
             # начать заново (удалили запись «Память чата (авто)», пересборка), а
             # факты при этом остаются: повторный разбор того же куска давал
             # пересказанные другими словами дубли, и они занимали места в отборе.
-            facts_upto = 0
+            # «Разобраны до» — наибольшее из отметки meta.facts_upto (её ставит
+            # удачный разбор, даже без единого факта) и источника фактов.
+            facts_upto, gap = 0, []
             if self.want_facts:
-                facts_upto = (await db.execute(
-                    select(func.max(models.HoraeFact.source_message_id))
-                    .where(models.HoraeFact.session_id == self.session_id)
-                )).scalar() or 0
+                facts_upto = max(int_or_zero((entry.meta or {}).get("facts_upto")), (
+                    await db.execute(
+                        select(func.max(models.HoraeFact.source_message_id))
+                        .where(models.HoraeFact.session_id == self.session_id)
+                    )).scalar() or 0)
+                gap = await self._facts_gap(db, batch, facts_upto)
 
         # Вызов модели — вне сессии БД (может занять десятки секунд).
-        facts = await self._extract_facts(batch, facts_upto) if self.want_facts else []
+        facts = await self._extract_facts(gap + list(batch.messages), facts_upto) \
+            if self.want_facts else None
         if not self._alive():
             # Чат удалили, пока модель искала факты: снимок уже записан (и
             # удалён вместе с чатом), а факты под его id унаследовал бы новый чат.
@@ -657,36 +792,92 @@ class DbBatchSource:
             if facts:
                 await horae_recall.store_facts(db, self.session_id, facts, batch.last_id,
                                                self.connection)
+            if facts is not None:
+                # Разбор удался (пусть и без фактов): отметка идёт вперёд, и
+                # следующий пакет не пошлёт эти сообщения модели фактов снова.
+                # Только вперёд: пакеты пересборки идут с начала чата, и их
+                # «разобрано до» меньше давно разобранного.
+                entry = await _summary_entry(db, self.session_id)
+                meta = dict(entry.meta or {}) if entry is not None else {}
+                if entry is not None and int_or_zero(meta.get("facts_upto")) < batch.last_id:
+                    entry.meta = {**meta, "facts_upto": batch.last_id}
+                    await db.commit()
             # Пока модель считала, сообщения куска могли удалить: тогда указатель
             # (и факты из них) прижимаются так же, как при удалении.
             if await clamp_summary_pointer(db, self.session_id) is not None:
                 await db.commit()
         return True
 
+    async def _facts_gap(self, db, batch: hm.Batch, facts_upto: int) -> list[hm.MemoryMessage]:
+        """
+        Сообщения до пакета, которые ещё не разобраны фактами: между отметкой
+        «разобраны до» и началом пакета, не больше _FACTS_GAP_BATCHES пакетов.
+
+        ПОЧЕМУ: снимок коммитится ДО запроса фактов, и если ответ модели фактов
+        не пришёл (сбой провайдера, «Остановить», остановка сервера посреди
+        запроса), факты этого пакета раньше не извлекались уже никогда:
+        следующий пакет брал только свои сообщения новее отметки (финальное
+        ревью, сервис M1). Теперь пропуск доизвлекает следующий пакет. Предел —
+        чтобы включение фактов в давно идущем чате не отправило модели
+        фактов весь его бэклог разом (старая переписка, как и раньше, без
+        фактов).
+        """
+        if facts_upto >= batch.first_id - 1:
+            return []
+        session = await db.get(models.ChatSession, self.session_id)
+        if session is None:
+            return []
+        cap = max(1, self.manager.config.batch_size) * _FACTS_GAP_BATCHES
+        lowest = (await db.execute(
+            select(models.Message.id).where(
+                models.Message.session_id == self.session_id,
+                models.Message.id > facts_upto,
+                models.Message.id < batch.first_id,
+                _has_content(),
+            ).order_by(models.Message.id.desc()).offset(cap - 1).limit(1)
+        )).scalar()
+        after = max(facts_upto, (lowest or 0) - 1)
+        return await load_memory_messages(db, session, after, batch.first_id)
+
     async def _has_more(self, db, after_id: int) -> bool:
         """Остались ли после пакета сообщения старше окна."""
         before = await _window_start_id(db, self.session_id, self.window)
         return before != 0 and await _count_between(db, self.session_id, after_id, before) > 0
 
-    async def _extract_facts(self, batch: hm.Batch, facts_upto: int) -> list[str]:
+    async def _extract_facts(self, messages: list[hm.MemoryMessage],
+                             facts_upto: int) -> list[str] | None:
         """
-        Атомарные факты пакета (слой 3 Horae). Запрос идёт через manager.call:
-        пауза между запросами и повторы при сбоях провайдера — общие со
-        слиянием, лимит частоты не различает виды запросов.
+        Атомарные факты (слой 3 Horae) из сообщений новее facts_upto: пропуск
+        до пакета (_facts_gap) и сам пакет. → факты; None — разбор не удался
+        (сбой модели, отмена прогона), и эти сообщения доизвлечёт следующий
+        пакет. Запрос идёт через manager.call: пауза между запросами и повторы
+        при сбоях провайдера — общие со слиянием, лимит частоты не различает
+        виды запросов.
+
+        В запрос — самые свежие строки в пределах бюджета пакета (batch_max_chars):
+        пропуск вместе с пакетом бывает вдвое длиннее пакета, а пакет важнее.
         """
         max_chars = self.manager.config.batch_max_chars
-        lines = [line for m in batch.messages
+        lines = [line for m in messages
                  if m.id > facts_upto and (line := hm.normalize_message(m, max_chars))]
-        if not lines:
+        kept, size = [], 0
+        for line in reversed(lines):
+            size += len(line) + 2
+            if kept and size > max_chars:
+                break
+            kept.append(line)
+        if not kept:
             return []
         try:
             return horae_recall.parse_facts(await self.manager.call([
                 {"role": "system", "content": horae_recall.FACTS_PROMPT},
-                {"role": "user", "content": "[Новые события]\n" + "\n\n".join(lines)},
+                {"role": "user", "content": "[Новые события]\n" + "\n\n".join(reversed(kept))},
             ]))
+        except hm.MemoryCancelled:
+            return None  # «Остановить»/сброс: без запроса, факты — со следующим пакетом
         except Exception:  # noqa: BLE001 — без фактов снимок всё равно полезен
             logger.exception("Факты чата %s не извлеклись", self.session_id)
-            return []
+            return None
 
 
 # ============================================================================
@@ -769,38 +960,153 @@ def _make_run(session_id: int, deps: MemoryDeps, *, mode: str, threshold: int, u
     return manager, bg_conn, source
 
 
+# ---------------------------------------------------------------------------
+# Ошибка ежеходного прохода и пауза после неё
+# ---------------------------------------------------------------------------
+# Пауза после сбоя ежеходного прохода: 10 мин · 2^(failures−1), не больше 6 ч.
+_TURN_RETRY_BASE = timedelta(minutes=10)
+_TURN_RETRY_MAX = timedelta(hours=6)
+# Ошибки ежеходного прохода чатов, у которых записи снимка ещё нет (упал самый
+# первый проход): meta хранить негде, а заводить пустую запись ради ошибки —
+# значит показать во вкладке «снимок есть» там, где его нет. Живёт в процессе:
+# после перезапуска будет одна попытка, и ошибка запишется заново.
+_turn_errors: dict[int, dict] = {}
+# Событие отмены идущего ежеходного прохода чата: сброс памяти (purge) его
+# ставит, и проход останавливается после текущего запроса к модели, а не
+# доделывает до шести пакетов (см. purge).
+_turn_cancels: dict[int, asyncio.Event] = {}
+
+
+def describe_error(err: BaseException) -> tuple[str, str]:
+    """
+    Ошибка прогона памяти → (вид, русский текст для вкладки «Память»). Одни
+    тексты у статуса задания (job.error) и у ошибки ежеходного прохода
+    (snapshot.last_error).
+    """
+    if isinstance(err, hm.MemoryLLMError):
+        return err.kind, err.message
+    if isinstance(err, hm.SnapshotValidationError):
+        return "validation", "модель вернула снимок не по схеме: " + "; ".join(err.problems)
+    if isinstance(err, hm.SourceConflictError):
+        return "conflict", "переписка менялась во время сжатия, повторите"
+    return "internal", f"внутренняя ошибка: {err}"
+
+
+def _parse_utc(value) -> datetime | None:
+    try:
+        stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+
+
+def turn_retry_after(error) -> datetime | None:
+    """Когда ежеходный проход попробует снова после ошибки error (None — ошибки нет)."""
+    if not isinstance(error, dict):
+        return None
+    at = _parse_utc(error.get("at"))
+    if at is None:
+        return None
+    failures = max(1, int_or_zero(error.get("failures")))
+    # Степень ограничена: 2^(failures−1) при сотнях сбоев переполнил бы timedelta.
+    return at + min(_TURN_RETRY_MAX, _TURN_RETRY_BASE * 2 ** min(failures - 1, 16))
+
+
+def _turn_error(entry, session_id: int) -> dict | None:
+    """Последняя ошибка ежеходного прохода: из meta записи, а без записи — из процесса."""
+    if entry is None:
+        return _turn_errors.get(session_id)
+    error = (entry.meta or {}).get("last_error")
+    return error if isinstance(error, dict) else None
+
+
+async def _record_turn_error(session_id: int, err: BaseException) -> None:
+    """
+    Запомнить сбой ежеходного прохода: meta.last_error = {message, kind, at,
+    failures}. ПОЧЕМУ: указатель при сбое стоит, бэклог по-прежнему выше
+    порога, и КАЖДЫЙ следующий ход повторял тот же платный провал (обрыв
+    лимитом — три полноразмерных вызова за ход), а видна ошибка была только
+    в логе: вкладка показывала лишь растущее «ждут сжатия» (финальное ревью).
+    Теперь следующий проход ждёт паузу (turn_retry_after), а статус отдаёт
+    ошибку и время следующей попытки.
+    """
+    kind, message = describe_error(err)
+    async with AsyncSessionLocal() as db:
+        if await db.get(models.ChatSession, session_id) is None:
+            return  # чат удалили посреди прохода: его id может достаться новому
+        entry = await _summary_entry(db, session_id)
+        previous = _turn_error(entry, session_id) or {}
+        error = {"message": message, "kind": kind, "at": _utc_iso(),
+                 "failures": int_or_zero(previous.get("failures")) + 1}
+        if entry is None:
+            _turn_errors[session_id] = error
+            return
+        entry.meta = {**(entry.meta or {}), "last_error": error}
+        await db.commit()
+
+
+async def _clear_turn_error(session_id: int) -> None:
+    """Проход (или задание) прошёл без ошибки — старая ошибка и пауза больше не нужны."""
+    _turn_errors.pop(session_id, None)
+    async with AsyncSessionLocal() as db:
+        entry = await _summary_entry(db, session_id)
+        if entry is not None and "last_error" in (entry.meta or {}):
+            entry.meta = {k: v for k, v in entry.meta.items() if k != "last_error"}
+            await db.commit()
+
+
 async def run_incremental(session_id: int, deps: MemoryDeps, *, max_batches: int,
                           on_progress: Callable[[hm.ScanProgress], None] | None = None,
                           ) -> hm.ScanResult | None:
     """
     Ежеходный проход: свернуть в снимок то, что вышло из окна, не больше
     max_batches пакетов. None — проход не делался: чат занят (идёт задание или
-    другой проход) или авто-сводка выключена.
+    другой проход), авто-сводка выключена или после ошибки прошлого прохода
+    ещё не вышла пауза (turn_retry_after; ручные «Догнать»/«Пересобрать» её
+    не ждут).
 
     Кусок, изменившийся под моделью, не пишется и не пересобирается сразу
     (retry_conflicts=False): следующий ход начнёт его заново. Исключения ядра
-    (ошибка API, снимок не по схеме) уходят вызывающему — main их логирует, а
-    указатель стоит, и следующий ход повторит пакет.
+    (ошибка API, снимок не по схеме) записываются в meta.last_error и уходят
+    вызывающему — main их логирует; указатель стоит, и пакет повторит проход
+    после паузы.
     """
     if is_busy(session_id):
         return None
     async with chat_lock(session_id):
         _busy.add(session_id)
+        cancel = _turn_cancels[session_id] = asyncio.Event()
         try:
             async with AsyncSessionLocal() as db:
                 # Выключатель (вкладка «Память»): settings/ui -> auto_summary=false.
                 ui, ui_value = await _ui_setting(db)
                 if not ui_flag(ui, "auto_summary"):
                     return None
+                failed = _turn_error(await _summary_entry(db, session_id), session_id)
+                retry_at = turn_retry_after(failed)
+                if retry_at is not None and datetime.now(timezone.utc) < retry_at:
+                    return None
                 connection = await deps.get_connection(db)
             manager, _, source = _make_run(
                 session_id, deps, mode="incremental", threshold=_summary_every(ui_value),
                 ui=ui, ui_value=ui_value, connection=connection)
-            return await manager.scan_and_compress_history(
-                source, on_progress=on_progress, max_batches=max_batches,
-                retry_conflicts=False)
+            try:
+                result = await manager.scan_and_compress_history(
+                    source, on_progress=on_progress, max_batches=max_batches,
+                    retry_conflicts=False, cancel=cancel)
+            except Exception as err:
+                try:
+                    await _record_turn_error(session_id, err)
+                except Exception:  # noqa: BLE001 — не заслонять исходную ошибку
+                    logger.exception("Ошибка памяти чата %s не записалась", session_id)
+                raise
+            if failed is not None:
+                await _clear_turn_error(session_id)
+            return result
         finally:
             _busy.discard(session_id)
+            if _turn_cancels.get(session_id) is cancel:
+                del _turn_cancels[session_id]
 
 
 # ============================================================================
@@ -845,6 +1151,11 @@ class MemoryJob:
     line: str = ""
     error: str | None = None
     warnings: list[str] = field(default_factory=list)
+    # Размер снимка, который работает ПОСЛЕ задания (для тоста «… → N токенов»).
+    # state_tokens — это цель прогона: у пересборки буфер, у пустой — ноль, и
+    # тост «пересобрана: 0 сообщений → 0 токенов» при живом снимке читался как
+    # «память стёрта». None — задание ещё идёт или упало.
+    snapshot_tokens: int | None = None
     # queued_at — постановка в очередь; started_at — переход в running. Раньше
     # «начато» ставилось при постановке, и задание, минуты ждавшее ежеходный
     # проход, показывало во вкладке неверное время старта.
@@ -874,6 +1185,7 @@ class MemoryJob:
             "total": self.total, "batches": self.batches, "state_tokens": self.state_tokens,
             "phase": self.phase, "retry_in_s": self.retry_in_s, "line": self.line,
             "error": self.error, "warnings": list(self.warnings),
+            "snapshot_tokens": self.snapshot_tokens,
             "queued_at": self.queued_at, "started_at": self.started_at,
             "finished_at": self.finished_at,
         }
@@ -927,10 +1239,13 @@ def cancel_job(session_id: int) -> MemoryJob | None:
     """
     Остановить задание чата → это задание; None — останавливать нечего.
 
-    Идущее задание доводит начатый пакет и останавливается между пакетами:
+    Идущее задание доводит начатый запрос к модели и останавливается:
     оплаченный пакет не пропадает (у пересборки он остаётся в буфере, её
-    можно продолжить). Задание в очереди снимается сразу — ждать замка ему
-    незачем, а ежеходный проход может держать его минуты.
+    можно продолжить), а паузы между запросами и перед повторами прерываются
+    сразу (ядро, _pause). Остановленную пересборку ежеходные проходы не
+    продолжают — только «Продолжить» (см. _read_target). Задание в очереди
+    снимается сразу — ждать замка ему незачем, а ежеходный проход может
+    держать его минуты.
     """
     job = _jobs.get(session_id)
     if job is None or job.status not in _ACTIVE:
@@ -956,8 +1271,11 @@ def forget_job(session_id: int) -> MemoryJob | None:
     работе — получал бы 409 на «Пересобрать». Идущее задание доводит начатый
     пакет на своём объекте MemoryJob, но записать его уже не может (источник
     сверяется с реестром через _owns_chat) и завершается ошибкой «чат удалён».
+    Ошибка ежеходного прохода чата без записи снимка (_turn_errors) уходит
+    туда же — по той же причине.
     """
     cancel_job(session_id)
+    _turn_errors.pop(session_id, None)
     return _jobs.pop(session_id, None)
 
 
@@ -968,36 +1286,53 @@ async def wait_job(session_id: int) -> None:
         await asyncio.wait({job.task})
 
 
+# Одно задание памяти на процесс: остальные ждут в очереди (queued). ПОЧЕМУ:
+# пауза между запросами (delay_ms) действует внутри ОДНОГО прогона, а задания
+# разных чатов шли разом — пять «Пересобрать» подряд давали около трёх
+# запросов в секунду на общий ключ провайдера: 429 у заданий и у ходов всех
+# пользователей (финальное ревью, API M1). Замок заводится на цикл событий:
+# asyncio-примитив привязывается к циклу при первом ожидании, а тесты гоняют
+# каждый в своём цикле (см. chat_lock).
+_job_gate: tuple[object, asyncio.Lock] | None = None
+
+
+def _jobs_gate() -> asyncio.Lock:
+    global _job_gate
+    loop = asyncio.get_running_loop()
+    if _job_gate is None or _job_gate[0] is not loop:
+        _job_gate = (loop, asyncio.Lock())
+    return _job_gate[1]
+
+
 async def _run_job(job: MemoryJob, deps: MemoryDeps, *, resume: bool) -> None:
-    """Задача задания: дождаться замка чата, выполнить, перевести ошибку в текст для UI."""
+    """Задача задания: дождаться очереди и замка чата, выполнить, перевести ошибку в текст для UI."""
     try:
-        # Замок общий с ежеходным инкрементом: пока идёт задание, проходы после
-        # ходов пропускаются, а задание ждёт конца уже начатого прохода (queued).
-        async with chat_lock(job.session_id):
-            job.status = "running"
-            job.started_at = _utc_iso()
-            _busy.add(job.session_id)
-            try:
-                await _execute_job(job, deps, resume=resume)
-            finally:
-                _busy.discard(job.session_id)
+        # Сначала общая очередь заданий, потом замок чата: задание, ждущее
+        # очереди, не держит свой чат, и ежеходные проходы в нём идут как шли.
+        async with _jobs_gate():
+            # Замок общий с ежеходным инкрементом: пока идёт задание, проходы после
+            # ходов пропускаются, а задание ждёт конца уже начатого прохода (queued).
+            async with chat_lock(job.session_id):
+                job.status = "running"
+                job.started_at = _utc_iso()
+                _busy.add(job.session_id)
+                try:
+                    await _execute_job(job, deps, resume=resume)
+                finally:
+                    _busy.discard(job.session_id)
     except asyncio.CancelledError:
         # Снято из очереди (cancel_job) или сервер останавливается. Готовые
         # пакеты уже в БД; отмену не глотаем — её ждёт тот, кто отменял.
         if job.status in _ACTIVE:
             job.finish("cancelled")
         raise
-    except hm.MemoryLLMError as err:
-        job.finish("error", err.message)
-    except hm.SnapshotValidationError as err:
-        job.finish("error", "модель вернула снимок не по схеме: " + "; ".join(err.problems))
-    except hm.SourceConflictError:
-        job.finish("error", "переписка менялась во время сжатия, повторите")
     except _ChatGone:
         job.finish("error", "чат удалён — памяти больше некуда записываться")
+    except (hm.MemoryLLMError, hm.SnapshotValidationError, hm.SourceConflictError) as err:
+        job.finish("error", describe_error(err)[1])
     except Exception as err:  # noqa: BLE001 — задание не должно падать молча
         logger.exception("Задание памяти чата %s (%s) упало", job.session_id, job.mode)
-        job.finish("error", f"внутренняя ошибка: {err}")
+        job.finish("error", describe_error(err)[1])
 
 
 async def _execute_job(job: MemoryJob, deps: MemoryDeps, *, resume: bool) -> None:
@@ -1035,18 +1370,51 @@ async def _execute_job(job: MemoryJob, deps: MemoryDeps, *, resume: bool) -> Non
         if await db.get(models.ChatSession, sid) is None or not _owns_chat(job):
             raise _ChatGone
         if result.status == "cancelled":
-            job.finish("cancelled")  # буфер пересборки остаётся — её можно продолжить
+            # Буфер пересборки остаётся — её можно продолжить, но только
+            # кнопкой: остановленный буфер ежеходные проходы не трогают.
+            if job.mode == "rebuild":
+                await _pause_rebuild_buffer(db, sid)
+            job.snapshot_tokens = await _live_snapshot_tokens(db, sid)
+            job.finish("cancelled")
             return
         if job.mode == "rebuild" and not await _adopt_rebuild_buffer(db, sid, manager.warnings):
             # Без строки UI показал бы «готово» при нетронутом снимке, и
             # нажатие «Пересобрать» выглядело бы так, будто ничего не сделало.
             job.warnings.append(EMPTY_REBUILD_WARNING)
+        elif result.processed == 0:
+            # То же для задания без записи памяти: «готово: 0 сообщений → 0
+            # токенов» читалось как «память стёрта». Объяснение — по причине.
+            whole_chat = await _window_start_id(db, sid, _memory_window(ui_value)) == 0
+            job.warnings.append(NOTHING_TO_COMPRESS_WARNING if whole_chat or job.mode == "rebuild"
+                                else NOTHING_TO_CATCH_UP_WARNING)
+        job.snapshot_tokens = await _live_snapshot_tokens(db, sid)
+    # Задание прошло без ошибки — ошибка ежеходного прохода и пауза после неё
+    # больше не нужны («Догнать» — ручной повтор, см. статус last_error).
+    await _clear_turn_error(sid)
     job.finish("done")
+
+
+async def _live_snapshot_tokens(db, session_id: int) -> int:
+    """Размер снимка, который сейчас идёт в контекст (0 — снимка нет)."""
+    entry = await _summary_entry(db, session_id)
+    return snapshot_tokens(entry.content if entry is not None else "")
+
+
+async def _pause_rebuild_buffer(db, session_id: int) -> None:
+    """Пометить буфер пересборки остановленным (meta.rebuild.paused) — см. _read_target."""
+    entry = await _summary_entry(db, session_id)
+    meta = dict(entry.meta or {}) if entry is not None else {}
+    if isinstance(meta.get("rebuild"), dict):
+        meta["rebuild"] = {**meta["rebuild"], "paused": True}
+        entry.meta = meta
+        await db.commit()
 
 
 async def _open_rebuild_buffer(db, session_id: int, job: MemoryJob, *, resume: bool) -> None:
     """
-    Пустой буфер пересборки в meta["rebuild"]; resume — оставить начатый.
+    Пустой буфер пересборки в meta["rebuild"]; resume — оставить начатый
+    (и снять с него пометку «остановлен»: «Продолжить» — тот самый случай,
+    когда буфер снова продолжают).
 
     Старый снимок при этом продолжает работать: пока буфер копится, в
     контекст идёт он, а окно верит его указателю. Иначе на время пересборки
@@ -1058,6 +1426,10 @@ async def _open_rebuild_buffer(db, session_id: int, job: MemoryJob, *, resume: b
         return
     meta = dict(entry.meta or {})
     if resume and isinstance(meta.get("rebuild"), dict):
+        if meta["rebuild"].get("paused"):
+            meta["rebuild"] = {k: v for k, v in meta["rebuild"].items() if k != "paused"}
+            entry.meta = meta
+            await db.commit()
         return
     meta["rebuild"] = {"content": "", "last_message_id": 0, "manual": True,
                        "started_at": _utc_iso(), "batch_size": job.batch_size}
@@ -1067,6 +1439,10 @@ async def _open_rebuild_buffer(db, session_id: int, job: MemoryJob, *, resume: b
 
 # Предупреждение задания «Пересобрать», когда буфер так и остался пустым.
 EMPTY_REBUILD_WARNING = "пересборка не нашла сообщений старше окна — прежний снимок оставлен"
+# Задание без записи памяти: весь чат в окне (или пересобирать без снимка нечего)…
+NOTHING_TO_COMPRESS_WARNING = "сжимать нечего — весь чат в окне"
+# …или «Догнать», когда всё старше окна уже в снимке.
+NOTHING_TO_CATCH_UP_WARNING = "догонять нечего — всё, что старше окна, уже в снимке"
 
 
 async def _adopt_rebuild_buffer(db, session_id: int, warnings) -> bool:
@@ -1106,8 +1482,16 @@ async def _count_rows(db, model, session_id: int) -> int:
     )).scalar() or 0
 
 
-async def status(db, session_id: int) -> dict:
-    """Всё, что показывает блок «Мастер-память»: снимок, буфер, бэклог, факты, задание."""
+async def status(db, session_id: int, connection: dict | None = None) -> dict:
+    """
+    Всё, что показывает блок «Мастер-память»: снимок, буфер, бэклог, факты,
+    задание, ошибку ежеходного прохода.
+
+    :param connection: подключение (main передаёт настройки «Подключения»):
+        по модели памяти считается settings.max_snapshot_tokens — наибольший
+        бюджет снимка, который она успевает написать за ответ. None — не
+        считается (max_snapshot_tokens: null, как у неизвестной LiteLLM модели).
+    """
     _, ui_value = await _ui_setting(db)
     config = memory_config(ui_value)
     window = _memory_window(ui_value)
@@ -1121,8 +1505,25 @@ async def status(db, session_id: int) -> dict:
     # явный meta.rebuild. Сводка старого формата пересобирается неявно, с нуля:
     # бэклог (_pending_count) считается от нуля, и без буфера в статусе
     # вкладка показала бы «учтено до #400» и «ждут сжатия 850» без объяснения.
+    # Остановленный буфер (paused) показывается тоже — он ждёт «Продолжить»,
+    # хотя бэклог уже считается от живого снимка.
     target = _read_target(entry)
     buffer = meta.get("rebuild") if isinstance(meta.get("rebuild"), dict) else {}
+    staged = target.paused if target.paused is not None else (
+        {"last_message_id": target.pointer, "content": target.state} if target.rebuilding else None)
+    warnings = list(meta.get("warnings") or [])
+    max_budget = (max_snapshot_tokens(memory_output_limit(connection))
+                  if connection is not None else None)
+    if max_budget is not None and config.snapshot_tokens > max_budget:
+        # Снимок, которого модель памяти не успевает написать за ответ,
+        # обрывается на каждом обновлении. Прогоны и так работают с этим
+        # потолком (build_manager), но бюджет в настройках его не показывал.
+        warnings.append(
+            f"модель памяти успевает написать снимок не больше ≈{hm._fmt_int(max_budget)} "
+            f"токенов, а бюджет — {hm._fmt_int(config.snapshot_tokens)}: память работает "
+            "с меньшим бюджетом — уменьшите его или выберите модель с длинным выводом")
+    last_error = _turn_error(entry, session_id)
+    retry_after = turn_retry_after(last_error)
     updated_at = entry.updated_at if entry is not None else None
     job = _jobs.get(session_id)
     return {
@@ -1136,13 +1537,19 @@ async def status(db, session_id: int) -> dict:
             "structured": hm.is_structured(content),
             "updated_at": _utc_iso(updated_at) if updated_at else None,
             "over_budget": tokens > config.snapshot_tokens,
-            "warnings": list(meta.get("warnings") or []),
+            "warnings": warnings,
+            # Сбой ежеходного прохода и когда он попробует снова; ручные
+            # «Догнать»/«Пересобрать» паузу не ждут.
+            "last_error": None if last_error is None else {
+                k: last_error.get(k) for k in ("message", "kind", "at", "failures")},
+            "retry_after": _utc_iso(retry_after) if retry_after else None,
         },
-        "staging": None if not target.rebuilding else {
-            "last_message_id": target.pointer,
-            "tokens": snapshot_tokens(target.state),
+        "staging": None if staged is None else {
+            "last_message_id": int_or_zero(staged.get("last_message_id")),
+            "tokens": snapshot_tokens(staged.get("content")),
             "manual": bool(buffer.get("manual")),
             "started_at": buffer.get("started_at"),
+            "paused": target.paused is not None,
         },
         "backlog": {
             "pending": await _pending_count(db, session_id, window),
@@ -1151,7 +1558,8 @@ async def status(db, session_id: int) -> dict:
         },
         "facts": {"count": await _count_rows(db, models.HoraeFact, session_id)},
         "settings": {"batch_size": config.batch_size, "delay_ms": config.delay_ms,
-                     "snapshot_tokens": config.snapshot_tokens},
+                     "snapshot_tokens": config.snapshot_tokens,
+                     "max_snapshot_tokens": max_budget},
     }
 
 
@@ -1165,8 +1573,17 @@ async def purge(db, session_id: int) -> dict:
     воскресил бы только что стёртую память. Удаление — под замком чата по той
     же причине: ежеходный проход, начатый до сброса, записал бы снимок со
     старым содержимым поверх пустоты.
+
+    Ждать приходится недолго: паузы между запросами и перед повторами отмена
+    прерывает сразу (ядро, _pause), а идущий ежеходный проход получает ту же
+    отмену (_turn_cancels) и останавливается после текущего запроса к модели.
+    Раньше сброс ждал минуты бэкоффа по Retry-After и все пакеты прохода — до
+    шести платных слияний, результат которых тут же стирался.
     """
     cancel_job(session_id)
+    turn = _turn_cancels.get(session_id)
+    if turn is not None:
+        turn.set()
     await wait_job(session_id)
     async with chat_lock(session_id):
         snapshot = await db.execute(sql_delete(models.HoraeEntry).where(
@@ -1176,6 +1593,7 @@ async def purge(db, session_id: int) -> dict:
         facts = await db.execute(sql_delete(models.HoraeFact).where(
             models.HoraeFact.session_id == session_id))
         await db.commit()
+        _turn_errors.pop(session_id, None)
     return {"snapshot_deleted": bool(snapshot.rowcount), "facts_deleted": int(facts.rowcount or 0)}
 
 

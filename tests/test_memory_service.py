@@ -334,8 +334,10 @@ async def test_rebuild_resumes_from_checkpoint():
 async def test_cancelled_rebuild_keeps_buffer_shows_staging_and_resumes():
     """
     Остановка идущей пересборки: начатый пакет доводится и остаётся в буфере,
-    старый снимок работает дальше, статус показывает прерванную пересборку и
-    бэклог от её указателя. «Продолжить» доделывает остаток и подменяет снимок.
+    старый снимок работает дальше, статус показывает прерванную (остановленную)
+    пересборку, а бэклог — от живого снимка: остановленный буфер ежеходные
+    проходы не продолжают (задача 11). «Продолжить» доделывает остаток и
+    подменяет снимок.
     """
     from backend import memory_service, models
     from backend.database import AsyncSessionLocal, engine
@@ -360,7 +362,8 @@ async def test_cancelled_rebuild_keeps_buffer_shows_staging_and_resumes():
     async with AsyncSessionLocal() as db:
         st = await memory_service.status(db, sid)
     assert st["staging"]["last_message_id"] == ids[9] and st["staging"]["manual"] is True
-    assert st["backlog"]["pending"] == 20 and st["snapshot"]["covered_upto"] == ids[29]
+    assert st["staging"]["paused"] is True
+    assert st["backlog"]["pending"] == 0 and st["snapshot"]["covered_upto"] == ids[29]
     assert st["job"]["status"] == "cancelled"
 
     with patch("backend.main.complete", new=_snapshot_llm([])):
@@ -859,7 +862,7 @@ async def test_first_unreadable_batch_keeps_the_entry_off_until_text_appears():
 
 def test_adopt_summary_counts_tokens_once_and_empty_weighs_nothing():
     """
-    meta.tokens — одна оценка (horae_memory.estimate_tokens, как у менеджера):
+    meta.tokens — одна оценка (horae_memory.count_tokens, как у менеджера):
     переданное значение не пересчитывается, пустой снимок весит ноль.
     """
     from types import SimpleNamespace
@@ -871,7 +874,7 @@ def test_adopt_summary_counts_tokens_once_and_empty_weighs_nothing():
     snap = hm.render_snapshot({hm.SEC_CHRONICLE: "- [#1–#2] ворота открыты"})
     memory_service.adopt_summary(entry, snap, 5)
     assert entry.meta["tokens"] == estimate_tokens(snap) == memory_service.snapshot_tokens(snap)
-    with patch("backend.memory_service.estimate_tokens", side_effect=AssertionError("пересчёт")):
+    with patch("backend.memory_service.count_tokens", side_effect=AssertionError("пересчёт")):
         memory_service.adopt_summary(entry, snap, 6, tokens=7)
     assert entry.meta["tokens"] == 7 and entry.enabled is True
     memory_service.adopt_summary(entry, "  \n", 7)
@@ -929,7 +932,8 @@ async def test_status_of_legacy_summary_agrees_with_its_backlog():
         await db.commit()
         st = await memory_service.status(db, sid)
     assert st["snapshot"]["covered_upto"] == ids[39] and st["backlog"]["pending"] == 40
-    assert st["staging"] == {"last_message_id": 0, "tokens": 0, "manual": False, "started_at": None}
+    assert st["staging"] == {"last_message_id": 0, "tokens": 0, "manual": False, "started_at": None,
+                             "paused": False}
     await engine.dispose()
 
 
@@ -985,4 +989,440 @@ async def test_free_chat_lock_is_dropped_but_never_while_someone_waits():
         await memory_service.wait_job(sid)
     assert job.status == "done" and held and all(h is lock for h in held)
     assert sid not in memory_service._locks
+    await engine.dispose()
+
+
+# ============================================================================
+# Доработки по финальному ревью (задача 11)
+# ============================================================================
+def _stream_chunk(text, finish_reason=None):
+    """Чанк стрима LiteLLM для подмены litellm.acompletion (настоящий шлюз)."""
+    class _Delta:
+        content = text
+
+    class _Choice:
+        delta = _Delta()
+
+    _Choice.finish_reason = finish_reason
+
+    class _Chunk:
+        choices = [_Choice()]
+
+    return _Chunk()
+
+
+async def _no_persist(*a, **k):
+    return None
+
+
+def _ago(minutes):
+    from datetime import datetime, timedelta, timezone
+    stamp = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+    return stamp.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+async def test_truncated_stream_is_length_and_the_turn_pass_backs_off():
+    """
+    Финальное ревью (I1), сквозь настоящий шлюз: стрим оборван лимитом вывода
+    (непустой текст, finish_reason=length). Раньше — корректирующие ходы с
+    тем же лимитом, три полноразмерных вызова, отказ, и так на КАЖДОМ ходу.
+    Теперь это length: слияние и один повтор (сжимать пока нечего), ошибка
+    записана, а следующий ход модель не зовёт, пока не выйдет пауза.
+    """
+    from backend import main, memory_service
+    from backend.database import AsyncSessionLocal, engine
+    await _fresh_db()
+    _, sid, _ = await _make_chat(12 + hr.DEFAULT_WINDOW)
+    requests = []
+
+    async def truncated(**kw):
+        requests.append(kw["messages"])
+
+        async def gen():
+            yield _stream_chunk(hm.ENVELOPE_OPEN + f"\n## [{hm.SEC_CHRONICLE}]\n- [#1–#2] оборв")
+            yield _stream_chunk("ано", "length")
+        return gen()
+
+    with patch("backend.llm_gateway.litellm.acompletion", new=truncated), \
+            patch("backend.usage_stats._persist", new=_no_persist):
+        await main._maybe_update_summary(sid)
+        assert len(requests) == 2   # слияние и один повтор — без корректирующих ходов
+        assert not any("Ответ отклонён" in str(r[-1]["content"]) for r in requests)
+        await main._maybe_update_summary(sid)
+        assert len(requests) == 2   # следующий ход ждёт паузу, а не платит снова
+    async with AsyncSessionLocal() as db:
+        st = await memory_service.status(db, sid)
+    err = st["snapshot"]["last_error"]
+    assert err["kind"] == "length" and err["failures"] == 1 and "лимит" in err["message"]
+    assert st["snapshot"]["retry_after"] > err["at"]
+    assert await _entry(sid) is None
+    await engine.dispose()
+
+
+async def test_turn_failure_backs_off_grows_and_clears_on_success():
+    """
+    Ошибка ежеходного прохода — в meta.last_error; следующий проход ждёт
+    min(6 ч, 10 мин · 2^(failures−1)) с момента ошибки. Ручное задание паузу
+    не ждёт; удачная запись снимка ошибку убирает.
+    """
+    from backend import main, memory_service, models
+    from backend.database import AsyncSessionLocal, engine
+    await _fresh_db()
+    _, sid, ids = await _make_chat(40 + hr.DEFAULT_WINDOW)
+    async with AsyncSessionLocal() as db:
+        db.add(models.HoraeEntry(session_id=sid, category="summary", title="t",
+                                 content=hm.render_snapshot({hm.SEC_CHRONICLE: "- [#1–#2] старое"}),
+                                 always_on=True, enabled=True,
+                                 meta={"last_message_id": ids[9], "v": 2}))
+        await db.commit()
+
+    class Denied(Exception):
+        status_code = 401
+
+    calls = []
+
+    async def denied(messages, params=None, connection=None, kind="service"):
+        calls.append(1)
+        raise Denied("no key")
+
+    async def shift_error(minutes):
+        async with AsyncSessionLocal() as db:
+            entry = (await db.execute(select(models.HoraeEntry).where(
+                models.HoraeEntry.session_id == sid))).scalars().first()
+            entry.meta = {**entry.meta, "last_error": {**entry.meta["last_error"],
+                                                       "at": _ago(minutes)}}
+            await db.commit()
+
+    with patch("backend.main.complete", new=denied):
+        await main._maybe_update_summary(sid)
+        first = (await _entry(sid)).meta["last_error"]
+        assert first["kind"] == "auth" and first["failures"] == 1 and len(calls) == 1
+        await main._maybe_update_summary(sid)
+        assert len(calls) == 1                        # пауза 10 мин ещё идёт
+        await shift_error(11)
+        await main._maybe_update_summary(sid)
+        assert len(calls) == 2 and (await _entry(sid)).meta["last_error"]["failures"] == 2
+        await shift_error(11)                         # второй раз пауза уже 20 мин
+        await main._maybe_update_summary(sid)
+        assert len(calls) == 2
+    async with AsyncSessionLocal() as db:
+        st = await memory_service.status(db, sid)
+    assert st["snapshot"]["last_error"]["failures"] == 2 and st["snapshot"]["retry_after"]
+
+    with patch("backend.main.complete", new=_snapshot_llm([])):
+        job = await _run_rebuild(sid, mode="catchup", batch_size=10)   # ручное — без паузы
+    assert job.status == "done"
+    entry = await _entry(sid)
+    assert "last_error" not in entry.meta and entry.meta["last_message_id"] == ids[39]
+    async with AsyncSessionLocal() as db:
+        st = await memory_service.status(db, sid)
+    assert st["snapshot"]["last_error"] is None and st["snapshot"]["retry_after"] is None
+    await engine.dispose()
+
+
+async def test_memory_output_is_clamped_to_the_model_limit():
+    """
+    Финальное ревью (API I1): max_tokens памяти (1,4 × бюджет + 1024) не
+    сверялся с лимитом модели — у gpt-4o (модель по умолчанию) 16 384, запрос
+    с 17 824 получал 400 на каждом проходе. Теперь вывод и рабочий бюджет
+    снимка прижаты к лимиту, если LiteLLM знает модель памяти.
+    """
+    import litellm
+
+    from backend import llm_gateway, memory_service
+    limit = litellm.get_model_info("gpt-4o")["max_output_tokens"]
+    seen = []
+
+    async def spy(messages, params=None, connection=None, kind="service"):
+        seen.append(dict(llm_gateway._SAMPLING_OVERRIDES.get() or {}))
+        return "ok"
+
+    deps = memory_service.MemoryDeps(complete=spy, get_connection=None)
+    for conn, max_tokens in (({"default_model": "gpt-4o"}, limit),
+                             ({"default_model": "alias-x", "summary_model": "gpt-4o"}, limit),
+                             ({"default_model": "alias-that-litellm-does-not-know"}, 17_824)):
+        manager, _ = memory_service.build_manager(conn, {"memory_snapshot_tokens": 12_000}, deps)
+        await manager.call([{"role": "user", "content": "x"}])
+        assert seen[-1]["max_tokens"] == max_tokens and manager.config.output_tokens == max_tokens
+        expected_budget = 12_000 if max_tokens == 17_824 else int((limit - 1024) / 1.4)
+        assert manager.config.snapshot_tokens == expected_budget
+
+
+async def test_status_reports_the_largest_snapshot_budget_the_model_can_write():
+    from backend import memory_service
+    from backend.database import AsyncSessionLocal, engine
+    await _fresh_db()
+    _, sid, _ = await _make_chat(3)
+    async with AsyncSessionLocal() as db:
+        known = await memory_service.status(db, sid, connection={"default_model": "gpt-4o"})
+        unknown = await memory_service.status(db, sid, connection={"default_model": "alias-x"})
+        plain = await memory_service.status(db, sid)
+    max_budget = known["settings"]["max_snapshot_tokens"]
+    assert isinstance(max_budget, int) and 1000 < max_budget < known["snapshot"]["budget"]
+    assert any(hm._fmt_int(max_budget) in w for w in known["snapshot"]["warnings"])
+    assert unknown["settings"]["max_snapshot_tokens"] is None
+    assert plain["settings"]["max_snapshot_tokens"] is None
+    assert unknown["snapshot"]["warnings"] == [] == plain["snapshot"]["warnings"]
+    await engine.dispose()
+
+
+async def test_rejected_max_tokens_is_retried_once_with_the_default():
+    """
+    Провайдер отверг max_tokens (400 со словом max_tokens/maxOutputTokens):
+    один повтор с DEFAULT_MAX_TOKENS и предупреждение; дальше в прогоне —
+    сразу с ним. Другие 400 не повторяются.
+    """
+    from backend import llm_gateway, memory_service
+    from backend.config import settings
+    seen = []
+
+    class BadRequestError(Exception):
+        status_code = 400
+
+    async def picky(messages, params=None, connection=None, kind="service"):
+        wanted = (llm_gateway._SAMPLING_OVERRIDES.get() or {}).get("max_tokens")
+        seen.append(wanted)
+        if messages[0]["content"] == "другое":
+            raise BadRequestError("model not found")
+        if wanted != settings.DEFAULT_MAX_TOKENS:
+            raise BadRequestError(f"Unable to submit request because it has a maxOutputTokens "
+                                  f"value of {wanted} but the supported range is 1 to 8192")
+        return "ok"
+
+    deps = memory_service.MemoryDeps(complete=picky, get_connection=None)
+    manager, _ = memory_service.build_manager({"default_model": "alias-x"}, {}, deps)
+    assert await manager.call([{"role": "user", "content": "x"}]) == "ok"
+    assert await manager.call([{"role": "user", "content": "y"}]) == "ok"
+    assert seen[0] > settings.DEFAULT_MAX_TOKENS
+    assert seen[1:] == [settings.DEFAULT_MAX_TOKENS] * 2
+    assert any("max_tokens" in w for w in manager.warnings)
+    with pytest.raises(hm.MemoryLLMError) as e:
+        await manager.call([{"role": "system", "content": "другое"}])
+    assert e.value.kind == "bad_request" and seen[-1] == settings.DEFAULT_MAX_TOKENS
+
+
+async def test_job_reports_snapshot_tokens_and_why_nothing_was_done():
+    """
+    Итог задания для тоста: snapshot_tokens — размер принятого снимка, а
+    задание без работы объясняет почему (весь чат в окне / всё уже в снимке).
+    """
+    from backend import memory_service
+    from backend.database import AsyncSessionLocal, engine
+    await _fresh_db()
+    _, sid, _ = await _make_chat(30 + hr.DEFAULT_WINDOW)
+    with patch("backend.main.complete", new=_snapshot_llm([])):
+        job = await _run_rebuild(sid, mode="catchup", batch_size=10)
+        async with AsyncSessionLocal() as db:
+            st = await memory_service.status(db, sid)
+        assert job.to_dict()["snapshot_tokens"] == st["snapshot"]["tokens"] > 0
+        assert job.warnings == []
+        again = await _run_rebuild(sid, mode="catchup")
+    assert again.status == "done" and again.processed == 0
+    assert again.warnings == [memory_service.NOTHING_TO_CATCH_UP_WARNING]
+
+    _, small, _ = await _make_chat(10)                     # весь чат в окне, снимка нет
+    with patch("backend.main.complete", new=_snapshot_llm([])):
+        job = await _run_rebuild(small)
+    assert job.status == "done" and job.processed == 0
+    assert job.warnings == [memory_service.NOTHING_TO_COMPRESS_WARNING]
+    assert job.to_dict()["snapshot_tokens"] == 0
+    await engine.dispose()
+
+
+async def test_stopped_rebuild_is_not_continued_by_turn_passes():
+    """
+    Финальное ревью (сервис, M2): после «Остановить» буфер пересборки
+    оставался, и ежеходные проходы продолжали его — до шести платных слияний
+    за ход, а живой снимок не обновлялся. Теперь остановленный буфер ждёт
+    «Продолжить», а ежеходные проходы пишут в живой снимок.
+    """
+    from backend import main, memory_service, models
+    from backend.database import AsyncSessionLocal, engine
+    await _fresh_db()
+    _, sid, ids = await _make_chat(30 + hr.DEFAULT_WINDOW)
+    live = hm.render_snapshot({hm.SEC_CHRONICLE: "- [#0–#9] СТАРЫЙ"})
+    async with AsyncSessionLocal() as db:
+        db.add(models.HoraeEntry(session_id=sid, category="summary", title="t", content=live,
+                                 always_on=True, enabled=True,
+                                 meta={"last_message_id": ids[9], "v": 2}))
+        await db.commit()
+
+    async def cancel_on_first_merge(messages, params=None, connection=None, kind="service"):
+        if messages[0]["content"] == hm.MASTER_STATE_PROMPT:
+            memory_service.cancel_job(sid)
+        return await _snapshot_llm([])(messages, params, connection, kind)
+
+    with patch("backend.main.complete", new=cancel_on_first_merge):
+        job = await _run_rebuild(sid, batch_size=10)
+    assert job.status == "cancelled"
+    assert (await _entry(sid)).meta["rebuild"]["last_message_id"] == ids[9]
+
+    seen = []
+    with patch("backend.main.complete", new=_snapshot_llm(seen)):
+        await main._maybe_update_summary(sid)
+    merges = [m[1]["content"] for m in seen if m[0]["content"] == hm.MASTER_STATE_PROMPT]
+    assert merges and merges[0].startswith("[Текущая память]\n" + live)   # поверх живого
+    entry = await _entry(sid)
+    assert entry.meta["last_message_id"] == ids[29] and entry.content != live
+    buffer = entry.meta["rebuild"]
+    assert buffer["last_message_id"] == ids[9] and buffer["paused"] is True   # буфер ждёт
+    async with AsyncSessionLocal() as db:
+        st = await memory_service.status(db, sid)
+    assert st["staging"]["last_message_id"] == ids[9] and st["staging"]["paused"] is True
+    assert st["backlog"]["pending"] == 0
+
+    seen.clear()
+    with patch("backend.main.complete", new=_snapshot_llm(seen)):
+        job = await _run_rebuild(sid, resume=True, batch_size=10)   # «Продолжить»
+    assert job.status == "done" and job.processed == 20
+    merges = [m[1]["content"] for m in seen if m[0]["content"] == hm.MASTER_STATE_PROMPT]
+    assert merges[0].startswith("[Текущая память]\n" + buffer["content"])  # с буфера
+    entry = await _entry(sid)
+    assert "rebuild" not in entry.meta and entry.meta["updated_by"] == "rebuild"
+    await engine.dispose()
+
+
+async def test_only_one_memory_job_runs_at_a_time():
+    """
+    Пауза между запросами действует внутри одного прогона: задания разных
+    чатов разом множили частоту запросов к общему ключу. Теперь в процессе
+    идёт одно задание памяти, остальные ждут в очереди.
+    """
+    from backend import main, memory_service
+    from backend.database import engine
+    await _fresh_db()
+    _, first, _ = await _make_chat(12 + hr.DEFAULT_WINDOW)
+    _, second, _ = await _make_chat(12 + hr.DEFAULT_WINDOW)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_first(messages, params=None, connection=None, kind="service"):
+        if messages[0]["content"] == hm.MASTER_STATE_PROMPT and not release.is_set():
+            entered.set()
+            await release.wait()
+        return await _snapshot_llm([])(messages, params, connection, kind)
+
+    with patch("backend.main.complete", new=slow_first):
+        a = await memory_service.start_job(first, main._memory_deps(), mode="catchup")
+        await entered.wait()
+        b = await memory_service.start_job(second, main._memory_deps(), mode="catchup")
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert a.status == "running" and b.status == "queued"
+        release.set()
+        await memory_service.wait_job(first)
+        await memory_service.wait_job(second)
+    assert a.status == b.status == "done" and b.started_at >= a.finished_at
+    await engine.dispose()
+
+
+async def test_cancel_stops_a_job_during_the_pause_between_requests():
+    """«Остановить» посреди паузы между запросами не ждёт её конца (здесь — минуту)."""
+    from backend import main, memory_service
+    from backend.database import engine
+    await _fresh_db()
+    _, sid, _ = await _make_chat(30 + hr.DEFAULT_WINDOW)
+    with patch("backend.main.complete", new=_snapshot_llm([])):
+        job = await memory_service.start_job(sid, main._memory_deps(), mode="catchup",
+                                             batch_size=10, delay_ms=60_000)
+        for _ in range(200):
+            if job.phase == "wait":
+                break
+            await asyncio.sleep(0.01)
+        assert job.phase == "wait"
+        memory_service.cancel_job(sid)
+        await asyncio.wait_for(memory_service.wait_job(sid), 5)
+    assert job.status == "cancelled" and job.processed == 10
+    await engine.dispose()
+
+
+async def test_purge_stops_a_running_turn_pass_after_its_current_call():
+    """
+    Сброс памяти посреди ежеходного прохода: раньше сброс ждал, пока проход
+    доделает все свои пакеты (до шести платных слияний). Теперь проход
+    останавливается после текущего запроса.
+    """
+    from backend import main, memory_service
+    from backend.database import AsyncSessionLocal, engine
+    await _fresh_db()
+    _, sid, _ = await _make_chat(60 + hr.DEFAULT_WINDOW)
+    entered, release = asyncio.Event(), asyncio.Event()
+    merges = []
+
+    async def slow(messages, params=None, connection=None, kind="service"):
+        if messages[0]["content"] == hm.MASTER_STATE_PROMPT:
+            merges.append(1)
+            entered.set()
+            await release.wait()
+        return await _snapshot_llm([])(messages, params, connection, kind)
+
+    async def purge():
+        async with AsyncSessionLocal() as db:
+            return await memory_service.purge(db, sid)
+
+    with patch("backend.main.complete", new=slow):
+        turn = asyncio.create_task(main._maybe_update_summary(sid))
+        await entered.wait()
+        purging = asyncio.create_task(purge())
+        for _ in range(20):
+            await asyncio.sleep(0)
+        release.set()
+        await asyncio.wait_for(purging, 5)
+        await turn
+    assert len(merges) == 1 and await _entry(sid) is None
+    await engine.dispose()
+
+
+async def test_facts_skipped_by_a_failed_call_are_extracted_with_the_next_batch():
+    """
+    Финальное ревью (сервис, M1): снимок пакета записан, а ответ модели фактов
+    не пришёл (сбой или остановка сервера) — факты этого пакета не
+    извлекались уже никогда. Теперь следующий пакет берёт сообщения от
+    последнего разобранного фактами, а не только свои.
+    """
+    from backend import main, models
+    from backend.database import AsyncSessionLocal, engine
+    await _fresh_db()
+    _, sid, ids = await _make_chat(40 + hr.DEFAULT_WINDOW)
+    facts_requests = []
+
+    class Boom(Exception):
+        status_code = 400
+
+    async def facts_fail_once(messages, params=None, connection=None, kind="service"):
+        if messages[0]["content"] == hr.FACTS_PROMPT:
+            facts_requests.append(messages[1]["content"])
+            if len(facts_requests) == 1:
+                raise Boom("facts provider down")
+            return "- Эльвира нашла карту\n- Артур ранен"
+        return await _snapshot_llm([])(messages, params, connection, kind)
+
+    with patch("backend.main.complete", new=facts_fail_once):
+        assert await main._summary_pass(sid) is True
+        assert await main._summary_pass(sid) is False
+    assert len(facts_requests) == 2
+    assert f"[#{ids[0]} · " in facts_requests[1] and f"[#{ids[39]} · " in facts_requests[1]
+    async with AsyncSessionLocal() as db:
+        count = (await db.execute(select(models.HoraeFact).where(
+            models.HoraeFact.session_id == sid))).scalars().all()
+    assert count
+    await engine.dispose()
+
+
+async def test_facts_pass_without_facts_is_not_sent_again():
+    """
+    Удачный разбор фактов без единого факта двигает отметку meta.facts_upto:
+    иначе (отметкой служил бы только источник сохранённых фактов) следующий
+    пакет слал бы эти сообщения модели фактов ещё раз.
+    """
+    from backend import main
+    from backend.database import engine
+    await _fresh_db()
+    _, sid, ids = await _make_chat(40 + hr.DEFAULT_WINDOW)
+    seen = []
+    with patch("backend.main.complete", new=_snapshot_llm(seen)):   # факты — всегда пусто
+        await main._summary_pass(sid)
+        await main._summary_pass(sid)
+    facts = [m[1]["content"] for m in seen if m[0]["content"] == hr.FACTS_PROMPT]
+    assert len(facts) == 2 and f"[#{ids[0]} · " not in facts[1]
+    assert (await _entry(sid)).meta["facts_upto"] == ids[39]
     await engine.dispose()

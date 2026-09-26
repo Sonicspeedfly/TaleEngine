@@ -453,7 +453,9 @@ async def _maybe_update_summary(session_id: int) -> None:
     Бэклог режется на пакеты, и указатель двигается только за тем, что модель
     действительно видела. За ход — не больше _SUMMARY_MAX_CHUNKS пакетов:
     большой бэклог (импорт) догоняется за несколько ходов, а целиком — кнопкой
-    «Догнать»/«Пересобрать» во вкладке «Память».
+    «Догнать»/«Пересобрать» во вкладке «Память». Ошибку прохода сервис
+    записывает в meta.last_error (её видно во вкладке), и следующие ходы
+    ждут паузу, а не повторяют платный провал на каждом ходу.
     """
     if memory_service.is_busy(session_id):
         return  # идёт задание или прошлый проход — второй посчитал бы те же сообщения
@@ -1062,6 +1064,15 @@ async def inspect_context(
     )
     report["character"] = character.name
     report["model"] = (params.model if params else "") or ""
+    if sess.is_group:
+        # Монитор уровней считает конвейер ЛИЧНОГО чата (окно, снимок в
+        # хвосте), а ход группы собирает group_chat.build_group_messages: окна
+        # нет, транскрипт идёт целиком, снимок — в системном промпте, и так на
+        # каждого отвечающего. Для группы монитор занижал цену хода в разы и
+        # писал «выброшено окном» про сообщения, которые уходят дословно
+        # (финальное ревью). Честнее не показывать уровни вовсе.
+        report["tiers"] = None
+        report["tiers_unavailable"] = "group"
     return report
 
 
@@ -1089,7 +1100,8 @@ async def memory_status(
 ):
     """Снимок, буфер пересборки, бэклог, факты и последнее задание памяти чата."""
     await _memory_session(db, session_id, user)
-    return await memory_service.status(db, session_id)
+    # Подключение — ради лимита вывода модели памяти (settings.max_snapshot_tokens).
+    return await memory_service.status(db, session_id, connection=await get_connection(db))
 
 
 @app.post("/api/sessions/{session_id}/memory/rebuild", status_code=202)
