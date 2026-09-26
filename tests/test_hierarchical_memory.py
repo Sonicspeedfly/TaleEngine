@@ -906,6 +906,29 @@ async def test_progress_reports_retry_compact_and_wait_phases():
         < phases.index(("wait", 1.0)) < phases.index(("done", None))
 
 
+async def test_model_request_is_never_reported_as_wait_or_retry():
+    # Ревью задачи 10 (I1): «wait»/«retry» уходили перед сном, а после сна фаза
+    # не возвращалась — и всё время платного запроса вкладка «Память» писала
+    # «пауза между запросами» или «повтор через 2 с», а «сжатие хроники»
+    # перетиралось паузой. В момент запроса к модели последнее событие обязано
+    # называть работу этого запроса: слияние или сжатие, без обратного отсчёта.
+    progress, seen = [], []
+
+    async def llm(messages):
+        kind = "merge" if messages[0]["content"] == hm.MASTER_STATE_PROMPT else "compact"
+        seen.append((kind, progress[-1].phase, progress[-1].retry_in_s))
+        if len(seen) == 1:
+            raise _Err(503)
+        return _wrap(_snap(chron=_LONG_CHRON if kind == "merge" else _ARC))
+
+    m, sleeps = _mgr(llm, delay_ms=1000, snapshot_tokens=600, batch_size=1)
+    await m.scan_and_compress_history([_msg(80), _msg(81)], on_progress=progress.append)
+    # Сценарий действительно прошёл через повтор, паузы и сжатия.
+    assert 2.0 in sleeps and 1.0 in sleeps
+    assert [k for k, _, _ in seen].count("compact") >= 2
+    assert [(phase, retry) for _, phase, retry in seen] == [(k, None) for k, _, _ in seen]
+
+
 async def test_max_batches_counts_rejected_commits():
     calls = []
     m, _ = _mgr(_echo_llm(calls), batch_size=5)

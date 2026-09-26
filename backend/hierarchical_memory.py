@@ -1043,6 +1043,9 @@ class HierarchicalMemoryManager:
         # и события пауз, повторов и сжатия никуда не уходят.
         self._progress: ScanProgress | None = None
         self._on_progress: Callable[[ScanProgress], None] | None = None
+        # (phase, retry_in_s) последнего отданного события — то, что сейчас
+        # видит UI; call() по нему решает, нужно ли вернуть фазу работы.
+        self._shown: tuple[str, float | None] | None = None
 
     # ---------------------------------------------------------------- пакеты
     def plan_batch(self, messages) -> Batch | None:
@@ -1059,7 +1062,9 @@ class HierarchicalMemoryManager:
         """Событие прогресса: текущее состояние прогона + изменённые поля (фаза и т. п.)."""
         if self._on_progress is None or self._progress is None:
             return
-        self._on_progress(replace(self._progress, **fields))
+        event = replace(self._progress, **fields)
+        self._shown = (event.phase, event.retry_in_s)
+        self._on_progress(event)
 
     def _warn(self, text: str, *, supersedes: str | None = None) -> None:
         """
@@ -1136,7 +1141,7 @@ class HierarchicalMemoryManager:
         return new
 
     # ------------------------------------------------------------ вызов модели
-    async def call(self, messages: list[dict]) -> str:
+    async def call(self, messages: list[dict], *, phase: str = "merge") -> str:
         """
         Один запрос к модели: пауза-ограничитель + повтор с бэкоффом (§4.4).
 
@@ -1145,6 +1150,11 @@ class HierarchicalMemoryManager:
         держится на всём вызове, включая повторы: без него два одновременных
         call() прочли бы один _last_end, выждали одинаково и ушли к провайдеру
         разом, а бэкофф одного пропускал бы вперёд запрос другого.
+
+        :param phase: работа запроса для событий прогресса — "merge" (слияние
+            и факты пакета) или "compact". Перед каждым запросом к модели
+            событие с этой фазой уходит, если UI видит другое: паузу, повтор
+            или фазу прошлого запроса.
         """
         async with self._lock:
             delay = max(0.0, self.config.delay_ms / 1000)
@@ -1155,6 +1165,15 @@ class HierarchicalMemoryManager:
                     await self._sleep(wait)
             attempt = 0
             while True:
+                if self._shown != (phase, None):
+                    # «wait» и «retry» уходят ПЕРЕД сном, а следующее событие
+                    # прогона — только после записи пакета. Без возврата фазы
+                    # опрос вкладки «Память» весь платный запрос видел «пауза
+                    # между запросами» или замерший «повтор через 2 с», а
+                    # «сжатие хроники» тут же перетиралось паузой (ревью
+                    # задачи 10, I1). То же после сжатия: повтор слияния на
+                    # пути length и факты пакета — уже не сжатие.
+                    self._emit(phase=phase, retry_in_s=None)
                 try:
                     out = await self._llm(messages)
                 except asyncio.CancelledError:
@@ -1189,7 +1208,7 @@ class HierarchicalMemoryManager:
                     return out
 
     async def _ask_snapshot(self, messages: list[dict], *, prev: str,
-                            check_shrink: bool) -> str:
+                            check_shrink: bool, phase: str = "merge") -> str:
         """
         Запросить снимок и проверить его; брак вернуть модели корректирующим
         ходом, до validation_retries раз, затем SnapshotValidationError.
@@ -1201,7 +1220,7 @@ class HierarchicalMemoryManager:
         convo = messages
         problems: list[str] = []
         for _ in range(max(0, self.config.validation_retries) + 1):
-            raw = await self.call(convo)
+            raw = await self.call(convo, phase=phase)
             text, problems = validate_snapshot(raw, prev, config=self.config,
                                                estimate_tokens=self._est,
                                                check_shrink=check_shrink)
@@ -1307,7 +1326,7 @@ class HierarchicalMemoryManager:
             compacted = await self._ask_snapshot(
                 [{"role": "system", "content": system},
                  {"role": "user", "content": "[Текущая память]\n" + state}],
-                prev=state, check_shrink=False)
+                prev=state, check_shrink=False, phase="compact")
         except (SnapshotValidationError, MemoryLLMError) as err:
             self._warn(f"сжатие хроники не удалось ({err}) — оставлен прежний снимок")
         else:
