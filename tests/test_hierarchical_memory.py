@@ -1445,3 +1445,29 @@ def test_paired_blocks_are_cut_like_before():
     assert hm.normalize_message(_msg(1, "a <!-- b --> c <!-- d")).endswith("] a  c <!-- d")
     assert hm.normalize_message(_msg(1, "<style>x <!-- y --> z")).endswith("] <style>x  z")
     assert hm.extract_snapshot("<think>a</think>текст <think>оборвано") == ("текст", False)
+
+
+def test_extended_key_is_linear_on_many_trailing_notes():
+    # Регулярка хвостовых пометок «(#id)»/«(было: …)» перебирала число пометок
+    # от каждой позиции строки: 20 000 символов «(#1)(#1)…x» — около секунды
+    # синхронно в цикле событий, и так для каждой такой записи на каждом пакете.
+    import time
+    line = "- Кольцо " + "(#1)" * 5000 + "x"
+    started = time.perf_counter()
+    for _ in range(3):
+        hm._extended_key(line)
+        hm._extended_key("- Кольцо " + "(#1)" * 5000)
+    assert time.perf_counter() - started < 0.5
+
+
+@pytest.mark.parametrize("line, key", [
+    ("- Linkin Park — «Numb» — тема ссоры (#3)", "linkin park numb тема ссоры"),
+    ("- Linkin Park — «Numb» — тема (было: ссора, #5) (#12)  ", "linkin park numb тема"),
+    ("1. Кольцо (золотое) — у Артура (#7)", "кольцо золотое у артура"),
+    ("- Кольцо (золотое)", "кольцо золотое"),          # не пометка — часть имени
+    ("- Письмо (#2) (утеряно)", "письмо 2 утеряно"),    # пометка не в конце — остаётся
+    ("- Стражник (БЫЛО: спит) ", "стражник"),
+    ("- (#4)", ""),
+])
+def test_extended_key_drops_only_trailing_notes(line, key):
+    assert hm._extended_key(line) == key

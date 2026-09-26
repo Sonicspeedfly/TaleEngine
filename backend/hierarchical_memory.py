@@ -720,9 +720,33 @@ def _entry_key(first_line: str) -> str:
 
 # Хвостовые пометки, которые модель дописывает к записи при обновлении на
 # месте: «(#12)», «(было: ранен, #5)». Расширенный ключ их не учитывает —
-# иначе запись, обновлённая на месте, выглядела бы потерянной.
-_TRAILING_NOTES_RE = re.compile(r"(?:\s*\((?:#|было\b)[^()]*\))+\s*$", re.IGNORECASE)
+# иначе запись, обновлённая на месте, выглядела бы потерянной. Пометка —
+# скобка без вложенных скобок, начинается с «#» или слова «было».
+_NOTE_HEAD_RE = re.compile(r"(?:#|было\b)", re.IGNORECASE)
 _EXT_KEY_MAX = 200
+
+
+def _strip_trailing_notes(text: str) -> str:
+    """
+    Снять с конца строки цепочку пометок «(#id)»/«(было: …)» вместе с
+    пробелами между ними.
+
+    ПОЧЕМУ сканер с конца, а не регулярка «(?:\\s*\\((?:#|было)[^()]*\\))+\\s*$»:
+    она пробовала цепочку от КАЖДОЙ позиции строки и на каждой перебирала
+    число пометок — на 20 000 символах «(#1)(#1)…x» около секунды синхронно
+    в цикле событий, и так для каждой такой записи на каждом пакете. Сканер
+    проходит строку один раз: каждая пометка отрезается по ближайшей «(».
+    """
+    end = len(text.rstrip())
+    while end and text[end - 1] == ")":
+        start = text.rfind("(", 0, end - 1)
+        inner = text[start + 1:end - 1] if start >= 0 else ""
+        if start < 0 or ")" in inner or not _NOTE_HEAD_RE.match(inner):
+            break
+        end = start
+        while end and text[end - 1].isspace():
+            end -= 1
+    return text[:end]
 
 
 def _extended_key(first_line: str) -> str:
@@ -732,7 +756,7 @@ def _extended_key(first_line: str) -> str:
     обычный ключ в старом разделе повторяется: у «Linkin Park — «Numb» — …» и
     «Linkin Park — «In the End» — …» ключ один — «linkin park».
     """
-    text = _TRAILING_NOTES_RE.sub("", _ENTRY_MARKER_RE.sub("", first_line.strip(), count=1))
+    text = _strip_trailing_notes(_ENTRY_MARKER_RE.sub("", first_line.strip(), count=1))
     return " ".join(_NON_WORD_RE.sub(" ", _fold(text)).split())[:_EXT_KEY_MAX].strip()
 
 
