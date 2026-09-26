@@ -799,13 +799,17 @@ label.btn:focus-within, label.btn-primary:focus-within, label.btn-icon:focus-wit
   background: var(--surface-3); margin-bottom: var(--sp-4);
 }
 .ins-bar i { display: block; height: 100%; }
+/* Точка подписи — цветовой ключ к сегменту полосы. Серый фон здесь только
+   запасной, для строки без своего сегмента. Правило обязано стоять ДО .seg-*:
+   специфичность у них одна, и побеждает то, что ниже. Стояло после — и все
+   точки легенды (инспектор, монитор «Памяти») были серыми при цветной полосе. */
+.ins-dot { width: 10px; height: 10px; border-radius: 50%; flex: none; background: var(--text-tertiary); }
 .seg-character { background: var(--seg-character); }
 .seg-persona   { background: var(--seg-persona); }
 .seg-horae     { background: var(--seg-horae); }
 .seg-guides    { background: var(--seg-guides); }
 .seg-history   { background: var(--seg-history); }
 .seg-tail      { background: var(--seg-tail); }
-.ins-dot { width: 10px; height: 10px; border-radius: 50%; flex: none; background: var(--text-tertiary); }
 .ins-block, .ins-horae {
   display: flex; align-items: center; gap: var(--sp-2);
   padding: 8px 0; border-bottom: 1px solid var(--border-subtle);
@@ -1127,12 +1131,16 @@ input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
 .mem-master p { margin: var(--sp-2) 0; }
 .mem-progress { margin: var(--sp-2) 0; }
 .mem-progress .muted { margin-top: var(--sp-1); font-size: var(--fs-100); }
+/* «Нет связи с сервером» — не ход работы, а беда: цветом предупреждения, как
+   строка «обрезано бюджетом» в инспекторе, а не серым среди строк прогресса. */
+.mem-progress .mem-offline { color: var(--warn); }
 .mem-progress .btn-danger { margin-top: var(--sp-1); }
 /* Четыре кнопки в ряд шире телефона: .row не переносит, и ряд выталкивал бы
    панель в горизонтальную прокрутку. */
 .mem-actions { flex-wrap: wrap; gap: 6px; margin: var(--sp-2) 0 var(--sp-3); }
-/* Подписи ярусов: точка цвета сегмента и число — полоса над ними лишь
-   повторяет их цветом (она aria-hidden). Общие для вкладки и инспектора. */
+/* Подписи ярусов: точка цвета сегмента (.ins-dot + .seg-*, см. порядок правил
+   у .ins-dot) и число — полоса над ними лишь повторяет их цветом (она
+   aria-hidden). Общие для вкладки и инспектора. */
 .mem-tiers { list-style: none; margin: 0 0 var(--sp-2); padding: 0; font-size: var(--fs-100); }
 .mem-tiers li { display: flex; align-items: center; gap: var(--sp-2); padding: 2px 0; }
 .mem-tier-note { font-size: var(--fs-100); }

@@ -205,6 +205,13 @@ createApp({
       // показывает пустое состояние, а не падает на memStatus.snapshot.
       memStatus: null,
       memBusy: false,           // идёт запрос панели: первая загрузка, запуск, сброс
+      // Сбои опроса статуса подряд во время задания (сеть, 5xx). С третьего
+      // панель пишет «Нет связи с сервером» и реже опрашивает (_memPollDelay).
+      memPollFails: 0,
+      // Чат, чью память сейчас сбрасывают (DELETE в полёте), или null. Сброс
+      // ждёт конца текущего пакета на сервере — это бывают минуты. Хранится
+      // id, а не флаг: ушли в другой чат — там «Сбрасываю…» не к месту.
+      memPurgingId: null,
       groupReplyDelay: 3,       // пауза (сек) между ответами персонажей в группе
       groupWaiting: 0,          // идёт пауза перед следующим ответом группы (сек)
 
@@ -738,6 +745,48 @@ createApp({
     memJobActive() {
       const job = this.memStatus && this.memStatus.job;
       return !!job && (job.status === "running" || job.status === "queued");
+    },
+    // Строка прогресса: строка сервера «[Обработано 140/800 …]» и рядом — с
+    // какого времени задание идёт. У задания в очереди строки сервера ещё нет,
+    // и время его постановки ничего не говорит: вместо них — «В очереди».
+    memJobLine() {
+      const job = this.memStatus && this.memStatus.job;
+      if (!job) return "";
+      let since = "";
+      if (job.status === "queued") since = "в очереди";
+      else if (this.fmtClock(job.started_at)) since = "идёт с " + this.fmtClock(job.started_at);
+      const s = [job.line, since].filter(Boolean).join(" · ");
+      if (s) return s.charAt(0).toUpperCase() + s.slice(1);
+      // Ни строки, ни времени (сервер их не прислал): пустая строка под
+      // полосой выглядела бы как зависание.
+      return job.status === "running" ? "Идёт…" : "";
+    },
+    // Под строкой прогресса (спека §9): «Пакет 7 · пауза между запросами».
+    // batches — сколько пакетов уже записано. Пока ни одного, номер не пишем:
+    // «Пакет 0» читается как сбой, а фаза понятна и без номера. Без фазы и
+    // номера строки нет вовсе — лишняя пустая строка в живом регионе ни к чему.
+    memJobPhase() {
+      const job = this.memStatus && this.memStatus.job;
+      if (!job || job.status !== "running") return "";
+      const parts = [];
+      const n = Number(job.batches) || 0;
+      if (n > 0) parts.push("Пакет " + this.fmtNum(n));
+      if (job.phase === "wait") parts.push("пауза между запросами");
+      else if (job.phase === "compact") parts.push("сжатие хроники");
+      else if (job.phase === "retry") {
+        // retry_in_s — float (2.4817 с): вверх до целых, чтобы не обещать
+        // повтор раньше, чем он будет. Числа нет — просто «повторяю».
+        const s = Number(job.retry_in_s);
+        parts.push(job.retry_in_s != null && s > 0
+          ? "сбой API — повтор через " + Math.ceil(s) + " с"
+          : "сбой API — повторяю…");
+      }
+      const s = parts.join(" · ");
+      return s ? s.charAt(0).toUpperCase() + s.slice(1) : "";
+    },
+    // Сброс памяти ОТКРЫТОГО чата ещё ждёт ответа сервера.
+    memPurging() {
+      return this.memPurgingId != null && this.memPurgingId === this.sessionId;
     },
     // Стоимость показываем ТОЛЬКО если пользователь задал свой тариф: у каждого
     // прокси он свой, и выдуманное число здесь хуже отсутствующего.
@@ -1493,6 +1542,15 @@ createApp({
     fmtNum(n) {
       const v = Number(n);
       return n == null || n === "" || !Number.isFinite(v) ? "—" : v.toLocaleString("ru-RU");
+    },
+    // «14:05» из ISO-времени сервера (UTC с «Z») — в поясе браузера, а не чата:
+    // fmtWhen берёт пояс, сохранённый за чатом (у общего чата — пояс владельца),
+    // а «идёт с …» сверяют с часами того, кто смотрит на экран. Нет даты или
+    // она битая — "", а не «Invalid Date».
+    fmtClock(iso) {
+      if (!iso) return "";
+      const d = new Date(iso);
+      return isNaN(d) ? "" : d.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
     },
     // Доля части в процентах — ширина сегмента полосы и строки монитора токенов.
     // Пустой знаменатель (пустой чат, старый сервер) даёт 0, а не «NaN%» в подписи.
@@ -3403,6 +3461,13 @@ createApp({
         }
         if (!this.params.safety_overrides) this.params.safety_overrides = {};
       }
+      // Что saveUiPrefs запишет в ctx_budget_v. «2» — только если миграцию
+      // бюджета выше и правда проверили. С пресетом по умолчанию (applyParams =
+      // false) params задаёт пресет, сохранённые ui.params не читаются, и флаг
+      // «сделано» закрыл бы миграцию, так её и не проверив: снимут пресет —
+      // сохранённый 1 млн останется. Тогда флаг уходит в PUT таким, каким
+      // лежал (не было — не будет и в PUT). Поле с _: Vue его не проксирует.
+      this._ctxBudgetV = applyParams ? 2 : ui ? ui.ctx_budget_v : undefined;
       if (ui && ui.jailbreak) {
         this.jailbreak = {
           enabled: !!ui.jailbreak.enabled,
@@ -3500,8 +3565,10 @@ createApp({
             // Флаги разовых миграций (см. loadUiPrefs). PUT заменяет значение
             // целиком: не допиши их сюда — следующее же сохранение стёрло бы
             // флаги, и миграции снова перетёрли бы окно 20 и бюджет 1 млн.
+            // ctx_budget_v — из loadUiPrefs: миграцию бюджета проверяют не на
+            // каждом пути загрузки. undefined JSON.stringify просто опускает.
             memory_defaults_v: 2,
-            ctx_budget_v: 2,
+            ctx_budget_v: this._ctxBudgetV,
             jailbreak: this.jailbreak,
           }),
         }).catch(() => {});
@@ -3589,7 +3656,15 @@ createApp({
     async loadMemStatus() {
       const sid = this.sessionId;
       const seq = (this._memSeq = (this._memSeq || 0) + 1);
-      if (!sid) { this._stopMemPoll(); this.memStatus = null; return; }
+      if (!sid) {
+        // Без чата панели нет, и ждать больше нечего. «Загружаю…» снимаем
+        // здесь: обогнанный запрос прежнего чата его уже не снимет (см. ниже).
+        this._stopMemPoll();
+        this.memStatus = null;
+        this.memBusy = false;
+        this.memPollFails = 0;
+        return;
+      }
       // «Загружаю…» — только пока показывать нечего: опрос раз в 1,5 с иначе
       // мигал бы выключенными кнопками всю пересборку.
       const first = !this.memStatus;
@@ -3601,15 +3676,24 @@ createApp({
       } catch (e) {
         failed = e;
       }
-      if (first) this.memBusy = false;
+      // Флаг первой загрузки снимает только ПОСЛЕДНИЙ запрос. Обогнанный ответ
+      // (открыли вкладку и сразу ↻) иначе включил бы кнопки и убрал
+      // «Загружаю…», пока новый запрос ещё идёт. Проверка чата — уже после:
+      // сменили чат, а нового запроса нет (вкладка закрыта) — флаг всё равно
+      // надо снять, иначе он висел бы до следующей загрузки.
+      if (first && seq === this._memSeq) this.memBusy = false;
       if (seq !== this._memSeq || this.sessionId !== sid) return;
       // Сбой сети или 5xx посреди пересборки не гасит опрос: задание идёт на
       // сервере, следующий запрос его покажет. 4xx — честный отказ (чат удалён,
       // старый сервер без эндпоинта, сменился код доступа): пустое состояние.
+      // Сбои считаем подряд: с третьего панель говорит «Нет связи с сервером»
+      // и опрашивает всё реже (_memPollDelay), а не молчит с замёрзшей полосой.
       if (failed && (!failed.status || failed.status >= 500) && this.memJobActive) {
+        this.memPollFails += 1;
         this._pollMem();
         return;
       }
+      this.memPollFails = 0;
       // Ответ не того вида приравниваем к «статуса нет»: шаблон читает snapshot
       // и backlog без проверок и на чужом JSON упал бы при рендере.
       if (!st || typeof st !== "object" || !st.snapshot || !st.backlog) st = null;
@@ -3639,7 +3723,15 @@ createApp({
     // снимается, иначе ↻ посреди опроса запускал бы вторую цепочку запросов.
     _pollMem() {
       this._stopMemPoll();
-      this._memTimer = setTimeout(() => { this._memTimer = null; this.loadMemStatus(); }, 1500);
+      this._memTimer = setTimeout(() => { this._memTimer = null; this.loadMemStatus(); }, this._memPollDelay());
+    },
+    // Пауза опроса: 1,5 с. После трёх сбоев подряд — 1,5 → 3 → 6 → 10 с и
+    // дальше по 10: сервер лежит или сеть пропала, и долбить его раз в 1,5 с
+    // минутами незачем, а 10 с — ещё терпимая задержка, когда связь вернётся.
+    // Удачный ответ обнуляет счётчик (loadMemStatus) — пауза снова 1,5 с.
+    _memPollDelay() {
+      const f = this.memPollFails;
+      return f < 3 ? 1500 : Math.min(10000, 1500 * 2 ** (f - 3));
     },
     _stopMemPoll() {
       clearTimeout(this._memTimer);
@@ -3653,7 +3745,7 @@ createApp({
     // а пересборка с нуля начинает с первого сообщения.
     async startMemJob(mode, resume = false) {
       const sid = this.sessionId;
-      if (!sid || this.memBusy) return;
+      if (!sid || this.memBusy || this.memPurging) return;
       if (mode === "rebuild" && !resume) {
         const b = (this.memStatus && this.memStatus.backlog) || {};
         const older = Math.max(0, (Number(b.messages_total) || 0) - (Number(b.window) || 0));
@@ -3703,10 +3795,15 @@ createApp({
     // соберётся заново, — поэтому после сброса пересчитываем и бюджет хода.
     async purgeMemory() {
       const sid = this.sessionId;
-      if (!sid || this.memBusy) return;
+      if (!sid || this.memBusy || this.memPurging) return;
       if (!(await this.askConfirm("Сбросить память чата? Сотрутся мастер-снимок, буфер пересборки и атомарные факты. Сообщения останутся.", { okText: "Сбросить" }))) return;
       if (this.sessionId !== sid) return;
       this.memBusy = true;
+      // Ответа можно ждать минуты: сервер сперва останавливает задание и ждёт
+      // конца текущего пакета (и начатого ежеходного прохода), иначе тот
+      // воскресил бы стёртую память. Пока ждём — «Сбрасываю…» и кнопки
+      // выключены, чтобы долгий запрос не казался зависшим.
+      this.memPurgingId = sid;
       let ok = false;
       try {
         const r = await this.api("/sessions/" + sid + "/memory", { method: "DELETE" });
@@ -3717,6 +3814,7 @@ createApp({
         this.showToast("⚠ Память: " + e.message);
       } finally {
         this.memBusy = false;
+        if (this.memPurgingId === sid) this.memPurgingId = null;
       }
       await this.loadMemStatus();
       if (!ok) return;
@@ -4299,12 +4397,14 @@ createApp({
     // показывала бы вес предыдущего.
     // То же со статусом мастер-памяти: опрос прежнего чата снимаем, иначе его
     // ответ (и тост о завершении) пришёл бы в чужой чат. Статус нужен только
-    // открытой вкладке «Память» — без неё запрос не шлём.
+    // открытой вкладке «Память» — без неё запрос не шлём. Счёт сбоев связи
+    // тоже чужой: в новом чате «Нет связи» не должно всплыть после первого же.
     sessionId() {
       this.ctxStats = null;
       this.loadCtxStats();
       this._stopMemPoll();
       this.memStatus = null;
+      this.memPollFails = 0;
       if (this.drawerTab === "memory") this.loadMemStatus();
     },
     // Вкладку «Память» открывают не только её кнопкой (импорт чата переключает
@@ -5579,36 +5679,54 @@ createApp({
                Эндпоинтов может не быть (старый сервер) — тогда memStatus = null,
                блок показывает пустое состояние, а кнопки заданий выключены. -->
           <section v-if="sessionId" class="card mem-master" aria-labelledby="mem-master-h">
+            <!-- Пока сброс ждёт сервера (memPurging), выключены ВСЕ кнопки блока:
+                 запуск, остановка, экспорт и перечитка статуса наперегонки со
+                 сбросом показали бы память, которой через миг не станет. -->
             <div class="row-between"><h4 id="mem-master-h">🧠 Мастер-память этого чата</h4>
-              <button class="btn-icon" @click="loadMemStatus" aria-label="Обновить статус памяти">↻</button></div>
+              <button class="btn-icon" :disabled="memPurging" @click="loadMemStatus" aria-label="Обновить статус памяти">↻</button></div>
+            <!-- «Старая схема» — только у непустого снимка: пакет из одних пустых
+                 сообщений даёт запись с пустым текстом, is_structured("") на
+                 сервере ложно, но пересобирать там нечего. -->
             <p class="muted" v-if="memStatus && memStatus.snapshot.exists">
               Снимок {{ fmtNum(memStatus.snapshot.tokens) }} / {{ fmtNum(memStatus.snapshot.budget) }} ток.
               · учтено до #{{ memStatus.snapshot.covered_upto }}
               · ждут сжатия {{ memStatus.backlog.pending }}
-              <span v-if="!memStatus.snapshot.structured" class="tag">старая схема — пересоберите</span>
+              <span v-if="!memStatus.snapshot.structured && memStatus.snapshot.tokens" class="tag">старая схема — пересоберите</span>
               <span v-if="memStatus.snapshot.over_budget" class="tag">больше бюджета</span></p>
             <p class="muted" v-else-if="memStatus">Снимка нет: окно пропускает историю целиком.
               Ждут сжатия {{ memStatus.backlog.pending }}.</p>
             <p class="muted" v-else>{{ memBusy ? 'Загружаю статус памяти…' : 'Статус памяти недоступен.' }}</p>
+            <!-- Буфер пересборки без задания. manual — ручную «Пересобрать»
+                 прервали (остановка, ошибка, перезапуск сервера): продолжаем с
+                 места. Не manual — старую сводку (до 2.4.0) сервер переводит в
+                 новую схему сам, ежеходными проходами: «прервана» тут неправда.
+                 И «Продолжить» тут не к месту: буфера может ещё не быть
+                 (указатель 0), и кнопка молча начала бы пересборку всего чата.
+                 Доделать сразу умеет «Догнать» — сколько это, видно по «ждут
+                 сжатия» в строке выше. -->
             <p class="muted" v-if="memStatus && memStatus.staging && !memJobActive">
-              Пересборка прервана на #{{ memStatus.staging.last_message_id }}.
-              <button class="btn-primary" :disabled="memBusy" @click="startMemJob('rebuild', true)">Продолжить</button></p>
+              <template v-if="memStatus.staging.manual">Пересборка прервана на #{{ memStatus.staging.last_message_id }}.
+                <button class="btn-primary" :disabled="memBusy || memPurging" @click="startMemJob('rebuild', true)">Продолжить</button></template>
+              <template v-else>Старая сводка переводится в новую схему<template v-if="memStatus.staging.last_message_id">: готово до #{{ memStatus.staging.last_message_id }}</template>.<template v-if="memStatus.backlog.pending"> «Догнать» доделает это сразу.</template></template></p>
             <!-- Прогресс не только цветом: рядом с полосой строка сервера с
-                 числами «Обработано 140/800 | Сжато до 4 200 токенов». -->
+                 числами «Обработано 140/800 | Сжато до 4 200 токенов» и время
+                 начала, под ней — номер пакета и фаза (спека §9). -->
             <div v-if="memJobActive" class="mem-progress" role="status" aria-live="polite">
               <span class="upload-track"><span class="upload-fill"
                 :style="{ width: (memStatus.job.total ? Math.round(memStatus.job.processed / memStatus.job.total * 100) : 0) + '%' }"></span></span>
-              <div class="muted">{{ memStatus.job.line || 'В очереди…' }}</div>
-              <div class="muted" v-if="memStatus.job.phase === 'retry'">Сбой API — повтор через {{ memStatus.job.retry_in_s }} с</div>
-              <div class="muted" v-else-if="memStatus.job.phase === 'wait'">Пауза между запросами…</div>
-              <button class="btn-danger" @click="cancelMemJob">Остановить</button>
+              <div class="muted">{{ memJobLine }}</div>
+              <div class="muted" v-if="memJobPhase">{{ memJobPhase }}</div>
+              <!-- Опрос третий раз подряд не дозвался сервера: полоса стоит не
+                   потому, что пакет долгий, — говорим об этом прямо. -->
+              <div class="muted mem-offline" v-if="memPollFails >= 3">Нет связи с сервером, повторяю…</div>
+              <button class="btn-danger" :disabled="memPurging" @click="cancelMemJob">Остановить</button>
             </div>
             <p v-if="memStatus && memStatus.job && memStatus.job.status === 'error'" class="danger-text">⚠ {{ memStatus.job.error }}</p>
             <div class="row mem-actions">
-              <button class="btn-primary" :disabled="memBusy || memJobActive || !memStatus" @click="startMemJob('rebuild')">Пересобрать с нуля</button>
-              <button :disabled="memBusy || memJobActive || !memStatus || !memStatus.backlog.pending" @click="startMemJob('catchup')">Догнать</button>
-              <button :disabled="!memStatus || !memStatus.snapshot.exists" @click="exportMemory">Экспорт .md</button>
-              <button class="btn-danger" :disabled="memBusy || memJobActive || !memStatus" @click="purgeMemory">Сбросить память</button>
+              <button class="btn-primary" :disabled="memBusy || memJobActive || !memStatus || memPurging" @click="startMemJob('rebuild')">Пересобрать с нуля</button>
+              <button :disabled="memBusy || memJobActive || !memStatus || !memStatus.backlog.pending || memPurging" @click="startMemJob('catchup')">Догнать</button>
+              <button :disabled="!memStatus || !memStatus.snapshot.exists || memPurging" @click="exportMemory">Экспорт .md</button>
+              <button class="btn-danger" :disabled="memBusy || memJobActive || !memStatus || memPurging" @click="purgeMemory">{{ memPurging ? 'Сбрасываю…' : 'Сбросить память' }}</button>
             </div>
             <!-- Поля пишут значение по change, а не по вводу, через numFromInput:
                  стёртое поле или «2,5» не должны улететь на сервер (422). -->
