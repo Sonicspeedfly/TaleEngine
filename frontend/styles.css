@@ -1135,6 +1135,24 @@ input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
    строка «обрезано бюджетом» в инспекторе, а не серым среди строк прогресса. */
 .mem-progress .mem-offline { color: var(--warn); }
 .mem-progress .btn-danger { margin-top: var(--sp-1); }
+/* Без задания блок прогресса остаётся в DOM ради живого региона внутри (см.
+   шаблон) — пустым он не должен занимать место. */
+.mem-progress.mem-idle { margin: 0; }
+/* Метки строки статуса («старая схема — пересоберите», «больше бюджета»).
+   Пробел между ними Vue при сборке шаблона убирает, и они стояли вплотную, а
+   вторая на 375 px рвалась на две строки. Метка переносится целиком, промежуток
+   — отступом справа: слева он сдвигал бы метку, перенесённую на новую строку. */
+.mem-status .tag { display: inline-block; white-space: nowrap; margin-right: var(--sp-1); }
+/* Сбой ежеходного обновления — память стоит, пока его не исправят: цветом
+   предупреждения, как «Нет связи с сервером». Предупреждения снимка и задания —
+   серые подсказки (.field-hint) с ⚠. Текст сервера бывает с длинными словами
+   без пробелов — переносим где угодно, лишь бы без горизонтальной прокрутки. */
+.mem-master .mem-failed { color: var(--warn); overflow-wrap: anywhere; }
+.mem-warnings { list-style: none; margin: 0 0 var(--sp-2); padding: 0; font-size: var(--fs-100); overflow-wrap: anywhere; }
+/* Мастер-снимок в списке записей: свёрнут, с переводами строк — разделы и
+   списки снимка видны как есть. */
+.mem-snapshot > summary { cursor: pointer; margin-top: var(--sp-1); font-size: var(--fs-100); color: var(--text-secondary); }
+.mem-snapshot-text { margin-top: var(--sp-1); white-space: pre-wrap; overflow-wrap: anywhere; }
 /* Четыре кнопки в ряд шире телефона: .row не переносит, и ряд выталкивал бы
    панель в горизонтальную прокрутку. */
 .mem-actions { flex-wrap: wrap; gap: 6px; margin: var(--sp-2) 0 var(--sp-3); }
