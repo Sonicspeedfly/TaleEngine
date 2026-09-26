@@ -506,3 +506,64 @@ async def test_sampling_overrides_apply_only_inside_context():
         await llm_gateway.complete([{"role": "user", "content": "x"}], None, {})
     assert seen[0] == {"max_tokens": 17824, "temperature": 0.2}
     assert seen[1]["max_tokens"] != 17824 and seen[1]["temperature"] != 0.2
+
+
+def _finish_chunk(text, finish_reason=None):
+    """Чанк стрима с текстом и (в последнем) finish_reason."""
+    class _Delta:
+        content = text
+
+    class _Choice:
+        delta = _Delta()
+
+    _Choice.finish_reason = finish_reason
+
+    class _Chunk:
+        choices = [_Choice()]
+
+    return _Chunk()
+
+
+@pytest.mark.asyncio
+async def test_finish_reason_probe_reports_length_for_a_non_empty_answer():
+    """
+    Ответ, оборванный лимитом вывода, НЕ пустой: шлюз отдаёт его как успех, а
+    исключение с finish_reason бросает только для пустого. Памяти нужно знать,
+    что снимок оборван (финальное ревью, I1): stream_completion сообщает
+    finish_reason в пробник вызывающего, сигнатуры complete не меняются.
+    """
+    from backend import llm_gateway
+
+    async def fake_acompletion(**kw):
+        async def gen():
+            yield _finish_chunk("<master_state>\n## [ХРОН")
+            yield _finish_chunk("ИКА", "length")
+        return gen()
+
+    with patch("backend.llm_gateway.litellm.acompletion", new=fake_acompletion), \
+            patch("backend.usage_stats._persist", new=lambda *a, **k: _noop()):
+        with llm_gateway.finish_reason_probe() as probe:
+            text = await llm_gateway.complete([{"role": "user", "content": "x"}], None, {})
+        # Вне пробника ничего не пишется и ничего не ломается.
+        again = await llm_gateway.complete([{"role": "user", "content": "x"}], None, {})
+    assert text == again == "<master_state>\n## [ХРОНИКА"
+    assert probe["finish_reason"] == "length"
+    assert llm_gateway.is_length_finish("length") and llm_gateway.is_length_finish("MAX_TOKENS")
+    assert not llm_gateway.is_length_finish("stop") and not llm_gateway.is_length_finish(None)
+
+
+def test_model_max_output_tokens_knows_only_mapped_models():
+    """
+    Лимит вывода модели памяти — из карты LiteLLM; через прокси имя идёт с
+    префиксом litellm_proxy/, пробуем и без него. Неизвестная модель — None
+    (без зажима), а не исключение.
+    """
+    import litellm
+
+    from backend import llm_gateway
+    expected = litellm.get_model_info("gpt-4o")["max_output_tokens"]
+    assert llm_gateway.model_max_output_tokens("gpt-4o") == expected
+    assert llm_gateway.model_max_output_tokens("litellm_proxy/gpt-4o") == expected
+    assert llm_gateway.model_max_output_tokens("  gpt-4o \n") == expected
+    assert llm_gateway.model_max_output_tokens("my-proxy-alias-that-does-not-exist") is None
+    assert llm_gateway.model_max_output_tokens("") is None

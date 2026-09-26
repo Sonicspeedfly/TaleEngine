@@ -280,6 +280,74 @@ def sampling_overrides(**kw):
         _SAMPLING_OVERRIDES.reset(token)
 
 
+# Почему закончился стрим (finish_reason) — для служебного вызова, которому это
+# важно. Непустой ответ, оборванный лимитом вывода, stream_completion отдаёт как
+# успех (исключение с finish_reason — только для ПУСТОГО ответа), и сводчик
+# памяти принимал обрывок снимка за брак модели: корректирующие ходы с тем же
+# лимитом, три полноразмерных платных вызова и отказ — на каждом ходу
+# (финальное ревью, I1). ContextVar с изменяемым «ящиком», а не аргумент:
+# сигнатуры complete/stream_completion не меняются (на них рассчитаны подмены
+# в тестах), и ящик виден стриму даже в дочерней задаче — она наследует копию
+# контекста со ссылкой на тот же словарь.
+_FINISH_PROBE: ContextVar[Optional[dict]] = ContextVar("finish_reason_probe", default=None)
+# finish_reason обрыва по лимиту: OpenAI-совместимый «length», у Anthropic/Gemini
+# в сыром виде «max_tokens»/«MAX_TOKENS» (LiteLLM обычно приводит к «length»).
+_LENGTH_FINISH = frozenset({"length", "max_tokens"})
+
+
+@contextmanager
+def finish_reason_probe():
+    """
+    Пока блок активен, stream_completion пишет в отданный словарь
+    finish_reason последнего стрима ({"finish_reason": None} — не сообщался).
+    """
+    box: dict = {"finish_reason": None}
+    token = _FINISH_PROBE.set(box)
+    try:
+        yield box
+    finally:
+        _FINISH_PROBE.reset(token)
+
+
+def is_length_finish(reason) -> bool:
+    """Стрим оборван лимитом длины вывода (max_tokens)?"""
+    return str(reason or "").strip().lower() in _LENGTH_FINISH
+
+
+def model_max_output_tokens(model: str) -> Optional[int]:
+    """
+    Лимит вывода модели по карте LiteLLM (max_output_tokens); None — модель
+    неизвестна.
+
+    Нужен памяти: снимок переписывается целиком, и её max_tokens считается от
+    бюджета снимка (1,4 × бюджет + 1024). LiteLLM значение не прижимает, и
+    при модели по умолчанию gpt-4o (лимит 16 384) запрос с 17 824 получал 400
+    «max_tokens is too large» на КАЖДОМ проходе — память молча не собиралась
+    никогда (финальное ревью). Имя пробуем как есть, без первого префикса
+    («litellm_proxy/gpt-4o» → «gpt-4o», «openrouter/openai/gpt-4o» →
+    «openai/gpt-4o») и последним сегментом; псевдоним прокси, которого LiteLLM
+    не знает, — None, без зажима.
+    """
+    name = (model or "").strip()
+    if not name:
+        return None
+    candidates = [name]
+    if "/" in name:
+        candidates += [name.split("/", 1)[1], name.rsplit("/", 1)[1]]
+    for candidate in dict.fromkeys(candidates):
+        try:
+            info = litellm.get_model_info(candidate)
+        except Exception:  # noqa: BLE001 — «не знаю такую модель» у LiteLLM — Exception
+            continue
+        try:
+            limit = int((info or {}).get("max_output_tokens") or 0)
+        except (TypeError, ValueError, AttributeError):
+            limit = 0
+        if limit > 0:
+            return limit
+    return None
+
+
 # Просить ли у провайдера отчёт о потраченных токенах (usage в конце стрима).
 # Без него расход не посчитать: длина текста не учитывает ни файлы, ни кэш, ни
 # размышления. Параметр стандартный (OpenAI-совместимый), но если чей-то прокси
@@ -477,6 +545,9 @@ async def stream_completion(
                 yield delta
         if finish_reason:
             entry["finish_reason"] = finish_reason
+        probe = _FINISH_PROBE.get()
+        if probe is not None:
+            probe["finish_reason"] = finish_reason
         if usage:
             # Видно прямо в отладочной панели: сколько ушло во вход, сколько из
             # него взято из кэша провайдера (дешёвая часть) и сколько сгенерировано.
