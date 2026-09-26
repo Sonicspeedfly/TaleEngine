@@ -23,6 +23,7 @@ _adopt_summary резал готовую сводку слайсом [:6000] с�
 import asyncio
 import re
 import time
+from collections import Counter
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Awaitable, Callable, Protocol, Sequence, runtime_checkable
@@ -69,7 +70,13 @@ DEFAULT_WINDOW = 50
 WINDOW_STEP = 4
 # Порог «неправдоподобно длинного» снимка. При бюджете 12 000 токенов нормальный
 # снимок — десятки тысяч символов; 200 000 — скорее зацикленная генерация.
+# Это нижняя граница: порог растёт с бюджетом (_max_snapshot_chars) — русский
+# текст около 1,9 символа на токен, и при бюджете больше ~100 тыс. токенов
+# снимок В ПРЕДЕЛАХ бюджета отвергался бы как «неправдоподобный».
 MAX_SNAPSHOT_CHARS = 200_000
+# Сколько символов на токен бюджета допускает порог — с запасом вчетверо
+# против русского текста (≈ 1,9 символа на токен).
+_SNAPSHOT_CHARS_PER_TOKEN = 8
 # Нижняя граница бюджета пакета (MemoryConfig.batch_max_chars). Шапка строки
 # «[#id · время · автор]» и маркер вырезанной середины вместе занимают около
 # сотни символов, а MEMORY_BATCH_CHARS в настройках снизу не ограничен: при
@@ -131,6 +138,12 @@ class MemoryConfig:
     shrink_ratio: float = 0.5          # новый снимок < 50% старого — брак
     shrink_min_tokens: int = 800       # проверку «сдувания» включаем от этого размера
     keep_recent_chronicle: int = 12    # сколько последних записей хроники не сжимать в арки
+    # Лимит вывода модели памяти в токенах (max_tokens, который уходит в запрос;
+    # None — неизвестен, проверки нет). Модель переписывает снимок ЦЕЛИКОМ,
+    # поэтому снимок больше лимита заведомо оборвётся: merge_block не зовёт
+    # модель, если в лимит не влезают даже разделы 2–4 (их сжатие не трогает),
+    # и сначала сжимает хронику, если не влезает весь снимок.
+    output_tokens: int | None = None
 
     def __post_init__(self):
         try:
@@ -218,13 +231,36 @@ class SourceConflictError(Exception):
     """Кусок истории трижды подряд менялся, пока модель его сворачивала."""
 
 
+class MemoryCancelled(Exception):
+    """
+    Прогон остановили («Остановить», сброс памяти) посреди паузы между
+    запросами или паузы перед повтором: следующий платный запрос не делается.
+
+    ПОЧЕМУ своё исключение, а не asyncio.CancelledError: это не отмена задачи,
+    а просьба прогона. scan_and_compress_history превращает её в статус
+    «cancelled» и сохраняет уже сделанное; CancelledError же ядро не
+    перехватывает никогда — её ждёт тот, кто отменял задачу.
+    """
+
+
 # ============================================================================
 # Нормализация сообщения
 # ============================================================================
 # Скрытые рассуждения моделей не часть реплики. Вырезаются по всему тексту,
 # даже внутри блока кода: мысли не бывают содержимым, а их размер сопоставим
 # с самим ответом.
-_THINK_RE = re.compile(r"<(think|thinking)\b[^>]*>[\s\S]*?</\1\s*>", re.IGNORECASE)
+#
+# Парные блоки (<think>…</think>, <style>…</style>, <!--…-->) режет не одна
+# регулярка вида «<x>[\s\S]*?</x>», а сканер _drop_paired. ПОЧЕМУ: на тексте с
+# тысячами НЕзакрытых <think>/<!--/<style> такая регулярка от каждого открытия
+# искала закрытие до конца текста — квадратичное время: 80 000 символов —
+# 3–5 с синхронно в цикле событий, и так на каждом ходу, пока пакет не записан
+# (финальное ревью, M5). Атрибуты открывающего тега ограничены по длине по той
+# же причине: «[^>]*» на «<think <think <think…» без «>» тоже сканировал до
+# конца текста от каждого вхождения.
+_TAG_ATTRS_MAX = 512
+_THINK_OPEN_RE = re.compile(r"<(think|thinking)\b[^>]{0,%d}>" % _TAG_ATTRS_MAX, re.IGNORECASE)
+_THINK_CLOSE = {name: re.compile(rf"</{name}\s*>", re.IGNORECASE) for name in ("think", "thinking")}
 # data:-URI картинок, вставленных прямо в текст: сотни килобайт base64, которые
 # модель не прочтёт, а бюджет пакета съедят целиком.
 _DATA_URI_RE = re.compile(r"\bdata:[a-z]+/[\w.+-]+(?:;[\w.+=-]+)*,[^\s\"'<>()\]]*",
@@ -239,8 +275,15 @@ _B64_MIN_HINT_SHARE = 1 / 3
 # Блок кода — ```…``` или `…`. Внутри него теги и разметку не трогаем:
 # `vector<int>` или пример HTML — это содержимое, а не мусор оформления.
 _CODE_RE = re.compile(r"```[\s\S]*?```|`[^`\n]+`")
-_STYLE_SCRIPT_RE = re.compile(r"<(style|script)\b[^>]*>[\s\S]*?</\1\s*>|<!--[\s\S]*?-->",
-                              re.IGNORECASE)
+# <style>, <script> и HTML-комментарии вырезаются вместе с содержимым (сканером
+# _drop_paired, см. выше). У комментария имени нет — его ключ в словаре закрытий "".
+_STYLE_SCRIPT_OPEN_RE = re.compile(r"<(style|script)\b[^>]{0,%d}>|<!--" % _TAG_ATTRS_MAX,
+                                   re.IGNORECASE)
+_STYLE_SCRIPT_CLOSE = {
+    "style": re.compile(r"</style\s*>", re.IGNORECASE),
+    "script": re.compile(r"</script\s*>", re.IGNORECASE),
+    "": re.compile(r"-->"),
+}
 # Теги, после которых в отображаемом тексте был бы перенос строки.
 _BREAK_RE = re.compile(r"<br\s*/?>|</(?:p|div|li|tr|h[1-6]|blockquote)\s*>", re.IGNORECASE)
 # Известные HTML-теги (оформление карточек SillyTavern, <span style=…>):
@@ -250,7 +293,7 @@ _BREAK_RE = re.compile(r"<br\s*/?>|</(?:p|div|li|tr|h[1-6]|blockquote)\s*>", re.
 # продолжим>») и текст вроде «x <y and z> w». Атрибуты — по синтаксису HTML
 # (имя латиницей, значение в кавычках или без пробелов), поэтому и
 # «<i думаю, что он врёт>» остаётся текстом. style и script вырезаются вместе
-# с содержимым раньше, в _STYLE_SCRIPT_RE. Регистр имён не важен (<linearGradient>).
+# с содержимым раньше (_STYLE_SCRIPT_OPEN_RE). Регистр имён не важен (<linearGradient>).
 _HTML_TAG_NAMES = (
     "a", "b", "i", "u", "s", "em", "strong", "span", "div", "p", "br", "hr", "font",
     "center", "small", "big", "sub", "sup", "code", "pre", "blockquote", "ul", "ol",
@@ -311,9 +354,43 @@ def _drop_base64(m: re.Match) -> str:
     return run
 
 
+def _drop_paired(text: str, open_re: re.Pattern, closers: dict) -> str:
+    """
+    Вырезать парные блоки «открывающий тег … ближайшее закрытие» вместе с
+    содержимым — то же, что делала регулярка «<x>[\\s\\S]*?</x>», но за
+    линейное время.
+
+    open_re находит открытие (group(1) — имя тега, у комментария None);
+    closers — закрытие по имени. Блок режется до ПЕРВОГО закрытия после
+    открытия, незакрытый блок остаётся текстом. ПОЧЕМУ линейно: если после
+    открытия закрытия нет, его нет и после любого следующего открытия того же
+    вида, поэтому этот вид дальше не ищется вовсе (dead), — а регулярка
+    честно искала закрытие от каждого из тысяч открытий до конца текста.
+    """
+    out: list[str] = []
+    keep = pos = 0      # keep — начало ещё не скопированного текста
+    dead: set[str] = set()
+    while len(dead) < len(closers):
+        opened = open_re.search(text, pos)
+        if opened is None:
+            break
+        kind = (opened.group(1) or "").lower()
+        close = None if kind in dead else closers[kind].search(text, opened.end())
+        if close is None:
+            dead.add(kind)
+            # С соседней позиции, а не с конца тега: внутри «открытия» без пары
+            # может начаться блок другого вида (так было и у регулярки).
+            pos = opened.start() + 1
+            continue
+        out.append(text[keep:opened.start()])
+        keep = pos = close.end()
+    out.append(text[keep:])
+    return "".join(out)
+
+
 def _strip_markup(text: str) -> str:
     """Снять HTML-оформление вне блоков кода."""
-    text = _STYLE_SCRIPT_RE.sub("", text)
+    text = _drop_paired(text, _STYLE_SCRIPT_OPEN_RE, _STYLE_SCRIPT_CLOSE)
     text = _BREAK_RE.sub("\n", text)
     return _TAG_RE.sub("", text)
 
@@ -331,7 +408,7 @@ def _outside_code(text: str, fn: Callable[[str], str]) -> str:
 
 def _clean_text(text: str) -> str:
     text = _ZERO_WIDTH_RE.sub("", text or "")
-    text = _THINK_RE.sub("", text)
+    text = _drop_paired(text, _THINK_OPEN_RE, _THINK_CLOSE)
     text = _DATA_URI_RE.sub("", text)
     text = _B64_RUN_RE.sub(_drop_base64, text)
     text = _outside_code(text, _strip_markup)
@@ -511,7 +588,6 @@ def is_structured(text) -> bool:
 # ============================================================================
 # Разбор и проверка ответа модели
 # ============================================================================
-_UNCLOSED_THINK_RE = re.compile(r"<(?:think|thinking)\b[^>]*>[\s\S]*$", re.IGNORECASE)
 _FENCE_LINE_RE = re.compile(r"^[ \t]*```[\w-]*[ \t]*$", re.MULTILINE)
 _OPEN_RE = re.compile(re.escape(ENVELOPE_OPEN), re.IGNORECASE)
 _CLOSE_RE = re.compile(re.escape(ENVELOPE_CLOSE), re.IGNORECASE)
@@ -529,9 +605,11 @@ def extract_snapshot(raw) -> tuple[str, bool]:
     вывода, текст возвращается с флагом True. Обёртки нет вовсе — мягкий
     режим: весь текст (разделы потом проверит parse_sections).
     """
-    text = _THINK_RE.sub("", str(raw or ""))
+    text = _drop_paired(str(raw or ""), _THINK_OPEN_RE, _THINK_CLOSE)
     # Незакрытый <think> — модель оборвалась посреди рассуждений: всё после него мысли.
-    text = _UNCLOSED_THINK_RE.sub("", text)
+    unclosed_think = _THINK_OPEN_RE.search(text)
+    if unclosed_think:
+        text = text[:unclosed_think.start()]
     text = _FENCE_LINE_RE.sub("", text)
     # ПОЧЕМУ не первая и не последняя обёртка. Модель упоминает тег и до
     # снимка («Вот снимок в формате <master_state>…</master_state>:»), и после
@@ -569,6 +647,15 @@ def default_estimate_tokens(text) -> int:
     return max(1, int(heavy / 2 + (len(text) - heavy) / 4))
 
 
+def _max_snapshot_chars(config: MemoryConfig) -> int:
+    """Порог «неправдоподобно длинного» снимка: MAX_SNAPSHOT_CHARS или больше — по бюджету."""
+    try:
+        budget = int(config.snapshot_tokens or 0)
+    except (TypeError, ValueError):
+        budget = 0
+    return max(MAX_SNAPSHOT_CHARS, budget * _SNAPSHOT_CHARS_PER_TOKEN)
+
+
 def validate_snapshot(raw, prev, *, config: MemoryConfig | None = None,
                       estimate_tokens: Callable[[str], int] | None = None,
                       check_shrink: bool = True) -> tuple[str, list[str]]:
@@ -588,7 +675,7 @@ def validate_snapshot(raw, prev, *, config: MemoryConfig | None = None,
     if not text:
         problems.append("пустой ответ")
         return text, problems
-    if len(text) > MAX_SNAPSHOT_CHARS:
+    if len(text) > _max_snapshot_chars(config):
         problems.append("снимок неправдоподобно длинный")
     sections = parse_sections(text)
     problems.extend(f"нет раздела [{sec}]" for sec in SECTIONS if sec not in sections)
@@ -631,6 +718,24 @@ def _entry_key(first_line: str) -> str:
     return _norm_key(text[:stop.start()] if stop else text)
 
 
+# Хвостовые пометки, которые модель дописывает к записи при обновлении на
+# месте: «(#12)», «(было: ранен, #5)». Расширенный ключ их не учитывает —
+# иначе запись, обновлённая на месте, выглядела бы потерянной.
+_TRAILING_NOTES_RE = re.compile(r"(?:\s*\((?:#|было\b)[^()]*\))+\s*$", re.IGNORECASE)
+_EXT_KEY_MAX = 200
+
+
+def _extended_key(first_line: str) -> str:
+    """
+    Расширенный ключ записи — вся первая строка (без маркера и хвостовых
+    «(#id)»/«(было: …)»), нормализованная как _norm_key. Нужен, когда
+    обычный ключ в старом разделе повторяется: у «Linkin Park — «Numb» — …» и
+    «Linkin Park — «In the End» — …» ключ один — «linkin park».
+    """
+    text = _TRAILING_NOTES_RE.sub("", _ENTRY_MARKER_RE.sub("", first_line.strip(), count=1))
+    return " ".join(_NON_WORD_RE.sub(" ", _fold(text)).split())[:_EXT_KEY_MAX].strip()
+
+
 def _heading_key(line: str) -> str:
     return _norm_key(line.strip().lstrip("#"))
 
@@ -640,13 +745,66 @@ def _jaccard(a: set, b: set) -> float:
     return len(a & b) / len(union) if union else 0.0
 
 
-def _similar(key: str, keys: set, token_sets: list) -> bool:
-    """Точное совпадение ключа или Жаккар по словам ≥ 0.6 (переименование «Орден
-    Зари» → «Тайный орден Зари» — та же запись, а не пропавшая)."""
-    if key in keys:
-        return True
-    tokens = set(key.split())
-    return any(_jaccard(tokens, other) >= _JACCARD_MIN for other in token_sets)
+def _lost_entries(old: list, new_entries: list) -> list:
+    """
+    Записи старого раздела, которым в новом не нашлось пары: [(подзаголовок, запись), …].
+
+    Сопоставление — МУЛЬТИМНОЖЕСТВО: одна запись нового снимка покрывает одну
+    запись старого. Раньше запись считалась сохранённой, если её ключ (или
+    похожий по Жаккару ≥ 0,6) был где угодно в разделе, и разные записи с
+    одним ключом прикрывали друг друга: пропавший трек «Linkin Park — «In the
+    End»» не возвращался, пока в списке оставался «Linkin Park — «Numb»», как
+    и «Кольцо (золотое)» рядом с «Кольцо (серебряное)» (финальное ревью, I2).
+
+    Ключ сравнения: обычный (имя до « — »/«:»/«(»), а для ключей, повторяющихся
+    в старом разделе, — расширенный (_extended_key). Сначала точные совпадения,
+    потом похожие (Жаккар ≥ 0,6; из свободных — самое похожее): иначе
+    «Кинжал из белой стали» занял бы пару «Кинжала из чёрной стали», похожего на
+    него ровно на 0,6. Лишний возврат (модель слила две записи в одну строку)
+    безопаснее потери. Одинаковые старые записи считаются одной.
+    """
+    new_keys = [_entry_key(e[0]) for e in new_entries]
+    new_ext = [_extended_key(e[0]) for e in new_entries]
+    by_key: dict[str, list[int]] = {}
+    by_ext: dict[str, list[int]] = {}
+    for j, (key, ext) in enumerate(zip(new_keys, new_ext)):
+        if key:
+            by_key.setdefault(key, []).append(j)
+            by_ext.setdefault(ext, []).append(j)
+    old_keys = [_entry_key(e[0]) for _, e in old]
+    repeats = {k for k, n in Counter(old_keys).items() if k and n > 1}
+    used = [False] * len(new_entries)
+    pending, seen = [], set()
+    for (heading, entry), key in zip(old, old_keys):
+        whole = " ".join(_NON_WORD_RE.sub(" ", _fold("\n".join(entry))).split())
+        if not key or whole in seen:
+            continue  # пустой ключ не охраняется; копия записи — та же запись
+        seen.add(whole)
+        extended = key in repeats
+        probe = _extended_key(entry[0]) if extended else key
+        pool = (by_ext if extended else by_key).get(probe, ())
+        j = next((j for j in pool if not used[j]), None)
+        if j is None:
+            pending.append((heading, entry, probe, extended))
+        else:
+            used[j] = True
+    lost = []
+    key_tokens = [set(k.split()) for k in new_keys] if pending else []
+    ext_tokens = [set(x.split()) for x in new_ext] if pending else []
+    for heading, entry, probe, extended in pending:
+        tokens = set(probe.split())
+        best, best_score = None, 0.0
+        for j, other in enumerate(ext_tokens if extended else key_tokens):
+            if used[j] or not new_keys[j]:
+                continue
+            score = _jaccard(tokens, other)
+            if score >= _JACCARD_MIN and score > best_score:
+                best, best_score = j, score
+        if best is None:
+            lost.append((heading, entry))
+        else:
+            used[best] = True
+    return lost
 
 
 def _split_groups(body: str) -> list[list]:
@@ -696,10 +854,6 @@ def _parse_entries(lines: list) -> list[list[str]]:
     return entries
 
 
-def _group_keys(groups) -> list[str]:
-    return [k for _, lines in groups for e in _parse_entries(lines) if (k := _entry_key(e[0]))]
-
-
 def _target_group(groups: list, heading: str | None) -> list:
     """Группа нового снимка для восстановленной записи; нет подсписка — создать."""
     if heading is None:
@@ -742,7 +896,8 @@ def guard_entries(prev, new) -> tuple[str, list[str]]:
     записей (имя до « — »/«:»; регистр, ё/е и пунктуация не важны) и
     дописывает пропавшие исходным текстом в конец своего раздела, а записи
     списка — в свой подсписок. Обновлённую на месте запись («Артём — ранен» →
-    «артем — здоров (было: ранен)») он не дублирует: ключ тот же.
+    «артем — здоров (было: ранен)») он не дублирует: ключ тот же. Записи с
+    одинаковым ключом друг друга не прикрывают — см. _lost_entries.
 
     → (канонический текст, ключи восстановленных записей).
     """
@@ -754,20 +909,16 @@ def guard_entries(prev, new) -> tuple[str, list[str]]:
         if not old_body:
             continue
         groups = _split_groups(new_secs.get(sec, ""))
-        keys = _group_keys(groups)
-        key_set, token_sets = set(keys), [set(k.split()) for k in keys]
-        lost = 0
-        for heading, lines in _split_groups(old_body):
-            for entry in _parse_entries(lines):
-                key = _entry_key(entry[0])
-                if not key or _similar(key, key_set, token_sets):
-                    continue
-                target = _target_group(groups, heading)[1]
-                while target and not target[-1].strip():
-                    target.pop()
-                target.extend(entry)
-                restored.append(key)
-                lost += 1
+        new_entries = [e for _, lines in groups for e in _parse_entries(lines)]
+        old = [(heading, entry) for heading, lines in _split_groups(old_body)
+               for entry in _parse_entries(lines)]
+        lost = _lost_entries(old, new_entries)
+        for heading, entry in lost:
+            target = _target_group(groups, heading)[1]
+            while target and not target[-1].strip():
+                target.pop()
+            target.extend(entry)
+            restored.append(_entry_key(entry[0]))
         if lost:
             new_secs[sec] = _render_groups(groups)
     return render_snapshot(new_secs), restored
@@ -986,6 +1137,46 @@ _OVER_BUDGET = "снимок превышает бюджет:"
 _ARC_RE = re.compile(r"[*_\s]*(?:\[[^\]\n]*\][*_\s]*)?арк[аи]\b", re.IGNORECASE)
 
 
+# Тексты ошибки length, которые ядро ставит само (а не классифицирует ошибку
+# провайдера). Их видит пользователь: в статусе задания и в last_error
+# ежеходного прохода во вкладке «Память».
+_TRUNCATED_TEXT = (f"{_KIND_TEXT['length']}: снимок оборван на полуслове "
+                   f"(нет закрывающего {ENVELOPE_CLOSE})")
+_GUARDED_OVER_OUTPUT = ("реестр и списки больше лимита вывода модели памяти "
+                        "(≈ {tokens} из {limit} токенов): поднимите лимит/бюджет "
+                        "или почистите снимок вручную")
+_SNAPSHOT_OVER_OUTPUT = ("снимок больше лимита вывода модели памяти даже после сжатия "
+                         "хроники (≈ {tokens} из {limit} токенов): поднимите лимит/бюджет "
+                         "или почистите снимок вручную")
+_MESSAGE_ID_RE = re.compile(r"#(\d+)")
+
+
+def _chronicle_loss(before: str, after: str) -> str | None:
+    """
+    Нижняя граница ответа сжатия: что он потерял из хроники (None — ничего).
+
+    ПОЧЕМУ: раньше проверялось только «хроника стала короче», и ответ с
+    хроникой «—» принимался — вся хроника (десятки записей) стиралась молча, и
+    вернуть её могла только пересборка (финальное ревью, M1). Последние
+    keep_recent_chronicle записей промпт велит оставить как есть, поэтому
+    самый поздний номер сообщения самой свежей записи («[#a–#b]» → b)
+    обязан остаться в хронике — в этой записи или концом арки. В новой
+    хронике номер ищется без «#»: «[#1-79]» — тоже честная арка. Числа без
+    «#» (суммы, даты) в расчёт не идут; записи без номеров не проверяются.
+    """
+    if not before.strip():
+        return None
+    if not after.strip():
+        return "вернуло пустую хронику"
+    entries = _parse_entries(before.splitlines())
+    numbers = [int(n) for n in _MESSAGE_ID_RE.findall(entries[-1][0])] if entries else []
+    if numbers:
+        last = max(numbers)
+        if not re.search(rf"(?<!\d){last}(?!\d)", after):
+            return f"потеряло последние записи хроники (#{last})"
+    return None
+
+
 def _fold_threshold(keep: int) -> int:
     """
     Сколько записей для свёртки (старше keep и ещё не арок) нужно, чтобы
@@ -1046,6 +1237,9 @@ class HierarchicalMemoryManager:
         # (phase, retry_in_s) последнего отданного события — то, что сейчас
         # видит UI; call() по нему решает, нужно ли вернуть фазу работы.
         self._shown: tuple[str, float | None] | None = None
+        # Событие отмены идущего прогона (None — прогона нет или отмены не
+        # просили): паузы call() его слушают, см. _pause.
+        self._cancel: asyncio.Event | None = None
 
     # ---------------------------------------------------------------- пакеты
     def plan_batch(self, messages) -> Batch | None:
@@ -1084,6 +1278,20 @@ class HierarchicalMemoryManager:
         if supersedes:
             self.warnings[self._warn_from:] = [w for w in run if not w.startswith(supersedes)]
         self.warnings.append(text)
+
+    def warn(self, text: str) -> None:
+        """Предупреждение прогона извне ядра (сервис: модель не приняла max_tokens и т. п.)."""
+        self._warn(text)
+
+    def _forget_over_budget(self) -> None:
+        """
+        Снимок снова в бюджете — убрать из предупреждений прогона «снимок
+        превышает бюджет». Раньше оно оставалось и после удачного сжатия
+        следующего пакета и уходило в meta.warnings и итог задания неправдой
+        (финальное ревью, M2).
+        """
+        run = self.warnings[self._warn_from:]
+        self.warnings[self._warn_from:] = [w for w in run if not w.startswith(_OVER_BUDGET)]
 
     def _foldable(self, state: str, *, arcs: bool = False) -> int:
         """
@@ -1124,6 +1332,7 @@ class HierarchicalMemoryManager:
         budget = self.config.snapshot_tokens
         tokens = self._tokens(state)
         if tokens <= budget:
+            self._forget_over_budget()
             return
         text = f"{_OVER_BUDGET} {_fmt_int(tokens)} из {_fmt_int(budget)} токенов"
         if (self._foldable(state) < _fold_threshold(self.config.keep_recent_chronicle)
@@ -1141,6 +1350,38 @@ class HierarchicalMemoryManager:
         return new
 
     # ------------------------------------------------------------ вызов модели
+    def _cancel_requested(self) -> bool:
+        return self._cancel is not None and self._cancel.is_set()
+
+    async def _pause(self, seconds: float) -> None:
+        """
+        Пауза между запросами или перед повтором, которую прерывает отмена
+        прогона → MemoryCancelled.
+
+        ПОЧЕМУ: отмена проверялась только между пакетами, а пауза перед
+        повтором по Retry-After длится до 300 с (до max_retries раз на запрос):
+        «Остановить» и «Сбросить память» ждали минутами, и после паузы шли ещё
+        платные попытки (финальное ревью, M3). Вне прогона (_cancel is None) —
+        обычный сон.
+        """
+        if self._cancel is None:
+            await self._sleep(seconds)
+            return
+        if self._cancel.is_set():
+            raise MemoryCancelled()
+        sleeper = asyncio.ensure_future(self._sleep(seconds))
+        waiter = asyncio.ensure_future(self._cancel.wait())
+        try:
+            await asyncio.wait({sleeper, waiter}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            # И при отмене самой задачи (CancelledError из wait): висящие
+            # сон и ожидание события иначе пережили бы прогон.
+            for pending in (sleeper, waiter):
+                if not pending.done():
+                    pending.cancel()
+        if self._cancel.is_set():
+            raise MemoryCancelled()
+
     async def call(self, messages: list[dict], *, phase: str = "merge") -> str:
         """
         Один запрос к модели: пауза-ограничитель + повтор с бэкоффом (§4.4).
@@ -1151,18 +1392,24 @@ class HierarchicalMemoryManager:
         call() прочли бы один _last_end, выждали одинаково и ушли к провайдеру
         разом, а бэкофф одного пропускал бы вперёд запрос другого.
 
+        Отмена прогона (cancel в scan_and_compress_history) прерывает паузы и
+        не пускает новый запрос: MemoryCancelled. Уже начатый запрос к модели
+        доводится — он оплачен, и его результат пакет ещё может записать.
+
         :param phase: работа запроса для событий прогресса — "merge" (слияние
             и факты пакета) или "compact". Перед каждым запросом к модели
             событие с этой фазой уходит, если UI видит другое: паузу, повтор
             или фазу прошлого запроса.
         """
         async with self._lock:
+            if self._cancel_requested():
+                raise MemoryCancelled()
             delay = max(0.0, self.config.delay_ms / 1000)
             if self._last_end is not None:
                 wait = delay - (self._clock() - self._last_end)
                 if wait > 0:
                     self._emit(phase="wait", retry_in_s=round(wait, 1))
-                    await self._sleep(wait)
+                    await self._pause(wait)
             attempt = 0
             while True:
                 if self._shown != (phase, None):
@@ -1201,7 +1448,7 @@ class HierarchicalMemoryManager:
                     # Повтор — тоже запрос: короткий бэкофф не должен обходить паузу.
                     wait = max(wait, delay)
                     self._emit(phase="retry", retry_in_s=wait)
-                    await self._sleep(wait)
+                    await self._pause(wait)
                     attempt += 1
                 else:
                     self._last_end = self._clock()
@@ -1216,11 +1463,20 @@ class HierarchicalMemoryManager:
         В повторный запрос идёт только ПОСЛЕДНИЙ брак (исходный запрос + сырой
         ответ + «Ответ отклонён: …»): каждая попытка размером со снимок, и
         копить их все — раздувать вход с каждой неудачей.
+
+        Ответ, оборванный лимитом вывода (открытая обёртка без закрытия), —
+        не брак, а MemoryLLMError("length"): корректирующий ход с тем же
+        лимитом оборвался бы снова. Раньше так и было — три полноразмерных
+        платных вызова, отказ, и на КАЖДОМ следующем ходу то же самое, а путь
+        «сжать хронику и повторить» (merge_block) не срабатывал никогда: шлюз
+        сообщает о length только при ПУСТОМ ответе (финальное ревью, I1).
         """
         convo = messages
         problems: list[str] = []
         for _ in range(max(0, self.config.validation_retries) + 1):
             raw = await self.call(convo, phase=phase)
+            if extract_snapshot(raw)[1]:
+                raise MemoryLLMError("length", _TRUNCATED_TEXT, retryable=False)
             text, problems = validate_snapshot(raw, prev, config=self.config,
                                                estimate_tokens=self._est,
                                                check_shrink=check_shrink)
@@ -1255,6 +1511,7 @@ class HierarchicalMemoryManager:
             # В пакете одни пустые сообщения: вливать нечего, а указатель всё
             # равно должен их пройти (см. Batch) — вызов модели был бы впустую.
             return state
+        state = await self._fit_output(state)
         try:
             new = await self._merge(state, batch)
         except MemoryLLMError as err:
@@ -1269,12 +1526,50 @@ class HierarchicalMemoryManager:
             # обычных записей для свёртки нет, и без арок сжатие не звалось
             # вовсе: повтор слияния упирался в тот же лимит.
             state = await self.compact(state, min_fold=1, fold_arcs=True)
+            if self._cancel_requested():
+                # Сжатие прервала отмена — повтор слияния не делается.
+                raise MemoryCancelled() from err
             new = await self._merge(state, batch)
         if is_structured(state):
             new = self._guard(state, new)
         if self._tokens(new) > self.config.snapshot_tokens:
             new = await self.compact(new)
+        else:
+            self._forget_over_budget()
         return new
+
+    async def _fit_output(self, state: str) -> str:
+        """
+        Снимок перед слиянием должен влезать в лимит вывода модели
+        (config.output_tokens): модель переписывает его целиком плюс события.
+
+        Разделы 2–4 сами больше лимита — MemoryLLMError("length") без вызова
+        модели: их сжатие не трогает, любой ответ будет оборван, и каждая
+        попытка — полноразмерный платный вызов впустую. Весь снимок больше
+        лимита, а разделы 2–4 влезают — сначала сжатие хроники (с арками, как
+        на пути length), потом слияние; не помогло — та же ошибка. Лимит
+        неизвестен или снимок старой схемы — проверки нет.
+        """
+        limit = self.config.output_tokens
+        if not limit or limit <= 0 or not is_structured(state):
+            return state
+        guarded = self._guarded_tokens(state)
+        if guarded >= limit:
+            raise MemoryLLMError(
+                "length", _GUARDED_OVER_OUTPUT.format(tokens=_fmt_int(guarded),
+                                                      limit=_fmt_int(limit)),
+                retryable=False)
+        if self._tokens(state) >= limit:
+            state = await self.compact(state, min_fold=1, fold_arcs=True)
+            if self._cancel_requested():
+                raise MemoryCancelled()
+            tokens = self._tokens(state)
+            if tokens >= limit:
+                raise MemoryLLMError(
+                    "length", _SNAPSHOT_OVER_OUTPUT.format(tokens=_fmt_int(tokens),
+                                                           limit=_fmt_int(limit)),
+                    retryable=False)
+        return state
 
     # ----------------------------------------------------------------- сжатие
     async def compact(self, state: str, *, min_fold: int | None = None,
@@ -1282,12 +1577,19 @@ class HierarchicalMemoryManager:
         """
         Сжать хронику снимка в арки (§4.7) → снимок.
 
-        Разделы 2–4 не сжимаются никогда: промпт требует перенести их дословно,
-        а страж возвращает то, что модель всё же выронила. Любая неудача
-        (брак после корректирующих ходов, ошибка API, хроника не стала
-        короче) — не повод терять готовый снимок: предупреждение и прежний
-        текст. Гистерезис двойной: цель в промпте — _COMPACT_TARGET от бюджета,
-        а модель зовётся, только когда накопилось что сворачивать.
+        Разделы 2–4 не сжимаются никогда: из ответа модели берётся ТОЛЬКО
+        хроника, а разделы 2–4 остаются из входного снимка символ в символ.
+        Раньше ответ шёл в снимок целиком, а страж сверяет лишь ключи записей:
+        модель честно сворачивала хронику и «заодно» ужимала «Эльвира —
+        здоровье: …; при себе: ключ №7…; скрытые мотивы: ищет брата» до
+        «Эльвира — ранена», и это принималось молча — раз в несколько пакетов,
+        с накоплением потерь (финальное ревью, I3). Любая неудача (брак после
+        корректирующих ходов, ошибка API, хроника не стала короче или потеряла
+        свежие записи — _chronicle_loss) — не повод терять готовый снимок:
+        предупреждение и прежний текст. Отмена прогона посреди паузы перед
+        сжатием — прежний текст без предупреждения: сожмёт следующий прогон.
+        Гистерезис двойной: цель в промпте — _COMPACT_TARGET от бюджета, а
+        модель зовётся, только когда накопилось что сворачивать.
 
         :param min_fold: сколько записей для свёртки (старше keep и не арок)
             нужно, чтобы звать модель; None — _fold_threshold(keep). Меньше —
@@ -1327,13 +1629,18 @@ class HierarchicalMemoryManager:
                 [{"role": "system", "content": system},
                  {"role": "user", "content": "[Текущая память]\n" + state}],
                 prev=state, check_shrink=False, phase="compact")
+        except MemoryCancelled:
+            return state
         except (SnapshotValidationError, MemoryLLMError) as err:
             self._warn(f"сжатие хроники не удалось ({err}) — оставлен прежний снимок")
         else:
-            before = self._tokens(chronicle)
-            after = self._tokens(parse_sections(compacted).get(SEC_CHRONICLE, ""))
-            if after < before:
-                result, done = self._guard(state, compacted), True
+            new_chronicle = parse_sections(compacted).get(SEC_CHRONICLE, "")
+            loss = _chronicle_loss(chronicle, new_chronicle)
+            if loss:
+                self._warn(f"сжатие {loss} — оставлен прежний снимок")
+            elif self._tokens(new_chronicle) < self._tokens(chronicle):
+                result = render_snapshot({**parse_sections(state), SEC_CHRONICLE: new_chronicle})
+                done = True
             else:
                 self._warn("сжатие не сократило хронику — оставлен прежний снимок")
         self._warn_over_budget(result, compacted=done)
@@ -1342,6 +1649,8 @@ class HierarchicalMemoryManager:
     # ------------------------------------------------------------ цикл свёртки
     async def scan_and_compress_history(
             self, source: Sequence[MemoryMessage] | BatchSource, state: str = "", *,
+            batch_size: int | None = None,
+            delay_ms: int | None = None,
             on_progress: Callable[[ScanProgress], None] | None = None,
             cancel: asyncio.Event | None = None,
             max_batches: int | None = None,
@@ -1353,9 +1662,17 @@ class HierarchicalMemoryManager:
         пакета N-1 — в этом вся свёртка. Готовый пакет сразу уходит в
         source.commit, поэтому отмена, лимит или ошибка не теряют сделанного.
 
+        Сигнатура ТЗ — scan_and_compress_history(chat_history, batch_size=20,
+        delay_ms=1500): список сообщений и оба параметра подходят как есть.
+        batch_size и delay_ms — переопределения конфигурации на ЭТОТ прогон
+        (None — из MemoryConfig); после прогона config прежний.
+
         :param source: BatchSource или просто список MemoryMessage.
-        :param cancel: проверяется МЕЖДУ пакетами — начатый пакет доводится и
-            сохраняется.
+        :param cancel: проверяется МЕЖДУ пакетами — начатый запрос к модели
+            доводится, а слитый пакет сохраняется. Паузы между запросами и
+            перед повторами отмена прерывает сразу, и новых запросов после неё
+            нет (_pause): пакет, чьё слияние не успело, не пишется, у слитого
+            пропускается только сжатие.
         :param max_batches: сколько попыток, дошедших до commit (принятых и
             отвергнутых), сделать за прогон; ежеходный проход так не занимает
             модель надолго.
@@ -1369,14 +1686,20 @@ class HierarchicalMemoryManager:
         """
         if not isinstance(source, BatchSource):
             source = ListSource(source)
+        saved_config = self.config
+        overrides = {k: v for k, v in (("batch_size", batch_size), ("delay_ms", delay_ms))
+                     if v is not None}
+        if overrides:
+            self.config = replace(self.config, **overrides)
         # Прогон отдаёт только свои предупреждения, даже если менеджер уже
         # поработал раньше; повторы _warn тоже ищет только среди них.
         warn_from = self._warn_from = len(self.warnings)
         processed = batches = attempts = conflicts = 0
         self._on_progress = on_progress
-        self._progress = ScanProgress(processed=0, total=await source.pending(), batches=0,
-                                      state_tokens=self._tokens(state), phase="merge")
+        self._cancel = cancel
         try:
+            self._progress = ScanProgress(processed=0, total=await source.pending(), batches=0,
+                                          state_tokens=self._tokens(state), phase="merge")
             self._emit()
             while True:
                 if cancel is not None and cancel.is_set():
@@ -1390,7 +1713,13 @@ class HierarchicalMemoryManager:
                 if batch is None:
                     status = "done"
                     break
-                new = await self.merge_block(state, batch)
+                try:
+                    new = await self.merge_block(state, batch)
+                except MemoryCancelled:
+                    # Отмена прервала паузу до слияния (или повтор после
+                    # обрыва): писать нечего, готовые пакеты уже в source.
+                    status = "cancelled"
+                    break
                 attempts += 1
                 if not await source.commit(batch, new):
                     if not retry_conflicts:
@@ -1419,6 +1748,8 @@ class HierarchicalMemoryManager:
         finally:
             self._on_progress = None
             self._progress = None
+            self._cancel = None
+            self.config = saved_config
             # Отсчёт повторов — только на время прогона. Иначе прямой вызов
             # merge_block/compact после прогона сверял бы свои предупреждения с
             # предупреждениями прогона и молча не добавлял уже выданное им.

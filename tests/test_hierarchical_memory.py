@@ -459,6 +459,10 @@ async def test_length_error_compacts_state_then_retries_merge():
         calls.append(messages[0]["content"])
         if len(calls) == 1:
             raise RuntimeError("Технически: ПУСТОЙ ответ, finish_reason=LENGTH.")
+        if messages[0]["content"] != hm.MASTER_STATE_PROMPT:
+            # Сжатие — арка до последней записи: ответ без свежих записей
+            # хроники теперь отвергается (нижняя граница, задача 11).
+            return _wrap(_snap(chron=_ARC))
         return _wrap(_snap())
 
     m, _ = _mgr(llm)
@@ -964,7 +968,10 @@ async def test_compaction_that_does_not_shorten_keeps_the_snapshot():
     assert "сжатие не сократило хронику — оставлен прежний снимок" in m.warnings
 
 
-async def test_guard_restores_entries_lost_by_compaction():
+async def test_compaction_keeps_entries_the_model_dropped():
+    # Раньше выпавшую при сжатии запись возвращал страж (с предупреждением).
+    # Теперь (задача 11) разделы 2–4 из ответа сжатия не берутся вовсе —
+    # терять и возвращать нечего.
     state = _snap(chron=_LONG_CHRON, lists="### Треки\n- «A» — тема (#1)\n- «B» — тема (#2)")
 
     async def llm(messages):
@@ -973,7 +980,7 @@ async def test_guard_restores_entries_lost_by_compaction():
     m, _ = _mgr(llm, snapshot_tokens=10**6)
     out = await m.compact(state)
     assert "Арка «Дорога»" in out and "- «B» — тема (#2)" in out
-    assert m.warnings == ["модель потеряла 1 запись — возвращены из предыдущего снимка"]
+    assert m.warnings == []
 
 
 async def test_retry_after_is_capped():
@@ -1169,3 +1176,272 @@ async def test_length_error_does_not_fold_when_chronicle_fits_in_keep():
     await m.merge_block(_snap(chron=chron), hm.plan_batch([_msg(13)], batch_size=20,
                                                           max_chars=10**6))
     assert systems == [hm.MASTER_STATE_PROMPT] * 2
+
+
+# ==================== Доработки по финальному ревью (задача 11) ====================
+
+def _batch(i=80):
+    return hm.plan_batch([_msg(i)], batch_size=20, max_chars=10**6)
+
+
+async def test_truncated_answer_is_length_and_goes_to_compaction_not_correction():
+    # Финальное ревью (I1): НЕпустой ответ, оборванный лимитом вывода, уходил в
+    # корректирующие ходы с тем же лимитом — три платных вызова, отказ, и так на
+    # каждом ходу; путь «сжать хронику и повторить» не срабатывал никогда.
+    # Обрыв (открытая обёртка без закрытия) — это length: сразу сжатие и повтор.
+    systems, users = [], []
+
+    async def llm(messages):
+        systems.append(messages[0]["content"])
+        users.append(messages[-1]["content"])
+        if len(systems) == 1:
+            return hm.ENVELOPE_OPEN + "\n" + _snap(chron=_LONG_CHRON)[:300]
+        if messages[0]["content"] == hm.MASTER_STATE_PROMPT:
+            return _wrap(_snap(chron=_ARC + "\n- [#80–#80] пакет"))
+        return _wrap(_snap(chron=_ARC))
+
+    m, _ = _mgr(llm)
+    state = await m.merge_block(_snap(chron=_LONG_CHRON), _batch())
+    assert len(systems) == 3
+    assert systems[0] == systems[2] == hm.MASTER_STATE_PROMPT
+    assert systems[1].startswith(hm.COMPACT_PROMPT.split("{", 1)[0])
+    assert hm.COMPACT_ARCS_PROMPT in systems[1]
+    assert not any("Ответ отклонён" in u for u in users)
+    assert "- [#80–#80] пакет" in state
+
+
+async def test_repeated_truncation_goes_up_as_one_length_error():
+    systems, users = [], []
+
+    async def llm(messages):
+        systems.append(messages[0]["content"])
+        users.append(messages[-1]["content"])
+        return f"{hm.ENVELOPE_OPEN}\n## [{hm.SEC_CHRONICLE}]\n- [#1–#2] оборвано на полусл"
+
+    m, _ = _mgr(llm)
+    with pytest.raises(hm.MemoryLLMError) as e:
+        await m.merge_block(_snap(chron=_LONG_CHRON), _batch())
+    assert e.value.kind == "length" and not e.value.retryable
+    # Слияние, одна попытка сжатия (тоже обрыв — снимок прежний), один повтор.
+    assert systems.count(hm.MASTER_STATE_PROMPT) == 2 and len(systems) == 3
+    assert not any("Ответ отклонён" in u for u in users)
+
+
+async def test_registry_and_lists_over_the_output_limit_are_refused_without_a_call():
+    # Разделы 2–4 сжатие не трогает: если они сами больше лимита вывода, любой
+    # ответ модели будет оборван — звать её бессмысленно и платно.
+    calls = []
+
+    async def llm(messages):
+        calls.append(messages)
+        return _wrap(_snap())
+
+    m, _ = _mgr(llm, output_tokens=len(_BIG_LIST) // 2)  # оценка токенов — len
+    with pytest.raises(hm.MemoryLLMError) as e:
+        await m.merge_block(_snap(lists=_BIG_LIST), _batch())
+    assert e.value.kind == "length" and not e.value.retryable
+    assert "реестр и списки больше лимита вывода модели памяти" in e.value.message
+    assert calls == []
+
+
+async def test_snapshot_over_the_output_limit_is_compacted_before_the_merge():
+    # Весь снимок больше лимита вывода, а разделы 2–4 в него влезают: слияние
+    # заведомо оборвалось бы — сначала сжатие хроники, потом слияние.
+    systems = []
+
+    async def llm(messages):
+        systems.append(messages[0]["content"])
+        if messages[0]["content"] == hm.MASTER_STATE_PROMPT:
+            return _wrap(_snap(chron=_ARC + "\n- [#80–#80] пакет"))
+        return _wrap(_snap(chron=_ARC))
+
+    state = _snap(chron=_LONG_CHRON)
+    m, _ = _mgr(llm, output_tokens=1000)
+    assert m._guarded_tokens(state) < 1000 < len(state)
+    out = await m.merge_block(state, _batch())
+    assert len(systems) == 2 and systems[1] == hm.MASTER_STATE_PROMPT
+    assert systems[0].startswith(hm.COMPACT_PROMPT.split("{", 1)[0])
+    assert "- [#80–#80] пакет" in out
+
+
+@pytest.mark.parametrize("section, kept, lost", [
+    # Плейлист из ТЗ: ключ обеих записей — «linkin park».
+    (hm.SEC_LISTS, "### Плейлист Эльвиры\n- Linkin Park — «Numb» — тема ссоры (#3)",
+     "- Linkin Park — «In the End» — тема примирения (#9)"),
+    # Варианты через скобки: ключ — «кольцо» и «стражник».
+    (hm.SEC_REGISTRY, "- Кольцо (серебряное) — у Эльвиры (#4)", "- Кольцо (золотое) — у Артура (#7)"),
+    (hm.SEC_CHARACTERS, "- Стражник (у ворот) — пропустил героев", "- Стражник (в башне) — спит"),
+    # Четыре слова, три общих: Жаккар ровно 0,6.
+    (hm.SEC_REGISTRY, "- Кинжал из чёрной стали — у Артура (#5)",
+     "- Кинжал из белой стали — у Эльвиры (#6)"),
+])
+def test_guard_restores_an_entry_hidden_by_a_same_key_neighbour(section, kept, lost):
+    # Финальное ревью (I2): запись считалась сохранённой, если её ключ (или
+    # похожий) был где угодно в разделе, — разные записи с одним ключом
+    # прикрывали друг друга, и потеря была тихой. Теперь сопоставление —
+    # мультимножество: одна новая запись покрывает одну старую.
+    prev = hm.render_snapshot({hm.SEC_CHRONICLE: "- [#1–#2] x", section: kept + "\n" + lost})
+    new = hm.render_snapshot({hm.SEC_CHRONICLE: "- [#1–#3] x", section: kept})
+    fixed, restored = hm.guard_entries(prev, new)
+    body = hm.parse_sections(fixed)[section]
+    assert lost.strip() in body and body.count(kept.splitlines()[-1]) == 1
+    assert len(restored) == 1
+
+
+def test_guard_keeps_same_key_entries_that_are_both_present_or_updated():
+    prev = _snap(lists="### Плейлист\n- Linkin Park — «Numb» — тема ссоры (#3)\n"
+                       "- Linkin Park — «In the End» — тема примирения (#9)",
+                 chars="- Стражник (у ворот) — пропустил героев\n- Стражник (в башне) — спит")
+    new = _snap(lists="### Плейлист\n- Linkin Park — «In the End» — тема примирения (#9)\n"
+                      "- Linkin Park — «Numb» — тема ссоры и прощания (было: тема ссоры, #12)",
+                chars="- Стражник (у ворот) — пропустил героев; позже поднял тревогу (#30)\n"
+                      "- Стражник (в башне) — спит")
+    fixed, restored = hm.guard_entries(prev, new)
+    assert restored == [] and fixed.count("Numb") == 1 and fixed.count("у ворот") == 1
+
+
+async def test_compaction_takes_only_the_chronicle_from_the_model():
+    # Финальное ревью (I3): ответ сжатия шёл в снимок целиком, а страж сверяет
+    # только ключи — «ужатые» моделью атрибуты персонажа, реестр и списки
+    # («ключ №7», «ищет брата») пропадали молча. Сжатию позволено менять только
+    # хронику, поэтому из ответа берётся только она.
+    chars = ("- Эльвира — здоровье: ранена в плечо; при себе: ключ №7, письмо Артура; "
+             "скрытые мотивы: ищет брата")
+    reg = "- Таверна «Серый гусь» — место встречи; хозяин должен Артуру 30 золотых (#4)"
+    lists = "### Треки\n- «A» — тема; играла в сцене #3 (#1)"
+    state = _snap(chron=_LONG_CHRON, chars=chars, reg=reg, lists=lists)
+
+    async def llm(messages):
+        return _wrap(_snap(chron=_ARC, chars="- Эльвира — ранена",
+                           reg="- Таверна «Серый гусь» — место встречи",
+                           lists="### Треки\n- «A» — тема (#1)"))
+
+    m, _ = _mgr(llm, snapshot_tokens=10**6)
+    out = await m.compact(state, min_fold=1)
+    secs, before = hm.parse_sections(out), hm.parse_sections(state)
+    assert secs[hm.SEC_CHRONICLE] == _ARC
+    for sec in hm.GUARDED_SECTIONS:
+        assert secs[sec] == before[sec]
+    assert m.warnings == []
+
+
+@pytest.mark.parametrize("chron", ["—", "- [#1–#40] Арка «Начало»: половина пути"])
+async def test_compaction_that_drops_the_recent_chronicle_is_refused(chron):
+    # Нижняя граница ответа сжатия: пустая хроника (или хроника без последних
+    # записей) стёрла бы историю, которую потом вернёт только пересборка.
+    async def llm(messages):
+        return _wrap(_snap(chron=chron))
+
+    state = _snap(chron=_LONG_CHRON)
+    m, _ = _mgr(llm, snapshot_tokens=10**6)
+    assert await m.compact(state, min_fold=1) == state
+    assert any("хроник" in w and "оставлен прежний снимок" in w for w in m.warnings)
+
+
+async def test_budget_warning_is_dropped_once_compaction_brings_the_snapshot_back():
+    # Финальное ревью (M2): «превышает бюджет» с пакета, где сжатие не удалось,
+    # оставалось в итогах прогона (и в meta.warnings) после удачного сжатия
+    # следующего пакета — неверное дважды.
+    merges, compacts = [], []
+
+    async def llm(messages):
+        if messages[0]["content"] == hm.MASTER_STATE_PROMPT:
+            merges.append(1)
+            n = 79 + len(merges)
+            return _wrap(_snap(chron=_LONG_CHRON + f"\n- [#{n}–#{n}] пакет"))
+        compacts.append(1)
+        return "ерунда" if len(compacts) == 1 else _wrap(_snap(chron=_ARC + "\n- [#81–#81] пакет"))
+
+    m, _ = _mgr(llm, batch_size=1, snapshot_tokens=600, validation_retries=0)
+    res = await m.scan_and_compress_history([_msg(80), _msg(81)])
+    assert len(compacts) == 2 and len(res.state) <= 600
+    assert not any(w.startswith("снимок превышает бюджет:") for w in res.warnings)
+    assert any(w.startswith("сжатие хроники не удалось") for w in res.warnings)
+
+
+async def test_cancel_interrupts_a_retry_pause_without_another_paid_call():
+    # Финальное ревью (M3): «Остановить» проверялся только между пакетами, а
+    # пауза повтора по Retry-After длится до 300 с — после неё шли ещё платные
+    # попытки. Отмена будит паузу сразу, новых запросов нет.
+    cancel, forever = asyncio.Event(), asyncio.Event()
+    attempts = []
+
+    async def llm(messages):
+        attempts.append(1)
+        raise _Err(429, retry_after=300)
+
+    async def long_sleep(seconds):
+        cancel.set()           # «Остановить» нажали посреди паузы
+        await forever.wait()   # настоящая пауза длилась бы минуты
+
+    m = hm.HierarchicalMemoryManager(llm, hm.MemoryConfig(delay_ms=0, max_retries=4),
+                                     sleep=long_sleep)
+    res = await asyncio.wait_for(
+        m.scan_and_compress_history([_msg(1), _msg(2)], cancel=cancel), 2)
+    assert res.status == "cancelled" and res.processed == 0 and len(attempts) == 1
+
+
+async def test_cancel_interrupts_the_pause_between_requests_and_keeps_the_batch():
+    # Пауза-ограничитель перед сжатием тоже прерывается: слитый (оплаченный)
+    # пакет записывается несжатым, а сжатие достанется следующему прогону.
+    cancel, forever = asyncio.Event(), asyncio.Event()
+    systems = []
+
+    async def llm(messages):
+        systems.append(messages[0]["content"])
+        return _wrap(_snap(chron=_LONG_CHRON))  # сверх бюджета — следом шло бы сжатие
+
+    async def long_sleep(seconds):
+        cancel.set()
+        await forever.wait()
+
+    m = hm.HierarchicalMemoryManager(
+        llm, hm.MemoryConfig(delay_ms=60_000, snapshot_tokens=600), sleep=long_sleep,
+        estimate_tokens=len)
+    res = await asyncio.wait_for(
+        m.scan_and_compress_history([_msg(1), _msg(2)], cancel=cancel), 2)
+    assert res.status == "cancelled" and res.processed == 2
+    assert systems == [hm.MASTER_STATE_PROMPT] and "событие 79" in res.state
+
+
+async def test_scan_accepts_batch_size_and_delay_like_the_spec_signature():
+    # Буквальная сигнатура ТЗ: scan_and_compress_history(chat_history,
+    # batch_size=20, delay_ms=1500) — переопределения конфигурации на один прогон.
+    calls = []
+    m, sleeps = _mgr(_echo_llm(calls))
+    res = await m.scan_and_compress_history([_msg(i) for i in range(1, 6)],
+                                            batch_size=2, delay_ms=1500)
+    assert res.batches == 3 and res.processed == 5 and sleeps == [1.5, 1.5]
+    assert (m.config.batch_size, m.config.delay_ms) == (20, 0)  # только на этот прогон
+
+
+def test_implausibly_long_limit_grows_with_the_budget():
+    # 200 000 символов — около 106 тыс. токенов русского текста: при бюджете
+    # снимка больше этого снимок в пределах бюджета отвергался как «неправдоподобный».
+    huge = _wrap(_snap(chron="- " + "событие " * 30_000))
+    assert "снимок неправдоподобно длинный" in hm.validate_snapshot(huge, None)[1]
+    roomy = hm.MemoryConfig(snapshot_tokens=100_000)
+    assert "снимок неправдоподобно длинный" not in hm.validate_snapshot(huge, None, config=roomy)[1]
+
+
+@pytest.mark.parametrize("unit", ["<think>x", "<think x", "<!--x", "<style>x", "<script a"])
+def test_normalization_is_fast_on_unclosed_blocks(unit):
+    # Финальное ревью (M5): тысячи незакрытых <think>/<!--/<style> в одном
+    # сообщении — квадратичный бэктрекинг, секунды синхронно в цикле событий на
+    # каждом ходу, пока пакет не записан.
+    import time
+    text = unit * (80_000 // len(unit))
+    started = time.perf_counter()
+    hm.normalize_message(_msg(1, text), max_chars=10**7)
+    hm.extract_snapshot(text)
+    assert time.perf_counter() - started < 1.0
+
+
+def test_paired_blocks_are_cut_like_before():
+    # Скорость — без смены смысла: блок режется до ПЕРВОГО закрытия после
+    # открытия, незакрытый блок остаётся текстом, регистр тегов не важен.
+    assert hm.normalize_message(_msg(1, "<think>а <think>б</think> хвост")).endswith("] хвост")
+    assert hm.normalize_message(_msg(1, "до <STYLE a=1>x</style > после")).endswith("] до  после")
+    assert hm.normalize_message(_msg(1, "a <!-- b --> c <!-- d")).endswith("] a  c <!-- d")
+    assert hm.normalize_message(_msg(1, "<style>x <!-- y --> z")).endswith("] <style>x  z")
+    assert hm.extract_snapshot("<think>a</think>текст <think>оборвано") == ("текст", False)
