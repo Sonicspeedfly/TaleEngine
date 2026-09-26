@@ -87,6 +87,9 @@ AiChat SSF/
 │  ├─ llm_gateway.py              # шлюз к LiteLLM: роутинг, мультимодальность, safety
 │  ├─ generation.py               # фоновые генерации: стоп, буфер при обрыве связи
 │  ├─ horae_memory.py             # сборка контекста: память Horae + персона + Author's Note
+│  ├─ horae_recall.py             # активное окно и атомарные факты долгой памяти
+│  ├─ hierarchical_memory.py      # ядро мастер-снимка: пакетная свёртка (только stdlib)
+│  ├─ memory_service.py           # мастер-снимок в БД: проходы, задания, статус, экспорт
 │  ├─ group_chat.py               # логика групповых чатов (режиссёр, очередь реплик)
 │  ├─ characters.py               # импорт/экспорт карточек SillyTavern (PNG/JSON, лорбук)
 │  ├─ chat_import.py              # импорт чатов SillyTavern (.jsonl, встроенные теги Horae)

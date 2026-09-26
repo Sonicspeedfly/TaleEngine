@@ -113,7 +113,30 @@ Node.js, npm и шаг компиляции не нужны.
   загруженного вложения — гонка с FileReader). `_dropBadAttachments` убирает битые,
   `_cleanAtts` шлёт на бэкенд только поля `AttachmentIn`. Пока грузятся — жёлтая плашка
   `.files-bar` и кнопка «⏳ файлы…».
-- **Память Horae:** `loadHorae`, `saveHorae`, `editHorae`, `deleteHorae`.
+- **Память Horae:** `loadHorae`, `saveHorae`, `editHorae`, `deleteHorae`. Запись
+  категории `summary` (мастер-снимок) в списке свёрнута в `<details>` «Показать
+  снимок (N строк)» (`textLines`), развёрнутая — с `white-space: pre-wrap`.
+- **Мастер-память чата** (вкладка «Память», блок «🧠 Мастер-память этого чата»;
+  подробно — [HORAE.md](HORAE.md)): `loadMemStatus` (статус `GET …/memory`; пока
+  задание `queued`/`running` — опрос раз в 1,5 с, `_memPollDelay`/`_stopMemPoll`,
+  номер запроса отсекает обогнанные ответы), `startMemJob(mode, resume)`
+  («Пересобрать с нуля», «Продолжить», «Догнать» — с подтверждением стоимости,
+  `_memCostText`), `cancelMemJob`, `purgeMemory`, `exportMemory` (`.md` через
+  `fetch`, имя из `Content-Disposition`), `memJobOutcome` (текст тоста и живого
+  региона по итогу: `snapshot_tokens`, `processed: 0` → текст предупреждения),
+  `_memFocus` (фокус на «Остановить» или заголовок блока после старта, сброса и
+  конца задания). Вычисляемые: `memJobActive`, `memJobLine`, `memJobPhase` («Пакет
+  N» — текущий при `merge`/`retry`/`compact`, «После пакета N» при `wait`),
+  `memWarnings` (`snapshot.warnings` + `job.warnings`, до пяти строк),
+  `memLastError` (`snapshot.last_error` + `retry_after`), `memSnapCap`
+  (`settings.max_snapshot_tokens`), `memTiers`/`memTierRows`/`memTiersGroup`
+  (монитор уровней; у группы — строка «монитор не считается»). Параметры пакетов:
+  `setMemPref`, `setMemoryWindow`, `_applyMemSettings` — поля «Размер пакета»,
+  «Пауза», «Бюджет снимка» (`MEM_UI_FIELDS`) берут значение из
+  `memStatus.settings` (то есть из `.env`), пока человек не поменял их сам, и
+  только выбранные им ключи уходят в `saveUiPrefs` (`_memUiSet`). Монитор
+  (`loadCtxStats`) пересчитывается при открытии вкладки, после задания и сброса,
+  после смены окна, бюджета снимка и бюджета хода.
 - **Персоны/Author's Note:** `loadPersonas`, `createPersona`, `applySessionMeta`.
 - **Аккаунты/друзья:** `submitAuth`, `logout`, `loadFriends`, `addFriend`,
   `acceptFriend`, `declineFriend`, `removeFriend`, `shareSession`.

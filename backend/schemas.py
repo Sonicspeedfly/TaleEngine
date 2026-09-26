@@ -238,6 +238,18 @@ class SessionFork(BaseModel):
     message_id: int
 
 
+class MemoryRebuildIn(BaseModel):
+    """
+    Задание мастер-памяти чата (вкладка «Память»): rebuild — собрать снимок с
+    нуля (resume — продолжить прерванную пересборку), catchup — свернуть бэклог
+    в текущий снимок. batch_size/delay_ms не заданы — берутся из настроек «ui».
+    """
+    mode: Literal["rebuild", "catchup"] = "rebuild"
+    resume: bool = False
+    batch_size: Optional[int] = Field(None, ge=1, le=200)
+    delay_ms: Optional[int] = Field(None, ge=0, le=60000)
+
+
 class GroupCreate(BaseModel):
     """Создание группового чата из нескольких персонажей."""
     name: str = "Групповой чат"

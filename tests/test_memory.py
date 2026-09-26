@@ -22,9 +22,10 @@ def test_ctx_budget_ui_overrides_default():
 
 @pytest.mark.asyncio
 async def test_auto_summary_creates_entry_and_tracks_progress():
+    from backend import hierarchical_memory as hm
     from backend import main, models
     from backend.database import AsyncSessionLocal, engine, init_db
-    from backend.horae_recall import DEFAULT_WINDOW
+    from backend.horae_recall import DEFAULT_WINDOW, FACTS_PROMPT
 
     # Пул соединений мог быть создан в чужом event loop (TestClient) — сбрасываем.
     await engine.dispose()
@@ -58,7 +59,10 @@ async def test_auto_summary_creates_entry_and_tracks_progress():
         assert "событие номер 12" not in joined and "событие номер 31" not in joined
         # Расход служебных вызовов учитывается отдельно от самого чата.
         assert kind == "summary"
-        return "Герои пережили двенадцать событий и заключили союз."
+        if messages[0]["content"] == FACTS_PROMPT:
+            return "Герои пережили двенадцать событий и заключили союз."
+        return hm.render_snapshot(
+            {hm.SEC_CHRONICLE: "- [#1–#12] Герои пережили двенадцать событий и заключили союз."})
 
     with patch("backend.main.complete", new=fake_complete):
         await main._maybe_update_summary(sid)

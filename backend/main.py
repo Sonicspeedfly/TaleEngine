@@ -53,6 +53,7 @@ from backend import (
     debug_log,
     group_chat,
     knowledge,
+    memory_service,
     models,
     native_io,
     telegram_runtime,
@@ -97,6 +98,7 @@ from backend.schemas import (
     GroupCreate,
     HoraeEntryUpdate,
     ImagePrompt,
+    MemoryRebuildIn,
     MessageEdit,
     PersonaBase,
     PersonaRead,
@@ -411,419 +413,86 @@ def _kb_chars(params) -> int | None:
 
 
 # ==================== АВТО-СВОДКА СЮЖЕТА (память Horae) ====================
-# Каждые ~N новых сообщений фоновая задача сжимает их в запись Horae
-# «Сводка сюжета (авто)» (always_on): даже когда старая история выпадает из окна
-# контекста, её суть остаётся видимой модели. Это и есть «долгая память» чата.
-_AUTO_SUMMARY_EVERY = settings.AUTO_SUMMARY_EVERY  # сообщений между обновлениями сводки
-_AUTO_SUMMARY_MARK = "__auto__"   # метка авто-записи в keywords
-_AUTO_SUMMARY_TITLE = "📜 Память чата (авто)"
+# Фоновая задача после каждого хода сворачивает вышедшую из окна переписку в
+# мастер-снимок — запись Horae «📜 Память чата (авто)» (always_on): даже когда
+# старая история выпадает из окна контекста, её суть остаётся видимой модели.
+# Это и есть «долгая память» чата. Сам движок — backend/memory_service.py
+# (поверх ядра hierarchical_memory); здесь — тонкие обёртки и прежние имена,
+# на которые опираются остальной код и тесты.
+_AUTO_SUMMARY_MARK = memory_service.AUTO_SUMMARY_MARK
+_AUTO_SUMMARY_TITLE = memory_service.AUTO_SUMMARY_TITLE
+_summary_last_id = memory_service.summary_last_id
+_int_or_zero = memory_service.int_or_zero
+_clamp_summary_pointer = memory_service.clamp_summary_pointer
+_adopt_summary = memory_service.adopt_summary
+_ui_flag = memory_service.ui_flag
+_SUMMARY_CHUNK_CHARS = settings.MEMORY_BATCH_CHARS         # потолок пакета в символах
+_SUMMARY_MAX_CHUNKS = settings.MEMORY_MAX_BATCHES_PER_TURN  # пакетов за ход: бэклог догоняется за несколько ходов
+_summary_running = memory_service._busy  # чаты, где прогон памяти идёт прямо сейчас
 
 logger = logging.getLogger("aichat.summary")
 
 
-def _summary_last_id(entry) -> int:
+def _memory_deps() -> memory_service.MemoryDeps:
     """
-    До какого сообщения авто-сводка уже учла события.
-
-    Читаем из служебного поля meta, но поддерживаем и СТАРЫЙ формат — метку
-    "last:123" внутри keywords. Старый формат был хрупким: keywords пользователь
-    правит руками в интерфейсе, и достаточно было тронуть ключевые слова записи
-    «Память чата (авто)», чтобы указатель исчез и сводка пересобиралась заново.
+    complete и get_connection для сервиса памяти — с поздним связыванием:
+    лямбды берут глобалы main в момент вызова, поэтому
+    patch("backend.main.complete") в тестах действует и на сервис.
     """
-    if entry is None:
-        return 0
-    meta = getattr(entry, "meta", None)
-    if isinstance(meta, dict):
-        try:
-            value = int(meta.get("last_message_id") or 0)
-            if value > 0:
-                return value
-        except (TypeError, ValueError):
-            pass
-    for kw in (entry.keywords or []):  # легаси-метка
-        if isinstance(kw, str) and kw.startswith("last:"):
-            try:
-                return int(kw[5:])
-            except ValueError:
-                pass
-    return 0
-
-
-def _int_or_zero(value) -> int:
-    try:
-        return max(0, int(value or 0))
-    except (TypeError, ValueError):
-        return 0
-
-
-async def _clamp_summary_pointer(db, session_id: int) -> int | None:
-    """
-    Не даёт указателю авто-сводки стоять дальше последнего сообщения чата.
-    Возвращает новый указатель, если его пришлось сдвинуть; коммит — за вызывающим.
-
-    id сообщений в SQLite без AUTOINCREMENT: после удаления самых свежих
-    сообщений следующие получают ТЕ ЖЕ id. Раньше указатель при этом стоял на
-    месте, и переписанный заново ответ с «чужим» id считался уже учтённым: в
-    сводку и факты он не попадал никогда, а активное окно потом выбрасывало его
-    из контекста как «пересказанный». В памяти же жил удалённый текст.
-
-    Указатель ставится на последнее ОСТАВШЕЕСЯ сообщение, а не в ноль. Всё, что
-    осталось в чате, лежит до него и в сводке уже учтено. Сброс в ноль заставлял
-    модель заново «дописывать» в старую сводку весь чат с самого начала как
-    новые события — сюжет в хронике откатывался к первой сцене на десятки ходов,
-    а факты дублировались. Факты из удалённых сообщений уходят вместе с ними.
-
-    То же для указателя пересборки старой сводки (meta["rebuild"], см.
-    _summary_pass): он живёт по тем же id. Прижатие НЕ повышает версию сводки —
-    указатель старого формата так и остаётся недоверенным для окна.
-    """
-    entry = (await db.execute(
-        select(models.HoraeEntry).where(
-            models.HoraeEntry.session_id == session_id,
-            models.HoraeEntry.category == "summary",
-        )
-    )).scalars().first()
-    if entry is None:
-        return None
-    max_id = (await db.execute(
-        select(func.max(models.Message.id)).where(models.Message.session_id == session_id)
-    )).scalar() or 0
-    meta = dict(entry.meta or {})
-    moved = False
-    if _summary_last_id(entry) > max_id:
-        meta["last_message_id"] = max_id
-        # Легаси-метку «last:N» тоже убираем: при указателе 0 в meta она бы снова
-        # вернула старое значение (см. _summary_last_id).
-        entry.keywords = [
-            k for k in (entry.keywords or [])
-            if not (isinstance(k, str) and k.startswith("last:"))
-        ] or [_AUTO_SUMMARY_MARK]
-        moved = True
-    rebuild = meta.get("rebuild")
-    if isinstance(rebuild, dict) and _int_or_zero(rebuild.get("last_message_id")) > max_id:
-        meta["rebuild"] = {**rebuild, "last_message_id": max_id}
-        moved = True
-    if not moved:
-        return None
-    entry.meta = meta
-    await db.execute(sql_delete(models.HoraeFact).where(
-        models.HoraeFact.session_id == session_id,
-        models.HoraeFact.source_message_id > max_id,
-    ))
-    return max_id
-
-
-# Промпт скользящей сводки. Три раздела из требований к памяти (сюжет и цель,
-# решения и события, персонажи и инвентарь) плюс незакрытые линии — ради них
-# память и заводилась: обещание из начала чата не должно теряться к его концу.
-_SUMMARY_PROMPT = (
-    "Ты ведёшь СТРУКТУРИРОВАННУЮ память ролевого чата. Обнови память: слей "
-    "старую версию с новыми событиями, ничего важного не теряя. Верни ТОЛЬКО "
-    "текст памяти по разделам (пустые разделы опускай), без вступлений:\n\n"
-    "### Текущее состояние сюжета\n"
-    "(где все сейчас, что происходит прямо сейчас, текущая цель героев)\n"
-    "### Ключевые решения и события\n"
-    "(по порядку, маркированным списком, кратко: что случилось и что решили)\n"
-    "### Персонажи: статусы и инвентарь\n"
-    "(кто есть кто, отношения, раны и состояния, что у кого при себе)\n"
-    "### Локации и мир\n"
-    "(важные места, правила мира)\n"
-    "### Незакрытые линии\n"
-    "(обещания, загадки, цели, что ещё не разрешилось)\n\n"
-    "Пиши сжато и по делу. Обновляй факты (если состояние изменилось — "
-    "заменяй старое новым), не раздувай объём бесконечно."
-)
-_SUMMARY_CHUNK_CHARS = 24000  # столько текста переписки уходит в один проход сводки
-_SUMMARY_MAX_CHUNKS = 6       # проходов за запуск: большой бэклог догоняется за несколько ходов
-_summary_running: set[int] = set()  # чаты, по которым сводка сейчас считается
-
-
-def _adopt_summary(entry, content: str, last_id: int) -> None:
-    """
-    Записывает сводку текущего формата: текст, указатель «учтено до» и версию,
-    которой окно верит (horae_recall.SUMMARY_FORMAT). Незаконченная пересборка
-    старой сводки при этом уходит — эта сводка её и заменяет. Коммит — за
-    вызывающим.
-    """
-    from backend import horae_recall
-
-    meta = dict(entry.meta or {})
-    meta.pop("rebuild", None)
-    # Указатель — в служебное meta, а не в keywords: keywords пользователь
-    # редактирует руками, и правка ключевых слов ломала сводку.
-    meta.update(last_message_id=last_id, v=horae_recall.SUMMARY_FORMAT)
-    entry.meta = meta
-    entry.title = _AUTO_SUMMARY_TITLE
-    entry.content = (content or "")[:6000]
-    entry.keywords = [_AUTO_SUMMARY_MARK]
-    entry.always_on = True
-    entry.enabled = True
-    entry.priority = 50  # сводка важнее рядовых записей, но ниже ручных «100+»
-
-
-def _ui_flag(ui, key: str, default: bool = True) -> bool:
-    """Булев флаг из настроек «ui»: выключен только явным false."""
-    if ui and isinstance(ui.value, dict) and key in ui.value:
-        return ui.value.get(key) is not False
-    return default
+    return memory_service.MemoryDeps(
+        complete=lambda *a, **k: complete(*a, **k),
+        get_connection=lambda db: get_connection(db),
+    )
 
 
 async def _maybe_update_summary(session_id: int) -> None:
     """
-    Фоновое обновление памяти чата: скользящая сводка + атомарные факты.
+    Фоновое обновление памяти чата: мастер-снимок + атомарные факты.
     Любая ошибка здесь не роняет ход.
 
-    Раньше за один проход в модель уходили первые 24 000 символов новых
-    сообщений, а указатель «учтено до» ставился на ПОСЛЕДНЕЕ из них. В
-    импортированном или просто длинном чате всё, что не влезло в эти символы,
-    считалось учтённым и навсегда выпадало из памяти. Теперь бэклог режется на
-    куски, и указатель двигается только за тем, что модель действительно видела.
+    Бэклог режется на пакеты, и указатель двигается только за тем, что модель
+    действительно видела. За ход — не больше _SUMMARY_MAX_CHUNKS пакетов:
+    большой бэклог (импорт) догоняется за несколько ходов, а целиком — кнопкой
+    «Догнать»/«Пересобрать» во вкладке «Память». Ошибку прохода сервис
+    записывает в meta.last_error (её видно во вкладке), и следующие ходы
+    ждут паузу, а не повторяют платный провал на каждом ходу.
     """
-    if session_id in _summary_running:
-        return  # предыдущий запуск ещё идёт — второй посчитал бы те же сообщения
-    _summary_running.add(session_id)
+    if memory_service.is_busy(session_id):
+        return  # идёт задание или прошлый проход — второй посчитал бы те же сообщения
     try:
-        try:
-            for _ in range(_SUMMARY_MAX_CHUNKS):
-                if not await _summary_pass(session_id):
-                    break
-        except Exception:  # noqa: BLE001 — фоновая задача не должна ничего ронять
-            logger.exception("Авто-сводка чата %s не обновилась", session_id)
-        try:
-            # Отдельно от сводки: векторы нужны и при выключенной авто-сводке, и
-            # сбой сводки не должен останавливать их досчёт.
-            await _backfill_fact_vectors(session_id)
-        except Exception:  # noqa: BLE001
-            logger.exception("Векторы фактов чата %s не досчитались", session_id)
-    finally:
-        _summary_running.discard(session_id)
+        await memory_service.run_incremental(
+            session_id, _memory_deps(), max_batches=_SUMMARY_MAX_CHUNKS)
+    except Exception:  # noqa: BLE001 — фоновая задача не должна ничего ронять
+        logger.exception("Авто-сводка чата %s не обновилась", session_id)
+    try:
+        # Отдельно от сводки: векторы нужны и при выключенной авто-сводке, и
+        # сбой сводки не должен останавливать их досчёт.
+        await _backfill_fact_vectors(session_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("Векторы фактов чата %s не досчитались", session_id)
 
 
 async def _summary_pass(session_id: int) -> bool:
-    """Один проход сводки. True — проход сделан и в бэклоге ещё что-то осталось."""
-    from backend import horae_recall
+    """
+    Один пакет памяти. True — пакет записан и в бэклоге ещё что-то осталось.
 
-    async with AsyncSessionLocal() as db:
-        # Выключатель (вкладка «Память»): settings/ui -> auto_summary=false.
-        ui = await db.get(models.AppSetting, "ui")
-        if not _ui_flag(ui, "auto_summary"):
-            return False
-        want_facts = _ui_flag(ui, "horae_facts")
-        entry = (await db.execute(
-            select(models.HoraeEntry).where(
-                models.HoraeEntry.session_id == session_id,
-                models.HoraeEntry.category == "summary",
-            )
-        )).scalars().first()
-        # Указатель мог «уехать в будущее»: пользователь удалил последние
-        # сообщения, а чат старше этой защиты в delete_message. Тогда условие
-        # id > last_id не выполнялось бы НИКОГДА — сводка молча умирала навсегда.
-        # Указатель прижимается к последнему оставшемуся сообщению (не в ноль —
-        # см. _clamp_summary_pointer).
-        old_id = _summary_last_id(entry)
-        clamped = await _clamp_summary_pointer(db, session_id)
-        if clamped is not None:
-            logger.info(
-                "Указатель авто-сводки чата %s указывал на #%s, а последнее "
-                "сообщение — #%s (сообщения удаляли). Указатель прижат.",
-                session_id, old_id, clamped,
-            )
-            await db.commit()
-        # Сводка старого формата (до 2.4.0) пересобирается с нуля: она резала
-        # реплики до 1500 символов, а бэклог — до 24 000, и её указателю окно не
-        # верит (см. horae_recall.SUMMARY_FORMAT). Новая копится в
-        # meta["rebuild"], а в контекст до конца пересборки идёт СТАРАЯ: иначе
-        # на время догонки середина чата не была бы ни в пересказе, ни дословно.
-        meta = dict(entry.meta or {}) if entry is not None else {}
-        legacy = entry is not None and meta.get("v") != horae_recall.SUMMARY_FORMAT
-        rebuild = meta.get("rebuild") if isinstance(meta.get("rebuild"), dict) else {}
-        if legacy:
-            last_id = _int_or_zero(rebuild.get("last_message_id"))
-        else:
-            last_id = _summary_last_id(entry)
-        # Сжимается только то, что СТАРШЕ активного окна (см. horae_recall).
-        # Раньше в сводку и факты уходил и ответ, сохранённый миллисекунды назад.
-        # Пользователь потом перегенерировал его, жал «Продолжить» или правил
-        # текст, но указатель уже стоял за ним: новая версия в память не
-        # попадала никогда, а когда сообщение выходило из окна, модели оставался
-        # только пересказ ОТВЕРГНУТОГО свайпа. Пока сообщение в окне, модель видит
-        # его дословно; сжимается оно, уже устоявшись.
-        # Окно читается так же, как в horae_memory._long_memory: разойдись они —
-        # и сводка снова сжимала бы реплики, которые ещё лежат в окне и которые
-        # ещё могут перегенерировать или поправить.
-        ui_value = ui.value if ui and isinstance(ui.value, dict) else {}
-        try:
-            window = int(ui_value.get("memory_window", horae_recall.DEFAULT_WINDOW))
-        except (TypeError, ValueError):
-            window = horae_recall.DEFAULT_WINDOW
-        q = select(models.Message).where(
-            models.Message.session_id == session_id,
-            models.Message.id > last_id,
-        )
-        if window > 0:
-            # id самого старого сообщения окна: всё, что с ним и новее, ждёт.
-            window_from = (await db.execute(
-                select(models.Message.id)
-                .where(models.Message.session_id == session_id)
-                .order_by(models.Message.id.desc())
-                .offset(window - 1).limit(1)
-            )).scalar()
-            if window_from is None:
-                return False  # чат короче окна — модель и так видит его целиком
-            q = q.where(models.Message.id < window_from)
-        fresh = (await db.execute(q.order_by(models.Message.id))).scalars().all()
-        fresh = [m for m in fresh if (m.content or "").strip()]
-        # Порог настраивается в UI (вкладка «Память»): реже = дешевле, ведь
-        # каждое обновление сводки — ОТДЕЛЬНЫЙ платный запрос к модели.
-        every = _AUTO_SUMMARY_EVERY
-        if ui and isinstance(ui.value, dict) and ui.value.get("summary_every"):
-            try:
-                every = max(2, int(ui.value["summary_every"]))
-            except (TypeError, ValueError):
-                pass
-        if len(fresh) < every:
-            # Пересборка догнала бэклог настолько, насколько его догнал бы
-            # обычный сводчик: остаток меньше порога ждёт и у него. Подменяем
-            # сейчас, без вызова модели, — иначе старая сводка жила бы до тех
-            # пор, пока в чате не наберётся ещё summary_every сообщений.
-            if legacy and rebuild.get("content") and last_id:
-                _adopt_summary(entry, rebuild["content"], last_id)
-                await db.commit()
-            return False  # ещё рано — копим события
-        # Кусок не длиннее _SUMMARY_CHUNK_CHARS, но хотя бы одно сообщение.
-        # Сообщение идёт в кусок ЦЕЛИКОМ. Раньше каждое резалось до 1500
-        # символов, а указатель всё равно считал его учтённым: хвост длинного
-        # ответа (в ролевых чатах это 2–4 тысячи символов, и обещание часто
-        # стоит в конце) не попадал ни в сводку, ни в факты, а после выхода из
-        # окна пропадал и из контекста. Размер прохода и так ограничен куском.
-        # Одно сообщение длиннее куска (вставленный документ, гигантский ответ)
-        # режется до начала и конца: целиком оно шло бы отдельным запросом
-        # больше окна быстрой модели, запрос падал, указатель стоял, и КАЖДЫЙ
-        # следующий ход повторял ту же платную неудачу — память замирала.
-        lines: list[tuple[int, str]] = []
-        size = 0
-        half = _SUMMARY_CHUNK_CHARS // 2
-        for m in fresh:
-            line = (
-                f"{m.speaker_name or ('Пользователь' if m.role == 'user' else 'Персонаж')}: "
-                + (m.content or "")
-            )
-            if len(line) > _SUMMARY_CHUNK_CHARS:
-                line = line[:half] + "\n[…середина длинного сообщения пропущена…]\n" + line[-half:]
-            if lines and size + len(line) > _SUMMARY_CHUNK_CHARS:
-                break
-            lines.append((m.id, line))
-            size += len(line) + 1
-        transcript = "\n".join(t for _, t in lines)
-        newest_id = lines[-1][0]
-        more = len(lines) < len(fresh)
-        if legacy:
-            prev = (rebuild.get("content") or "") or "(пока пусто)"
-        else:
-            prev = (entry.content if entry else "") or "(пока пусто)"
-        # Факты — только из сообщений новее уже разобранных. Сводку можно начать
-        # заново (удалили запись «Память чата (авто)», пересборка старой), а
-        # факты при этом остаются: повторный разбор того же куска давал
-        # пересказанные другими словами дубли, и они занимали места в отборе.
-        facts_upto = (await db.execute(
-            select(func.max(models.HoraeFact.source_message_id))
-            .where(models.HoraeFact.session_id == session_id)
-        )).scalar() or 0
-        facts_transcript = "\n".join(t for mid, t in lines if mid > facts_upto)
-        # Отпечаток куска: перед записью проверим, что модель пересказала то,
-        # что лежит в чате сейчас (см. ниже).
-        chunk_sig = {m.id: hash(m.content or "") for m in fresh[:len(lines)]}
-        first_id = lines[0][0]
-        connection = await get_connection(db)
+    Остаток берётся из прогресса ядра (total − processed после пакета — это
+    DbBatchSource.pending()), а не из статуса прогона: при max_batches=1 ядро
+    ставит «limit» и тогда, когда бэклог уже пуст.
+    """
+    left: list[int] = []
+    result = await memory_service.run_incremental(
+        session_id, _memory_deps(), max_batches=1,
+        on_progress=lambda p: left.append(p.total - p.processed))
+    return bool(result and result.batches and left and left[-1] > 0)
 
-    # Фоновая работа идёт на быстрой модели, если она задана в подключении:
-    # сводке и фактам дорогая модель чата не нужна. Модель подменяется в
-    # ПОДКЛЮЧЕНИИ, а params остаются None. Через GenerationParams(model=…) вызов
-    # переставал быть служебным: у params фильтры безопасности по умолчанию
-    # включены (disable_safety=False), и на жёстком ролевом эпизоде провайдер
-    # блокировал сводку. Указатель тогда не двигался, каждый ход повторял
-    # платную попытку, а память чата молча замирала именно там, где нужна.
-    fast = (connection.get("summary_model") or "").strip()
-    bg_conn = {**connection, "default_model": fast} if fast else connection
 
-    # LLM-вызов ВНЕ сессии БД (может занять десятки секунд).
-    summary = (await complete(
-        [
-            {"role": "system", "content": _SUMMARY_PROMPT},
-            {"role": "user", "content": f"[Текущая память]\n{prev}\n\n[Новые события]\n{transcript}"},
-        ],
-        None, bg_conn, kind="summary",
-    )).strip()
-    if not summary:
-        return False
-
-    facts: list[str] = []
-    if want_facts and facts_transcript:
-        try:
-            facts = horae_recall.parse_facts(await complete(
-                [
-                    {"role": "system", "content": horae_recall.FACTS_PROMPT},
-                    {"role": "user", "content": f"[Новые события]\n{facts_transcript}"},
-                ],
-                None, bg_conn, kind="summary",
-            ))
-        except Exception:  # noqa: BLE001 — без фактов сводка всё равно полезна
-            logger.exception("Факты чата %s не извлеклись", session_id)
-
-    async with AsyncSessionLocal() as db:
-        # Пока модель считала, сообщения куска могли удалить или переписать, а
-        # освободившийся id — занять новый ответ (SQLite отдаёт id удалённых
-        # последних строк заново). Прижатие указателя этого не ловит: чат снова
-        # доходит до того же id. Тогда указатель лёг бы на текст, которого
-        # сводка не видела, и окно выбросило бы его из контекста навсегда.
-        # Кусок сверяется целиком; не совпал — проход не пишется и повторится.
-        now = {
-            mid: hash(content or "")
-            for mid, content in (await db.execute(
-                select(models.Message.id, models.Message.content).where(
-                    models.Message.session_id == session_id,
-                    models.Message.id >= first_id, models.Message.id <= newest_id,
-                )
-            )).all()
-            if (content or "").strip()
-        }
-        if now != chunk_sig:
-            logger.info("Кусок сводки чата %s изменился, пока модель считала: "
-                        "проход не записан и повторится", session_id)
-            return False
-        entry = (await db.execute(
-            select(models.HoraeEntry).where(
-                models.HoraeEntry.session_id == session_id,
-                models.HoraeEntry.category == "summary",
-            )
-        )).scalars().first()
-        created = entry is None
-        if created:
-            entry = models.HoraeEntry(session_id=session_id, category="summary")
-            db.add(entry)
-        meta = dict(entry.meta or {})
-        # Пересборка старой сводки продолжается, пока в бэклоге есть сообщения;
-        # догнала — подмена целиком. Не раньше: у сводки из импорта указатель
-        # неизвестен, и подмена «по указателю» случалась после первого же куска —
-        # хроника всего чата менялась на пересказ его первых сообщений. Если
-        # старую запись удалили, пока шёл проход, пересобранная сводка валидна
-        # сама по себе (покрывает всё до newest_id) и записывается сразу.
-        if (legacy and not created and more
-                and meta.get("v") != horae_recall.SUMMARY_FORMAT):
-            meta["rebuild"] = {"content": summary[:6000], "last_message_id": newest_id}
-            entry.meta = meta
-        else:
-            _adopt_summary(entry, summary, newest_id)
-        await db.commit()
-        # Факты — после коммита сводки и не бросают исключений: их сбой не
-        # должен откатить уже посчитанную (и оплаченную) сводку.
-        if facts:
-            await horae_recall.store_facts(db, session_id, facts, newest_id, connection)
-        # Пока модель считала, сообщения куска могли удалить: тогда указатель
-        # (и факты из них) прижимаются так же, как при удалении.
-        if await _clamp_summary_pointer(db, session_id) is not None:
-            await db.commit()
-    return more
+# Чаты, где досчёт векторов фактов идёт прямо сейчас. ПОЧЕМУ отдельно от
+# занятости памяти (_summary_running): досчёт идёт ПОСЛЕ прохода памяти, когда
+# замок чата уже отпущен, — иначе долгий досчёт держал бы и сжатие. Но тогда
+# ничто не мешало следующему ходу запустить второй досчёт тех же фактов: после
+# смены модели эмбеддингов это до сотен платных векторов, посчитанных дважды.
+_backfill_running: set[int] = set()
 
 
 async def _backfill_fact_vectors(session_id: int) -> None:
@@ -833,15 +502,24 @@ async def _backfill_fact_vectors(session_id: int) -> None:
     Эмбеддинги включили или сменили модель — старые факты чата получают векторы
     новой модели. Пока досчёт не кончился, поиск идёт по словам (см.
     horae_recall.recall), поэтому тянуть его на сотни сообщений нельзя.
+    Один досчёт на чат за раз (_backfill_running): пока идёт первый, второй
+    ход досчёт пропускает — остаток доделает следующий.
     """
     from backend import horae_recall
 
-    async with AsyncSessionLocal() as db:
-        ui = await db.get(models.AppSetting, "ui")
-        if not _ui_flag(ui, "horae_facts"):
-            return
-        connection = await get_connection(db)
-        await horae_recall.backfill_all(db, session_id, connection)
+    # Проверка и отметка — до первого await: иначе два хода оба прошли бы её.
+    if session_id in _backfill_running:
+        return
+    _backfill_running.add(session_id)
+    try:
+        async with AsyncSessionLocal() as db:
+            ui = await db.get(models.AppSetting, "ui")
+            if not _ui_flag(ui, "horae_facts"):
+                return
+            connection = await get_connection(db)
+            await horae_recall.backfill_all(db, session_id, connection)
+    finally:
+        _backfill_running.discard(session_id)
 
 
 # ---- Колбэки сохранения ответа ассистента (после завершения генерации) ----
@@ -1386,7 +1064,106 @@ async def inspect_context(
     )
     report["character"] = character.name
     report["model"] = (params.model if params else "") or ""
+    if sess.is_group:
+        # Монитор уровней считает конвейер ЛИЧНОГО чата (окно, снимок в
+        # хвосте), а ход группы собирает group_chat.build_group_messages: окна
+        # нет, транскрипт идёт целиком, снимок — в системном промпте, и так на
+        # каждого отвечающего. Для группы монитор занижал цену хода в разы и
+        # писал «выброшено окном» про сообщения, которые уходят дословно
+        # (финальное ревью). Честнее не показывать уровни вовсе.
+        report["tiers"] = None
+        report["tiers_unavailable"] = "group"
     return report
+
+
+# ==================== МАСТЕР-ПАМЯТЬ ЧАТА (вкладка «Память») ====================
+# Статус, задания «Пересобрать»/«Догнать», сброс и экспорт снимка. Логика —
+# в memory_service; здесь только доступ и HTTP-обёртка.
+async def _memory_session(db, session_id: int, user):
+    """
+    Чат для эндпоинтов памяти: нет чата — 404, чужой — 403.
+
+    Существование проверяется ДО доступа: _can_access_session(None) даёт False,
+    и удалённый чат иначе выглядел бы для интерфейса как чужой.
+    """
+    sess = await db.get(models.ChatSession, session_id)
+    if sess is None:
+        raise HTTPException(404, "Чат не найден")
+    if not await _can_access_session(db, sess, user):
+        raise HTTPException(403, "Нет доступа к этому чату")
+    return sess
+
+
+@app.get("/api/sessions/{session_id}/memory")
+async def memory_status(
+    session_id: int, user=Depends(current_user), db: AsyncSession = Depends(get_session)
+):
+    """Снимок, буфер пересборки, бэклог, факты и последнее задание памяти чата."""
+    await _memory_session(db, session_id, user)
+    # Подключение — ради лимита вывода модели памяти (settings.max_snapshot_tokens).
+    return await memory_service.status(db, session_id, connection=await get_connection(db))
+
+
+@app.post("/api/sessions/{session_id}/memory/rebuild", status_code=202)
+async def memory_rebuild(
+    session_id: int,
+    payload: MemoryRebuildIn,
+    user=Depends(current_user),
+    db: AsyncSession = Depends(get_session),
+):
+    """
+    Запустить задание памяти. Ответ — сразу (202): пересборка большого чата —
+    это сотни платных запросов, прогресс интерфейс опрашивает через GET /memory.
+    """
+    await _memory_session(db, session_id, user)
+    try:
+        job = await memory_service.start_job(
+            session_id, _memory_deps(), mode=payload.mode, resume=payload.resume,
+            batch_size=payload.batch_size, delay_ms=payload.delay_ms)
+    except memory_service.JobConflict:
+        raise HTTPException(409, "Память этого чата уже пересобирается")
+    return {"job": job.to_dict()}
+
+
+@app.post("/api/sessions/{session_id}/memory/cancel")
+async def memory_cancel(
+    session_id: int, user=Depends(current_user), db: AsyncSession = Depends(get_session)
+):
+    """Остановить задание между пакетами. ok=False — останавливать было нечего."""
+    await _memory_session(db, session_id, user)
+    job = memory_service.cancel_job(session_id)
+    shown = job or memory_service.get_job(session_id)
+    return {"ok": job is not None, "job": shown.to_dict() if shown else None}
+
+
+@app.delete("/api/sessions/{session_id}/memory")
+async def memory_purge(
+    session_id: int, user=Depends(current_user), db: AsyncSession = Depends(get_session)
+):
+    """Сбросить мастер-снимок и атомарные факты чата; сообщения остаются."""
+    await _memory_session(db, session_id, user)
+    return await memory_service.purge(db, session_id)
+
+
+@app.get("/api/sessions/{session_id}/memory/export")
+async def memory_export(
+    session_id: int,
+    facts: bool = False,
+    user=Depends(current_user),
+    db: AsyncSession = Depends(get_session),
+):
+    """Мастер-снимок .md-файлом (facts=1 — с приложением атомарных фактов)."""
+    await _memory_session(db, session_id, user)
+    exported = await memory_service.export_markdown(db, session_id, include_facts=facts)
+    if exported is None:
+        raise HTTPException(404, "Снимка памяти у этого чата ещё нет")
+    filename, text = exported
+    # Имя с кириллицей: HTTP-заголовки — только latin-1, поэтому ASCII-запасное
+    # имя + RFC 5987 (filename*) с процент-кодированием UTF-8, как в export_canvas.
+    disposition = (f'attachment; filename="memory-{session_id}.md"; '
+                   f"filename*=UTF-8''{urllib.parse.quote(filename)}")
+    return Response(text, media_type="text/markdown; charset=utf-8",
+                    headers={"Content-Disposition": disposition})
 
 
 @app.post("/api/sessions/{session_id}/fork")
@@ -1520,6 +1297,10 @@ async def delete_session(
     sess = await db.get(models.ChatSession, session_id)
     if not await _can_access_session(db, sess, user):
         raise HTTPException(403, "Нет доступа к этому чату")
+    # Задание памяти (пересборка/догонялка) снимается и забывается ДО удаления
+    # строк: id этого чата достанется следующему новому, и тот не должен ни
+    # видеть чужое задание, ни получать в память его работу (см. forget_job).
+    memory_service.forget_job(session_id)
     # Данные вложений сообщений этого чата (blob-таблица) — до удаления сообщений.
     await delete_message_blobs(
         db, select(models.Message.id).where(models.Message.session_id == session_id)
@@ -1916,8 +1697,8 @@ async def delete_message(message_id: int, db: AsyncSession = Depends(get_session
         await db.flush()
         # Удалили самые свежие сообщения — их id SQLite выдаст новым. Указатель
         # сводки прижимается к оставшимся СЕЙЧАС, до того как новые сообщения
-        # займут эти id и сойдут за уже учтённые (см. _clamp_summary_pointer).
-        await _clamp_summary_pointer(db, session_id)
+        # займут эти id и сойдут за уже учтённые (см. memory_service.clamp_summary_pointer).
+        await memory_service.clamp_summary_pointer(db, session_id)
         await db.commit()
     return {"ok": True}
 
