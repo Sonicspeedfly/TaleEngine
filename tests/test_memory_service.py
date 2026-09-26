@@ -3,6 +3,7 @@
 задания пересборки, статус, сброс и экспорт. LLM подменяется через
 backend.main.complete — как во всех тестах памяти.
 """
+import asyncio
 from unittest.mock import patch
 
 import pytest
@@ -168,17 +169,19 @@ async def test_incremental_batch_carries_files_time_and_skips_blank_messages():
 
 async def test_batch_time_honours_offset_and_survives_impossible_one():
     """
-    Пояс чата — свободный ввод в настройках. Смещение «+03:00» переводит время
-    строки пакета, а невозможное «UTC+25» оставляет его в UTC. Раньше
-    timezone() бросал ValueError на смещении от 24 часов: загрузка пакета
-    падала на каждом ходу, и память чата переставала обновляться.
+    Пояс чата — свободный ввод в настройках. IANA-имя и смещения «UTC+3» и
+    «+03:00» переводят время строки пакета, а мусор, неизвестный пояс и
+    невозможное «UTC+25» оставляют его в UTC. Раньше timezone() бросал
+    ValueError на смещении от 24 часов: загрузка пакета падала на каждом ходу,
+    и память чата переставала обновляться.
     """
     from datetime import datetime
 
     from backend import main, models
     from backend.database import AsyncSessionLocal, engine
     await _fresh_db()
-    for tz, shown in (("+03:00", "14:03"), ("UTC+25", "11:03")):
+    for tz, shown in (("Europe/Moscow", "14:03"), ("UTC+3", "14:03"), ("+03:00", "14:03"),
+                      ("Nowhere/Land", "11:03"), ("мусор", "11:03"), ("UTC+25", "11:03")):
         _, sid, ids = await _make_chat(12 + hr.DEFAULT_WINDOW)
         async with AsyncSessionLocal() as db:
             (await db.get(models.ChatSession, sid)).timezone = tz
@@ -621,3 +624,365 @@ def test_memory_endpoints_respect_access(client):
             json={"accounts_enabled": False, "admin_password": ""},
             headers={**ha, "X-Admin-Password": "hms_pw"},
         )
+
+
+# ============================================================================
+# Доработки по ревью задач 5–6 (задача 9)
+# ============================================================================
+async def test_fact_vector_backfill_runs_once_per_chat_at_a_time():
+    """
+    Досчёт векторов фактов идёт вне замка памяти чата (_busy снят до него).
+    Долгий досчёт (смена модели эмбеддингов — до сотен векторов) и следующий
+    ход запускали второй досчёт тех же фактов — платные вызовы впустую.
+    """
+    from backend import main
+    from backend.database import engine
+    await _fresh_db()
+    _, sid, _ = await _make_chat(3)
+    calls = []
+
+    async def slow_backfill(db, session_id, connection, *a, **k):
+        calls.append(session_id)
+        await asyncio.sleep(0.05)
+        return 0
+
+    with patch("backend.horae_recall.backfill_all", new=slow_backfill):
+        await asyncio.gather(main._backfill_fact_vectors(sid), main._backfill_fact_vectors(sid))
+        assert calls == [sid]
+        await main._backfill_fact_vectors(sid)  # первый кончился — следующий ход досчитывает снова
+    assert calls == [sid, sid] and sid not in main._backfill_running
+    await engine.dispose()
+
+
+@pytest.mark.parametrize("older, merges, upto", [(30, 2, 29), (25, 1, 19)])
+async def test_incremental_continues_manual_rebuild_buffer_and_swaps_when_caught_up(
+        older, merges, upto):
+    """
+    Ручная пересборка (v=2 + буфер manual: true), прерванная, например,
+    перезапуском сервера. Ежеходный проход продолжает буфер, пока в бэклоге
+    что-то есть, а в контекст идёт прежний снимок. Буфер догнал бэклог —
+    подмена: последним пакетом (30 старше окна: пакеты по 20 и 10) или без
+    вызова модели, когда остаток меньше summary_every (25: пакет 20, остаток 5).
+    Проходы по одному пакету (_summary_pass), чтобы видеть и промежуточный буфер.
+    """
+    from backend import main, models
+    from backend.database import AsyncSessionLocal, engine
+    await _fresh_db()
+    _, sid, ids = await _make_chat(older + hr.DEFAULT_WINDOW)
+    async with AsyncSessionLocal() as db:
+        db.add(models.HoraeEntry(
+            session_id=sid, category="summary", title="t", content="ЖИВОЙ", always_on=True,
+            enabled=True, meta={"last_message_id": ids[older - 1], "v": 2, "rebuild": {
+                "content": "", "last_message_id": 0, "manual": True}}))
+        await db.commit()
+    live = []
+    seen = []
+    fake = _snapshot_llm(seen)
+
+    async def watch_live(messages, params=None, connection=None, kind="service"):
+        if messages[0]["content"] == hm.MASTER_STATE_PROMPT:  # факты идут и после подмены
+            live.append((await _entry(sid)).content)
+        return await fake(messages, params, connection, kind)
+
+    with patch("backend.main.complete", new=watch_live):
+        assert await main._summary_pass(sid) is True             # бэклог ещё не догнан
+        entry = await _entry(sid)
+        assert entry.content == "ЖИВОЙ" and entry.meta["rebuild"]["last_message_id"] == ids[19]
+        assert entry.meta["rebuild"]["manual"] is True
+        assert await main._summary_pass(sid) is False
+    merged = [m[1]["content"] for m in seen if m[0]["content"] == hm.MASTER_STATE_PROMPT]
+    assert len(merged) == merges and all(c == "ЖИВОЙ" for c in live)
+    assert merged[0].startswith(f"[Текущая память]\n{hm.EMPTY_STATE}")  # с нуля, а не поверх живого
+    if merges == 2:
+        assert f"- [#{ids[0]}–#{ids[19]}] сжато" in merged[1]          # второй пакет — поверх буфера
+    entry = await _entry(sid)
+    assert "rebuild" not in entry.meta and entry.meta["last_message_id"] == ids[upto]
+    assert entry.meta["updated_by"] == "incremental" and entry.meta["schema"] == hm.SNAPSHOT_SCHEMA
+    assert "ЖИВОЙ" not in entry.content and f"## [{hm.SEC_CHRONICLE}]" in entry.content
+    await engine.dispose()
+
+
+async def test_job_error_texts_for_invalid_snapshot_and_source_conflict():
+    """Тексты ошибок задания для брака снимка и для куска, менявшегося под моделью."""
+    from backend import models
+    from backend.database import AsyncSessionLocal, engine
+    await _fresh_db()
+    _, sid, ids = await _make_chat(30 + hr.DEFAULT_WINDOW)
+
+    async def garbage(messages, params=None, connection=None, kind="service"):
+        return "просто пересказ без разделов"
+
+    with patch("backend.main.complete", new=garbage):
+        job = await _run_rebuild(sid, mode="catchup")
+    assert job.status == "error" and job.error.startswith("модель вернула снимок не по схеме: ")
+    assert f"нет раздела [{hm.SEC_LISTS}]" in job.error
+    assert await _entry(sid) is None
+
+    edits = []
+
+    async def edit_under_model(messages, params=None, connection=None, kind="service"):
+        if messages[0]["content"] == hm.MASTER_STATE_PROMPT:
+            edits.append(1)
+            async with AsyncSessionLocal() as db:
+                (await db.get(models.Message, ids[0])).content = f"правка {len(edits)}"
+                await db.commit()
+        return await _snapshot_llm([])(messages, params, connection, kind)
+
+    with patch("backend.main.complete", new=edit_under_model):
+        job = await _run_rebuild(sid, mode="catchup")
+    assert job.status == "error" and job.error == "переписка менялась во время сжатия, повторите"
+    assert len(edits) == 4                    # пакет и три пересборки подряд
+    assert await _entry(sid) is None
+    await engine.dispose()
+
+
+async def test_purge_during_running_job_cancels_it_and_deletes_memory():
+    """
+    «Сбросить» посреди пересборки: задание останавливается, начатый пакет
+    доводится, сброс ждёт его конца — и только потом стирает снимок и факты.
+    Иначе следующий пакет воскресил бы только что стёртую память.
+    """
+    from backend import main, memory_service, models
+    from backend.database import AsyncSessionLocal, engine
+    await _fresh_db()
+    _, sid, ids = await _make_chat(30 + hr.DEFAULT_WINDOW)
+    async with AsyncSessionLocal() as db:
+        db.add(models.HoraeFact(session_id=sid, content="ключ у стража", source_message_id=ids[0]))
+        await db.commit()
+    entered, release = asyncio.Event(), asyncio.Event()
+    merges = []
+
+    async def slow(messages, params=None, connection=None, kind="service"):
+        if messages[0]["content"] == hm.MASTER_STATE_PROMPT:
+            merges.append(1)
+            entered.set()
+            await release.wait()
+        return await _snapshot_llm([])(messages, params, connection, kind)
+
+    async def purge():
+        async with AsyncSessionLocal() as db:
+            return await memory_service.purge(db, sid)
+
+    with patch("backend.main.complete", new=slow):
+        job = await memory_service.start_job(sid, main._memory_deps(), mode="catchup", batch_size=10)
+        await entered.wait()
+        assert job.status == "running"
+        purging = asyncio.create_task(purge())
+        for _ in range(20):
+            if job.cancel.is_set():
+                break
+            await asyncio.sleep(0)
+        assert job.cancel.is_set() and not purging.done()   # отменил и ждёт конца пакета
+        release.set()
+        gone = await purging
+    assert job.status == "cancelled" and len(merges) == 1  # следующего пакета не было
+    assert gone == {"snapshot_deleted": True, "facts_deleted": 1}
+    assert await _entry(sid) is None
+    async with AsyncSessionLocal() as db:
+        assert (await memory_service.status(db, sid))["facts"]["count"] == 0
+    await engine.dispose()
+
+
+async def test_api_error_with_existing_snapshot_and_buffer_keeps_both():
+    """
+    Ошибка API посреди продолженной пересборки при живом снимке: снимок и его
+    указатель не тронуты, буфер стоит на последнем записанном пакете —
+    «Продолжить» доделает остаток (§6.5).
+    """
+    from backend import models
+    from backend.database import AsyncSessionLocal, engine
+    await _fresh_db()
+    _, sid, ids = await _make_chat(30 + hr.DEFAULT_WINDOW)
+    async with AsyncSessionLocal() as db:
+        db.add(models.HoraeEntry(
+            session_id=sid, category="summary", title="t", content="СТАРЫЙ", always_on=True,
+            enabled=True, meta={"last_message_id": ids[29], "v": 2, "rebuild": {
+                "content": hm.render_snapshot({hm.SEC_CHRONICLE: "- [#a–#b] уже сделано"}),
+                "last_message_id": ids[9], "manual": True}}))
+        await db.commit()
+
+    class Denied(Exception):
+        status_code = 401
+
+    merges = []
+
+    async def fail_second(messages, params=None, connection=None, kind="service"):
+        if messages[0]["content"] == hm.MASTER_STATE_PROMPT:
+            merges.append(1)
+            if len(merges) == 2:
+                raise Denied("no key")
+        return await _snapshot_llm([])(messages, params, connection, kind)
+
+    with patch("backend.main.complete", new=fail_second):
+        job = await _run_rebuild(sid, resume=True, batch_size=10)
+    assert job.status == "error" and job.error.startswith("Доступ к модели отклонён")
+    entry = await _entry(sid)
+    assert entry.content == "СТАРЫЙ" and entry.meta["last_message_id"] == ids[29]
+    buffer = entry.meta["rebuild"]
+    assert buffer["last_message_id"] == ids[19] and buffer["manual"] is True
+    assert f"- [#{ids[10]}–#{ids[19]}] сжато" in buffer["content"]
+    await engine.dispose()
+
+
+async def test_first_unreadable_batch_keeps_the_entry_off_until_text_appears():
+    """
+    Самый первый пакет чата нечитаем (одни <think>): указатель его проходит,
+    но пустая запись не включается — иначе в контекст уходил бы пустой блок
+    «Что было в истории». Первый непустой снимок её включает.
+    """
+    from backend import main, models
+    from backend.database import AsyncSessionLocal, engine
+    await _fresh_db()
+    _, sid, ids = await _make_chat(12 + hr.DEFAULT_WINDOW)
+    async with AsyncSessionLocal() as db:
+        for mid in ids[:12]:
+            (await db.get(models.Message, mid)).content = "<think>размышления модели</think>"
+        await db.commit()
+    seen = []
+    with patch("backend.main.complete", new=_snapshot_llm(seen)):
+        await main._maybe_update_summary(sid)
+    entry = await _entry(sid)
+    assert seen == [] and entry.meta["last_message_id"] == ids[11]
+    assert entry.content == "" and entry.enabled is False and entry.meta["tokens"] == 0
+
+    async with AsyncSessionLocal() as db:  # ещё 12 реплик — из окна вышли настоящие
+        db.add_all(models.Message(session_id=sid, role="user", content=f"новое {i}")
+                   for i in range(12))
+        await db.commit()
+    with patch("backend.main.complete", new=_snapshot_llm(seen)):
+        await main._maybe_update_summary(sid)
+    entry = await _entry(sid)
+    assert entry.enabled is True and f"## [{hm.SEC_CHRONICLE}]" in entry.content
+    assert entry.meta["last_message_id"] == ids[23]
+    await engine.dispose()
+
+
+def test_adopt_summary_counts_tokens_once_and_empty_weighs_nothing():
+    """
+    meta.tokens — одна оценка (horae_memory.estimate_tokens, как у менеджера):
+    переданное значение не пересчитывается, пустой снимок весит ноль.
+    """
+    from types import SimpleNamespace
+
+    from backend import memory_service
+    from backend.horae_memory import estimate_tokens
+    entry = SimpleNamespace(meta={}, title="", content="", keywords=[], always_on=False,
+                            enabled=False, priority=0)
+    snap = hm.render_snapshot({hm.SEC_CHRONICLE: "- [#1–#2] ворота открыты"})
+    memory_service.adopt_summary(entry, snap, 5)
+    assert entry.meta["tokens"] == estimate_tokens(snap) == memory_service.snapshot_tokens(snap)
+    with patch("backend.memory_service.estimate_tokens", side_effect=AssertionError("пересчёт")):
+        memory_service.adopt_summary(entry, snap, 6, tokens=7)
+    assert entry.meta["tokens"] == 7 and entry.enabled is True
+    memory_service.adopt_summary(entry, "  \n", 7)
+    assert entry.meta["tokens"] == 0 and entry.enabled is False
+
+
+def test_export_filename_is_capped():
+    """Название чата — до 300 символов; имя файла длиннее 255 браузер обрежет или не сохранит."""
+    from backend import memory_service
+    title = ("Долгая дорога домой. " * 15)[:300]
+    name = memory_service.export_filename(title, 7)
+    slug = name[len("memory-"):-len("-7.md")]
+    assert name.startswith("memory-Долгая_дорога_домой_") and name.endswith("-7.md")
+    assert len(slug) <= 80 and not slug.endswith("_")
+
+
+async def test_rebuild_with_nothing_older_than_window_keeps_snapshot_and_warns():
+    """
+    Пересобирать нечего (чат короче окна): прежний снимок остаётся, а задание
+    объясняет, почему «готово» ничего не изменило.
+    """
+    from backend import models
+    from backend.database import AsyncSessionLocal, engine
+    await _fresh_db()
+    _, sid, ids = await _make_chat(10)
+    async with AsyncSessionLocal() as db:
+        db.add(models.HoraeEntry(session_id=sid, category="summary", title="t",
+                                 content="СТАРЫЙ", always_on=True, enabled=True,
+                                 meta={"last_message_id": ids[5], "v": 2}))
+        await db.commit()
+    seen = []
+    with patch("backend.main.complete", new=_snapshot_llm(seen)):
+        job = await _run_rebuild(sid)
+    assert job.status == "done" and seen == []
+    assert job.warnings == ["пересборка не нашла сообщений старше окна — прежний снимок оставлен"]
+    entry = await _entry(sid)
+    assert entry.content == "СТАРЫЙ" and "rebuild" not in entry.meta
+    await engine.dispose()
+
+
+async def test_status_of_legacy_summary_agrees_with_its_backlog():
+    """
+    Сводка старого формата (без meta.v) пересобирается неявно: бэклог считается
+    от нуля. Статус показывает эту же цель — неявный буфер (manual: false,
+    указатель 0), иначе «учтено до #N» и «ждут сжатия 40» противоречили бы.
+    """
+    from backend import memory_service, models
+    from backend.database import AsyncSessionLocal, engine
+    await _fresh_db()
+    _, sid, ids = await _make_chat(40 + hr.DEFAULT_WINDOW)
+    async with AsyncSessionLocal() as db:
+        db.add(models.HoraeEntry(session_id=sid, category="summary", title="t",
+                                 content="Старая свободная сводка.", always_on=True, enabled=True,
+                                 meta={"last_message_id": ids[39]}))
+        await db.commit()
+        st = await memory_service.status(db, sid)
+    assert st["snapshot"]["covered_upto"] == ids[39] and st["backlog"]["pending"] == 40
+    assert st["staging"] == {"last_message_id": 0, "tokens": 0, "manual": False, "started_at": None}
+    await engine.dispose()
+
+
+async def test_job_is_started_when_it_leaves_the_queue():
+    """queued_at — постановка в очередь; started_at — переход в running, а не постановка."""
+    from backend import main, memory_service
+    from backend.database import engine
+    await _fresh_db()
+    _, sid, _ = await _make_chat(3)
+    lock = memory_service.session_lock(sid)
+    await lock.acquire()                      # ежеходный проход «идёт»
+    try:
+        job = await memory_service.start_job(sid, main._memory_deps(), mode="catchup")
+        await asyncio.sleep(0)
+        queued = job.to_dict()
+        assert queued["status"] == "queued" and queued["queued_at"] and queued["started_at"] is None
+    finally:
+        lock.release()
+    await memory_service.wait_job(sid)
+    done = job.to_dict()
+    assert done["status"] == "done" and done["started_at"] >= done["queued_at"]
+    await engine.dispose()
+
+
+async def test_free_chat_lock_is_dropped_but_never_while_someone_waits():
+    """
+    Реестр замков не копит чаты: asyncio.Lock привязывается к циклу событий
+    при первом ожидании, а id чатов повторяются (SQLite), и замок из чужого
+    цикла дал бы RuntimeError. Но замок, которого кто-то ждёт, из реестра не
+    убирается: следующий получил бы новый замок, и два прогона пошли бы разом.
+    """
+    from backend import main, memory_service
+    from backend.database import engine
+    await _fresh_db()
+    _, sid, _ = await _make_chat(30 + hr.DEFAULT_WINDOW)
+    with patch("backend.main.complete", new=_snapshot_llm([])):
+        await main._maybe_update_summary(sid)
+    assert sid not in memory_service._locks
+
+    held = []
+
+    async def check(messages, params=None, connection=None, kind="service"):
+        held.append(memory_service._locks.get(sid))
+        return await _snapshot_llm([])(messages, params, connection, kind)
+
+    with patch("backend.main.complete", new=check):
+        async with memory_service.chat_lock(sid):
+            lock = memory_service._locks[sid]
+            job = await memory_service.start_job(sid, main._memory_deps(), mode="rebuild")
+            await asyncio.sleep(0)
+            assert job.status == "queued"
+        assert memory_service._locks.get(sid) is lock  # задание ждёт — замок на месте
+        await memory_service.wait_job(sid)
+    assert job.status == "done" and held and all(h is lock for h in held)
+    assert sid not in memory_service._locks
+    await engine.dispose()

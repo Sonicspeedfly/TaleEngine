@@ -1,7 +1,9 @@
 """Монитор токенов по уровням памяти (report["tiers"]) и рендер мастер-снимка в хвосте."""
 from backend import hierarchical_memory as hm
 from backend import horae_recall as hr
-from backend.horae_memory import HoraeRecord, assemble_context, estimate_content_tokens
+from backend.config import Settings, settings
+from backend.horae_memory import (HoraeRecord, assemble_context, estimate_content_tokens,
+                                  knowledge_block)
 
 
 def _char():
@@ -18,14 +20,19 @@ def test_tiers_split_system_memory_window_current():
                       keywords=["__auto__"], always_on=True, enabled=True, priority=50)
     history = [{"role": "user", "content": f"реплика {i}"} for i in range(10)]
     report = {}
-    assemble_context(character=_char(), horae_records=[rec], history=history,
-                     user_message="Что дальше?", token_budget=200_000, report=report)
+    msgs = assemble_context(character=_char(), horae_records=[rec], history=history,
+                            user_message="Что дальше?", token_budget=200_000, report=report)
     t = report["tiers"]
     assert t["memory"] > 0 and t["window"] > 0 and t["system"] > 0 and t["current"] > 0
     assert t["total"] == t["system"] + t["memory"] + t["window"] + t["current"]
-    assert t["budget"] == 200_000 and t["model_limit"] == 1_000_000
+    # Лимит — из настроек: MODEL_CONTEXT_LIMIT в .env разработчика не должен
+    # ронять тест без регрессии. Дефолт проверяется отдельно, по полю Settings.
+    assert t["budget"] == 200_000 and t["model_limit"] == settings.MODEL_CONTEXT_LIMIT
+    assert Settings.model_fields["MODEL_CONTEXT_LIMIT"].default == 1_000_000
     keys = [b["key"] for b in report["tail"]]
     assert keys[0] == "snapshot" and "focus" in keys and "anchor" in keys
+    # Ключ блока хвоста нужен только отчёту: в модель сообщения уходят без него.
+    assert all(set(m) == {"role", "content"} for m in msgs)
 
 
 def test_structured_snapshot_is_rendered_without_title_prefix():
@@ -90,3 +97,61 @@ def test_current_counts_attachments_and_avatars_count_as_system():
     assemble_context(character=_char(), horae_records=[], history=[], user_message="",
                      token_budget=200_000, report=empty)
     assert empty["tiers"]["current"] == 0
+
+
+def test_snapshot_with_manual_summary_keeps_markup_and_puts_the_note_after_it():
+    """
+    Снимок и ручная запись категории summary срабатывают вместе. Раньше весь
+    блок уходил в старую ветку: префикс «- 📜 …:» прилипал к первому заголовку
+    снимка, а заметка оказывалась внутри раздела списков — модель читала её
+    как часть реестра. Теперь снимок идёт телом блока как есть (он первый,
+    хотя ручная запись с priority 100 сработала раньше), заметки — после него.
+    """
+    snap = hm.render_snapshot({hm.SEC_CHRONICLE: "- [#1–#9] Эльвира нашла карту.",
+                               hm.SEC_LISTS: "### Треки\n- «Lacrimosa» — тема утраты (#2)"})
+    auto = HoraeRecord(category="summary", title="📜 Память чата (авто)", content=snap,
+                       keywords=["__auto__"], always_on=True, enabled=True, priority=50)
+    note = HoraeRecord(category="summary", title="Моя заметка", content="Артур боится воды.",
+                       keywords=["заметка"], always_on=True, enabled=True, priority=100)
+    report = {}
+    msgs = assemble_context(character=_char(), horae_records=[note, auto], history=[],
+                            user_message="?", token_budget=200_000, report=report)
+    block = next(m["content"] for m in msgs if "ХРОНИКА И СОСТОЯНИЕ ЧАТА" in str(m["content"]))
+    assert "Мастер-снимок старой части чата" in block and "- 📜 Память чата (авто):" not in block
+    assert block.index("Мастер-снимок") < block.index(snap)       # разметка снимка цела
+    assert block.endswith(snap + "\n\nДополнительные записи памяти:\n- Моя заметка: Артур боится воды.")
+    assert report["tail"][0]["key"] == "snapshot"
+    assert report["tiers"]["memory"] == report["tail"][0]["tokens"]
+
+
+def test_two_free_summaries_keep_the_old_list():
+    """Без снимка новой схемы — прежний список «- заголовок: текст» без подзаголовка."""
+    recs = [HoraeRecord(category="summary", title=t, content=c, keywords=["__auto__"],
+                        always_on=True, enabled=True, priority=p)
+            for t, c, p in (("Сводка", "Герои в Дольне.", 50), ("Заметка", "Артур ранен.", 100))]
+    msgs = assemble_context(character=_char(), horae_records=recs, history=[],
+                            user_message="?", token_budget=200_000)
+    block = next(m["content"] for m in msgs if "ХРОНИКА И СОСТОЯНИЕ ЧАТА" in str(m["content"]))
+    assert block.endswith("\n- Заметка: Артур ранен.\n- Сводка: Герои в Дольне.")
+    assert "Дополнительные записи памяти" not in block
+
+
+def test_knowledge_media_and_wrappers_count_as_system():
+    """
+    База знаний в Tier 1 — целиком: обе служебные обёртки knowledge_block и
+    медиа (картинка ≈ 400 токенов), как аватары. Раньше считался только её
+    текст, и монитор занижал вес хода на сотни токенов за каждый файл.
+    """
+    media = [{"role": "user", "content": [
+        {"type": "text", "text": "[База знаний — файл «map.png»]"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}]
+    kw = dict(character=_char(), horae_records=[], history=[], user_message="?",
+              token_budget=200_000, knowledge_text="Ключ от башни — у стража.")
+    plain, rich = {}, {}
+    assemble_context(**kw, report=plain)
+    assemble_context(**kw, report=rich, knowledge_media=media)
+    assert rich["tiers"]["system"] - plain["tiers"]["system"] >= 400
+    assert rich["tiers"]["system"] - plain["tiers"]["system"] == estimate_content_tokens(media[0]["content"])
+    whole = sum(estimate_content_tokens(m["content"]) for m in knowledge_block(kw["knowledge_text"], media))
+    tail_system = sum(b["tokens"] for b in rich["tail"] if b["key"] not in ("snapshot", "recalled"))
+    assert rich["tiers"]["system"] == rich["system_tokens"] + whole + tail_system

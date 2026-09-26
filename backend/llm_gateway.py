@@ -256,9 +256,10 @@ def _merge_params(params: Optional[GenerationParams]) -> dict:
 
 # Переопределение сэмплинга для служебного вызова (память) без протаскивания
 # params через complete/stream_completion: params=None у памяти держит фильтры
-# безопасности выключенными (см. main._summary_pass), а нужны СВОИ температура
-# и длинный вывод под снимок. ContextVar, а не аргумент функции — так сигнатуры
-# complete/stream_completion не меняются (подмены в тестах на них рассчитаны).
+# безопасности выключенными (см. memory_service.build_manager), а нужны СВОИ
+# температура и длинный вывод под снимок. ContextVar, а не аргумент функции —
+# так сигнатуры complete/stream_completion не меняются (подмены в тестах на них
+# рассчитаны).
 _SAMPLING_OVERRIDES: ContextVar[Optional[dict]] = ContextVar("sampling_overrides", default=None)
 # Только сэмплинг-параметры litellm — не даём протащить сюда что-то ещё по ошибке.
 _OVERRIDABLE = ("max_tokens", "temperature", "top_p")

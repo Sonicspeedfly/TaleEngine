@@ -485,6 +485,14 @@ async def _summary_pass(session_id: int) -> bool:
     return bool(result and result.batches and left and left[-1] > 0)
 
 
+# Чаты, где досчёт векторов фактов идёт прямо сейчас. ПОЧЕМУ отдельно от
+# занятости памяти (_summary_running): досчёт идёт ПОСЛЕ прохода памяти, когда
+# замок чата уже отпущен, — иначе долгий досчёт держал бы и сжатие. Но тогда
+# ничто не мешало следующему ходу запустить второй досчёт тех же фактов: после
+# смены модели эмбеддингов это до сотен платных векторов, посчитанных дважды.
+_backfill_running: set[int] = set()
+
+
 async def _backfill_fact_vectors(session_id: int) -> None:
     """
     Досчёт векторов старых фактов после каждого хода, а не раз в проход сводки.
@@ -492,15 +500,24 @@ async def _backfill_fact_vectors(session_id: int) -> None:
     Эмбеддинги включили или сменили модель — старые факты чата получают векторы
     новой модели. Пока досчёт не кончился, поиск идёт по словам (см.
     horae_recall.recall), поэтому тянуть его на сотни сообщений нельзя.
+    Один досчёт на чат за раз (_backfill_running): пока идёт первый, второй
+    ход досчёт пропускает — остаток доделает следующий.
     """
     from backend import horae_recall
 
-    async with AsyncSessionLocal() as db:
-        ui = await db.get(models.AppSetting, "ui")
-        if not _ui_flag(ui, "horae_facts"):
-            return
-        connection = await get_connection(db)
-        await horae_recall.backfill_all(db, session_id, connection)
+    # Проверка и отметка — до первого await: иначе два хода оба прошли бы её.
+    if session_id in _backfill_running:
+        return
+    _backfill_running.add(session_id)
+    try:
+        async with AsyncSessionLocal() as db:
+            ui = await db.get(models.AppSetting, "ui")
+            if not _ui_flag(ui, "horae_facts"):
+                return
+            connection = await get_connection(db)
+            await horae_recall.backfill_all(db, session_id, connection)
+    finally:
+        _backfill_running.discard(session_id)
 
 
 # ---- Колбэки сохранения ответа ассистента (после завершения генерации) ----

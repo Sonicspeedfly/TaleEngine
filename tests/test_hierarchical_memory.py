@@ -855,7 +855,7 @@ def test_header_survives_any_max_chars():
 
 def test_batch_chars_has_a_floor():
     assert hm.MemoryConfig(batch_max_chars=30).batch_max_chars == 2000
-    assert hm.MemoryConfig(batch_max_chars=0).batch_max_chars == 2000
+    assert hm.MemoryConfig(batch_max_chars=-5).batch_max_chars == 2000
     assert hm.MemoryConfig(batch_max_chars=5000).batch_max_chars == 5000
 
 
@@ -1003,3 +1003,146 @@ def test_real_base64_is_cut_but_long_text_is_kept():
     for text in ("x" * 5000,
                  "Эльвира долго смотрела на море и вспоминала обещание Артура. " * 40):
         assert hm.normalize_message(_msg(3, text)).endswith(f"] {text.strip()}")
+
+
+# ==================== Доработки по ревью (задача 9) ====================
+
+def test_english_stage_remarks_in_angle_brackets_are_kept():
+    # Атрибут без значения признаётся только из списка булевых атрибутов HTML.
+    # Раньше им считалось любое латинское слово, и частые в англоязычном
+    # ролевом чате ремарки пропадали целиком — сообщение выпадало из пакета.
+    for text in ("<time skip>", "<a few hours later>", "<summary of events>", "<small talk>",
+                 "<i думаю, что он врёт>"):
+        assert hm.normalize_message(_msg(1, text)).endswith(f"] {text}")
+    for html, plain in (("<details open>текст</details>", "текст"),
+                        ("<DETAILS OPEN>текст</DETAILS>", "текст"),
+                        ('<a href="x">ссылка</a>', "ссылка"),
+                        ("<video controls autoplay muted loop playsinline>ролик</video>", "ролик"),
+                        ("<input type=checkbox checked disabled>пункт", "пункт")):
+        assert hm.normalize_message(_msg(1, html)).endswith(f"] {plain}")
+
+
+def test_card_and_svg_tags_are_stripped():
+    # Оформление карточек и SVG: раньше эти теги оставались в транскрипте текстом.
+    for html, plain in (
+            ("<strike>старое</strike> новое", "старое новое"),
+            ("<dl><dt>Имя</dt><dd>Эльвира</dd></dl>", "ИмяЭльвира"),
+            ("<table><caption>Итог</caption><tfoot></tfoot></table>", "Итог"),
+            ("<nav>меню</nav> <main>суть</main> <aside>сбоку</aside>", "меню суть сбоку"),
+            ('<svg><defs><linearGradient id="g"><stop offset="0"/></linearGradient>'
+             '<RadialGradient id="r"></RadialGradient></defs><circle cx="1" r="2"/>'
+             '<rect x=1 /><line x1=0 /><polygon points="0,0"/><polyline points="1"/>'
+             '<ellipse rx=1 /><text x="1"><tspan>Надпись</tspan></text></svg>', "Надпись")):
+        assert hm.normalize_message(_msg(1, html)).endswith(f"] {plain}")
+
+
+def test_extract_ignores_envelope_mention_after_the_snapshot():
+    # Зеркальный случай «последней обёртки»: упоминание тега ПОСЛЕ снимка
+    # давало «закрыта.» с флагом «обрезан» и платный корректирующий ход.
+    raw = _wrap(_snap()) + f"\nОбёртка {hm.ENVELOPE_OPEN} закрыта."
+    assert hm.extract_snapshot(raw) == (_snap(), False)
+    # И закрытое упоминание после снимка: последний закрытый — не снимок.
+    raw = _wrap(_snap()) + f"\nФормат: {hm.ENVELOPE_OPEN}…{hm.ENVELOPE_CLOSE}."
+    assert hm.extract_snapshot(raw) == (_snap(), False)
+    # Нет структурированного закрытого кандидата — последний закрытый.
+    assert hm.extract_snapshot(f"{hm.ENVELOPE_OPEN}a{hm.ENVELOPE_CLOSE} "
+                               f"{hm.ENVELOPE_OPEN}b{hm.ENVELOPE_CLOSE}") == ("b", False)
+    # Закрытых нет вовсе — последний открытый, и ответ обрезан.
+    assert hm.extract_snapshot(f"{hm.ENVELOPE_OPEN} упоминание\n{hm.ENVELOPE_OPEN}\n"
+                               + _snap()) == (_snap(), True)
+
+
+def test_batch_chars_none_or_zero_means_default():
+    # None и 0 — «по умолчанию» (80 000), а не TypeError в конструкторе и не
+    # молчаливые пакеты по 2000 символов; мусор — тоже дефолт.
+    for value in (None, 0, "", "мусор"):
+        assert hm.MemoryConfig(batch_max_chars=value).batch_max_chars == 80_000, value
+    assert hm.MemoryConfig(batch_max_chars="5000").batch_max_chars == 5000
+
+
+async def test_budget_warning_after_partial_compaction_names_the_cause():
+    # Модель свернула хронику лишь частично (записей для свёртки ещё на порог),
+    # а бюджет превышают списки — сами по себе больше бюджета. Без пояснения
+    # «X из Y» не объясняло, что автоматически это не пройдёт.
+    partial = "\n".join([_ARC] + [f"- [#{i}–#{i}] событие {i}" for i in range(60, 80)])
+
+    async def llm(messages):
+        return _wrap(_snap(chron=partial, lists=_BIG_LIST))
+
+    m, _ = _mgr(llm, snapshot_tokens=300)
+    out = await m.compact(_snap(chron=_LONG_CHRON, lists=_BIG_LIST))
+    assert "Арка «Дорога»" in out and m._foldable(out) >= hm._fold_threshold(12)
+    assert m.warnings == [_over_budget(len(out), 300)]
+
+
+async def test_failed_compaction_does_not_claim_the_chronicle_is_compacted():
+    # Сжатие не удалось — «хроника уже сжата» было бы неправдой, хотя списки
+    # и тут больше бюджета.
+    async def llm(messages):
+        return "ерунда"
+
+    m, _ = _mgr(llm, snapshot_tokens=300, validation_retries=0)
+    state = _snap(chron=_LONG_CHRON, lists=_BIG_LIST)
+    assert await m.compact(state) == state
+    assert m.warnings[-1] == (f"снимок превышает бюджет: {_nbsp_int(len(state))} из 300 токенов")
+
+
+async def test_direct_merge_after_a_run_warns_again():
+    # Отсчёт предупреждений прогона сбрасывается в конце прогона: иначе прямой
+    # merge_block/compact молча глотал предупреждение, уже выданное прогоном.
+    prev = _snap(lists="### Треки\n- «A» — тема (#1)\n- «B» — тема (#2)")
+
+    async def forgetful(messages):
+        return _wrap(_snap(lists="### Треки\n- «A» — тема (#1)"))
+
+    lost = "модель потеряла 1 запись — возвращены из предыдущего снимка"
+    m, _ = _mgr(forgetful)
+    res = await m.scan_and_compress_history([_msg(1)], prev)
+    assert res.warnings == [lost]
+    await m.merge_block(prev, hm.plan_batch([_msg(2)], batch_size=20, max_chars=10**6))
+    assert m.warnings == [lost, lost]
+
+
+async def test_length_error_folds_arcs_when_no_plain_entries_are_left():
+    # Длинный чат: хроника — «40 арок + 12 последних», обычных записей старше
+    # keep нет. Модель упёрлась в лимит вывода: раньше сжатие не звали вовсе
+    # (сворачивать «нечего»), и повтор слияния снова упирался в тот же лимит.
+    # Теперь на пути length сворачиваются и арки — в арку более высокого уровня.
+    arcs = [f"- [#{i * 10 + 1}–#{i * 10 + 10}] Арка «Глава {i}»: суть" for i in range(40)]
+    recent = [f"- [#{i}–#{i}] событие {i}" for i in range(401, 413)]
+    folded = "\n".join(["- [#1–#400] Арка «Книга»: суть сорока глав", *recent])
+    systems = []
+
+    async def llm(messages):
+        systems.append(messages[0]["content"])
+        if len(systems) == 1:
+            raise RuntimeError("Технически: ПУСТОЙ ответ, finish_reason=LENGTH.")
+        if messages[0]["content"] == hm.MASTER_STATE_PROMPT:
+            return _wrap(_snap(chron=folded + "\n- [#413–#413] пакет"))
+        return _wrap(_snap(chron=folded))
+
+    m, _ = _mgr(llm)
+    state = await m.merge_block(_snap(chron="\n".join(arcs + recent)),
+                                hm.plan_batch([_msg(413)], batch_size=20, max_chars=10**6))
+    assert len(systems) == 3
+    assert systems[0] == systems[2] == hm.MASTER_STATE_PROMPT
+    assert systems[1].startswith(hm.COMPACT_PROMPT.format(budget=int(12_000 * 0.8), keep=12))
+    assert hm.COMPACT_ARCS_PROMPT in systems[1]
+    assert "Арка «Книга»" in state and "Арка «Глава 0»" not in state
+
+
+async def test_length_error_does_not_fold_when_chronicle_fits_in_keep():
+    # Записей хроники не больше keep — сворачивать нечего и на пути length.
+    systems = []
+
+    async def llm(messages):
+        systems.append(messages[0]["content"])
+        if len(systems) == 1:
+            raise RuntimeError("Технически: ПУСТОЙ ответ, finish_reason=LENGTH.")
+        return _wrap(_snap())
+
+    m, _ = _mgr(llm)
+    chron = "\n".join(f"- [#{i}–#{i}] событие {i}" for i in range(1, 13))  # ровно keep
+    await m.merge_block(_snap(chron=chron), hm.plan_batch([_msg(13)], batch_size=20,
+                                                          max_chars=10**6))
+    assert systems == [hm.MASTER_STATE_PROMPT] * 2

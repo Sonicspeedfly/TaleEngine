@@ -22,6 +22,7 @@ MemoryDeps с поздним связыванием: main передаёт ля�
 import asyncio
 import logging
 import re
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Awaitable, Callable
@@ -151,6 +152,19 @@ async def clamp_summary_pointer(db, session_id: int) -> int | None:
     return max_id
 
 
+def snapshot_tokens(content) -> int:
+    """
+    Размер снимка в токенах — одна оценка на meta.tokens, статус и экспорт.
+
+    Тем же horae_memory.estimate_tokens, что у менеджера ядра (build_manager):
+    раньше число считали в трёх местах, и одно из них брало внедрённый в
+    источник оценщик, а другое — модульный, то есть две оценки на одно поле.
+    Пустой снимок (или одни пробелы) весит ноль, как пустой блок в инспекторе.
+    """
+    text = str(content or "")
+    return estimate_tokens(text) if text.strip() else 0
+
+
 def adopt_summary(entry, content: str, last_id: int, *, tokens: int | None = None,
                   updated_by: str = "incremental", warnings=None) -> None:
     """
@@ -165,6 +179,9 @@ def adopt_summary(entry, content: str, last_id: int, *, tokens: int | None = Non
     договорённости из начала чата. От мусора защищает проверка ядра (снимок
     длиннее hm.MAX_SNAPSHOT_CHARS не принимается), от раздувания — бюджет
     снимка и сжатие хроники в арки.
+
+    tokens — уже посчитанный размер: передан — не пересчитывается, иначе
+    snapshot_tokens(content).
     """
     content = content or ""
     meta = dict(entry.meta or {})
@@ -175,7 +192,7 @@ def adopt_summary(entry, content: str, last_id: int, *, tokens: int | None = Non
         last_message_id=last_id,
         v=horae_recall.SUMMARY_FORMAT,
         schema=hm.SNAPSHOT_SCHEMA,
-        tokens=int(tokens) if tokens is not None else (estimate_tokens(content) if content else 0),
+        tokens=int(tokens) if tokens is not None else snapshot_tokens(content),
         updated_by=updated_by,
         warnings=list(warnings or [])[-5:],
     )
@@ -184,13 +201,26 @@ def adopt_summary(entry, content: str, last_id: int, *, tokens: int | None = Non
     entry.content = content
     entry.keywords = [AUTO_SUMMARY_MARK]
     entry.always_on = True
-    entry.enabled = True
+    # Пустой снимок (самый первый пакет чата нечитаем — одни <think>) не
+    # включается: указатель его проходит, но в контекст ушёл бы пустой блок
+    # «Что было в истории». Первый непустой снимок запись включает.
+    entry.enabled = bool(content.strip())
     entry.priority = 50  # сводка важнее рядовых записей, но ниже ручных «100+»
 
 
 # ============================================================================
 # Настройки из «ui»
 # ============================================================================
+async def _ui_setting(db) -> tuple[object | None, dict]:
+    """
+    Строка настроек «ui» и её значение-словарь ({} — нет строки или мусор).
+    Один помощник на весь сервис: раньше то же выражение стояло в трёх
+    местах, и однажды одно из них прочло бы настройку иначе.
+    """
+    ui = await db.get(models.AppSetting, "ui")
+    return ui, (ui.value if ui is not None and isinstance(ui.value, dict) else {})
+
+
 def ui_flag(ui, key: str, default: bool = True) -> bool:
     """Булев флаг из настроек «ui»: выключен только явным false."""
     if ui and isinstance(ui.value, dict) and key in ui.value:
@@ -480,8 +510,9 @@ class DbBatchSource:
 
     def __init__(self, session_id: int, *, mode: str, threshold: int,
                  manager: hm.HierarchicalMemoryManager, want_facts: bool, connection: dict,
-                 window: int, estimate_tokens: Callable[[str], int] = estimate_tokens,
-                 alive: Callable[[], bool] | None = None):
+                 window: int, alive: Callable[[], bool] | None = None):
+        # Своего оценщика токенов у источника нет: размер снимка в meta.tokens
+        # считает adopt_summary (snapshot_tokens) — одна оценка на поле.
         if mode not in _MODES:
             raise ValueError(f"неизвестный режим памяти: {mode!r}")
         self.session_id = session_id
@@ -491,7 +522,6 @@ class DbBatchSource:
         self.want_facts = want_facts
         self.connection = connection
         self.window = window
-        self._est = estimate_tokens
         self._alive = alive or (lambda: True)
 
     # ------------------------------------------------------ протокол ядра
@@ -543,7 +573,7 @@ class DbBatchSource:
                 if (self.mode != "rebuild" and target.rebuilding
                         and target.state and target.pointer):
                     adopt_summary(target.entry, target.state, target.pointer,
-                                  tokens=self._est(target.state), updated_by=self.mode)
+                                  updated_by=self.mode)
                     await db.commit()
                 return []  # ещё рано — копим события
             return await load_memory_messages(db, session, target.pointer, before, limit=limit)
@@ -596,7 +626,6 @@ class DbBatchSource:
                 entry.meta = meta
             else:
                 adopt_summary(entry, new_state, batch.last_id,
-                              tokens=self._est(new_state) if new_state else 0,
                               updated_by=self.mode, warnings=self.manager.warnings)
             if not self._alive():
                 # Чат удалили, пока модель считала, и его id мог уже достаться
@@ -664,23 +693,80 @@ class DbBatchSource:
 # Занятость чата и ежеходный инкремент (§6.4)
 # ============================================================================
 # Один прогон памяти на чат за раз: второй посчитал бы те же сообщения и
-# записал бы снимок поверх первого. Замок общий у ежеходного инкремента и
-# заданий пересборки; _busy — чаты, где прогон идёт прямо сейчас (main видит
-# его как _summary_running).
+# записал бы снимок поверх первого. Замок общий у ежеходного инкремента,
+# заданий пересборки и сброса; _busy — чаты, где прогон идёт прямо сейчас
+# (main видит его как _summary_running).
 _locks: dict[int, asyncio.Lock] = {}
+# Сколько вызывающих держат замок чата или ждут его через chat_lock. По нулю
+# замок убирается из реестра (см. chat_lock).
+_lock_users: dict[int, int] = {}
 _busy: set[int] = set()
 
 
 def session_lock(session_id: int) -> asyncio.Lock:
+    """
+    Замок чата из реестра (создаётся при первом обращении). Сервис берёт его
+    только через chat_lock — она и убирает свободный замок; прямой доступ —
+    для тестов, которым нужно «занять» чат снаружи.
+    """
     lock = _locks.get(session_id)
     if lock is None:
         lock = _locks[session_id] = asyncio.Lock()
     return lock
 
 
+@asynccontextmanager
+async def chat_lock(session_id: int):
+    """
+    Держать замок чата на время блока; на выходе свободный замок без
+    ожидающих убирается из реестра.
+
+    ПОЧЕМУ убирать. asyncio.Lock привязывается к циклу событий при первом
+    ожидании, а реестр жил вечно: id чатов повторяются (SQLite отдаёт id
+    удалённого чата новому), и замок, однажды ожидавшийся в другом цикле
+    (тесты гоняют каждый в своём), дал бы «RuntimeError: … is bound to a
+    different event loop». Да и копить замки всех когда-либо тронутых чатов
+    незачем. ПОЧЕМУ считать вызывающих, а не смотреть на сам замок: пока
+    кто-то ждёт, lock.locked() в момент выхода бывает False, а удалить замок
+    из-под ожидающего нельзя — следующий вызывающий получил бы новый замок,
+    и два прогона пошли бы над одним чатом разом.
+    """
+    lock = session_lock(session_id)
+    _lock_users[session_id] = _lock_users.get(session_id, 0) + 1
+    try:
+        async with lock:
+            yield
+    finally:
+        left = _lock_users.get(session_id, 1) - 1
+        if left > 0:
+            _lock_users[session_id] = left
+        else:
+            _lock_users.pop(session_id, None)
+            if not lock.locked() and _locks.get(session_id) is lock:
+                del _locks[session_id]
+
+
 def is_busy(session_id: int) -> bool:
     lock = _locks.get(session_id)
     return session_id in _busy or (lock is not None and lock.locked())
+
+
+def _make_run(session_id: int, deps: MemoryDeps, *, mode: str, threshold: int, ui,
+              ui_value: dict, connection: dict, alive: Callable[[], bool] | None = None,
+              **overrides) -> tuple[hm.HierarchicalMemoryManager, dict, DbBatchSource]:
+    """
+    Всё для одного прогона → (менеджер, подключение фоновых вызовов, источник).
+    Один помощник на ежеходный проход и на задание: сборка была продублирована
+    почти дословно, и правка одной копии (окно, флаг фактов) разошлась бы с
+    другой. overrides — размер пакета и пауза задания (см. build_manager).
+    """
+    manager, bg_conn = build_manager(connection, ui_value, deps, **overrides)
+    source = DbBatchSource(
+        session_id, mode=mode, threshold=threshold, manager=manager,
+        want_facts=ui_flag(ui, "horae_facts"), connection=connection,
+        window=_memory_window(ui_value), alive=alive,
+    )
+    return manager, bg_conn, source
 
 
 async def run_incremental(session_id: int, deps: MemoryDeps, *, max_batches: int,
@@ -698,22 +784,18 @@ async def run_incremental(session_id: int, deps: MemoryDeps, *, max_batches: int
     """
     if is_busy(session_id):
         return None
-    async with session_lock(session_id):
+    async with chat_lock(session_id):
         _busy.add(session_id)
         try:
             async with AsyncSessionLocal() as db:
                 # Выключатель (вкладка «Память»): settings/ui -> auto_summary=false.
-                ui = await db.get(models.AppSetting, "ui")
+                ui, ui_value = await _ui_setting(db)
                 if not ui_flag(ui, "auto_summary"):
                     return None
                 connection = await deps.get_connection(db)
-            ui_value = ui.value if ui and isinstance(ui.value, dict) else {}
-            manager, _ = build_manager(connection, ui_value, deps)
-            source = DbBatchSource(
-                session_id, mode="incremental", threshold=_summary_every(ui_value),
-                manager=manager, want_facts=ui_flag(ui, "horae_facts"),
-                connection=connection, window=_memory_window(ui_value),
-            )
+            manager, _, source = _make_run(
+                session_id, deps, mode="incremental", threshold=_summary_every(ui_value),
+                ui=ui, ui_value=ui_value, connection=connection)
             return await manager.scan_and_compress_history(
                 source, on_progress=on_progress, max_batches=max_batches,
                 retry_conflicts=False)
@@ -763,7 +845,11 @@ class MemoryJob:
     line: str = ""
     error: str | None = None
     warnings: list[str] = field(default_factory=list)
-    started_at: str = field(default_factory=_utc_iso)
+    # queued_at — постановка в очередь; started_at — переход в running. Раньше
+    # «начато» ставилось при постановке, и задание, минуты ждавшее ежеходный
+    # проход, показывало во вкладке неверное время старта.
+    queued_at: str = field(default_factory=_utc_iso)
+    started_at: str | None = None
     finished_at: str | None = None
     # Что попросил пользователь (None — из «ui»); после старта — действующие значения.
     batch_size: int | None = None
@@ -788,7 +874,8 @@ class MemoryJob:
             "total": self.total, "batches": self.batches, "state_tokens": self.state_tokens,
             "phase": self.phase, "retry_in_s": self.retry_in_s, "line": self.line,
             "error": self.error, "warnings": list(self.warnings),
-            "started_at": self.started_at, "finished_at": self.finished_at,
+            "queued_at": self.queued_at, "started_at": self.started_at,
+            "finished_at": self.finished_at,
         }
 
 
@@ -886,8 +973,9 @@ async def _run_job(job: MemoryJob, deps: MemoryDeps, *, resume: bool) -> None:
     try:
         # Замок общий с ежеходным инкрементом: пока идёт задание, проходы после
         # ходов пропускаются, а задание ждёт конца уже начатого прохода (queued).
-        async with session_lock(job.session_id):
+        async with chat_lock(job.session_id):
             job.status = "running"
+            job.started_at = _utc_iso()
             _busy.add(job.session_id)
             try:
                 await _execute_job(job, deps, resume=resume)
@@ -922,19 +1010,15 @@ async def _execute_job(job: MemoryJob, deps: MemoryDeps, *, resume: bool) -> Non
     async with AsyncSessionLocal() as db:
         if await db.get(models.ChatSession, sid) is None or not _owns_chat(job):
             raise _ChatGone
-        ui = await db.get(models.AppSetting, "ui")
+        ui, ui_value = await _ui_setting(db)
         connection = await deps.get_connection(db)
-        ui_value = ui.value if ui and isinstance(ui.value, dict) else {}
-        manager, _ = build_manager(connection, ui_value, deps,
-                                   batch_size=job.batch_size, delay_ms=job.delay_ms)
+        manager, _, source = _make_run(
+            sid, deps, mode=job.mode, threshold=1, ui=ui, ui_value=ui_value,
+            connection=connection, alive=lambda: _owns_chat(job),
+            batch_size=job.batch_size, delay_ms=job.delay_ms)
         job.batch_size, job.delay_ms = manager.config.batch_size, manager.config.delay_ms
         if job.mode == "rebuild":
             await _open_rebuild_buffer(db, sid, job, resume=resume)
-    source = DbBatchSource(
-        sid, mode=job.mode, threshold=1, manager=manager,
-        want_facts=ui_flag(ui, "horae_facts"), connection=connection,
-        window=_memory_window(ui_value), alive=lambda: _owns_chat(job),
-    )
     try:
         result = await manager.scan_and_compress_history(
             source, cancel=job.cancel, on_progress=job.progress, retry_conflicts=True)
@@ -953,8 +1037,10 @@ async def _execute_job(job: MemoryJob, deps: MemoryDeps, *, resume: bool) -> Non
         if result.status == "cancelled":
             job.finish("cancelled")  # буфер пересборки остаётся — её можно продолжить
             return
-        if job.mode == "rebuild":
-            await _adopt_rebuild_buffer(db, sid, manager.warnings)
+        if job.mode == "rebuild" and not await _adopt_rebuild_buffer(db, sid, manager.warnings):
+            # Без строки UI показал бы «готово» при нетронутом снимке, и
+            # нажатие «Пересобрать» выглядело бы так, будто ничего не сделало.
+            job.warnings.append(EMPTY_REBUILD_WARNING)
     job.finish("done")
 
 
@@ -979,41 +1065,41 @@ async def _open_rebuild_buffer(db, session_id: int, job: MemoryJob, *, resume: b
     await db.commit()
 
 
-async def _adopt_rebuild_buffer(db, session_id: int, warnings) -> None:
+# Предупреждение задания «Пересобрать», когда буфер так и остался пустым.
+EMPTY_REBUILD_WARNING = "пересборка не нашла сообщений старше окна — прежний снимок оставлен"
+
+
+async def _adopt_rebuild_buffer(db, session_id: int, warnings) -> bool:
     """
     Атомарная подмена: снимок из буфера становится живым одним коммитом —
     даже если хвост короче summary_every (ежеходный проход ждал бы его).
+    → False, если подменять было нечем (буфер пуст), иначе True.
 
     Буфер пуст (указатель 0) — сжимать было нечего: весь чат в окне. Тогда
     прежний снимок остаётся, а буфер убирается, иначе ежеходные проходы так
     и писали бы в него. Затирать память пустым снимком молча нельзя — для
-    этого есть явный «Сбросить память».
+    этого есть явный «Сбросить память»; что снимок оставлен, задание пишет в
+    свои предупреждения (EMPTY_REBUILD_WARNING).
     """
     entry = await _summary_entry(db, session_id)
     meta = dict(entry.meta or {}) if entry is not None else {}
     buffer = meta.get("rebuild")
     if not isinstance(buffer, dict):
-        return  # записи не было: пакеты уже легли в живой снимок
+        return True  # записи не было: пакеты уже легли в живой снимок
     pointer = int_or_zero(buffer.get("last_message_id"))
     if pointer:
-        content = str(buffer.get("content") or "")
-        adopt_summary(entry, content, pointer,
-                      tokens=estimate_tokens(content) if content else 0,
+        adopt_summary(entry, str(buffer.get("content") or ""), pointer,
                       updated_by="rebuild", warnings=warnings)
     else:
         meta.pop("rebuild")
         entry.meta = meta
     await db.commit()
+    return bool(pointer)
 
 
 # ============================================================================
 # Статус, сброс, экспорт (§6.6)
 # ============================================================================
-async def _ui_value(db) -> dict:
-    ui = await db.get(models.AppSetting, "ui")
-    return ui.value if ui and isinstance(ui.value, dict) else {}
-
-
 async def _count_rows(db, model, session_id: int) -> int:
     return (await db.execute(
         select(func.count(model.id)).where(model.session_id == session_id)
@@ -1022,7 +1108,7 @@ async def _count_rows(db, model, session_id: int) -> int:
 
 async def status(db, session_id: int) -> dict:
     """Всё, что показывает блок «Мастер-память»: снимок, буфер, бэклог, факты, задание."""
-    ui_value = await _ui_value(db)
+    _, ui_value = await _ui_setting(db)
     config = memory_config(ui_value)
     window = _memory_window(ui_value)
     entry = await _summary_entry(db, session_id)
@@ -1030,9 +1116,13 @@ async def status(db, session_id: int) -> dict:
     content = (entry.content or "") if entry is not None else ""
     # Размер — по тексту, а не из meta.tokens: снимок правят руками во
     # вкладке «Память», и записанное при сжатии число тогда устаревает.
-    tokens = estimate_tokens(content) if content else 0
-    buffer = meta.get("rebuild") if isinstance(meta.get("rebuild"), dict) else None
-    staged = str(buffer.get("content") or "") if buffer else ""
+    tokens = snapshot_tokens(content)
+    # Буфер — та же цель, что у источника пакетов (_read_target), а не только
+    # явный meta.rebuild. Сводка старого формата пересобирается неявно, с нуля:
+    # бэклог (_pending_count) считается от нуля, и без буфера в статусе
+    # вкладка показала бы «учтено до #400» и «ждут сжатия 850» без объяснения.
+    target = _read_target(entry)
+    buffer = meta.get("rebuild") if isinstance(meta.get("rebuild"), dict) else {}
     updated_at = entry.updated_at if entry is not None else None
     job = _jobs.get(session_id)
     return {
@@ -1048,9 +1138,9 @@ async def status(db, session_id: int) -> dict:
             "over_budget": tokens > config.snapshot_tokens,
             "warnings": list(meta.get("warnings") or []),
         },
-        "staging": None if buffer is None else {
-            "last_message_id": int_or_zero(buffer.get("last_message_id")),
-            "tokens": estimate_tokens(staged) if staged else 0,
+        "staging": None if not target.rebuilding else {
+            "last_message_id": target.pointer,
+            "tokens": snapshot_tokens(target.state),
             "manual": bool(buffer.get("manual")),
             "started_at": buffer.get("started_at"),
         },
@@ -1078,7 +1168,7 @@ async def purge(db, session_id: int) -> dict:
     """
     cancel_job(session_id)
     await wait_job(session_id)
-    async with session_lock(session_id):
+    async with chat_lock(session_id):
         snapshot = await db.execute(sql_delete(models.HoraeEntry).where(
             models.HoraeEntry.session_id == session_id,
             models.HoraeEntry.category == "summary",
@@ -1093,11 +1183,16 @@ async def purge(db, session_id: int) -> dict:
 # в заголовок Content-Disposition и в файловую систему пользователя, где «/»,
 # «:» или «?» либо ломают сохранение, либо молча меняются браузером.
 _FILENAME_JUNK_RE = re.compile(r"[^0-9A-Za-zА-Яа-яЁё]+")
+# Потолок названия в имени файла. Название чата вмещает до 300 символов, а
+# имя длиннее 255 — предел Windows и большинства файловых систем — браузер
+# обрежет или не сохранит вовсе.
+_FILENAME_SLUG_MAX = 80
 
 
 def export_filename(title, session_id: int) -> str:
-    """memory-<очищенное название>-<id>.md; без названия — memory-<id>.md."""
-    slug = _FILENAME_JUNK_RE.sub("_", title or "").strip("_")
+    """memory-<очищенное название, ≤ 80 символов>-<id>.md; без названия — memory-<id>.md."""
+    # Срез — до strip: иначе «_» на месте разреза остался бы в конце имени.
+    slug = _FILENAME_JUNK_RE.sub("_", title or "")[:_FILENAME_SLUG_MAX].strip("_")
     return f"memory-{slug}-{session_id}.md" if slug else f"memory-{session_id}.md"
 
 
@@ -1126,8 +1221,8 @@ async def export_markdown(db, session_id: int,
         snapshot=content,
         covered_upto=summary_last_id(entry),
         messages_total=await _count_rows(db, models.Message, session_id),
-        tokens=estimate_tokens(content) if content else 0,
-        budget=memory_config(await _ui_value(db)).snapshot_tokens,
+        tokens=snapshot_tokens(content),
+        budget=memory_config((await _ui_setting(db))[1]).snapshot_tokens,
         schema=meta.get("schema"),
         exported_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         facts=facts,

@@ -75,6 +75,8 @@ MAX_SNAPSHOT_CHARS = 200_000
 # сотни символов, а MEMORY_BATCH_CHARS в настройках снизу не ограничен: при
 # бюджете в пару сотен символов от реплики не осталось бы ничего.
 _MIN_BATCH_CHARS = 2000
+# Бюджет пакета по умолчанию (MemoryConfig.batch_max_chars не задан или 0).
+_DEFAULT_BATCH_CHARS = 80_000
 
 
 # ============================================================================
@@ -109,8 +111,17 @@ class Batch:
 
 @dataclass
 class MemoryConfig:
+    """
+    Параметры менеджера.
+
+    batch_max_chars: None, 0, пустое или нечисловое значение — «по умолчанию»
+    (_DEFAULT_BATCH_CHARS = 80 000), а не «без лимита» и не 2000; затем
+    нижняя граница _MIN_BATCH_CHARS. ПОЧЕМУ: сервис берёт значение из
+    настроек (MEMORY_BATCH_CHARS), где его может не оказаться, — None раньше
+    ронял конструктор TypeError, а 0 молча давал пакеты по 2000 символов.
+    """
     batch_size: int = 20
-    batch_max_chars: int = 80_000
+    batch_max_chars: int = _DEFAULT_BATCH_CHARS
     delay_ms: int = 1500
     max_retries: int = 4
     backoff_base_s: float = 2.0
@@ -122,8 +133,11 @@ class MemoryConfig:
     keep_recent_chronicle: int = 12    # сколько последних записей хроники не сжимать в арки
 
     def __post_init__(self):
-        if self.batch_max_chars < _MIN_BATCH_CHARS:
-            self.batch_max_chars = _MIN_BATCH_CHARS
+        try:
+            chars = int(self.batch_max_chars or 0)
+        except (TypeError, ValueError):
+            chars = 0
+        self.batch_max_chars = max(_MIN_BATCH_CHARS, chars or _DEFAULT_BATCH_CHARS)
 
 
 def _fmt_int(n) -> str:
@@ -236,17 +250,31 @@ _BREAK_RE = re.compile(r"<br\s*/?>|</(?:p|div|li|tr|h[1-6]|blockquote)\s*>", re.
 # продолжим>») и текст вроде «x <y and z> w». Атрибуты — по синтаксису HTML
 # (имя латиницей, значение в кавычках или без пробелов), поэтому и
 # «<i думаю, что он врёт>» остаётся текстом. style и script вырезаются вместе
-# с содержимым раньше, в _STYLE_SCRIPT_RE.
+# с содержимым раньше, в _STYLE_SCRIPT_RE. Регистр имён не важен (<linearGradient>).
 _HTML_TAG_NAMES = (
     "a", "b", "i", "u", "s", "em", "strong", "span", "div", "p", "br", "hr", "font",
     "center", "small", "big", "sub", "sup", "code", "pre", "blockquote", "ul", "ol",
-    "li", "table", "thead", "tbody", "tr", "td", "th", "img", "details", "summary",
-    "h[1-6]", "section", "article", "header", "footer", "mark", "ruby", "rt", "rp",
-    "del", "ins", "q", "cite", "abbr", "time", "figure", "figcaption", "label",
-    "button", "input", "select", "option", "textarea", "iframe", "video", "audio",
-    "source", "svg", "path", "g",
+    "li", "table", "thead", "tbody", "tfoot", "tr", "td", "th", "caption", "img",
+    "details", "summary", "h[1-6]", "section", "article", "header", "footer", "nav",
+    "main", "aside", "mark", "ruby", "rt", "rp", "del", "ins", "strike", "q", "cite",
+    "abbr", "time", "figure", "figcaption", "dl", "dt", "dd", "label", "button",
+    "input", "select", "option", "textarea", "iframe", "video", "audio", "source",
+    # SVG: сама картинка модели не нужна, а её разметка — шум во входе.
+    "svg", "path", "g", "circle", "rect", "line", "polygon", "polyline", "ellipse",
+    "text", "tspan", "defs", "stop", "lineargradient", "radialgradient",
 )
-_TAG_ATTR = r"""\s+[A-Za-z_:][\w:.-]*(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'<>`]+))?"""
+# Атрибут без значения — только булев атрибут HTML. ПОЧЕМУ не любое слово:
+# тогда «тегом» были и англоязычные ремарки — «<time skip>», «<a few hours
+# later>», «<small talk>», «<summary of events>» (имя тега + «атрибуты» без
+# значений), и сообщение из одной ремарки выпадало из пакета целиком. Атрибут
+# со значением (style=…, href=…) по-прежнему любой: в ремарке «=» не бывает.
+_BOOLEAN_ATTRS = (
+    "open", "hidden", "controls", "autoplay", "loop", "muted", "disabled", "checked",
+    "selected", "readonly", "required", "multiple", "novalidate", "default", "reversed",
+    "async", "defer", "playsinline", "allowfullscreen", "inert", "itemscope",
+)
+_TAG_ATTR = (r"""\s+(?:[A-Za-z_:][\w:.-]*\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'<>`]+)"""
+             r"|(?:" + "|".join(_BOOLEAN_ATTRS) + r")(?![\w:.-]))")
 # (?![\w:-]) после имени: «<bold>» и «<b-side>» — не <b>.
 _TAG_RE = re.compile(r"</?(?:" + "|".join(_HTML_TAG_NAMES) + r")(?![\w:-])"
                      r"(?:" + _TAG_ATTR + r")*\s*/?>", re.IGNORECASE)
@@ -342,7 +370,7 @@ def _cut_middle(line: str, max_chars: int) -> str:
     return line[:head] + LONG_MESSAGE_MARK + line[len(line) - tail:]
 
 
-def normalize_message(msg: MemoryMessage, max_chars: int = 80_000) -> str:
+def normalize_message(msg: MemoryMessage, max_chars: int = _DEFAULT_BATCH_CHARS) -> str:
     """
     Строка сообщения для пакета:
 
@@ -493,26 +521,37 @@ def extract_snapshot(raw) -> tuple[str, bool]:
     """
     Текст снимка из сырого ответа → (текст, обрезан ли).
 
-    Мысли (<think>) и ограждения ``` вырезаются. Есть обёртка — берём
-    содержимое последней; открыта, но не закрыта — ответ упёрся в лимит
-    вывода, текст после открытия возвращается с флагом True. Обёртки нет
-    вовсе — мягкий режим: весь текст (разделы потом проверит parse_sections).
+    Мысли (<think>) и ограждения ``` вырезаются. Обёртка есть — кандидат
+    каждое открытие <master_state> до ближайшего следующего закрытия (или до
+    конца текста — такой кандидат «открыт»). Берётся последний ЗАКРЫТЫЙ
+    кандидат со снимком по схеме (is_structured); нет такого — последний
+    закрытый; закрытых нет — последний открытый: ответ упёрся в лимит
+    вывода, текст возвращается с флагом True. Обёртки нет вовсе — мягкий
+    режим: весь текст (разделы потом проверит parse_sections).
     """
     text = _THINK_RE.sub("", str(raw or ""))
     # Незакрытый <think> — модель оборвалась посреди рассуждений: всё после него мысли.
     text = _UNCLOSED_THINK_RE.sub("", text)
     text = _FENCE_LINE_RE.sub("", text)
-    # ПОСЛЕДНЯЯ открывающая обёртка, а не первая: модель иногда начинает с
-    # «Вот снимок в формате <master_state>…</master_state>:», и первая пара —
-    # лишь упоминание. Её «содержимое» дало бы четыре «нет раздела» и платный
-    # корректирующий ход при полностью годном снимке ниже.
+    # ПОЧЕМУ не первая и не последняя обёртка. Модель упоминает тег и до
+    # снимка («Вот снимок в формате <master_state>…</master_state>:»), и после
+    # («Обёртка <master_state> закрыта.»). Первая пара в первом случае —
+    # лишь упоминание, последнее открытие во втором — незакрытый хвост из
+    # одного слова с флагом «обрезан». Оба раза годный снимок получал четыре
+    # «нет раздела» и платный корректирующий ход; выбор по содержимому
+    # кандидата различает упоминание и снимок в обоих случаях.
     opens = list(_OPEN_RE.finditer(text))
-    opened = opens[-1] if opens else None
-    if opened:
-        closed = _CLOSE_RE.search(text, opened.end())
-        if not closed:
-            return text[opened.end():].strip(), True
-        return text[opened.end():closed.start()].strip(), False
+    if opens:
+        closed, unclosed = [], []
+        for opened in opens:
+            end = _CLOSE_RE.search(text, opened.end())
+            if end:
+                closed.append(text[opened.end():end.start()].strip())
+            else:
+                unclosed.append(text[opened.end():].strip())
+        if closed:
+            return next((c for c in reversed(closed) if is_structured(c)), closed[-1]), False
+        return unclosed[-1], True
     closed = _CLOSE_RE.search(text)
     if closed:
         text = text[:closed.start()]
@@ -1031,7 +1070,8 @@ class HierarchicalMemoryManager:
         копий вытеснили бы из meta.warnings (там последние ≤ 5) всё остальное.
         supersedes — начало предупреждения, которое новое заменяет: у «снимок
         превышает бюджет: X из Y» X меняется с каждым пакетом, а UI нужна одна
-        строка — с последними числами.
+        строка — с последними числами. Вне прогона повторы ищутся среди
+        предупреждений, выданных после конца последнего прогона.
         """
         run = self.warnings[self._warn_from:]
         if text in run:
@@ -1040,33 +1080,49 @@ class HierarchicalMemoryManager:
             self.warnings[self._warn_from:] = [w for w in run if not w.startswith(supersedes)]
         self.warnings.append(text)
 
-    def _foldable(self, state: str) -> int:
+    def _foldable(self, state: str, *, arcs: bool = False) -> int:
         """
         Сколько записей хроники compact() может свернуть: старше последних
         keep_recent_chronicle и ещё не арки. Арки не считаются: иначе после
         первого же сжатия хроника «арка + keep» всегда длиннее keep, и порог
         _fold_threshold ничего бы не сдерживал.
+
+        :param arcs: считать и арки — путь length, где их сворачивают в арку
+            более высокого уровня (см. merge_block).
         """
         chronicle = parse_sections(state).get(SEC_CHRONICLE, "")
         entries = _parse_entries(chronicle.splitlines())
         older = entries[:max(0, len(entries) - max(0, self.config.keep_recent_chronicle))]
+        if arcs:
+            return len(older)
         return sum(1 for e in older
                    if not _ARC_RE.match(_ENTRY_MARKER_RE.sub("", e[0].strip(), count=1)))
 
-    def _warn_over_budget(self, state: str) -> None:
+    def _guarded_tokens(self, state: str) -> int:
+        """Вес разделов 2–4 без хроники — той части снимка, которую сжатие не трогает."""
+        sections = parse_sections(state)
+        return self._tokens("\n\n".join(f"## [{sec}]\n{sections.get(sec) or '—'}"
+                                        for sec in GUARDED_SECTIONS))
+
+    def _warn_over_budget(self, state: str, *, compacted: bool = False) -> None:
         """
         «снимок превышает бюджет: X из Y токенов», если превышает.
 
-        Если сворачивать в хронике уже нечего (меньше порога _fold_threshold),
-        превышение держат разделы 2–4 — это и пишется в скобках: голое «X из Y»
-        не объясняло ни причины, ни того, что автоматически это не пройдёт.
+        Превышение держат разделы 2–4 — и это пишется в скобках, — если
+        сворачивать в хронике уже нечего (меньше порога _fold_threshold) или
+        если хронику только что сжали (compacted), а разделы 2–4 сами по себе
+        больше бюджета: никакое сжатие хроники тогда снимок в бюджет не
+        вернёт. Голое «X из Y» не объясняло ни причины, ни того, что
+        автоматически это не пройдёт. После НЕудачного сжатия «хроника уже
+        сжата» было бы неправдой — там решает только порог.
         """
         budget = self.config.snapshot_tokens
         tokens = self._tokens(state)
         if tokens <= budget:
             return
         text = f"{_OVER_BUDGET} {_fmt_int(tokens)} из {_fmt_int(budget)} токенов"
-        if self._foldable(state) < _fold_threshold(self.config.keep_recent_chronicle):
+        if (self._foldable(state) < _fold_threshold(self.config.keep_recent_chronicle)
+                or (compacted and self._guarded_tokens(state) > budget)):
             text += " (хроника уже сжата; реестр и списки не сжимаются автоматически)"
         self._warn(text, supersedes=_OVER_BUDGET)
 
@@ -1189,8 +1245,11 @@ class HierarchicalMemoryManager:
             # и большой снимок сам съедает бюджет ответа. Сжимаем хронику и
             # пробуем ещё раз; повторная length уходит наверх. Гистерезис по
             # записям тут не к месту: без сжатия повтор почти наверняка снова
-            # упрётся в лимит, так что сворачиваем хоть одну запись.
-            state = await self.compact(state, min_fold=1)
+            # упрётся в лимит, так что сворачиваем хоть одну запись — и арки
+            # тоже. В длинном чате хроника — «десятки арок + keep последних»,
+            # обычных записей для свёртки нет, и без арок сжатие не звалось
+            # вовсе: повтор слияния упирался в тот же лимит.
+            state = await self.compact(state, min_fold=1, fold_arcs=True)
             new = await self._merge(state, batch)
         if is_structured(state):
             new = self._guard(state, new)
@@ -1199,7 +1258,8 @@ class HierarchicalMemoryManager:
         return new
 
     # ----------------------------------------------------------------- сжатие
-    async def compact(self, state: str, *, min_fold: int | None = None) -> str:
+    async def compact(self, state: str, *, min_fold: int | None = None,
+                      fold_arcs: bool = False) -> str:
         """
         Сжать хронику снимка в арки (§4.7) → снимок.
 
@@ -1213,6 +1273,12 @@ class HierarchicalMemoryManager:
         :param min_fold: сколько записей для свёртки (старше keep и не арок)
             нужно, чтобы звать модель; None — _fold_threshold(keep). Меньше —
             снимок возвращается как есть.
+        :param fold_arcs: сворачивать и старые арки (путь length в
+            merge_block): в счёт min_fold идут все записи старше keep, а к
+            промпту добавляется COMPACT_ARCS_PROMPT — разрешение объединить
+            арки в арку более высокого уровня. Обычное сжатие (снимок сверх
+            бюджета) зовётся без него: там арки уже свёрнуты, и порог
+            _fold_threshold считает только обычные записи.
         """
         if not is_structured(state):
             # Пустая память или пересказ старой схемы: хроники-раздела нет,
@@ -1220,7 +1286,7 @@ class HierarchicalMemoryManager:
             return state
         if min_fold is None:
             min_fold = _fold_threshold(self.config.keep_recent_chronicle)
-        if self._foldable(state) < max(1, min_fold):
+        if self._foldable(state, arcs=fold_arcs) < max(1, min_fold):
             # Сокращать нечего или почти нечего: последние keep записей промпт
             # велит оставить как есть, арки уже свёрнуты, а раздуты разделы 2–4,
             # которые не сжимаются никогда. Раньше модель и тут получала запрос
@@ -1234,7 +1300,9 @@ class HierarchicalMemoryManager:
         chronicle = parse_sections(state).get(SEC_CHRONICLE, "")
         system = COMPACT_PROMPT.format(budget=int(budget * _COMPACT_TARGET),
                                        keep=self.config.keep_recent_chronicle)
-        result = state
+        if fold_arcs:
+            system += "\n" + COMPACT_ARCS_PROMPT
+        result, done = state, False
         try:
             compacted = await self._ask_snapshot(
                 [{"role": "system", "content": system},
@@ -1246,10 +1314,10 @@ class HierarchicalMemoryManager:
             before = self._tokens(chronicle)
             after = self._tokens(parse_sections(compacted).get(SEC_CHRONICLE, ""))
             if after < before:
-                result = self._guard(state, compacted)
+                result, done = self._guard(state, compacted), True
             else:
                 self._warn("сжатие не сократило хронику — оставлен прежний снимок")
-        self._warn_over_budget(result)
+        self._warn_over_budget(result, compacted=done)
         return result
 
     # ------------------------------------------------------------ цикл свёртки
@@ -1332,6 +1400,10 @@ class HierarchicalMemoryManager:
         finally:
             self._on_progress = None
             self._progress = None
+            # Отсчёт повторов — только на время прогона. Иначе прямой вызов
+            # merge_block/compact после прогона сверял бы свои предупреждения с
+            # предупреждениями прогона и молча не добавлял уже выданное им.
+            self._warn_from = len(self.warnings)
 
 
 # ============================================================================
@@ -1525,6 +1597,16 @@ COMPACT_PROMPT = f"""Снимок памяти превышает бюджет {
 Последние {{keep}} записей хроники оставь без изменений. Диапазоны арок должны покрывать объединённые записи без пропусков; имена, числа, цитаты, решения и договорённости из объединяемых записей не теряй, ничего не выдумывай.
 Разделы [{SEC_CHARACTERS}], [{SEC_REGISTRY}] и [{SEC_LISTS}] перенеси ДОСЛОВНО, символ в символ: ничего не удаляй, не сокращай и не переупорядочивай.
 Ответ — полный снимок из всех четырёх разделов в обёртке {ENVELOPE_OPEN}…{ENVELOPE_CLOSE}, без пояснений."""
+
+# Добавка к COMPACT_PROMPT, когда ответ модели упёрся в лимит длины вывода
+# (merge_block → compact(fold_arcs=True)). В длинном чате хроника — «десятки
+# арок + последние записи», и объединять, кроме арок, нечего: без этого
+# разрешения модель не имела права сократить хронику. В обычное сжатие не
+# добавляется: там арки уже свёрнуты, а поводом служат накопившиеся записи.
+# Формат через str.format не проходит, но фигурных скобок в тексте тоже нет.
+COMPACT_ARCS_PROMPT = """Снимок уже не помещается в лимит длины ответа, поэтому сокращай глубже: объединяй и старые арки — несколько соседних арок в одну арку более высокого уровня того же вида
+- [#a–#b] Арка «название»: суть, ключевые решения, последствия
+где диапазон — от начала первой объединённой арки до конца последней. Последние записи хроники по-прежнему не трогай; суть, решения и договорённости объединяемых арок сохрани."""
 
 # Корректирующий ход после брака (§4.5): модель видит свой сырой ответ и
 # список проблем. {problems} подставляет менеджер через str.format — других

@@ -682,23 +682,26 @@ def _visible_recalled(recalled_facts, history_ids, total: int, start: int) -> li
 _MEMORY_TAIL_KEYS = frozenset({"snapshot", "recalled"})
 
 
-def _context_tiers(report: dict, *, avatar_msgs, window_tokens: int, user_message: str,
-                   user_attachments_content, token_budget: int, window_messages: int,
-                   trimmed: int) -> dict:
+def _context_tiers(report: dict, *, avatar_msgs, knowledge_msgs, window_tokens: int,
+                   user_message: str, user_attachments_content, token_budget: int,
+                   window_messages: int, trimmed: int) -> dict:
     """
     Монитор токенов по уровням (§7 спеки): система (Tier 1), память — снимок и
     факты (Tier 2), дословное окно истории (Tier 3) и текущее сообщение.
 
     Считается из уже заполненного отчёта — теми же числами, что инспектор
     показывает по блокам, чтобы полоса монитора и разбор хода не расходились.
-    База знаний учитывается текстом (knowledge_tokens), как и в остальном отчёте.
+    База знаний идёт в Tier 1 целиком — все сообщения knowledge_block: обе
+    служебные обёртки, текст и медиа, как аватары. Раньше считался только её
+    текст (knowledge_tokens), и при двадцати файлах в базе знаний монитор
+    занижал вес хода тысяч на восемь токенов (картинка ≈ 400, аудио ≈ 1500).
     """
     from backend.config import settings
 
     tail = report.get("tail") or []
     system = (
         report.get("system_tokens", 0)
-        + report.get("knowledge_tokens", 0)
+        + sum(estimate_content_tokens(m.get("content")) for m in knowledge_msgs)
         + sum(estimate_content_tokens(m.get("content")) for m in avatar_msgs)
         + sum(b["tokens"] for b in tail if b.get("key") not in _MEMORY_TAIL_KEYS)
     )
@@ -877,7 +880,9 @@ def assemble_context(
     messages.extend(avatar_msgs)
 
     # База знаний — ДО истории и явно ОТДЕЛЕНА от диалога (см. knowledge_block).
-    messages.extend(knowledge_block(knowledge_text, knowledge_media))
+    # Список тоже держим отдельно: в Tier 1 монитора он идёт целиком.
+    knowledge_msgs = knowledge_block(knowledge_text, knowledge_media)
+    messages.extend(knowledge_msgs)
 
     messages.extend(trimmed_history)
 
@@ -899,22 +904,32 @@ def assemble_context(
     # неё остаётся, поэтому блок стоит у конца, где влияет сильнее.
     if summary_recs:
         head = "[ХРОНИКА И СОСТОЯНИЕ ЧАТА] Что было в истории — помни это.\n"
-        if len(summary_recs) == 1 and hm.is_structured(summary_recs[0].content):
-            # Мастер-снимок новой схемы — многострочный текст с разделами
-            # «## […]». Префикс «- 📜 Память чата (авто): » приклеился бы к
-            # первому заголовку и сломал бы разметку, по которой модель
-            # различает хронику, персонажей и реестр, поэтому снимок идёт
-            # телом блока как есть.
+        # Рендер — по записям. Мастер-снимок новой схемы (первая
+        # структурированная запись) — многострочный текст с разделами
+        # «## […]». Префикс «- 📜 Память чата (авто): » приклеился бы к
+        # первому заголовку и сломал бы разметку, по которой модель различает
+        # хронику, персонажей и реестр, поэтому снимок идёт телом блока как
+        # есть и первым, даже если ручная запись сработала раньше.
+        snapshot = next((r for r in summary_recs if hm.is_structured(r.content)), None)
+        # Старые свободные сводки и ручные записи категории summary — как
+        # раньше, списком «- заголовок: текст».
+        listed = "\n".join(
+            f"- {(r.title or 'Сводка')}: {r.content.strip()}"
+            for r in summary_recs if r is not snapshot
+        )
+        if snapshot is None:
+            body = listed
+        else:
             body = (
                 "Мастер-снимок старой части чата; последние сообщения выше идут дословно.\n\n"
-                + summary_recs[0].content.strip()
+                + snapshot.content.strip()
             )
-        else:
-            # Старые свободные сводки и ручные записи категории summary — как
-            # раньше, списком «- заголовок: текст».
-            body = "\n".join(
-                f"- {(r.title or 'Сводка')}: {r.content.strip()}" for r in summary_recs
-            )
+            if listed:
+                # После снимка, отдельно от него — пустой строкой и своим
+                # подзаголовком. Раньше вторая запись summary уводила весь блок
+                # в старую ветку, и заметка оказывалась внутри последнего
+                # раздела снимка: модель читала её как часть списков.
+                body += "\n\nДополнительные записи памяти:\n" + listed
         _to_tail("snapshot", head + body)
 
     # Факты из давней части чата, похожие на текущую реплику. Нет таких — нет и
@@ -1013,11 +1028,14 @@ def assemble_context(
         # Хвост — то, что переинъектируется в конец: сводка сюжета, заметка автора,
         # якорь характера, post-history. Именно он сильнее всего влияет на ответ,
         # поэтому в инспекторе он показан отдельно, а не растворён в системном блоке.
+        # strict: блок, добавленный в tail мимо _to_tail, без strict молча
+        # сдвинул бы ключи всех следующих блоков и выронил бы последний из
+        # отчёта (а с ним tail_tokens и tiers) — инспектор врал бы без ошибки.
         report["tail"] = [
             {"key": key,
              "tokens": estimate_content_tokens(m.get("content")),
              "text": m.get("content") if isinstance(m.get("content"), str) else ""}
-            for key, m in zip(tail_keys, tail)
+            for key, m in zip(tail_keys, tail, strict=True)
         ]
         report["tail_tokens"] = sum(b["tokens"] for b in report["tail"])
         report["total_tokens"] = sum(
@@ -1025,7 +1043,8 @@ def assemble_context(
         )
         report["messages"] = len(messages)
         report["tiers"] = _context_tiers(
-            report, avatar_msgs=avatar_msgs, window_tokens=sum(costs[start:]),
+            report, avatar_msgs=avatar_msgs, knowledge_msgs=knowledge_msgs,
+            window_tokens=sum(costs[start:]),
             user_message=user_message, user_attachments_content=user_attachments_content,
             token_budget=token_budget, window_messages=len(trimmed_history), trimmed=start,
         )
