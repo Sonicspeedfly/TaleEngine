@@ -136,9 +136,13 @@ def compression_engine(settings: dict | None, ui: dict | None) -> str:
     Кто в чате сжимает историю, вышедшую из окна:
       * "horae" — свёртки Хроники (summary_enabled на любом уровне настроек);
       * "snapshot" — мастер-снимок (авто-сводка в «ui» не выключена);
-      * "off" — никто: существующий снимок ещё идёт в ход, но не обновляется.
-    Второй механизм в чате не обновляется и в ход не идёт: иначе модель
-    получала бы одну историю дважды, а платили бы за оба сжатия.
+      * "off" — никто.
+    Обновляется только выбранный: за одну переписку не платят дважды. То, что
+    уже собрано, остаётся в ходе без повторов — снимок несёт историю до своей
+    отметки (snapshot_pointer), свёртки Хроники — после неё. Иначе смена
+    механизма посреди длинного чата выбрасывала бы из хода весь снимок, и окну
+    стало бы нечем заменить старую переписку: она шла бы дословно, до потолка
+    бюджета.
     """
     s = settings or {}
     if s.get("enabled") and s.get("summary_enabled"):
@@ -146,6 +150,22 @@ def compression_engine(settings: dict | None, ui: dict | None) -> str:
     if (ui or {}).get("auto_summary") is not False:
         return "snapshot"
     return "off"
+
+
+async def snapshot_pointer(db, session_id: int) -> int:
+    """
+    До какого сообщения историю чата несёт мастер-снимок, который идёт в ход
+    (включённый и «всегда активный»); 0 — такого снимка нет. Снимок и свёртки
+    Хроники делят историю по времени: снимок — до этой отметки, свёртки — после.
+    """
+    from backend import horae_recall
+
+    entry = (await db.execute(select(models.HoraeEntry).where(
+        models.HoraeEntry.session_id == session_id, models.HoraeEntry.category == "summary",
+        models.HoraeEntry.enabled == True,  # noqa: E712
+        models.HoraeEntry.always_on == True,  # noqa: E712
+    ))).scalars().first()
+    return horae_recall.trusted_pointer(entry.meta if entry is not None else None)
 
 
 async def chat_compression(db, session, character=None, data: dict | None = None) -> dict:

@@ -843,6 +843,17 @@ details.ins-block > summary { padding: 8px 0; }
 }
 .ins-fact-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .ins-fact .tag { flex: none; font-variant-numeric: tabular-nums; }
+/* Память хода — несколько строк сводки; отставшее сжатие и обрезка бюджетом
+   — цветом предупреждения. Подробности (факты, лорбук, блоки) свёрнуты. */
+.ins-mem { margin-bottom: var(--sp-2); }
+.ins-mem-row { margin: 0 0 var(--sp-1); font-size: var(--fs-200); overflow-wrap: anywhere; }
+.ins-mem-row.muted { font-size: var(--fs-100); }
+.ins-warn { color: var(--warn); }
+details.ins-more { border-top: 1px solid var(--border-subtle); }
+details.ins-more > summary {
+  cursor: pointer; padding: 10px 0; font-size: var(--fs-200); font-weight: 600;
+}
+details.ins-more[open] > summary { margin-bottom: var(--sp-1); }
 .menu-label {
   display: block; padding: 8px 12px 4px; font-size: var(--fs-100);
   color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 0.5px;
