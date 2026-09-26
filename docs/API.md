@@ -94,6 +94,36 @@ HTTP Basic Auth поверх всего нужен ещё заголовок `Au
 | POST | `/api/horae` | Создать запись (session_id / character_id / глобально) |
 | PATCH | `/api/horae/{id}` | Обновить |
 | DELETE | `/api/horae/{id}` | Удалить |
+| GET | `/api/sessions/{id}/memory` | Статус мастер-памяти чата: `job` (последнее задание или `null`), `snapshot` (`exists`, `tokens`, `budget`, `covered_upto`, `schema`, `structured`, `updated_at`, `over_budget`, `warnings`), `staging` (буфер пересборки или `null`), `backlog` (`pending`, `window`, `messages_total`), `facts.count`, `settings` (`batch_size`, `delay_ms`, `snapshot_tokens`) |
+| POST | `/api/sessions/{id}/memory/rebuild` | Задание памяти `{mode: "rebuild" \| "catchup", resume?, batch_size? 1–200, delay_ms? 0–60000}` → 202 `{job}`. `rebuild` — собрать снимок с нуля в буфер (`resume: true` — продолжить прерванную пересборку), `catchup` — свернуть бэклог в текущий снимок. 409 — у чата уже есть задание в очереди или в работе |
+| POST | `/api/sessions/{id}/memory/cancel` | Остановить задание между пакетами (из очереди — сразу) → `{ok, job}`; `ok: false` — останавливать нечего |
+| DELETE | `/api/sessions/{id}/memory` | Сброс: остановить задание, удалить снимок (с буфером) и все атомарные факты чата; сообщения остаются → `{snapshot_deleted, facts_deleted}` |
+| GET | `/api/sessions/{id}/memory/export?facts=1` | Снимок `.md`-файлом (`text/markdown; charset=utf-8`, `Content-Disposition: attachment`, имя `memory-<название>-<id>.md`); `facts=1` — с приложением атомарных фактов. Снимка нет → 404 |
+| GET | `/api/sessions/{id}/context` | Инспектор хода: что уйдёт в модель на следующем ходу (ход не выполняется). В отчёте — блоки, `tail` (у каждого блока хвоста `key`), `memory`, `recalled` и `tiers` — монитор токенов |
+
+Эндпоинты `/memory*` проверяют доступ как у чата (`_can_access_session`): нет
+чата → 404, чужой → 403. Задание идёт в фоне; ответ `rebuild` приходит сразу, а
+прогресс (`job.processed/total`, `job.line` вида `[Обработано 140/800 сообщений |
+Сжато до 4 200 токенов]`, `job.phase`: `merge`/`compact`/`wait`/`retry`/`done`)
+интерфейс опрашивает через `GET …/memory`. Статусы задания: `queued`, `running`,
+`done`, `error` (текст причины — в `job.error`), `cancelled`. Реестр заданий живёт
+в памяти процесса, поэтому после перезапуска сервера `job` — `null`, а буфер
+пересборки остаётся в `staging`.
+
+`tiers` в отчёте `/context`:
+
+```json
+{"system": 5200, "memory": 4300, "window": 61000, "current": 0,
+ "total": 70500, "budget": 200000, "model_limit": 1000000,
+ "pct_budget": 35.2, "pct_limit": 7.0,
+ "window_messages": 52, "dropped_messages": 848, "trimmed_messages": 0}
+```
+
+`system` — системный промпт, база знаний, аватары и статичные блоки хвоста;
+`memory` — блок мастер-снимка и вспомненные факты; `window` — дословная история
+после окна и обрезки по бюджету; `current` — текущее сообщение; `pct_*` — доли
+`total` от бюджета хода и от `MODEL_CONTEXT_LIMIT`. Подробно — в
+[HORAE.md](HORAE.md).
 
 ## Персоны, пресеты, настройки
 

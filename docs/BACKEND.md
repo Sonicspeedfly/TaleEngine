@@ -16,12 +16,15 @@ FastAPI-приложение. Содержит:
 - **SSE** `/sse/job/{job_id}` — дослушивание оборванной генерации.
 - Зависимость `current_user` и helper'ы доступа: `_can_access_session`,
   `_can_access_horae`, `_are_friends`, `_existing_friendship`.
+- Фоновая память после хода: `_maybe_update_summary` и `_summary_pass` — тонкие
+  обёртки над `memory_service` (зависимости передаёт `_memory_deps()`).
 - Раздача `frontend/` через StaticFiles (mount на `/`).
 
 ### `config.py`
 `Settings` (pydantic-settings) — читает `.env`. Главное: `DATABASE_URL`,
 `LITELLM_USE_PROXY/BASE_URL/API_KEY`, `DEFAULT_MODEL`, дефолтные `DEFAULT_*`-параметры
-генерации, `CONTEXT_TOKEN_BUDGET`, ключи провайдеров, `TELEGRAM_*`. Валидатор
+генерации, `CONTEXT_TOKEN_BUDGET`, настройки мастер-памяти `MEMORY_*` и
+`MODEL_CONTEXT_LIMIT` (см. [HORAE.md](HORAE.md)), ключи провайдеров, `TELEGRAM_*`. Валидатор
 `_blank_to_none` превращает пустые строки в `None` (иначе пустой
 `TELEGRAM_DEFAULT_CHARACTER_ID=` ронял запуск). Импорт: `from backend.config import settings`.
 
@@ -54,6 +57,11 @@ Pydantic-DTO для валидации запросов/ответов: `Generat
   Если ответ приходит ПУСТЫМ (провайдер заблокировал контент неотключаемым фильтром
   или «думающая» модель исчерпала `max_tokens` на рассуждения) — бросаем понятную
   ошибку с `finish_reason` (в отладочном логе и клиенту), а не молчим.
+- `sampling_overrides(max_tokens=…, temperature=…, top_p=…)` — контекстный менеджер
+  на `ContextVar`: внутри блока `stream_completion` кладёт эти значения поверх
+  `_merge_params`. Так служебный вызов памяти получает свои температуру и длинный
+  вывод, оставаясь при `params=None` (фильтры безопасности выключены), а сигнатуры
+  `complete`/`stream_completion` не меняются.
 - `GEMINI_SAFETY_OFF` — снятие настраиваемых фильтров Gemini/Vertex AI. Порог **`OFF`**
   (сильнее `BLOCK_NONE`: полностью выключает фильтр; для Gemini 2.5/3 это дефолт) на все
   категории, включая `CIVIC_INTEGRITY`. Применяется, когда `params is None` (служебные
@@ -76,6 +84,11 @@ asyncio-задачу, которая стримит токены подписч�
   и текущее сообщение (текст или мультимодальный контент).
 - `build_context_from_db(...)` — обёртка, читающая данные из БД и зовущая
   `assemble_context`. Подробности про память — в [HORAE.md](HORAE.md).
+- Отчёт для инспектора (`report`): у каждого блока хвоста — `key` (`snapshot`,
+  `recalled`, `anchor`, …), а `report["tiers"]` делит ход на уровни для монитора
+  токенов: система, память (снимок и факты), окно, текущее сообщение. Мастер-снимок
+  новой схемы идёт в блок `[ХРОНИКА И СОСТОЯНИЕ ЧАТА]` как есть, без префикса
+  «- заголовок:».
 - `messages_to_history(msgs)` — история с **СОХРАНЕНИЕМ вложений**: прошлые сообщения
   пользователя с картинкой/аудио превращаются в мультимодальный контент, чтобы модель
   «видела» присланный ранее файл и на последующих ходах (раньше вложения истории
@@ -84,6 +97,53 @@ asyncio-задачу, которая стримит токены подписч�
   и в путях regenerate/continue/retry.
 - `estimate_content_tokens(content)` — оценка токенов для мультимодального контента
   (base64 картинок/аудио НЕ считается как текст, иначе бюджет выбрасывал бы всю историю).
+
+### `hierarchical_memory.py`
+Чистое ядро иерархической пакетной памяти (2.5.0): свёртка старой истории в
+мастер-снимок `снимок_N = слияние(снимок_{N−1}, пакет_N)`. Импортирует **только
+stdlib** — ни БД, ни FastAPI, ни litellm; модель приходит колбэком, сообщения —
+готовыми `MemoryMessage` или через протокол `BatchSource`. Поэтому весь контракт
+проверяется тестами без сети и базы (`tests/test_hierarchical_memory.py`).
+- Схема снимка: четыре раздела (`SECTIONS`, `GUARDED_SECTIONS`), `SNAPSHOT_SCHEMA =
+  "hms-1"`, обёртка ответа `<master_state>…</master_state>`; `parse_sections`,
+  `render_snapshot`, `is_structured`.
+- `normalize_message` (строка `[#id · время · автор] текст` + `📎 вложения`, чистка
+  base64/HTML/`<think>`), `plan_batch`/`plan_batches` — пакеты по числу сообщений и
+  символам.
+- `validate_snapshot`/`extract_snapshot` — обёртка, разделы, «сдувание»;
+  `guard_entries` — возвращает записи разделов 2–4, которые модель потеряла.
+- `classify_error` → `MemoryLLMError(kind, message, retryable)`; исключения
+  `SnapshotValidationError`, `SourceConflictError`.
+- `HierarchicalMemoryManager`: `call` (пауза-ограничитель и повторы с бэкоффом для
+  любого запроса), `merge_block` (слияние + корректирующие ходы + страж), `compact`
+  (сжатие хроники в арки сверх бюджета), `scan_and_compress_history` (цикл по
+  пакетам с прогрессом `ScanProgress.line()`, отменой и лимитом пакетов).
+- `window_start`/`WINDOW_STEP`/`DEFAULT_WINDOW = 50` (реэкспортируются из
+  `horae_recall`), `SlidingWindow`, `budget_tiers` (монитор токенов),
+  `render_export_markdown`; промпты `MASTER_STATE_PROMPT`, `COMPACT_PROMPT`,
+  `COMPACT_ARCS_PROMPT`, `CORRECTION_PROMPT`.
+
+### `memory_service.py`
+Адаптер ядра к БД и к остальному бэкенду. `main` сюда не импортируется (цикл):
+`complete` и `get_connection` приходят через `MemoryDeps` лямбдами, которые берут
+глобалы `main` в момент вызова, — поэтому `patch("backend.main.complete")` в
+тестах действует и на сервис.
+- Запись «📜 Память чата (авто)»: `summary_last_id`, `adopt_summary` (снимок без
+  обрезки + `meta.schema/tokens/updated_by/warnings`), `clamp_summary_pointer`.
+- `memory_config`/`build_manager` — параметры из `ui` и `.env`, фоновая модель
+  `summary_model` в подключении при `params=None`, вывод через
+  `llm_gateway.sampling_overrides`; `load_memory_messages` — сообщения чата с
+  настоящими именами авторов и временем в поясе чата.
+- `DbBatchSource` — источник пакетов: только то, что старше активного окна; цель
+  записи — живой снимок или буфер пересборки `meta["rebuild"]`; сверка куска с
+  чатом перед записью; факты пакета после записи.
+- `run_incremental` — ежеходный проход (его зовёт `main._maybe_update_summary`, не
+  больше `MEMORY_MAX_BATCHES_PER_TURN` пакетов); `chat_lock`/`is_busy` — один
+  прогон памяти на чат.
+- Задания «Пересобрать»/«Догнать»: `MemoryJob`, `start_job`, `cancel_job`,
+  `forget_job` (удаление чата), `wait_job`; реестр — в памяти процесса.
+- `status`, `purge`, `export_markdown` — для эндпоинтов `/api/sessions/{id}/memory*`
+  (см. [API.md](API.md)). Тесты — `tests/test_memory_service.py`.
 
 ### `group_chat.py`
 Логика групповых чатов: определяет, кто из персонажей отвечает, и формирует очередь
