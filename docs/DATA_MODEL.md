@@ -54,8 +54,15 @@ ISO-строкой с «Z» — у user-сообщения это время о�
 ### `horae_entries` — `HoraeEntry`
 Запись памяти Horae. `session_id` (NULL = глобальный лор) и/или `character_id`
 (лорбук из карточки). Поля: `category`, `title`, `content`, `keywords` (JSON),
-`always_on` (подмешивать всегда), `enabled`, `priority`, `meta` (JSON, служебное:
-у авто-сводки — `last_message_id`, указатель «учтено до»). См. [HORAE.md](HORAE.md).
+`always_on` (подмешивать всегда), `enabled`, `priority`, `meta` (JSON, служебное).
+У авто-сводки «📜 Память чата (авто)» (`category="summary"`) в `meta`:
+`last_message_id` (указатель «учтено до»), `v` (формат указателя, `2` — окну можно
+верить), `schema` (`"hms-1"` — мастер-снимок строгой схемы), `tokens`,
+`updated_by` (`incremental`/`catchup`/`rebuild`), `warnings` (последние пять),
+`facts_upto` (до какого сообщения разобраны факты), `last_error` (сбой
+ежеходного прохода `{message, kind, at, failures}`) и `rebuild` — буфер
+пересборки `{content, last_message_id, manual, started_at, batch_size, paused}`.
+См. [HORAE.md](HORAE.md).
 
 ### `horae_facts` — `HoraeFact`
 Атомарный факт долговременной памяти чата (слой 3 Horae, `backend/horae_recall.py`).
@@ -103,8 +110,13 @@ ISO-строкой с «Z» — у user-сообщения это время о�
   `summary_model` — быстрая модель для фоновой сводки и фактов, `embedding_model` —
   модель эмбеддингов фактов; пустые = модель чата / поиск фактов по словам);
 - `ui` — общие настройки интерфейса, в том числе памяти: `auto_summary`,
-  `summary_every`, `memory_window` (активное окно, по умолчанию 20; 0 = вся
-  история), `horae_facts` (факты выключены только явным `false`);
+  `summary_every`, `memory_window` (активное окно, по умолчанию 50; 0 = вся
+  история), `horae_facts` (факты выключены только явным `false`),
+  `memory_batch` (размер пакета, 1–200), `memory_delay_ms` (пауза между
+  запросами памяти, 0–60000), `memory_snapshot_tokens` (бюджет снимка,
+  1000–200000; пока ключа нет — умолчания из `.env`), флаги разовых миграций
+  интерфейса `memory_defaults_v` (окно 20 → 50) и `ctx_budget_v` (бюджет хода
+  1 000 000 → 200 000 один раз);
 - `security` — `access_code`, `admin_password`, `accounts_enabled`, `basic_auth`;
 - `telegram` — токен, `enabled`, `default_character_id`, `model`, `open_to_all`,
   `whitelist[]`, `requests[]`.

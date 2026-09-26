@@ -62,6 +62,14 @@ Pydantic-DTO для валидации запросов/ответов: `Generat
   `_merge_params`. Так служебный вызов памяти получает свои температуру и длинный
   вывод, оставаясь при `params=None` (фильтры безопасности выключены), а сигнатуры
   `complete`/`stream_completion` не меняются.
+- `finish_reason_probe()` — контекстный менеджер на том же приёме: внутри блока
+  `stream_completion` пишет в отданный словарь `finish_reason` стрима. Нужен
+  памяти: непустой ответ, оборванный `max_tokens`, шлюз отдаёт как успех
+  (исключение — только при пустом), а для снимка это обрыв. `is_length_finish`
+  узнаёт `length`/`max_tokens`.
+- `model_max_output_tokens(model)` — лимит вывода модели по карте LiteLLM
+  (`max_output_tokens`; имя пробуется и без префикса `litellm_proxy/`), `None` —
+  модель неизвестна. По нему память прижимает свой `max_tokens` и бюджет снимка.
 - `GEMINI_SAFETY_OFF` — снятие настраиваемых фильтров Gemini/Vertex AI. Порог **`OFF`**
   (сильнее `BLOCK_NONE`: полностью выключает фильтр; для Gemini 2.5/3 это дефолт) на все
   категории, включая `CIVIC_INTEGRITY`. Применяется, когда `params is None` (служебные
@@ -81,7 +89,11 @@ asyncio-задачу, которая стримит токены подписч�
 - `assemble_context(...)` — **чистая** функция (без БД/сети, легко тестируется):
   системный промпт = паспорт персонажа + персона + сработавшие записи Horae +
   `STYLE_GUIDE` (подсказка по портативной разметке); затем история под бюджет токенов
-  и текущее сообщение (текст или мультимодальный контент).
+  и текущее сообщение (текст или мультимодальный контент). Всё, что от обрезки
+  истории не зависит (системный промпт, аватары, база знаний, блок снимка —
+  `_summary_tail`, статичный хвост — `_static_tail`, текущее сообщение),
+  собирается до неё и резервируется в бюджете (`stable_trim_start(reserved=…)`);
+  вне резерва — только вспомненные факты и манифест файлов, они зависят от обрезки.
 - `build_context_from_db(...)` — обёртка, читающая данные из БД и зовущая
   `assemble_context`. Подробности про память — в [HORAE.md](HORAE.md).
 - Отчёт для инспектора (`report`): у каждого блока хвоста — `key` (`snapshot`,
@@ -97,6 +109,10 @@ asyncio-задачу, которая стримит токены подписч�
   и в путях regenerate/continue/retry.
 - `estimate_content_tokens(content)` — оценка токенов для мультимодального контента
   (base64 картинок/аудио НЕ считается как текст, иначе бюджет выбрасывал бы всю историю).
+- `estimate_tokens(text)` — tiktoken `cl100k_base` с кэшем в два яруса: тексты до
+  20 000 символов — в большом (история пересчитывается каждый ход), длиннее — в
+  маленьком на 16 записей; `count_tokens(text)` — то же без кэша (им сервис
+  памяти считает снимки: каждый уникален, и кэш держал бы их тексты).
 
 ### `hierarchical_memory.py`
 Чистое ядро иерархической пакетной памяти (2.5.0): свёртка старой истории в
@@ -111,13 +127,21 @@ stdlib** — ни БД, ни FastAPI, ни litellm; модель приходи�
   base64/HTML/`<think>`), `plan_batch`/`plan_batches` — пакеты по числу сообщений и
   символам.
 - `validate_snapshot`/`extract_snapshot` — обёртка, разделы, «сдувание»;
-  `guard_entries` — возвращает записи разделов 2–4, которые модель потеряла.
+  `guard_entries` — возвращает записи разделов 2–4, которые модель потеряла
+  (сопоставление — мультимножество, для повторяющихся ключей — расширенный ключ).
 - `classify_error` → `MemoryLLMError(kind, message, retryable)`; исключения
-  `SnapshotValidationError`, `SourceConflictError`.
+  `SnapshotValidationError`, `SourceConflictError`, `MemoryCancelled` (отмена
+  прогона посреди паузы).
 - `HierarchicalMemoryManager`: `call` (пауза-ограничитель и повторы с бэкоффом для
-  любого запроса), `merge_block` (слияние + корректирующие ходы + страж), `compact`
-  (сжатие хроники в арки сверх бюджета), `scan_and_compress_history` (цикл по
-  пакетам с прогрессом `ScanProgress.line()`, отменой и лимитом пакетов).
+  любого запроса; отмена прогона обрывает паузы), `merge_block` (слияние +
+  корректирующие ходы + страж; обрыв лимитом вывода — сжатие и один повтор;
+  снимок больше лимита вывода `MemoryConfig.output_tokens` — сжатие до слияния
+  или отказ без вызова), `compact` (сжатие хроники в арки сверх бюджета; из
+  ответа берётся только хроника), `scan_and_compress_history` (цикл по пакетам с
+  прогрессом `ScanProgress.line()`, отменой и лимитом пакетов). Сигнатура из ТЗ
+  `scan_and_compress_history(chat_history, batch_size=20, delay_ms=1500)`
+  принимается как есть: `batch_size`/`delay_ms` — переопределения `MemoryConfig`
+  на один прогон.
 - `window_start`/`WINDOW_STEP`/`DEFAULT_WINDOW = 50` (реэкспортируются из
   `horae_recall`), `SlidingWindow`, `budget_tiers` (монитор токенов),
   `render_export_markdown`; промпты `MASTER_STATE_PROMPT`, `COMPACT_PROMPT`,
@@ -132,16 +156,24 @@ stdlib** — ни БД, ни FastAPI, ни litellm; модель приходи�
   обрезки + `meta.schema/tokens/updated_by/warnings`), `clamp_summary_pointer`.
 - `memory_config`/`build_manager` — параметры из `ui` и `.env`, фоновая модель
   `summary_model` в подключении при `params=None`, вывод через
-  `llm_gateway.sampling_overrides`; `load_memory_messages` — сообщения чата с
-  настоящими именами авторов и временем в поясе чата.
+  `llm_gateway.sampling_overrides`, прижатый к лимиту вывода модели
+  (`memory_output_limit`, `max_snapshot_tokens`); непустой ответ, оборванный
+  лимитом (`finish_reason_probe`), — `MemoryLLMError("length")`; 400 из-за
+  `max_tokens` — один повтор с `DEFAULT_MAX_TOKENS`. `load_memory_messages` —
+  сообщения чата с настоящими именами авторов и временем в поясе чата.
 - `DbBatchSource` — источник пакетов: только то, что старше активного окна; цель
-  записи — живой снимок или буфер пересборки `meta["rebuild"]`; сверка куска с
-  чатом перед записью; факты пакета после записи.
+  записи — живой снимок или буфер пересборки `meta["rebuild"]` (остановленный
+  буфер, `paused`, — только для «Продолжить»); сверка куска с чатом перед
+  записью; факты пакета после записи, с доизвлечением пропуска после сбоя
+  (`meta.facts_upto`, `_facts_gap`).
 - `run_incremental` — ежеходный проход (его зовёт `main._maybe_update_summary`, не
-  больше `MEMORY_MAX_BATCHES_PER_TURN` пакетов); `chat_lock`/`is_busy` — один
+  больше `MEMORY_MAX_BATCHES_PER_TURN` пакетов); сбой — в `meta.last_error`, и
+  следующий проход ждёт паузу `turn_retry_after`; `chat_lock`/`is_busy` — один
   прогон памяти на чат.
-- Задания «Пересобрать»/«Догнать»: `MemoryJob`, `start_job`, `cancel_job`,
-  `forget_job` (удаление чата), `wait_job`; реестр — в памяти процесса.
+- Задания «Пересобрать»/«Догнать»: `MemoryJob` (с `warnings` и `snapshot_tokens`),
+  `start_job`, `cancel_job`, `forget_job` (удаление чата), `wait_job`; реестр — в
+  памяти процесса, в работе — одно задание на процесс (`_jobs_gate`), остальные
+  `queued`.
 - `status`, `purge`, `export_markdown` — для эндпоинтов `/api/sessions/{id}/memory*`
   (см. [API.md](API.md)). Тесты — `tests/test_memory_service.py`.
 
