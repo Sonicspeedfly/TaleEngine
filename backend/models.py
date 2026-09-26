@@ -47,6 +47,10 @@ class Character(Base):
     model: Mapped[str | None] = mapped_column(String(200), nullable=True)
     # Закрепление персонажа наверху списка (см. ChatSession.pinned_at).
     pinned_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Профиль Horae персонажа: {"settings": {...}, "tables": [шаблоны таблиц]}.
+    # Настройки профиля ложатся поверх глобальных во всех чатах с персонажем
+    # (как «профиль карточки» плагина, но без ручной подгрузки).
+    horae_profile: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     sessions = relationship("ChatSession", back_populates="character")
@@ -131,6 +135,13 @@ class Message(Base):
     # Если задано — это «плашка документа»: ответ ИИ открывается в Канвасе по клику,
     # а не выводится полотном в чат. content тогда — короткий заголовок/превью.
     canvas_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Данные Horae State Engine: {"metas": [мета свайпа 0, …], "side": bool}.
+    # Мета — то, что модель записала служебными тегами <horae>/<horaeevent> в
+    # конце ответа (время, место, персонажи, предметы, события…); сами теги из
+    # content вырезаются при сохранении. Своя мета у каждого свайпа — поэтому
+    # переключение варианта ответа переключает и состояние сюжета.
+    # side — «побочная сцена»: сообщение не влияет на состояние и хронологию.
+    horae: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     session = relationship("ChatSession", back_populates="messages")
@@ -243,6 +254,49 @@ class HoraeFact(Base):
     # Последнее сообщение фрагмента, из которого извлечён факт: по нему считается
     # свежесть и отсекаются факты, чей источник и так лежит в активном окне.
     source_message_id: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class HoraeChatState(Base):
+    """
+    Данные Horae State Engine уровня чата (см. backend/horae_engine.py):
+    журнал правок пользователя, свёртки хронологии, таблицы, настройки RPG,
+    переопределения настроек, стартовое состояние переноса.
+
+    Само состояние сюжета здесь НЕ хранится: оно каждый раз пересчитывается из
+    мет сообщений и журнала правок — так свайп, правка или удаление сообщения
+    меняют его без особых путей «пересборки».
+    """
+    __tablename__ = "horae_chat_state"
+
+    session_id: Mapped[int] = mapped_column(ForeignKey("chat_sessions.id"), primary_key=True)
+    data: Mapped[dict] = mapped_column(JSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class HoraeMemoryDoc(Base):
+    """
+    Документ сообщения для вспоминания событий Horae (порт vectorManager):
+    события, место, персонажи и дата ответа ИИ одним текстом + его вектор.
+
+    message_id NULL — документ перенесён из прошлого чата («Новый чат с
+    памятью»): тогда текст исходного сообщения лежит в content, а строка
+    воспоминания собирается из brief.
+    """
+    __tablename__ = "horae_memory_docs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("chat_sessions.id"), index=True)
+    message_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    origin: Mapped[str] = mapped_column(String(80), default="")
+    doc_hash: Mapped[str] = mapped_column(String(40), default="")
+    document: Mapped[str] = mapped_column(Text, default="")
+    content: Mapped[str] = mapped_column(Text, default="")
+    brief: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    embedding: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    embed_model: Mapped[str] = mapped_column(String(200), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 

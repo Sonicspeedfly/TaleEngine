@@ -177,6 +177,30 @@ stdlib** — ни БД, ни FastAPI, ни litellm; модель приходи�
 - `status`, `purge`, `export_markdown` — для эндпоинтов `/api/sessions/{id}/memory*`
   (см. [API.md](API.md)). Тесты — `tests/test_memory_service.py`.
 
+### Horae State Engine (`horae_*.py`)
+Перенос плагина Horae: состояние сюжета из служебных тегов ответа. Подробно —
+[HORAE_STATE.md](HORAE_STATE.md), дизайн —
+[superpowers/specs/2026-09-26-horae-state-engine-design.md](superpowers/specs/2026-09-26-horae-state-engine-design.md).
+Чистые модули (stdlib, без БД и сети):
+- `horae_state.py` — формат меты, `parse_reply` (теги → текст + мета),
+  `strip_tags_text`, `merge_meta`, `normalize_meta`, `replay` (меты + журнал
+  правок → состояние), `render_state_block`, `render_timeline`, `timeline`,
+  `build_document`, `message_brief`, `to_api`;
+- `horae_time.py` — даты сюжета (григорианские, русские, фэнтези, свой
+  календарь), относительное время по-русски, возраст NPC;
+- `horae_rpg.py` — `<horaerpg>`: разбор, применение, рендер, правила;
+- `horae_tables.py` — `<horaetable:…>`: разбор, повтор, структура, рендер;
+- `horae_prompts.py` — промпты (`horae_prompts_ru/*.txt`), правила тегов,
+  промпты служебных задач и разбор их ответов;
+- `horae_settings.py` — настройки по умолчанию и слои глобально → персонаж → чат;
+- `horae_import.py` — данные плагина SillyTavern → наш формат.
+Сервисы: `horae_engine.py` (БД ↔ ядро: меты, состояние чата, `context_parts`
+для хода, `split_reply` для сохранения ответа, журнал правок, события, свёртки,
+удаление/ветка/экспорт), `horae_vector.py` (документы и вспоминание),
+`horae_tasks.py` (ИИ-анализ, скан, авто-свёртка, сжатие, заполнение NPC,
+переписывание запроса, перенос; очередь служебных запросов `aux_complete`),
+`horae_api.py` (эндпоинты; `build_router(current_user, can_access_session)`).
+
 ### `group_chat.py`
 Логика групповых чатов: определяет, кто из персонажей отвечает, и формирует очередь
 реплик. Используется раннером генерации (веб) и `_generate_group_reply` (Telegram).
@@ -209,8 +233,11 @@ V2. `extract_horae_entries` достаёт лорбук (`character_book`) → �
 ### `chat_import.py`
 Импорт чатов SillyTavern (.jsonl). `parse_sillytavern_chat` разбирает реплики, выводит
 имя персонажа из реплик при заглушке, **вырезает встроенные теги Horae**
-(`<horae>`/`<horaeevent>`) из текста и собирает из них снимок состояния + хронологию
-событий. См. [IMPORT_EXPORT.md](IMPORT_EXPORT.md).
+(`<horae>`/`<horaeevent>`) из текста и отдаёт структурные данные Horae
+(`horae_meta` каждого ответа, мету тегов по свайпам, глобальные данные
+`chat[0]`) — `main.import_chat` переводит их в наш формат (`horae_import`).
+Текстовые «снимок состояния + хронология» создаются, только если структурных
+данных нет. См. [IMPORT_EXPORT.md](IMPORT_EXPORT.md).
 
 ### `native_io.py`
 **Нативный формат AiChat** (`"format":"aichat.chat"`). `build_chat_export(...)` —

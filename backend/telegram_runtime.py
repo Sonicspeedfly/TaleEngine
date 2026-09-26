@@ -42,6 +42,7 @@ from backend.config import settings
 from backend.database import AsyncSessionLocal
 from backend.attachments import store_attachments
 from backend.document_service import is_document
+from backend import horae_engine
 from backend.horae_memory import build_context_from_db
 from backend.llm_gateway import build_user_content, complete, stream_completion
 from backend.schemas import AttachmentIn, GenerationParams
@@ -262,6 +263,31 @@ async def _get_or_create_session(tg_user_id: int, owner_id=None) -> int | None:
     return await _create_session(tg_user_id, char_id, owner_id=owner_id)
 
 
+async def _horae_after(session_id: int, after_id: int) -> None:
+    """
+    Обработка Horae после ответа бота (анализ ответа без тегов, документы
+    поиска, свёртка) — для ответов с id больше after_id.
+
+    Не отдельной задачей «выстрелил и забыл», а ожиданием в обработчике ПОСЛЕ
+    отправки ответа: пользователь её не ждёт, а задачу, которую никто не
+    ждёт, при остановке отменили бы посреди записи в SQLite — и незакрытая
+    транзакция держала бы файл БД (см. database.py про NullPool).
+    """
+    from backend import horae_tasks
+
+    try:
+        async with AsyncSessionLocal() as db:
+            ids = (await db.execute(
+                select(models.Message.id).where(
+                    models.Message.session_id == session_id, models.Message.id > after_id,
+                    models.Message.role == "assistant")
+            )).scalars().all()
+        if ids:
+            await horae_tasks.after_turn(session_id, list(ids))
+    except Exception:  # noqa: BLE001 — память не должна мешать боту
+        logging.getLogger("aichat.horae").exception("Horae после ответа бота не отработал")
+
+
 async def _generate_reply(session_id: int, text: str, attachments: list[AttachmentIn]) -> str:
     async with AsyncSessionLocal() as db:
         sess = await db.get(models.ChatSession, session_id)
@@ -287,12 +313,14 @@ async def _generate_reply(session_id: int, text: str, attachments: list[Attachme
         reply += token
 
     async with AsyncSessionLocal() as db:
-        db.add(
-            models.Message(
-                session_id=session_id, role="assistant", content=reply,
-                swipes=[reply], active_swipe=0,
-            )
+        # Служебные теги Horae — в мету, в Telegram уходит чистый текст.
+        reply, meta = await horae_engine.split_reply(db, session_id, reply)
+        msg = models.Message(
+            session_id=session_id, role="assistant", content=reply,
+            swipes=[reply], active_swipe=0,
+            horae=horae_engine.with_meta(None, 0, meta) if meta else None,
         )
+        db.add(msg)
         await db.commit()
     return reply
 
@@ -353,11 +381,14 @@ async def _generate_group_reply(
             )
         reply = await complete(gmsgs, params, connection, kind="chat")
         async with AsyncSessionLocal() as db:
-            db.add(models.Message(
+            reply, meta = await horae_engine.split_reply(db, session_id, reply)
+            msg = models.Message(
                 session_id=session_id, role="assistant", content=reply,
                 swipes=[reply], active_swipe=0,
                 speaker_name=character.name, model_used=model_used,
-            ))
+                horae=horae_engine.with_meta(None, 0, meta) if meta else None,
+            )
+            db.add(msg)
             await db.commit()
         results.append((character.name, reply))
     return results
@@ -369,6 +400,10 @@ async def _respond(message: TgMessage, session_id: int, text: str,
     await _maybe_autotitle(session_id, text)  # первую реплику делаем названием чата
     async with AsyncSessionLocal() as db:
         sess = await db.get(models.ChatSession, session_id)
+        before = (await db.execute(
+            select(models.Message.id).where(models.Message.session_id == session_id)
+            .order_by(models.Message.id.desc()).limit(1)
+        )).scalar() or 0
     if sess and sess.is_group:
         await _bot.send_chat_action(message.chat.id, "typing")
         results = await _generate_group_reply(session_id, text, attachments)
@@ -378,10 +413,12 @@ async def _respond(message: TgMessage, session_id: int, text: str,
         for name, reply in results:
             await _bot.send_chat_action(message.chat.id, "typing")
             await send_long(message, f"🎭 {name}:\n{reply}")
+        await _horae_after(session_id, before)
         return
     await _bot.send_chat_action(message.chat.id, "typing")
     reply = await _generate_reply(session_id, text, attachments)
     await send_long(message, reply)
+    await _horae_after(session_id, before)
 
 
 # Постоянные кнопки ПОД полем ввода (reply-клавиатура) — основные действия.

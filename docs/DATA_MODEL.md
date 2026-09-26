@@ -13,7 +13,8 @@ ORM-модели в `backend/models.py` — **единственный исто�
 (примеры реплик — держат «голос»), `post_history_instructions` (SillyTavern
 «jailbreak»/UJB — переинъектируются в самый конец контекста), `avatar_path`
 (data:URI или URL), `generation_params` (JSON, переопределяет дефолты), `model`,
-`owner_id`.
+`owner_id`, `horae_profile` (JSON: `{"settings": {...}, "tables": [...]}` —
+настройки Horae персонажа поверх глобальных и шаблоны таблиц персонажа).
 
 ### `chat_sessions` — `ChatSession`
 Сессия чата. `user_key` различает ведущего диалог: `web:<uuid>` или `tg:<telegram_id>`.
@@ -33,7 +34,9 @@ ORM-модели в `backend/models.py` — **единственный исто�
 ответила; при срабатывании запасной — она), `speaker_name` (кто сказал в группе),
 `reply_to_id` (ответ на конкретное сообщение), `created_at` (UTC; в API отдаётся
 ISO-строкой с «Z» — у user-сообщения это время отправки, у assistant — время
-готовности ответа).
+готовности ответа), `horae` (JSON или NULL: `{"metas": [мета свайпа 0, …],
+"side": bool}` — данные Horae State Engine по свайпам, см.
+[HORAE_STATE.md](HORAE_STATE.md); служебные теги из `content` вырезаны).
 
 ### `attachment_blobs` — `AttachmentBlob`
 Данные (base64) вложений — отдельно от сообщений: `message_id`, `data`.
@@ -75,6 +78,21 @@ ISO-строкой с «Z» — у user-сообщения это время о�
 фрагмента, из которого извлечён факт: по нему считается свежесть и отсекаются
 факты, чей источник модель и так видит дословно), `created_at`. Удаляются вместе
 с чатом (`database._cleanup_orphans`) и при удалении сообщений, из которых взяты.
+
+### `horae_chat_state` — `HoraeChatState`
+Данные Horae State Engine уровня чата: `session_id` (PK), `data` (JSON:
+журнал правок `ops`, свёртки хронологии `summaries`, таблицы чата `tables`,
+данные глобальных/персонажных таблиц `table_overlays`, `rpg_config`,
+переопределения настроек `settings`, стартовое состояние переноса `seed`,
+`pinned_npcs`, `favorite_npcs`, последний скан `scan`, ошибка свёртки
+`summary_error`, счётчик `seq`), `updated_at`. Само состояние сюжета не
+хранится — пересчитывается из мет сообщений и журнала (`horae_state.replay`).
+
+### `horae_memory_docs` — `HoraeMemoryDoc`
+Документы вспоминания событий: `session_id`, `message_id` (NULL — перенесён
+из прошлого чата), `origin`, `doc_hash`, `document` (события, место,
+персонажи, дата ответа), `content` и `brief` (для перенесённых — текст ответа
+и краткая мета), `embedding` + `embed_model`.
 
 ### `personas` — `Persona`
 Персона пользователя (кем он отыгрывает): `name`, `description`, `avatar_path`, `owner_id`.
@@ -119,7 +137,11 @@ ISO-строкой с «Z» — у user-сообщения это время о�
   1 000 000 → 200 000 один раз);
 - `security` — `access_code`, `admin_password`, `accounts_enabled`, `basic_auth`;
 - `telegram` — токен, `enabled`, `default_character_id`, `model`, `open_to_all`,
-  `whitelist[]`, `requests[]`.
+  `whitelist[]`, `requests[]`;
+- `horae` — глобальные настройки Horae State Engine (ключи — дизайн §7);
+- `horae_library` — `global_tables` (шаблоны глобальных таблиц),
+  `prompt_presets` (свои наборы промптов), `equipment_templates` (свои шаблоны
+  слотов снаряжения).
 
 ## Миграции
 

@@ -52,6 +52,10 @@ from backend import (
     admin_service,
     debug_log,
     group_chat,
+    horae_api,
+    horae_engine,
+    horae_state,
+    horae_tasks,
     knowledge,
     memory_service,
     models,
@@ -529,19 +533,23 @@ def _make_persist_new(model_used: str):
 
     async def cb(session_id: int, content: str, model_override: str | None = None) -> None:
         async with AsyncSessionLocal() as db:
-            db.add(
-                models.Message(
-                    session_id=session_id,
-                    role="assistant",
-                    content=content,
-                    swipes=[content],
-                    active_swipe=0,
-                    model_used=model_override or model_used,
-                )
+            # Служебные теги Horae — из текста в мету (в чате и истории их нет).
+            clean, meta = await horae_engine.split_reply(db, session_id, content)
+            msg = models.Message(
+                session_id=session_id,
+                role="assistant",
+                content=clean,
+                swipes=[clean],
+                active_swipe=0,
+                model_used=model_override or model_used,
+                horae=horae_engine.with_meta(None, 0, meta) if meta else None,
             )
+            db.add(msg)
             await db.commit()
+            message_id = msg.id
         # Ход завершён — возможно, пора освежить авто-сводку (фоном, не ждём).
         _spawn_bg(_maybe_update_summary(session_id))
+        _spawn_bg(horae_tasks.after_turn(session_id, [message_id]))
 
     return cb
 
@@ -554,13 +562,18 @@ def _make_persist_swipe(message_id: int, model_used: str):
             msg = await db.get(models.Message, message_id)
             if not msg:
                 return
+            clean, meta = await horae_engine.split_reply(db, session_id, content)
             swipes = list(msg.swipes or [])
-            swipes.append(content)
+            swipes.append(clean)
             msg.swipes = swipes
             msg.active_swipe = len(swipes) - 1
-            msg.content = content
+            msg.content = clean
             msg.model_used = model_override or model_used
+            # У каждого свайпа своя мета Horae: переключение варианта ответа
+            # переключает и состояние сюжета.
+            msg.horae = horae_engine.with_appended_meta(msg.horae, len(swipes), meta)
             await db.commit()
+        _spawn_bg(horae_tasks.after_turn(session_id, [message_id]))
 
     return cb
 
@@ -573,7 +586,10 @@ def _make_persist_continue(message_id: int, model_used: str):
             msg = await db.get(models.Message, message_id)
             if not msg:
                 return
-            new_full = (msg.content or "") + content
+            # Теги пишутся в конце ответа — значит, в продолжении. Мета
+            # продолжения сливается с прежней мета этого свайпа.
+            clean, meta = await horae_engine.split_reply(db, session_id, content)
+            new_full = (msg.content or "") + clean
             msg.content = new_full
             swipes = list(msg.swipes or [])
             if swipes:
@@ -582,7 +598,12 @@ def _make_persist_continue(message_id: int, model_used: str):
                 swipes = [new_full]
             msg.swipes = swipes
             msg.model_used = model_override or model_used
+            if meta:
+                old = horae_engine.active_meta(msg.horae, msg.active_swipe)
+                msg.horae = horae_engine.with_meta(msg.horae, msg.active_swipe or 0,
+                                                   horae_state.merge_meta(old, meta))
             await db.commit()
+        _spawn_bg(horae_tasks.after_turn(session_id, [message_id]))
 
     return cb
 
@@ -1210,8 +1231,9 @@ async def fork_session(
         .where(models.Message.session_id == session_id, models.Message.id <= pivot.id)
         .order_by(models.Message.id)
     )).scalars().all()
+    id_map: dict[int, int] = {}
     for m in msgs:
-        db.add(models.Message(
+        copy_msg = models.Message(
             session_id=fork.id,
             role=m.role,
             content=m.content,
@@ -1223,7 +1245,13 @@ async def fork_session(
             reply_to_id=None,   # ссылки на реплики исходного чата в ветке не имеют смысла
             canvas_id=None,     # общий канвас связал бы ветку с исходным документом
             created_at=m.created_at,
-        ))
+            horae=m.horae,      # данные Horae — вместе с сообщением
+        )
+        db.add(copy_msg)
+        await db.flush()
+        id_map[m.id] = copy_msg.id
+    # Состояние Horae ветки: правки и свёртки до развилки, с новыми id.
+    await horae_engine.copy_to_fork(db, session_id, fork.id, id_map, pivot.id)
     # Группа без участников перестала бы быть группой.
     if src.is_group:
         members = (await db.execute(
@@ -1301,6 +1329,8 @@ async def delete_session(
     # строк: id этого чата достанется следующему новому, и тот не должен ни
     # видеть чужое задание, ни получать в память его работу (см. forget_job).
     memory_service.forget_job(session_id)
+    horae_tasks.forget_job(session_id)
+    await horae_engine.on_session_deleted(db, session_id)
     # Данные вложений сообщений этого чата (blob-таблица) — до удаления сообщений.
     await delete_message_blobs(
         db, select(models.Message.id).where(models.Message.session_id == session_id)
@@ -1441,6 +1471,10 @@ async def get_messages(
             "canvas_kind": canvas_meta.get(m.canvas_id, {}).get("kind") if m.canvas_id else None,
             # Время сообщения: у user — момент отправки, у assistant — момент ответа.
             "created_at": _iso_utc(m.created_at),
+            # Строка Horae под ответом («2026/2/4 15:00 · Таверна · …») и пометка
+            # «побочная сцена»; полная мета — GET /messages/{id}/horae.
+            "horae_brief": horae_state.message_brief(horae_engine.active_meta(m.horae, m.active_swipe)),
+            "horae_side": horae_engine.is_side(m.horae),
         }
         for m in rows
     ]
@@ -1675,15 +1709,25 @@ async def edit_message(
         msg.active_swipe = idx
         msg.content = swipes[idx]
     if payload.content is not None:
-        msg.content = payload.content
+        content = payload.content
+        if msg.role == "assistant" and horae_state.has_tags(content):
+            # В правленый ответ вписали теги Horae руками — разбираем их в мету
+            # этого свайпа, как свежий ответ модели.
+            content, meta = await horae_engine.split_reply(db, msg.session_id, content)
+            if meta:
+                msg.horae = horae_engine.with_meta(msg.horae, msg.active_swipe or 0, meta)
+        msg.content = content
         # Синхронизируем активный свайп с отредактированным текстом.
         swipes = list(msg.swipes or [])
         if swipes:
-            swipes[msg.active_swipe] = payload.content
+            swipes[msg.active_swipe] = content
         else:
-            swipes = [payload.content]
+            swipes = [content]
         msg.swipes = swipes
     await db.commit()
+    if msg.role == "assistant":
+        # Свайп переключили или вписали теги — документ поиска Horae догонит.
+        _spawn_bg(horae_tasks.after_turn(msg.session_id, None))
     return {"ok": True, "content": msg.content, "active_swipe": msg.active_swipe}
 
 
@@ -1699,6 +1743,9 @@ async def delete_message(message_id: int, db: AsyncSession = Depends(get_session
         # сводки прижимается к оставшимся СЕЙЧАС, до того как новые сообщения
         # займут эти id и сойдут за уже учтённые (см. memory_service.clamp_summary_pointer).
         await memory_service.clamp_summary_pointer(db, session_id)
+        # Horae: свёртки, доходящие до удалённого, снимаются; якоря правок и
+        # таблиц прижимаются; документ поиска удаляется.
+        await horae_engine.on_messages_deleted(db, session_id, [message_id])
         await db.commit()
     return {"ok": True}
 
@@ -1942,7 +1989,10 @@ async def export_session(
             c = await db.get(models.Character, gm.character_id)
             if c:
                 members.append(c)
-    data = native_io.build_chat_export(sess, character, persona, messages, horae, members)
+    data = native_io.build_chat_export(
+        sess, character, persona, messages, horae, members,
+        horae_chat=await horae_engine.load_chat_data(db, sess.id),
+    )
     # Полный экспорт: данные вложений подтягиваем из blob-таблицы в файл.
     await hydrate_export_attachments(db, data, messages)
     return data
@@ -2053,6 +2103,7 @@ async def _import_native_chat(db, data: dict, owner_id, user) -> dict:
             speaker_name=m.get("speaker_name"),
             attachments=[],
             model_used=m.get("model_used"),
+            horae=m.get("horae") if isinstance(m.get("horae"), dict) else None,
         )
         db.add(msg)
         await db.flush()  # получаем msg.id, не закрывая транзакцию
@@ -2063,6 +2114,13 @@ async def _import_native_chat(db, data: dict, owner_id, user) -> dict:
             pending_replies.append((msg, m["reply_to_idx"]))
     for msg, ridx in pending_replies:
         msg.reply_to_id = idx_to_id.get(ridx)
+    # Состояние Horae чата: в файле id сообщений — idx + 1 (см. native_io).
+    if isinstance(data.get("horae_chat"), dict):
+        chat_data = horae_engine.blank_chat_data()
+        chat_data.update(data["horae_chat"])
+        position_to_id = {int(idx) + 1: mid for idx, mid in idx_to_id.items() if idx is not None}
+        await horae_engine.save_chat_data(
+            db, sess.id, horae_engine.remap_chat_data(chat_data, position_to_id))
 
     # Память Horae: память чата — всегда; лорбук персонажа — только если персонаж
     # новый (у существующего лорбук уже есть, не плодим дубли).
@@ -2144,20 +2202,52 @@ async def import_chat(
     await db.commit()
     await db.refresh(sess)
 
-    for m in parsed["messages"]:
-        db.add(
-            models.Message(
-                session_id=sess.id,
-                role=m["role"],
-                content=m["content"],
-                swipes=m["swipes"],
-                active_swipe=m["active_swipe"],
-                speaker_name=m.get("speaker"),
-            )
-        )
+    # Horae State Engine: структурные данные плагина — мета каждого свайпа
+    # (horae_meta активного + встроенные теги всех) и состояние чата из chat[0]
+    # (свёртки, память сцен, таблицы, RPG, правки) с переводом индексов файла в id.
+    from backend import horae_import
 
-    # Детали Horae: текущее состояние (always_on) и хронология событий (отдельной
-    # записью без always_on — чтобы не раздувать каждый запрос; включается в UI).
+    index_to_mid: dict[int, int] = {}
+    summary_texts: dict = {}
+    structured_count = 0
+    for m in parsed["messages"]:
+        horae = None
+        if m["role"] == "assistant":
+            metas = list(m.get("horae_swipe_metas") or [None] * len(m["swipes"]))
+            active = m["active_swipe"]
+            if m.get("horae_raw"):
+                summary_texts.update(horae_import.summary_card_texts(m["horae_raw"]))
+                inline = metas[active] if active < len(metas) else None
+                metas[active] = horae_import.convert_message_meta(m["horae_raw"], text_meta=inline)
+            if any(metas) or m.get("horae_side"):
+                horae = {"metas": metas, "side": bool(m.get("horae_side"))}
+                structured_count += 1 if any(metas) else 0
+        msg = models.Message(
+            session_id=sess.id,
+            role=m["role"],
+            content=m["content"],
+            swipes=m["swipes"],
+            active_swipe=m["active_swipe"],
+            speaker_name=m.get("speaker"),
+            horae=horae,
+        )
+        db.add(msg)
+        await db.flush()
+        if m.get("st_index") is not None:
+            index_to_mid[m["st_index"]] = msg.id
+    horae_chat_saved = False
+    if parsed.get("horae_chat0") or summary_texts:
+        chat_data = horae_import.convert_chat_meta(parsed.get("horae_chat0") or {}, index_to_mid,
+                                                   summary_texts=summary_texts)
+        await horae_engine.save_chat_data(db, sess.id, chat_data)
+        horae_chat_saved = True
+
+    # Детали Horae текстом: текущее состояние (always_on) и хронология событий —
+    # только если структурных данных нет (старый экспорт без horae_meta). Иначе
+    # то же самое уже есть в блоке состояния Horae, и текст шёл бы дублем.
+    if structured_count:
+        parsed["horae_state"] = ""
+        parsed["horae_events"] = ""
     horae_saved = bool(parsed.get("horae_state"))
     if horae_saved:
         db.add(
@@ -2192,6 +2282,10 @@ async def import_chat(
         "horae_saved": horae_saved,
         "horae_events_saved": events_saved,
         "horae_preview": (parsed.get("horae_state") or "")[:400],
+        # Сколько ответов пришло со структурными данными Horae (время, место,
+        # персонажи, предметы, события…) и перенесено ли состояние чата плагина.
+        "horae_structured": structured_count,
+        "horae_chat_saved": horae_chat_saved,
     }
 
 
@@ -2484,6 +2578,7 @@ async def canvas_generate(
         history_files_turns=_hist_files_turns(params),
         knowledge_chars=_kb_chars(params),
         assistant_mode=bool(params and params.assistant_mode),
+        horae_tags=False,   # документ Канваса — не ход сюжета, теги Horae ему не нужны
     )
     messages.append({"role": "system", "content": (
         "Сгенерируй по запросу пользователя ПОЛНЫЙ, законченный материал (документ, "
@@ -2491,6 +2586,8 @@ async def canvas_generate(
         "приветствий и разговорных вставок. Если это код — оберни его в один блок ```."
     )})
     result = await complete(messages, params, connection, kind="canvas")
+    # Модель могла дописать теги Horae по привычке прошлых ходов — в документ их не пускаем.
+    result = horae_state.strip_tags_text(result, partial=True)
 
     kind, language, content = _detect_canvas(result)
     title = _canvas_title(content, kind)
@@ -2800,16 +2897,20 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
                 allowed = [m for m in rmembers if m.id not in excluded_ids]
                 chosen = group_chat.round_robin_next(allowed, last_speaker) if allowed else []
 
+        saved_ids: list[int] = []
+
         async def _save_reply(character, text: str) -> None:
             async with AsyncSessionLocal() as rdb:
-                rdb.add(
-                    models.Message(
-                        session_id=session_id, role="assistant", content=text,
-                        swipes=[text], active_swipe=0,
-                        speaker_name=character.name, model_used=model_used,
-                    )
+                clean, meta = await horae_engine.split_reply(rdb, session_id, text)
+                msg = models.Message(
+                    session_id=session_id, role="assistant", content=clean,
+                    swipes=[clean], active_swipe=0,
+                    speaker_name=character.name, model_used=model_used,
+                    horae=horae_engine.with_meta(None, 0, meta) if meta else None,
                 )
+                rdb.add(msg)
                 await rdb.commit()
+                saved_ids.append(msg.id)
 
         # Пауза между ответами персонажей: несколько запросов подряд быстро
         # выбирают квоту токенов-в-минуту у Vertex (429). Разносим их во времени.
@@ -2854,6 +2955,7 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
             job.broadcast({"type": "speaker_done", "name": character.name})
         # Ход группы завершён — освежаем авто-сводку сюжета (фоном).
         _spawn_bg(_maybe_update_summary(session_id))
+        _spawn_bg(horae_tasks.after_turn(session_id, list(saved_ids)))
 
     job_id = uuid.uuid4().hex
     await generation_manager.start_runner(job_id, session_id, runner)
@@ -3812,6 +3914,11 @@ def _localize_cdn(html: str, vendor: set[str]) -> str:
     return html.replace("</head>", f'  <meta name="tale-vendor" content="{names}" />\n  </head>', 1)
 
 
+# Эндпоинты Horae State Engine — ДО раздачи статики: mount на «/» ниже
+# перехватил бы их пути.
+app.include_router(horae_api.build_router(current_user, _can_access_session))
+
+
 if _frontend_dir.exists():
 
     @app.get("/", include_in_schema=False)
@@ -3825,7 +3932,7 @@ if _frontend_dir.exists():
         снимает выбор: адрес меняется РОВНО тогда, когда изменился файл.
         """
         html = (_frontend_dir / "index.html").read_text(encoding="utf-8")
-        for asset in ("app.js", "styles.css"):
+        for asset in ("app.js", "styles.css", "horae.js"):
             html = html.replace(f'"/{asset}"', f'"/{asset}?v={_asset_version(asset)}"')
         html = _localize_cdn(html, _vendor_files())
         return Response(html, media_type="text/html; charset=utf-8")

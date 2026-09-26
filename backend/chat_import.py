@@ -188,7 +188,13 @@ def parse_sillytavern_chat(raw_text: str) -> dict:
     Возвращает:
       character_name, user_name, messages[],
       horae_state  — текущий снимок состояния (always_on),
-      horae_events — хронология событий (по тексту, по одному в строке).
+      horae_events — хронология событий (по тексту, по одному в строке),
+      horae_chat0  — глобальные данные плагина Horae (horae_meta первого
+                     сообщения: свёртки, память сцен, таблицы, RPG…) или None,
+      horae_structured — есть ли у сообщений структурные данные Horae.
+    У каждого сообщения дополнительно: st_index (индекс в файле — на него
+    ссылаются свёртки плагина), horae_raw (его horae_meta), horae_swipe_metas
+    (мета из встроенных тегов по каждому свайпу, наш формат) и horae_side.
 
     Имя персонажа берём из метаданных, а если там заглушка ('unused') — выводим из
     самих реплик. Horae собираем И из встроенных тегов в тексте, И из поля horae_meta.
@@ -212,11 +218,16 @@ def parse_sillytavern_chat(raw_text: str) -> dict:
     except json.JSONDecodeError:
         pass
 
+    from backend import horae_state
+
     messages: list[dict] = []
     name_counts: dict[str, int] = {}
     latest_meta = None
     latest_inline_state = None
     all_events: list[str] = []
+    chat0_meta = None
+    structured = False
+    st_index = -1
 
     for line in lines[start:]:
         try:
@@ -225,6 +236,9 @@ def parse_sillytavern_chat(raw_text: str) -> dict:
             continue
         if not isinstance(obj, dict) or "mes" not in obj:
             continue
+        st_index += 1
+        if st_index == 0 and isinstance(obj.get("horae_meta"), dict):
+            chat0_meta = obj["horae_meta"]
 
         # Horae: и из встроенных тегов, и из JSON-поля — собираем всегда, даже у
         # системных сообщений (чтобы ничего не потерять).
@@ -243,14 +257,20 @@ def parse_sillytavern_chat(raw_text: str) -> dict:
         role = "user" if obj.get("is_user") else "assistant"
         name = (obj.get("name") or "").strip()
 
-        # Чистим все свайпы от встроенных тегов Horae.
+        # Чистим все свайпы от встроенных тегов Horae; мета из тегов каждого
+        # свайпа — в наш формат (Horae State Engine).
         raw_swipes = obj.get("swipes") or [obj.get("mes", "")]
         swipes = []
+        swipe_metas = []
         for s in raw_swipes:
-            _, _, cs = _extract_inline_horae(s if isinstance(s, str) else "")
+            text = s if isinstance(s, str) else ""
+            _, _, cs = _extract_inline_horae(text)
             swipes.append(cs)
+            _, smeta = horae_state.parse_reply(text) if role == "assistant" else ("", None)
+            swipe_metas.append(smeta)
         if not swipes:
             swipes = [clean]
+            swipe_metas = [None]
 
         # Сообщение, в котором кроме Horae-тегов ничего не было, — пропускаем как реплику.
         if not clean.strip() and not any(s.strip() for s in swipes):
@@ -262,6 +282,9 @@ def parse_sillytavern_chat(raw_text: str) -> dict:
         swipe_id = obj.get("swipe_id", 0)
         if not isinstance(swipe_id, int) or swipe_id < 0 or swipe_id >= len(swipes):
             swipe_id = 0
+        raw_meta = obj.get("horae_meta") if isinstance(obj.get("horae_meta"), dict) else None
+        if role == "assistant" and (raw_meta and _meta_nonempty(raw_meta) or any(swipe_metas)):
+            structured = True
         messages.append(
             {
                 "role": role,
@@ -269,6 +292,10 @@ def parse_sillytavern_chat(raw_text: str) -> dict:
                 "swipes": swipes,
                 "active_swipe": swipe_id,
                 "speaker": name if role == "assistant" else None,
+                "st_index": st_index,
+                "horae_raw": raw_meta,
+                "horae_swipe_metas": swipe_metas,
+                "horae_side": bool(raw_meta and raw_meta.get("_skipHorae")),
             }
         )
 
@@ -280,11 +307,11 @@ def parse_sillytavern_chat(raw_text: str) -> dict:
 
     # Текущее состояние: встроенный <horae> приоритетнее (он и подробнее, и свежее).
     if latest_inline_state:
-        horae_state = _summarize_inline_state(latest_inline_state)
+        horae_state_text = _summarize_inline_state(latest_inline_state)
     elif latest_meta:
-        horae_state = summarize_horae_meta(latest_meta)
+        horae_state_text = summarize_horae_meta(latest_meta)
     else:
-        horae_state = ""
+        horae_state_text = ""
 
     # Хронология событий: дедуп с сохранением порядка.
     seen: set[str] = set()
@@ -299,6 +326,8 @@ def parse_sillytavern_chat(raw_text: str) -> dict:
         "character_name": character_name,
         "user_name": user_name,
         "messages": messages,
-        "horae_state": horae_state,
+        "horae_state": horae_state_text,
         "horae_events": horae_events,
+        "horae_chat0": chat0_meta,
+        "horae_structured": structured,
     }
