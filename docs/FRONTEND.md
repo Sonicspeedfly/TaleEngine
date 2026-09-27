@@ -110,12 +110,20 @@ Node.js, npm и шаг компиляции не нужны.
   При переполнении `msgStripEdge` ставит `data-more` — затухание у правого края.
 - **WebSocket/генерация:** `connectWs`, `onWsEvent`, `send`, `regenerate`, `stop`,
   `continueReply`, `finishStream`, `resumeSSE`; кросс-чат: `_handoffStreaming`,
-  `_trackBackgroundJob`, `showToast`. Прокрутка за ответом — `streamFollow` (меню «⋯»
-  → «Следовать за ответом», `localStorage.streamFollow`, по умолчанию выкл.):
-  выключено — лента во время генерации стоит на месте; включено — `_followStream`
-  едет за текстом, только пока лента у нижнего края. В конце дописанного ответа —
+  `_trackBackgroundJob`, `showToast`. Прокрутка — вкладка «Генерация» → «Лента чата»
+  (обе по умолчанию выкл., в `localStorage`): `sendScroll` — вниз при отправке
+  сообщения или файлов; `streamFollow` — за ответом, пока он пишется
+  (`_followStream`, только пока лента у нижнего края). В конце дописанного ответа —
   звук (`soundOn`) и плашка «✅ Ответ получен» (клик — к началу ответа,
   `_scrollToLastReply`); на ошибке и ручной остановке плашки нет.
+- **Дописать к запросу:** Enter (или «➕ Дописать») во время ответа обычного хода
+  (`streamKind` `send`/`retry`, не группа и не канвас — `canAppend`) →
+  `appendToRequest`: ответ останавливается, `finishStream` передаёт текст в
+  `_applyAppend` — удаляет сохранённый остановкой недописанный ответ (сообщения
+  после `_turnFloor`), дописывает текст к реплике (`PATCH /messages/{id}`) и
+  запускает ответ заново (`retryGeneration`). Реплика не успела сохраниться —
+  отправляется заново вместе с дописанным. Страховочный таймер `stop()` привязан
+  к своему ответу (`_genSeq`) и новый не обрывает.
 - **Вложения:** `onAttach`/`onPaste`/`onDrop`→`addFiles` (📎, Ctrl+V, drag&drop),
   `toggleRecord` (запись голоса). **Голос → MP3:** MediaRecorder пишет webm/Opus (Chrome),
   а Gemini его НЕ принимает (только wav/mp3/ogg/flac/aac). Поэтому запись перекодируется:

@@ -325,6 +325,14 @@ createApp({
       // стоит, где вы читаете, а о конце ответа скажут звук и плашка. Включённое —
       // едет за текстом, только пока вы у нижнего края (см. _followStream).
       streamFollow: false,
+      // Прокручивать ленту вниз, когда вы отправляете сообщение или файлы. По
+      // умолчанию нет: отправили — лента стоит, где вы читаете (вниз — ⤓ / End).
+      sendScroll: false,
+      // Как начался идущий ответ: "send" — обычная отправка, "retry" — ответ на
+      // повисшую реплику, "" — прочее (перегенерация, «Продолжить», группа,
+      // канвас). «Дописать» (appendToRequest) умеет только первые два: там
+      // остановленный ответ — отдельное новое сообщение, его можно убрать.
+      streamKind: "",
 
       // --- Групповые чаты ---
       groups: [],
@@ -603,6 +611,10 @@ createApp({
       return Math.min(400, Math.max(10, Math.round(Number(this.messagePreload) || 40)));
     },
     // Последний ход остался без ответа (ошибка/обрыв/ручная остановка) — можно повторить.
+    // Можно ли дописать к идущему запросу: обычный ответ личного чата, есть текст.
+    canAppend() {
+      return this.streaming && !!this.streamKind && !this.currentIsGroup && this.composerMode === "text";
+    },
     canRetry() {
       if (this.streaming || !this.messages.length) return false;
       const last = this.messages[this.messages.length - 1];
@@ -653,6 +665,8 @@ createApp({
       if (this.composerMode === "canvasGen") return "Опишите документ или код… (Esc — обычное сообщение)";
       if (this.composerMode === "art") return "Опишите картинку… (Esc — обычное сообщение)";
       if (this.currentIsGroup) return "Сообщение… Режиссура: +Имя вызвать, -Имя исключить (🎬)";
+      if (this.canAppend) return "Дописать к запросу — ответ начнётся заново с учётом дописанного"
+        + (this.isTouch ? "" : " (Enter)");
       return this.isTouch
         ? "Сообщение… (Enter — перенос строки)"
         : "Сообщение… (Enter — отправить, Shift+Enter — перенос)";
@@ -1376,7 +1390,7 @@ createApp({
       // Оптимистично показываем своё сообщение в чате.
       this.messages.push({ id: "tmp", role: "user", content: prompt, swipes: [prompt], active_swipe: 0 });
       this.canvasGenerating = true;
-      this.scrollDown();
+      if (this.sendScroll) this.scrollDown();
       try {
         const r = await this._postWithProgress("/sessions/" + this.sessionId + "/canvas_generate",
           { prompt, attachments, params: this.params });
@@ -1396,7 +1410,7 @@ createApp({
       if (!this.canvas || !this.canvas.id) return;
       this.messages.push({ id: "tmp", role: "user", content: prompt, swipes: [prompt], active_swipe: 0 });
       this.canvasBusy = true;            // оверлей «ИИ дорабатывает…» поверх канваса
-      this.scrollDown();
+      if (this.sendScroll) this.scrollDown();
       try {
         const r = await this.api("/sessions/" + this.sessionId + "/canvas_edit", {
           method: "POST",
@@ -2330,6 +2344,8 @@ createApp({
         this._trackBackgroundJob(this.sessionId, this.currentJobId);
       }
       this.streaming = false;
+      this.streamKind = "";
+      this._appendText = null;
       this.currentJobId = null;
       this.currentReply = "";
       this.currentThought = "";
@@ -2898,6 +2914,10 @@ createApp({
       // только про ответ, который дописан.
       const answered = !this.chatError && !this._userStopped;
       this._userStopped = false;
+      const append = this._appendText;
+      this._appendText = null;
+      this._genSeq = (this._genSeq || 0) + 1;   // ответ закончился (см. stop)
+      this.streamKind = "";
       this.streaming = false;
       this.currentJobId = null;
       this.processingNote = false;
@@ -2914,8 +2934,52 @@ createApp({
       this.currentReply = "";
       this.currentThought = "";
       this.liveBubbles = [];
+      // «Дописать»: остановленный ответ убираем, текст дописываем к реплике и
+      // запускаем ответ заново — без звука и плашки, ответа ещё нет.
+      if (append) return this._applyAppend(append);
       if (this.soundOn) this.playChime();
       if (answered) this.showToast("✅ Ответ получен", () => this._scrollToLastReply());
+    },
+    // Дописать к запросу, пока модель отвечает: Enter во время генерации.
+    // Идущий ответ останавливается (дальше токены не тратятся), а когда
+    // остановка дойдёт (finishStream), _applyAppend прибавит текст к вашей
+    // реплике и запустит ответ заново. Файлы так не дописать — только текст.
+    appendToRequest() {
+      const text = this.input.trim();
+      if (!text || !this.canAppend) return;
+      if (this.pendingAttachments.length) {
+        this.showToast("Файлы к идущему запросу не дописать — дождитесь ответа или остановите его");
+        return;
+      }
+      this.input = "";
+      this.resetComposerHeight();
+      // Второй Enter до остановки — дописываем оба куска.
+      this._appendText = this._appendText ? this._appendText + "\n\n" + text : text;
+      if (!this._userStopped) this.stop();
+    },
+    async _applyAppend(text) {
+      const floor = this._turnFloor || 0;
+      const own = this.messages.filter((m) => typeof m.id === "number" && m.id > floor);
+      const user = own.filter((m) => m.role === "user").pop();
+      try {
+        if (!user) {
+          // Реплика не успела сохраниться до остановки — отправляем всё заново.
+          this.input = ((this._turnText || "") + "\n\n" + text).trim();
+          return await this.send();
+        }
+        // Недописанный ответ отвечал на неполный запрос — убираем его.
+        for (const m of own.filter((x) => x.role === "assistant" && x.id > user.id)) {
+          await this.api("/messages/" + m.id, { method: "DELETE" });
+        }
+        const merged = (user.content || "").replace(/\s+$/, "") + "\n\n" + text;
+        await this.api("/messages/" + user.id, { method: "PATCH", body: JSON.stringify({ content: merged }) });
+        await this.loadMessages();
+        this.retryGeneration();
+      } catch (e) {
+        this.chatError = "Не удалось дописать запрос: " + e.message;
+        this.input = text;
+        await this.loadMessages();
+      }
     },
     // За ответом во время генерации — только если «Следовать за ответом»
     // включено И вы у нижнего края. Отмотали вверх читать — экран не дёргается.
@@ -2995,7 +3059,7 @@ createApp({
     // выбиралось в двух местах (цепочка v-else-if в шаблоне и if-цепочка в
     // обработчике Enter), они могли разойтись между собой.
     submitComposer() {
-      if (this.streaming) return;
+      if (this.streaming) return this.appendToRequest();
       if (this.composerMode === "canvasCmd") return this.applyCanvasCmd();
       if (this.composerMode === "art") return this.sendArt();
       return this.send();
@@ -3055,6 +3119,11 @@ createApp({
         }
       }
       this.chatError = "";
+      // Граница хода для «дописать»: всё, что сервер сохранит после неё, —
+      // реплика этого хода и ответ на неё (см. _applyAppend).
+      const known = this.messages.filter((m) => typeof m.id === "number");
+      this._turnFloor = known.length ? known[known.length - 1].id : 0;
+      this._turnText = content;
       const pend = this.pendingAttachments.slice();
       const attFiles = this._attFiles || {};
       const bigList = pend.filter((a) => !a.data && attFiles[a.id]); // файлы для multipart
@@ -3070,12 +3139,13 @@ createApp({
       this.currentThought = "";
       this.liveBubbles = [];
       this.streaming = true;
+      this.streamKind = this.currentIsGroup ? "" : "send";
       this._lastEvtAt = Date.now();
       this.input = "";
       this.pendingAttachments = [];
       this.replyToId = null;
       this.resetComposerHeight();
-      this.scrollDown();
+      if (this.sendScroll) this.scrollDown();
       if (bigList.length) {
         // БОЛЬШИЕ файлы: multipart — браузер шлёт байты прямо с диска (без
         // base64 в памяти), сервер сам кодирует. Прогресс загрузки — тот же XHR.
@@ -3126,6 +3196,7 @@ createApp({
     },
     regenerate() {
       if (!this.connected || this.streaming) return;
+      this.streamKind = "";
       this.chatError = "";
       this.currentReply = "";
       this.currentThought = "";
@@ -3140,6 +3211,12 @@ createApp({
     // useFallback=true — повторить ход ЗАПАСНОЙ моделью (кнопка в баннере ошибки).
     retryGeneration(useFallback = false) {
       if (!this.connected || this.streaming) return;
+      // Ответ на повисшую реплику — новое сообщение, его «дописать» может убрать;
+      // новый свайп к уже данному ответу — нет (удалился бы весь ответ со свайпами).
+      const last = this.messages[this.messages.length - 1];
+      const hanging = !this.currentIsGroup && last && last.role === "user" && typeof last.id === "number";
+      this.streamKind = hanging ? "retry" : "";
+      if (hanging) { this._turnFloor = last.id - 1; this._turnText = last.content || ""; }
       this.chatError = "";
       this.currentReply = "";
       this.currentThought = "";
@@ -3152,7 +3229,7 @@ createApp({
         ? { ...this.params, model: this.fallbackModel }
         : this.params;
       this.ws.send(JSON.stringify({ type: "retry", params }));
-      this.scrollDown();
+      if (this.sendScroll) this.scrollDown();
     },
     stop() {
       if (!this.streaming) return;
@@ -3164,8 +3241,11 @@ createApp({
       }
       if (this.ws && this.connected) {
         this.ws.send(JSON.stringify({ type: "stop" }));
-        // Если done потерялся (сокет умер молча) — разблокируемся сами.
-        setTimeout(() => { if (this.streaming) this.finishStream(); }, 4000);
+        // Если done потерялся (сокет умер молча) — разблокируемся сами. Только
+        // если идёт всё тот же ответ: «дописать» к этому моменту уже мог
+        // запустить новый, и таймер оборвал бы его на экране.
+        const gen = this._genSeq || 0;
+        setTimeout(() => { if (this.streaming && (this._genSeq || 0) === gen) this.finishStream(); }, 4000);
       } else {
         // Соединения нет: просто снимаем блокировку и перечитываем БД
         // (частичный ответ, если был, сервер уже сохранил).
@@ -3599,6 +3679,7 @@ createApp({
     // ---------- Функция «Продолжить» ----------
     continueReply() {
       if (!this.connected || this.streaming) return;
+      this.streamKind = "";
       this.chatError = "";
       this.currentReply = "";
       this.currentThought = "";
@@ -4806,6 +4887,7 @@ createApp({
     "params.context_tokens"() { this._ctxAfterSave = true; },
     soundOn(v) { localStorage.setItem("soundOn", v ? "1" : "0"); },
     streamFollow(v) { try { localStorage.setItem("streamFollow", v ? "1" : "0"); } catch (e) { /* приватный режим */ } },
+    sendScroll(v) { try { localStorage.setItem("sendScroll", v ? "1" : "0"); } catch (e) { /* приватный режим */ } },
 
     // Фокус при открытии оверлея уходит внутрь, при закрытии ВОЗВРАЩАЕТСЯ на
     // вызвавший элемент. Раньше клавиатурный путь после каждого закрытия
@@ -4927,6 +5009,7 @@ createApp({
     this.userToken = localStorage.getItem("userToken") || "";
     this.soundOn = localStorage.getItem("soundOn") !== "0";
     this.streamFollow = localStorage.getItem("streamFollow") === "1";
+    this.sendScroll = localStorage.getItem("sendScroll") === "1";
     try {
       this.authStatus = await fetch("/api/auth/status").then((r) => r.json());
     } catch (e) {}
@@ -5302,7 +5385,6 @@ createApp({
             <button v-if="sessionId && !sharedView" @click="openMembers(); headerMenu=false">👥➕ {{ currentIsGroup ? 'Участники группы' : 'Добавить персонажа' }}</button>
             <button v-if="currentIsGroup" @click="toggleDirector(); headerMenu=false">🎬 ИИ-режиссёр: {{ currentGroup.director ? 'вкл' : 'выкл' }}</button>
             <button @click="soundOn=!soundOn; headerMenu=false">{{ soundOn ? '🔊 Звук вкл' : '🔇 Звук выкл' }}</button>
-            <button @click="streamFollow=!streamFollow; headerMenu=false">{{ streamFollow ? '⬇ Следовать за ответом: вкл' : '📌 Следовать за ответом: выкл' }}</button>
             <button v-if="currentUserObj" @click="openProfile(); headerMenu=false">👤 Профиль {{ currentUserObj.username }}</button>
             <button v-if="sessionId && authStatus.accounts_enabled && !sharedView" @click="openInvite({ id: sessionId }); headerMenu=false">👥 Пригласить в чат</button>
             <button v-if="sessionId" @click="bgPicker=!bgPicker; headerMenu=false">🖼 Фон чата</button>
@@ -5726,6 +5808,8 @@ createApp({
                     :aria-label="composerPlaceholder"
                     :placeholder="composerPlaceholder"
                     @input="autoGrow" @keydown="onComposerKeydown" @paste="onPaste"></textarea>
+          <button v-if="streaming && canAppend && input.trim()" class="btn-primary" @click="appendToRequest"
+                  title="Остановить ответ, дописать текст к запросу и начать ответ заново">➕ Дописать</button>
           <button v-if="streaming" class="btn-danger" @click="stop">■ Стоп</button>
           <!-- ОДНА кнопка на все режимы. Раньше их было четыре в цепочке
                v-else-if, и порядок цепочки решал, что произойдёт: надпись могла
@@ -5866,6 +5950,12 @@ createApp({
 
         <!-- ВКЛАДКА: Генерация -->
         <div v-if="drawerTab==='generation'" id="drawer-panel-generation" role="tabpanel" aria-labelledby="drawer-tab-generation">
+          <h3>Лента чата</h3>
+          <label class="check"><input type="checkbox" v-model="sendScroll" /> Прокручивать вниз, когда отправляю сообщение или файлы</label>
+          <label class="check"><input type="checkbox" v-model="streamFollow" /> Следовать за ответом, пока он пишется (только если я внизу)</label>
+          <label class="check"><input type="checkbox" v-model="soundOn" /> Звук, когда ответ готов</label>
+          <p class="muted" style="margin:2px 0 10px">Выключено — лента стоит там, где вы читаете. Когда ответ готов — плашка «Ответ получен» (клик — к началу ответа). Вниз — кнопка ⤓ или клавиша End. Пока ответ пишется, можно дописать запрос: введите текст и нажмите Enter — ответ начнётся заново с учётом дописанного.</p>
+          <div class="hr"></div>
           <h3>Параметры генерации</h3>
           <label>Модель <input v-model="params.model" list="models-list" placeholder="как в прокси" />
             <datalist id="models-list"><option v-for="m in models" :key="m" :value="m"></option></datalist>
@@ -5912,7 +6002,7 @@ createApp({
                     :aria-pressed="params.history_files_mb === p[0] ? 'true' : 'false'"
                     @click="params.history_files_mb = p[0]">{{ p[1] }}</button>
           </div>
-          <label>📎 …и только из последних сообщений <span class="range-val">{{ params.history_files_turns ? params.history_files_turns + ' сообщ.' : 'без ограничения' }}</span>
+          <label>📎 …и только из последних сообщений — ваших и ответов, каждое по отдельности <span class="range-val">{{ params.history_files_turns ? params.history_files_turns + ' сообщ.' : 'без ограничения' }}</span>
             <input type="number" min="0" max="1000" step="1" inputmode="numeric"
                    :value="params.history_files_turns"
                    @change="params.history_files_turns = numFromInput($event, 1000, params.history_files_turns)" /></label>
@@ -5922,7 +6012,7 @@ createApp({
                     :aria-pressed="params.history_files_turns === p[0] ? 'true' : 'false'"
                     @click="params.history_files_turns = p[0]">{{ p[1] }}</button>
           </div>
-          <p class="muted" style="margin:2px 0 10px">0 в любом из двух полей — без ограничения (дорого). По умолчанию 8 МБ из последних 12 сообщений.</p>
+          <p class="muted" style="margin:2px 0 10px">0 в любом из двух полей — без ограничения (дорого). По умолчанию 8 МБ из последних 12 сообщений: 12 сообщений — это примерно 6 ваших реплик с ответами. Файлы отправляемого сейчас сообщения идут всегда, в этот счёт не входят.</p>
           <p class="muted" style="margin:2px 0 10px"><b>Главная статья расхода в долгих чатах.</b> Прежние фото/аудио/видео пересылаются модели заново на КАЖДОМ ходу — она их «видит», а не вспоминает по пометкам. Одно видео без ограничений = десятки тысяч токенов входа в каждом ходу до конца чата. Файл вне окна модель по-прежнему знает по пометке <code>[видео: имя]</code>.</p>
 
           <label>📚 База знаний в контексте
