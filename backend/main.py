@@ -2941,7 +2941,9 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
             text = ""
             _thought = lambda t: job.broadcast({"type": "thought", "content": t})  # noqa: E731
             try:
-                async for tok in stream_completion(messages, params, connection, on_thought=_thought):
+                async for tok in stream_completion(
+                        messages, params, connection, on_thought=_thought,
+                        on_notice=lambda t: job.broadcast({"type": "notice", "content": t})):
                     text += tok
                     job.broadcast({"type": "token", "content": tok})
             except Exception:  # noqa: BLE001 — сбой одного персонажа (в т.ч. [Errno 5])

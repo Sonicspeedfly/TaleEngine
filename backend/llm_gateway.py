@@ -49,12 +49,40 @@ logging.getLogger("litellm").setLevel(logging.ERROR)
 GEMINI_SAFETY_OFF = censorship.safety_settings("off")
 
 
+def split_base64(data: str | None, default_mime: str = "") -> tuple[str, str]:
+    """
+    (mime, чистый base64) из data:URI или голого base64.
+
+    Провайдер отвечает «Base64 decoding failed», а конвертер LiteLLM на прокси
+    режет data:URI не там, если данные чуть «неровные»:
+      * запись из браузера несёт параметры в mime — «video/webm;codecs=vp8,opus»:
+        запятая внутри mime, и старый разбор «до первой запятой» отдавал
+        провайдеру «opus;base64,AAAA…» вместо данных;
+      * переносы строк и пробелы (MIME режет base64 по 76 символов);
+      * URL-safe алфавит («-», «_») и срезанное выравнивание «=».
+    Здесь всё это приводится к виду «type/subtype» + строгий base64.
+    """
+    d = (data or "").strip()
+    mime = ""
+    if d[:5].lower() == "data:":
+        head, sep, payload = d.partition(";base64,")
+        if not sep:
+            head, _, payload = d.partition(",")
+        mime = head[5:].split(";")[0].split(",")[0].strip().lower()
+        d = payload
+    if any(ch in d for ch in " \n\r\t"):
+        d = "".join(d.split())
+    if "-" in d or "_" in d:
+        d = d.replace("-", "+").replace("_", "/")
+    if len(d) % 4 in (2, 3):
+        d += "=" * (4 - len(d) % 4)
+    return (mime or (default_mime or "").split(";")[0].strip().lower()), d
+
+
 def _attachment_data_uri(att: AttachmentIn, default_mime: str) -> str:
-    """data:URI вложения (данные могут прийти и голым base64, и готовым data:URI)."""
-    data = (att.data or "").strip()
-    if data.startswith("data:"):
-        return data
-    return f"data:{att.mime or default_mime};base64,{data}"
+    """Чистый data:URI вложения (данные могут прийти и голым base64, и data:URI)."""
+    mime, b64 = split_base64(att.data, default_mime)
+    return f"data:{mime or default_mime};base64,{b64}"
 
 
 def _content_from_attachment(att: AttachmentIn) -> dict:
@@ -72,7 +100,8 @@ def _content_from_attachment(att: AttachmentIn) -> dict:
         img_mime = mime if mime.startswith("image/") else "image/jpeg"
         # format — ЯВНАЯ подсказка mime: старый конвертер LiteLLM на прокси иначе
         # может ошибиться с типом. Для картинок это тоже страховка.
-        return {"type": "image_url", "image_url": {"url": att.data, "format": img_mime}}
+        return {"type": "image_url", "image_url": {"url": _attachment_data_uri(att, img_mime),
+                                                   "format": img_mime}}
     if kind == "video":
         # data:URI внутри image_url + ЯВНЫЙ format=video/… — LiteLLM создаёт для
         # Gemini inline_data именно как ВИДЕО (а не один кадр image/jpeg, чем грешит
@@ -80,9 +109,10 @@ def _content_from_attachment(att: AttachmentIn) -> dict:
         vmime = mime if mime.startswith("video/") else "video/mp4"
         return {"type": "image_url", "image_url": {"url": _attachment_data_uri(att, vmime), "format": vmime}}
     if kind == "audio":
-        # Gemini 1.5 Pro принимает аудио НАТИВНО — Whisper не нужен.
-        b64 = att.data.split(",")[-1]  # отрезаем 'data:audio/...;base64,' если он есть
-        fmt = (att.mime or "audio/wav").split("/")[-1]
+        # Gemini 1.5 Pro принимает аудио НАТИВНО — Whisper не нужен. Формат — подтип
+        # без параметров: «audio/ogg; codecs=opus» → «ogg», а не «ogg; codecs=opus».
+        amime, b64 = split_base64(att.data, mime or "audio/wav")
+        fmt = (mime or amime or "audio/wav").split("/")[-1] or "wav"
         return {"type": "input_audio", "input_audio": {"data": b64, "format": fmt}}
     if kind == "document":
         # Word/PDF/текст: конвертируем в PDF или извлекаем текст (см. document_service).
@@ -416,12 +446,52 @@ def _apply_connection(call_kwargs: dict, params, connection: Optional[dict]) -> 
     call_kwargs.update(_route_kwargs(connection, model_name))
 
 
+_MEDIA_BLOCKS = ("image_url", "input_audio")
+# Признаки того, что провайдер или прокси не переварили САМ запрос с файлами:
+# обрыв связи или таймаут на передаче, лимит размера, битый base64.
+_HEAVY_REQUEST_ERRORS = ("connection", "timed out", "timeout", "payload", "too large",
+                         "exceeds", "413", "entity", "base64", "inline_data",
+                         "invalid image", "image url not in expected format")
+
+
+def _history_media_count(messages: list[dict]) -> int:
+    """Сколько файлов (медиа-блоков) в запросе ДО последней реплики пользователя."""
+    last_user = max((i for i, m in enumerate(messages) if m.get("role") == "user"), default=-1)
+    return sum(
+        1 for m in messages[:max(last_user, 0)] if isinstance(m.get("content"), list)
+        for b in m["content"] if isinstance(b, dict) and b.get("type") in _MEDIA_BLOCKS
+    )
+
+
+def _strip_history_media(messages: list[dict]) -> list[dict]:
+    """
+    Копия запроса без файлов истории: медиа-блоки всех сообщений до последней
+    реплики пользователя заменяются короткой пометкой. Файлы самой реплики,
+    ради которой ход, остаются; текст и подписи файлов («[Файл ранее
+    присланный: «имя» — аудио]») — тоже, так что модель знает, что файлы были.
+    """
+    last_user = max((i for i, m in enumerate(messages) if m.get("role") == "user"), default=-1)
+    out = []
+    for i, m in enumerate(messages):
+        c = m.get("content")
+        if i < last_user and isinstance(c, list):
+            c = [
+                {"type": "text", "text": "[содержимое файла в этот раз не передано: запрос был слишком большим]"}
+                if isinstance(b, dict) and b.get("type") in _MEDIA_BLOCKS else b
+                for b in c
+            ]
+            m = {**m, "content": c}
+        out.append(m)
+    return out
+
+
 async def stream_completion(
     messages: list[dict],
     params: Optional[GenerationParams] = None,
     connection: Optional[dict] = None,
     on_thought=None,
     kind: str = "chat",
+    on_notice=None,
 ) -> AsyncGenerator[str, None]:
     """
     Стримит ответ модели по токенам (async generator).
@@ -432,7 +502,50 @@ async def stream_completion(
     :param kind: под каким видом писать расход токенов в статистику
         (chat / summary / director / canvas / image-prompt). Позволяет увидеть,
         сколько квоты съедают ФОНОВЫЕ служебные вызовы, а сколько — сам чат.
+    :param on_notice: колбэк для пояснения пользователю (строка), если запрос
+        пришлось повторить облегчённым.
+
+    Запрос с файлами истории (все файлы последних N сообщений — это легко сотни
+    мегабайт аудио и видео) прокси или провайдер могут не принять: обрыв связи,
+    лимит размера, «Base64 decoding failed». Тогда, если ответ ещё не начался,
+    запрос повторяется один раз без файлов истории — файлы текущей реплики
+    уходят, а о старых модель знает по подписям. Иначе ход падал целиком, и
+    «иногда» — пока тяжёлый файл не выходил из окна истории.
     """
+    started = False
+    try:
+        async for token in _stream_once(messages, params, connection, on_thought, kind):
+            started = True
+            yield token
+        return
+    except Exception as exc:  # noqa: BLE001
+        dropped = 0 if started else _history_media_count(messages)
+        text = str(exc).lower()
+        if not dropped or not any(sign in text for sign in _HEAVY_REQUEST_ERRORS):
+            raise
+        mb = _payload_bytes(messages) / (1024 * 1024)
+        note = (f"Запрос с файлами истории (~{mb:.0f} МБ) не прошёл — повторяю без "
+                f"{dropped} старых файлов; файлы этого сообщения ушли модели. Если так "
+                "часто — уменьшите «Файлы в памяти диалога» в «Генерации».")
+        logging.getLogger("aichat.llm").warning("%s Исходная ошибка: %s", note, exc)
+        if on_notice:
+            try:
+                on_notice(note)
+            except Exception:  # noqa: BLE001 — пояснение не роняет ход
+                pass
+    async for token in _stream_once(_strip_history_media(messages), params, connection,
+                                    on_thought, kind):
+        yield token
+
+
+async def _stream_once(
+    messages: list[dict],
+    params: Optional[GenerationParams] = None,
+    connection: Optional[dict] = None,
+    on_thought=None,
+    kind: str = "chat",
+) -> AsyncGenerator[str, None]:
+    """Одна попытка запроса к модели со стримом (см. stream_completion)."""
     call_kwargs: dict = {
         "messages": messages,
         "stream": True,

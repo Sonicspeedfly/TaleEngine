@@ -2902,6 +2902,9 @@ createApp({
         this.currentThought = "";
         this.liveBubbles = [];
         this.showToast("⚠ Основная модель не ответила — пробую запасную: " + (ev.model || ""));
+      } else if (ev.type === "notice") {
+        // Сервер облегчил запрос (например, повторил без файлов истории) — говорим, что и почему.
+        this.showToast("⚠ " + (ev.content || ""));
       } else if (ev.type === "done") this.finishStream();
       else if (ev.type === "error") {
         // Ошибку НЕ прячем — показываем баннером, чтобы было видно причину.
