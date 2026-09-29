@@ -605,6 +605,9 @@ async def _stream_once(
             "params": {k: call_kwargs.get(k) for k in ("temperature", "top_p", "max_tokens")},
             "safety_off": safety_off,
             "reasoning": reasoning or "auto",
+            # Вес запроса с файлами (base64): видно, какой ход упёрся в лимит
+            # прокси или провайдера, а какой прошёл.
+            "payload_mb": round(_payload_bytes(messages) / (1024 * 1024), 1),
         },
     )
     global _ask_usage

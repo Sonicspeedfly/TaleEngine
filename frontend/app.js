@@ -6832,7 +6832,7 @@ createApp({
       <div class="card" v-for="(e, i) in debugEntries" :key="i">
         <div class="row-between">
           <b>{{ e.kind === 'image' ? '🖼' : '💬' }} {{ e.model }}</b>
-          <span :class="e.status==='ok' ? 'status-ok' : (e.status==='error' ? 'status-err' : 'muted')">{{ e.ts }} · {{ e.status }}</span>
+          <span :class="e.status==='ok' ? 'status-ok' : (e.status==='error' ? 'status-err' : 'muted')">{{ e.ts }} · {{ e.status }}<template v-if="e.payload_mb"> · {{ e.payload_mb }} МБ</template></span>
         </div>
         <div class="muted" style="font-size:12px">{{ e.api_base }}</div>
         <div v-if="e.messages" style="font-size:12px; margin-top:4px; display:flex; gap:4px; flex-wrap:wrap">
