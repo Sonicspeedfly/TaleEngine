@@ -51,10 +51,10 @@ def is_document(mime: str | None, name: str | None) -> bool:
 
 
 def _decode(data: str) -> bytes:
-    """data может быть data:URI или голым base64."""
-    if data.strip().lower().startswith("data:") and "," in data:
-        data = data.split(",", 1)[1]
-    return base64.b64decode(data)
+    """data может быть data:URI или голым base64 (см. llm_gateway.split_base64)."""
+    from backend.llm_gateway import split_base64
+
+    return base64.b64decode(split_base64(data)[1])
 
 
 def _ext_of(mime: str | None, name: str | None) -> str:
@@ -208,11 +208,12 @@ def prepare_document(data: str, mime: str | None, name: str | None) -> dict:
     ext = _ext_of(mime, name)
     label = name or "документ"
 
-    # PDF — как есть.
+    # PDF — как есть (тот же base64, только в чистом data:URI без переносов и параметров).
     if ext == ".pdf":
-        if data.strip().lower().startswith("data:application/pdf"):
-            return {"type": "image_url", "image_url": {"url": data}}
-        return _pdf_block(raw)
+        from backend.llm_gateway import split_base64
+
+        return {"type": "image_url",
+                "image_url": {"url": "data:application/pdf;base64," + split_base64(data)[1]}}
 
     # Word/ODT/RTF — сперва пробуем настоящий PDF, иначе текст.
     if ext in _CONVERTIBLE:
