@@ -12,6 +12,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -162,6 +163,65 @@ class AttachmentBlob(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     message_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     data: Mapped[str] = mapped_column(Text, default="")
+
+
+class MediaRef(Base):
+    """
+    Ссылка на копию вложения в хранилище провайдера (см. backend/media_refs.py).
+
+    Файл ОДИН раз загружается через LiteLLM-прокси — в Google Cloud Storage
+    (Vertex, ссылка gs://…) или в Files API (Gemini, ссылка …/v1beta/files/…),
+    и дальше модель получает его ссылкой, а не мегабайтами base64 в каждом
+    запросе. Оригинал остаётся в attachment_blobs нетронутым.
+
+    scope — где ссылка действует: «gcs:<прокси>» (общая для всех моделей
+    Vertex этого прокси) или «files_api:<прокси>:<модель>» (ключ Gemini API у
+    каждой модели свой). blob_owner — message_id блоба на момент загрузки:
+    SQLite переиспользует id удалённых строк, и ссылка чужого файла по нему
+    отсеивается.
+    """
+    __tablename__ = "media_refs"
+    __table_args__ = (UniqueConstraint("blob_id", "scope", name="uq_media_ref_blob_scope"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    blob_id: Mapped[int] = mapped_column(Integer, index=True)
+    blob_owner: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    scope: Mapped[str] = mapped_column(String(300), index=True)
+    family: Mapped[str] = mapped_column(String(20), default="")
+    uri: Mapped[str] = mapped_column(Text, default="")
+    # Закодированный прокси id (file-…): по нему файл удаляют и проверяют.
+    file_id: Mapped[str] = mapped_column(Text, default="")
+    mime: Mapped[str] = mapped_column(String(100), default="")
+    bytes: Mapped[int] = mapped_column(Integer, default=0)
+    # ready — ссылка рабочая; failed — загрузка (или чтение моделью) не удалась,
+    # следующая попытка не раньше next_try_at; rejected — прокси или модель такой
+    # файл не принимают (размер, формат) — ссылкой он не пойдёт.
+    status: Mapped[str] = mapped_column(String(20), default="ready")
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_try_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Files API обрабатывает загруженное видео/аудио не мгновенно (PROCESSING →
+    # ACTIVE): до этого момента ссылку не используем.
+    usable_after: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Files API хранит файл 48 часов; у GCS срока нет (NULL).
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class MediaRefTrash(Base):
+    """
+    Копии удалённых файлов в хранилище провайдера, которые ещё надо стереть.
+
+    Заполняет триггер SQLite media_refs_blob_gone (см. database.init_db): при
+    удалении строки attachment_blobs её ссылки уходят из media_refs сразу — любым
+    путём удаления и в любом процессе, так что ссылка удалённого файла не
+    достанется новому файлу с тем же id. Фоновый загрузчик разбирает корзину.
+    """
+    __tablename__ = "media_ref_trash"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    scope: Mapped[str] = mapped_column(String(300), default="")
+    uri: Mapped[str] = mapped_column(Text, default="")
 
 
 class KnowledgeFile(Base):

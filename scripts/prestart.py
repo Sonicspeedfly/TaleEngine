@@ -126,6 +126,11 @@ def backup_sqlite(db: Path, backups: Path, *, keep: int = BACKUP_KEEP,
     выдаёт себя за целую. Старые копии сверх `keep` удаляются.
     """
     backups.mkdir(parents=True, exist_ok=True)
+    # База с вложениями весит гигабайты — тогда хватит двух копий.
+    if db.stat().st_size > 1024 ** 3:
+        keep = min(keep, 2)
+    # Лишние копии убираем ДО новой: на диске не бывает keep + 1 копий сразу.
+    _prune(backups, db, max(0, keep - 1))
     stamp = (now or datetime.now()).strftime("%Y-%m-%d_%H-%M-%S")
     target = backups / f"{db.stem}-{stamp}{db.suffix}"
     n = 1
@@ -133,17 +138,27 @@ def backup_sqlite(db: Path, backups: Path, *, keep: int = BACKUP_KEEP,
         target = backups / f"{db.stem}-{stamp}-{n}{db.suffix}"
         n += 1
     tmp = target.with_name(target.name + ".part")
-    src = sqlite3.connect(str(db), timeout=30)
     try:
-        dst = sqlite3.connect(str(tmp))
+        src = sqlite3.connect(str(db), timeout=30)
         try:
-            src.backup(dst)
+            dst = sqlite3.connect(str(tmp))
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
         finally:
-            dst.close()
-    finally:
-        src.close()
-    tmp.replace(target)
+            src.close()
+        tmp.replace(target)
+    except BaseException:
+        # Оборванная копия (кончилось место) не должна занимать диск дальше.
+        tmp.unlink(missing_ok=True)
+        raise
+    _prune(backups, db, keep)
+    return target
 
+
+def _prune(backups: Path, db: Path, keep: int) -> None:
+    """Оставляет `keep` самых свежих копий базы, остальные удаляет."""
     old = sorted(backups.glob(f"{db.stem}-*{db.suffix}"),
                  key=lambda p: p.stat().st_mtime, reverse=True)
     for extra in old[keep:]:
@@ -151,7 +166,43 @@ def backup_sqlite(db: Path, backups: Path, *, keep: int = BACKUP_KEEP,
             extra.unlink()
         except OSError:
             pass
-    return target
+
+
+# Запас свободного места поверх размера копии: SQLite и серверу тоже нужно где писать.
+BACKUP_HEADROOM = 512 * 1024 * 1024
+
+
+def ensure_backup_space(db: Path, backups: Path, *, headroom: int = BACKUP_HEADROOM,
+                        free: Optional[Callable[[Path], int]] = None) -> bool:
+    """
+    Хватит ли места на копию базы. Не хватает — удаляются старые копии (они
+    всё равно уходят по ротации), самые старые первыми, пока место не
+    появится. Если не хватит и без них всех — они не трогаются, False.
+    """
+    import shutil
+
+    def _free(path: Path) -> int:
+        probe = path if path.exists() else path.parent
+        return shutil.disk_usage(str(probe)).free
+
+    free = free or _free
+    need = int(db.stat().st_size * 1.1) + headroom
+    where = backups if backups.exists() else db.parent
+    if free(where) >= need:
+        return True
+    old = sorted(backups.glob(f"{db.stem}-*{db.suffix}"), key=lambda p: p.stat().st_mtime) \
+        if backups.exists() else []
+    if free(where) + sum(p.stat().st_size for p in old) < need:
+        return False   # даже без старых копий не влезет — их не трогаем
+    for extra in old:
+        try:
+            extra.unlink()
+            log(f"[db] Удалил старую копию базы ради места: {extra.name}")
+        except OSError:
+            continue
+        if free(where) >= need:
+            return True
+    return free(where) >= need
 
 
 def prepare_database(
@@ -174,6 +225,15 @@ def prepare_database(
         return True
 
     exists = db is not None and db.is_file() and db.stat().st_size > 0
+    if exists and not skip_backup and not ensure_backup_space(db, state_dir / BACKUP_DIR_NAME):
+        # База с вложениями весит гигабайты: копия, которая не влезает на диск,
+        # не спасает ничего, а упавший запуск оставляет пользователя без сервера.
+        # Миграция init_db() по устройству только ДОБАВЛЯЕТ (create_all +
+        # недостающие колонки; разовые переносы данных идемпотентны и идут при
+        # каждом старте сервера и так) — без копии она не теряет данные.
+        log("[warn] Для копии базы не хватает места на диске — обновляю БЕЗ копии. "
+            "Освободите место, чтобы следующие обновления снова сохраняли копию.")
+        skip_backup = True
     if exists and not skip_backup:
         try:
             copy = backup_sqlite(db, state_dir / BACKUP_DIR_NAME, keep=keep, now=now)

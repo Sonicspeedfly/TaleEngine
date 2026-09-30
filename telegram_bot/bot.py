@@ -19,6 +19,7 @@ from backend import models
 from backend.config import settings
 from backend.database import AsyncSessionLocal, init_db
 from backend.horae_memory import build_context_from_db
+from backend.attachments import store_attachments
 from backend.llm_gateway import build_user_content, stream_completion
 from backend.schemas import AttachmentIn, GenerationParams
 from backend.settings_service import get_connection
@@ -86,14 +87,12 @@ async def _generate_reply(
             settings.CONTEXT_TOKEN_BUDGET,
         )
 
-        db.add(
-            models.Message(
-                session_id=session_id,
-                role="user",
-                content=text,
-                attachments=[a.model_dump() for a in attachments],
-            )
-        )
+        msg = models.Message(session_id=session_id, role="user", content=text, attachments=[])
+        db.add(msg)
+        await db.flush()
+        # Данные файлов — в blob-таблицу, как в вебе: иначе у файла нет id, и
+        # модель не получит его ссылкой на хранилище (см. backend/media_refs.py).
+        msg.attachments = await store_attachments(db, msg.id, attachments)
         await db.commit()
 
     # Собираем ответ из стрима. Те же параметры/настройки, что и в вебе.

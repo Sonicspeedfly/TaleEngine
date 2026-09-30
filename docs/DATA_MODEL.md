@@ -45,6 +45,24 @@ ISO-строкой с «Z» — у user-сообщения это время о�
 (`backend/attachments.py`). Легаси-строки мигрируются на старте
 (`database._migrate_attachment_blobs`).
 
+### `media_refs` — `MediaRef`
+Ссылки на копии вложений в хранилище провайдера (см. `backend/media_refs.py`):
+файл один раз загружается через LiteLLM-прокси, дальше модель получает ссылку.
+`blob_id` + `scope` уникальны (`gcs:<прокси>:<бакет>` — общая для моделей
+Vertex одного бакета; `files_api:<прокси>:<модель>` — у ключа Gemini API своя),
+`blob_owner` (message_id блоба при загрузке — отсев переиспользованных id),
+`family` (`gcs|files_api`), `uri` (`gs://…` или `https://generativelanguage…/files/…`),
+`file_id` (id прокси `file-…`), `mime`, `bytes`, `status` (`ready|failed|rejected`),
+`attempts`, `next_try_at`, `usable_after` (Files API ещё обрабатывает файл),
+`expires_at` (Files API — 48 ч; у GCS NULL), `error`, `created_at`.
+`messages.attachments` при этом не меняется.
+
+### `media_ref_trash` — `MediaRefTrash`
+Корзина копий удалённых файлов (`scope`, `uri`), которые загрузчик стирает в
+хранилище. Наполняет триггер SQLite `media_refs_blob_gone` (создаётся в
+`database.init_db`): удалили строку `attachment_blobs` любым путём — её ссылки
+тут же уходят из `media_refs`, а копии — сюда.
+
 ### `group_members` — `GroupMember`
 Связь сессия ↔ персонаж для групповых чатов.
 

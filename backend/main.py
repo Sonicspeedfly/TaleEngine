@@ -20,6 +20,7 @@ import hmac
 import json
 import logging
 import re
+import time
 import urllib.parse
 import uuid
 from contextlib import asynccontextmanager
@@ -57,6 +58,7 @@ from backend import (
     horae_state,
     horae_tasks,
     knowledge,
+    media_refs,
     memory_service,
     models,
     native_io,
@@ -174,6 +176,14 @@ async def lifespan(app: FastAPI):
     await _migrate_kb_pdfs()  # PDF базы знаний -> текст (разово, чинит раздутые запросы)
     async with AsyncSessionLocal() as db:
         await admin_service.load_caches(db)  # код доступа, пароль админа, настройки TG
+        # Файлы для модели ссылкой: результаты проверок хранилища прокси и
+        # подключение (для уборки копий удалённых файлов), затем фоновый загрузчик.
+        try:
+            await media_refs.load_caps(db)
+            media_refs.remember_connection(await get_connection(db))
+        except Exception:  # noqa: BLE001 — без ссылок всё работает как раньше
+            logger.exception("Не удалось загрузить состояние хранилища файлов")
+    media_refs.uploader.start()
     # Автозапуск Telegram-бота, если он включён в админке, задан токен И не
     # запрещён через TELEGRAM_AUTOSTART (защита от двойного polling — Conflict 409,
     # когда второй/тестовый инстанс делит БД с боевым сервером).
@@ -184,6 +194,7 @@ async def lifespan(app: FastAPI):
         except Exception:  # noqa: BLE001 — не мешаем старту веб-сервера
             pass
     yield
+    await media_refs.uploader.stop()
     await telegram_runtime.stop()
     # Даём фоновым задачам дозавершиться (обычно это быстрые чтения БД);
     # зависших — отменяем. Резкая отмена посреди SQL-запроса опасна, поэтому
@@ -381,32 +392,6 @@ def _ctx_budget(params) -> int:
     if params and params.context_tokens:
         return max(1000, int(params.context_tokens))
     return settings.CONTEXT_TOKEN_BUDGET
-
-
-def _hist_files_limit(params) -> int | None:
-    """
-    Лимит ФАЙЛОВ истории в символах base64 (то, сколько прежних вложений модель
-    заново «видит» на каждом ходу). None — БЕЗ лимита: полная память по файлам.
-    UI (params.history_files_mb) важнее дефолта из .env; 0 — без лимита.
-    """
-    mb = params.history_files_mb if params and params.history_files_mb is not None \
-        else settings.HISTORY_FILES_MB
-    if not mb or mb <= 0:
-        return None
-    return int(mb * 1024 * 1024 * 4 / 3)  # size хранится «сырым», base64 длиннее
-
-
-def _hist_files_turns(params) -> int | None:
-    """
-    Возрастное окно файлов истории: вложения пересылаются модели только из N
-    последних сообщений. None — без ограничения по возрасту.
-
-    Это главный рычаг экономии в долгом чате: лимит в МБ не мешает одному и тому
-    же видео уходить провайдеру заново на КАЖДОМ ходу до конца жизни чата.
-    """
-    turns = params.history_files_turns if params and params.history_files_turns is not None \
-        else settings.HISTORY_FILES_TURNS
-    return turns if turns and turns > 0 else None
 
 
 def _kb_chars(params) -> int | None:
@@ -1072,17 +1057,18 @@ async def inspect_context(
         params = GenerationParams()
 
     report: dict = {}
-    await build_context_from_db(
+    built = await build_context_from_db(
         db, sess, character,
         "",            # следующий ход ещё не написан
         None,
         _ctx_budget(params),
-        history_files_limit=_hist_files_limit(params),
-        history_files_turns=_hist_files_turns(params),
         knowledge_chars=_kb_chars(params),
         assistant_mode=bool(params and params.assistant_mode),
         report=report,
     )
+    # Файлы хода: сколько пойдёт ссылкой, сколько целиком и сколько ждёт
+    # загрузки в хранилище модели — по мете, данные файлов не читаются.
+    report["files"] = await media_refs.preview(built, params, await get_connection(db), db=db)
     report["character"] = character.name
     report["model"] = (params.model if params else "") or ""
     if sess.is_group:
@@ -1691,6 +1677,7 @@ async def delete_knowledge(kid: int, user=Depends(current_user), db: AsyncSessio
         await db.execute(sql_delete(models.AttachmentBlob).where(models.AttachmentBlob.id == kf.blob_id))
     await db.delete(kf)
     await db.commit()
+    media_refs.uploader.sweep_soon()   # копия файла в хранилище модели — тоже
     return {"ok": True}
 
 
@@ -1912,7 +1899,41 @@ async def write_connection(
     # В режиме аккаунтов менять подключение (доступ к Gemini) может только админ.
     if user is not None and user.role != "admin":
         raise HTTPException(403, "Только администратор")
-    return await set_connection(db, payload.model_dump())
+    conn = await set_connection(db, payload.model_dump())
+    media_refs.remember_connection(conn)
+    return conn
+
+
+# ==================== ФАЙЛЫ ДЛЯ МОДЕЛИ (ССЫЛКИ НА ХРАНИЛИЩЕ) ====================
+_media_probe_at: dict[str, float] = {}
+
+
+@app.get("/api/media/status")
+async def media_status(model: str = "", db: AsyncSession = Depends(get_session)):
+    """
+    Состояние хранилища файлов у прокси для модели: работает ли загрузка
+    ссылками, почему нет, сколько файлов уже загружено и сколько в очереди.
+    """
+    connection = await get_connection(db)
+    params = GenerationParams(model=model.strip() or None)
+    return await media_refs.status(db, params, connection)
+
+
+@app.post("/api/media/probe")
+async def media_probe(payload: dict | None = None, db: AsyncSession = Depends(get_session)):
+    """«Проверить снова»: загрузка тестовой картинки и её чтение моделью по ссылке."""
+    connection = await get_connection(db)
+    model = str((payload or {}).get("model") or "").strip()
+    params = GenerationParams(model=model or None)
+    route = media_refs.route_for(params, connection)
+    if route is None:
+        raise HTTPException(400, "Ссылки на файлы работают только через LiteLLM-прокси (вкладка «Подключение»).")
+    now = time.monotonic()
+    if now - _media_probe_at.get(route.cap_key, 0) < 20:
+        raise HTTPException(429, "Проверка уже шла только что — подождите немного.")
+    _media_probe_at[route.cap_key] = now
+    await media_refs.probe(route)
+    return await media_refs.status(db, params, connection)
 
 
 @app.get("/api/models")
@@ -2574,8 +2595,6 @@ async def canvas_generate(
     user_content = build_user_content(prompt, attachments, current=True)
     messages = await build_context_from_db(
         db, sess, character, prompt, user_content, _ctx_budget(params),
-        history_files_limit=_hist_files_limit(params),
-        history_files_turns=_hist_files_turns(params),
         knowledge_chars=_kb_chars(params),
         assistant_mode=bool(params and params.assistant_mode),
         horae_tags=False,   # документ Канваса — не ход сюжета, теги Horae ему не нужны
@@ -2854,6 +2873,7 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
         await db.flush()
         msg.attachments = await store_attachments(db, msg.id, attachments)
         await db.commit()
+        media_refs.enqueue_message(msg.attachments, params, connection)
 
     model_used = _effective_model(params, connection)
 
@@ -2934,8 +2954,6 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
                 messages = await group_chat.build_group_messages(
                     rdb, rsess, character, _ctx_budget(params),
                     send_avatars=bool(params and params.send_avatars),
-                    history_files_limit=_hist_files_limit(params),
-                    history_files_turns=_hist_files_turns(params),
                     knowledge_chars=_kb_chars(params),
                 )
             text = ""
@@ -2992,8 +3010,6 @@ async def _start_user_turn(session_id, content, attachments, params, db, reply_t
     messages = await build_context_from_db(
         db, sess, character, model_text, user_content, _ctx_budget(params),
         send_avatars=bool(params and params.send_avatars),
-        history_files_limit=_hist_files_limit(params),
-        history_files_turns=_hist_files_turns(params),
         knowledge_chars=_kb_chars(params),
         web_access=bool(params and params.web_access),
         assistant_mode=bool(params and params.assistant_mode),
@@ -3010,6 +3026,9 @@ async def _start_user_turn(session_id, content, attachments, params, db, reply_t
     # Тяжёлый base64 — в blob-таблицу, в сообщении остаётся лёгкая мета.
     msg.attachments = await store_attachments(db, msg.id, attachments)
     await db.commit()
+    # Файлы реплики — первыми в очередь загрузки в хранилище модели: к следующему
+    # ходу они, скорее всего, пойдут ссылкой, а не целиком.
+    media_refs.enqueue_message(msg.attachments, params, connection)
 
     job_id = uuid.uuid4().hex
     await generation_manager.start(
@@ -3054,13 +3073,11 @@ async def _start_regenerate(session_id, params, db) -> str:
     boundary_id = last_user.id if last_user else target.id
     # История сохраняет вложения (модель «видит» прежние файлы); данные — из blobs.
     prior = [m for m in msgs if m.id < boundary_id]
-    history = await messages_to_history_db(
-        db, prior, _hist_files_limit(params), _hist_files_turns(params),
-    )
-    user_content = build_user_content(
-        user_text,
-        [],  # вложения прошлой реплики при перегенерации не пересобираем
-    )
+    history = await messages_to_history_db(db, prior)
+    # Файлы самой реплики тоже видны модели (раньше при перегенерации они
+    # терялись): заготовками, ссылками или целиком — см. backend/media_refs.py.
+    user_content = media_refs.history_content(
+        user_text, (last_user.attachments if last_user else None), current=True, priority=2)
     messages = await build_context_from_db(
         db,
         sess,
@@ -3117,10 +3134,9 @@ async def _start_continue(session_id, params, db) -> str:
     boundary_id = last_user.id if last_user else target.id
     # История сохраняет вложения (модель «видит» прежние файлы); данные — из blobs.
     prior = [m for m in msgs if m.id < boundary_id]
-    history = await messages_to_history_db(
-        db, prior, _hist_files_limit(params), _hist_files_turns(params),
-    )
-    user_content = build_user_content(user_text, [])
+    history = await messages_to_history_db(db, prior)
+    user_content = media_refs.history_content(
+        user_text, (last_user.attachments if last_user else None), current=True, priority=2)
     messages = await build_context_from_db(
         db, sess, character, user_text, user_content, _ctx_budget(params),
         history=history, history_ids=[m.id for m in prior],
@@ -3180,9 +3196,7 @@ async def _start_retry(session_id, params, db) -> str:
     # Контекст: история ДО последней реплики + сама реплика как текущее сообщение —
     # ровно то же, что видел бы _start_user_turn, но без повторного сохранения.
     prior = [m for m in msgs if m.id < last.id]
-    history = await messages_to_history_db(
-        db, prior, _hist_files_limit(params), _hist_files_turns(params),
-    )
+    history = await messages_to_history_db(db, prior)
     messages = await build_context_from_db(
         db, sess, character, last.content, user_content, _ctx_budget(params),
         history=history, history_ids=[m.id for m in prior],

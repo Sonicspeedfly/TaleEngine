@@ -73,6 +73,10 @@ class GenerationManager:
     def get(self, job_id: str) -> Optional[GenerationJob]:
         return self._jobs.get(job_id)
 
+    def active(self) -> int:
+        """Сколько генераций идёт сейчас (фоновый загрузчик файлов ждёт, пока их нет)."""
+        return sum(1 for j in self._jobs.values() if not j.done)
+
     async def start(
         self,
         job_id: str,

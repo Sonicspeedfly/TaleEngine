@@ -75,6 +75,30 @@ async def init_db() -> None:
         await conn.run_sync(_migrate_attachment_blobs)
         # Разовая чистка «сирот» от старого некаскадного удаления чатов (см. ниже).
         await conn.run_sync(_cleanup_orphans)
+        # Ссылки на копии файлов в хранилище модели уходят вместе с файлом.
+        await conn.run_sync(_media_ref_trigger)
+
+
+def _media_ref_trigger(sync_conn) -> None:
+    """
+    Триггер: удалили строку attachment_blobs (сообщение, чат, файл базы знаний —
+    любым путём) — её ссылки на копии в хранилище провайдера (media_refs) тут же
+    удаляются, а сами копии попадают в корзину media_ref_trash на удаление.
+    Без этого SQLite, переиспользующий id удалённых строк, мог бы отдать модели
+    ссылку на старый чужой файл вместо нового.
+    """
+    if not _is_sqlite:
+        return
+    from sqlalchemy import text
+
+    sync_conn.execute(text(
+        "CREATE TRIGGER IF NOT EXISTS media_refs_blob_gone AFTER DELETE ON attachment_blobs "
+        "BEGIN "
+        "INSERT INTO media_ref_trash(scope, uri) SELECT scope, uri FROM media_refs "
+        "WHERE blob_id = OLD.id AND uri <> ''; "
+        "DELETE FROM media_refs WHERE blob_id = OLD.id; "
+        "END"
+    ))
 
 
 def _migrate_attachment_blobs(sync_conn) -> None:

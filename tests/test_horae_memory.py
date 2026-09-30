@@ -249,35 +249,49 @@ def test_persona_injected_into_system_prompt():
     assert "Молодой картограф." in messages[0]["content"]
 
 
-def test_history_keeps_attachments_so_model_sees_earlier_files():
+async def test_history_keeps_attachments_so_model_sees_earlier_files():
     """
     Баг: вложения из истории терялись — модель «видела» файл только на своём ходу.
-    Теперь прошлое сообщение с картинкой попадает в историю мультимодальным блоком.
+    Теперь прошлое сообщение с картинкой попадает в историю заготовкой файла, а
+    перед запросом (media_refs.materialize) — мультимодальным блоком.
     """
+    from backend.media_refs import MARK, materialize
+
     img = {"type": "image", "data": "data:image/png;base64,AAAABBBB", "mime": "image/png", "name": "p.png"}
     msgs = [
         _msg(1, "user", "посмотри на это фото", [img]),
         _msg(2, "assistant", "вижу картинку"),
     ]
     hist = messages_to_history(msgs)
-    # Реплика пользователя стала мультимодальной: текст + картинка.
     first = hist[0]["content"]
     assert isinstance(first, list)
-    assert any(b.get("type") == "image_url" for b in first)
+    assert any(MARK in b for b in first)                         # заготовка, данных не читали
     assert any(b.get("type") == "text" and "фото" in b["text"] for b in first)
     # Ответ ассистента — обычный текст.
     assert hist[1] == {"role": "assistant", "content": "вижу картинку"}
 
+    built = await materialize(hist, connection={"use_proxy": False})
+    sent = built.messages[0]["content"]
+    assert any(b.get("type") == "image_url" for b in sent)      # ушла сама картинка
+    assert not any(MARK in b for b in sent)                      # служебная мета не утекла
+    assert any("«p.png» — изображение" in (b.get("text") or "") for b in sent)
 
-def test_history_attachment_over_limit_becomes_note():
-    """Слишком объёмное вложение из истории заменяется пометкой, а не тянется целиком."""
-    from backend.horae_memory import _MAX_HISTORY_ATT_BYTES
-    huge = {"type": "audio", "data": "Q" * (_MAX_HISTORY_ATT_BYTES + 10), "mime": "audio/mp3", "name": "v.mp3"}
+
+async def test_history_attachment_over_limit_becomes_note(monkeypatch):
+    """Файл истории сверх лимита «целиком» (без ссылки) уходит пометкой, а не тянется целиком."""
+    from backend.config import settings
+    from backend.media_refs import NOTE_OVER, materialize
+
+    monkeypatch.setattr(settings, "INLINE_FILES_MB", 1)
+    huge = {"type": "audio", "data": "Q" * (2 * 1024 * 1024), "mime": "audio/mp3", "name": "v.mp3"}
     msgs = [_msg(1, "user", "послушай", [huge])]
-    hist = messages_to_history(msgs)
-    assert isinstance(hist[0]["content"], str)      # не мультимодальный список
-    assert "[аудио]" in hist[0]["content"]           # но пометка о факте вложения есть
-    assert "послушай" in hist[0]["content"]
+    built = await materialize(messages_to_history(msgs), connection={"use_proxy": False})
+    content = built.messages[0]["content"]
+    texts = [b.get("text") or "" for b in content]
+    assert not any(b.get("type") in ("image_url", "input_audio") for b in content)
+    assert NOTE_OVER in texts                                     # пометка вместо данных
+    assert any("«v.mp3» — аудио" in t for t in texts)             # но модель знает о файле
+    assert "послушай" in texts
 
 
 def test_estimate_content_tokens_ignores_base64_size():
@@ -287,8 +301,8 @@ def test_estimate_content_tokens_ignores_base64_size():
         {"type": "text", "text": "hi"},
         {"type": "image_url", "image_url": {"url": "data:image/png;base64," + big_b64}},
     ]
-    # Мультимодальный блок стоит десятки токенов, а не миллион (как длина base64).
-    assert estimate_content_tokens(multimodal) < 1000
+    # Картинка стоит ~1100 токенов (как у Gemini), а не миллион (как длина base64).
+    assert estimate_content_tokens(multimodal) < 2000
     assert estimate_content_tokens("просто текст") == estimate_tokens("просто текст")
 
 
@@ -405,12 +419,17 @@ def test_chat_tzinfo_parses_offsets_and_rejects_impossible_ones():
         assert session_user_time(SimpleNamespace(timezone=bad)) == "", bad
 
 
-def test_video_attachment_label_in_history_note():
-    """Видео, не влезшее в лимит вложений истории, помечается как [видео: имя]."""
-    big = "data:video/mp4;base64," + "A" * 6_000_000  # больше _MAX_HISTORY_ATT_BYTES
+async def test_video_attachment_label_in_history_note(monkeypatch):
+    """Видео, не влезшее в лимит «целиком», остаётся подписью с именем и пометкой."""
+    from backend.config import settings
+    from backend.media_refs import materialize
+
+    monkeypatch.setattr(settings, "INLINE_FILES_MB", 1)
+    big = "data:video/mp4;base64," + "A" * 6_000_000
     msgs = [
         _msg(1, "user", "смотри", [{"type": "video", "data": big, "mime": "video/mp4", "name": "clip.mp4"}]),
         _msg(2, "assistant", "вижу"),
     ]
-    history = messages_to_history(msgs)
-    assert "[видео: clip.mp4]" in history[0]["content"]
+    built = await materialize(messages_to_history(msgs), connection={"use_proxy": False})
+    texts = [b.get("text") or "" for b in built.messages[0]["content"]]
+    assert "[Файл ранее присланный: «clip.mp4» — видео]" in texts

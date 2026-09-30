@@ -91,10 +91,8 @@ async def build_knowledge(
         символов ≈ 50 тыс. токенов входа на каждом ходу. None — дефолт из
         настроек (KNOWLEDGE_TEXT_CHARS); 0 — без ограничения.
     """
-    from backend.attachments import load_blob
     from backend.config import settings
-    from backend.llm_gateway import _content_from_attachment
-    from backend.schemas import AttachmentIn
+    from backend.media_refs import placeholder
 
     files = await list_files(db, session_id)
     if not files:
@@ -107,6 +105,9 @@ async def build_knowledge(
     text_parts: list[str] = []
     media_msgs: list[dict] = []
     used = 0
+    # Размер медиа — для оценки их веса в токенах и лимита «целиком»; у файла
+    # базы знаний своей колонки размера нет, поэтому — длина base64 в blob.
+    sizes = await _blob_sizes(db, [f.blob_id for f in files if not f.content and f.blob_id])
     for f in files:
         if f.content:
             chunk = f.content
@@ -116,15 +117,14 @@ async def build_knowledge(
                 text_parts.append(f"[Файл «{f.name}»]\n{chunk}")
                 used += len(chunk)
         elif f.blob_id:
-            data = await load_blob(db, f.blob_id)
-            if not data:
-                continue
-            try:
-                block = _content_from_attachment(
-                    AttachmentIn(type=(f.kind if f.kind != "document" else "document"),
-                                 data=data, mime=f.mime, name=f.name)
-                )
-            except Exception:  # noqa: BLE001 — битый файл не должен рушить контекст
+            # Заготовка, а не данные: ссылкой на копию в хранилище модели (или
+            # целиком, пока влезает) файл сделает stream_completion — см.
+            # backend/media_refs.py. Раньше медиа базы знаний уходили base64-ом
+            # в КАЖДОМ запросе без всякого лимита.
+            block = placeholder({"type": f.kind if f.kind in ("image", "audio", "video") else "document",
+                                 "mime": f.mime, "name": f.name, "size": sizes.get(f.blob_id, 0),
+                                 "blob_id": f.blob_id}, priority=1)
+            if block is None:
                 continue
             media_msgs.append({
                 "role": "user",
@@ -138,3 +138,17 @@ async def build_knowledge(
     if text_parts:
         knowledge_text = "\n\n".join(text_parts)
     return knowledge_text, media_msgs
+
+
+async def _blob_sizes(db, blob_ids) -> dict[int, int]:
+    """{blob_id: размер файла в байтах} по длине base64 (данные в Python не читаются)."""
+    from sqlalchemy import func, select
+
+    ids = sorted({int(i) for i in blob_ids if i})
+    if not ids:
+        return {}
+    rows = (await db.execute(
+        select(models.AttachmentBlob.id, func.length(models.AttachmentBlob.data))
+        .where(models.AttachmentBlob.id.in_(ids))
+    )).all()
+    return {i: int((n or 0) * 3 / 4) for i, n in rows}
