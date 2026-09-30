@@ -223,23 +223,31 @@ def _request_timeout(messages: list[dict], ref_mb: float = 0.0) -> int:
     return max(settings.LARGE_REQUEST_TIMEOUT, min(1800, int(mb * 10 + ref_mb)))
 
 
-def _has_media_blocks(messages: list[dict]) -> bool:
+def _has_media_blocks(messages: list[dict], media=None) -> bool:
     """
-    Есть ли файлы у ТЕКУЩЕЙ реплики (последнее сообщение пользователя):
-    image_url/input_audio — фото, видео, PDF, аудио, данными или ссылкой.
+    Есть ли файлы у ТЕКУЩЕЙ реплики: image_url/input_audio — фото, видео, PDF,
+    аудио, данными или ссылкой — в последнем сообщении пользователя.
 
     Файлы истории не в счёт: модель теперь видит файлы всего окна, и одно фото
     где-то в чате включало бы платные рассуждения на КАЖДОМ ходу.
+
+    :param media: (answered, history) — id() блоков из media_refs.materialize:
+        файлы отвечаемой реплики (в «Продолжить» она не последняя) и файлы
+        истории (в группе приклеены к последней реплике).
     """
+    answered, history = media or (set(), set())
+    if answered:
+        return True
     last = next((m for m in reversed(messages) if m.get("role") == "user"), None)
     c = (last or {}).get("content")
     return isinstance(c, list) and any(
-        isinstance(b, dict) and (b.get("type") in ("image_url", "input_audio") or "_te" in b)
+        isinstance(b, dict) and id(b) not in history
+        and (b.get("type") in ("image_url", "input_audio") or "_te" in b)
         for b in c
     )
 
 
-def effective_reasoning(params: Optional[GenerationParams], messages: list[dict]) -> str:
+def effective_reasoning(params: Optional[GenerationParams], messages: list[dict], media=None) -> str:
     """
     Итоговый уровень рассуждений (reasoning_effort для LiteLLM):
       * явный выбор пользователя ("disable"/"low"/"medium"/"high") — как есть;
@@ -261,7 +269,7 @@ def effective_reasoning(params: Optional[GenerationParams], messages: list[dict]
     if effort:
         return effort  # явный выбор пользователя — всегда как есть
     # Автовключение — только когда фильтры НЕ сняты (иначе thinking их вернёт).
-    if not params.disable_safety and params.file_reasoning and _has_media_blocks(messages):
+    if not params.disable_safety and params.file_reasoning and _has_media_blocks(messages, media):
         return "medium"
     return ""
 
@@ -483,7 +491,8 @@ def _history_ref_ids(messages: list[dict]) -> set:
     }
 
 
-def _history_positions(messages: list[dict], extra_ids=None, refs: bool = False) -> list[tuple[int, int]]:
+def _history_positions(messages: list[dict], extra_ids=None, refs: bool = False,
+                       keep_ids=None) -> list[tuple[int, int]]:
     """
     Где в запросе лежат данными файлы ИСТОРИИ: все файлы сообщений до
     последней реплики пользователя плюс блоки из extra_ids (файлы истории,
@@ -492,6 +501,7 @@ def _history_positions(messages: list[dict], extra_ids=None, refs: bool = False)
     """
     last_user = max((i for i, m in enumerate(messages) if m.get("role") == "user"), default=-1)
     ids = extra_ids or set()
+    keep = keep_ids or set()   # файлы отвечаемой реплики не снимаются никогда
     out = []
     for i, m in enumerate(messages):
         c = m.get("content")
@@ -499,24 +509,25 @@ def _history_positions(messages: list[dict], extra_ids=None, refs: bool = False)
             continue
         for j, b in enumerate(c):
             media = _is_inline_media(b) or (refs and isinstance(b, dict) and b.get("type") == "image_url")
-            if media and (i < last_user or id(b) in ids):
+            if media and id(b) not in keep and (i < last_user or id(b) in ids):
                 out.append((i, j))
     return out
 
 
-def _history_media_count(messages: list[dict], extra_ids=None) -> int:
+def _history_media_count(messages: list[dict], extra_ids=None, keep_ids=None) -> int:
     """Сколько файлов истории лежит в запросе данными (см. _history_positions)."""
-    return len(_history_positions(messages, extra_ids))
+    return len(_history_positions(messages, extra_ids, keep_ids=keep_ids))
 
 
-def _strip_history_media(messages: list[dict], extra_ids=None, refs: bool = False) -> list[dict]:
+def _strip_history_media(messages: list[dict], extra_ids=None, refs: bool = False,
+                         keep_ids=None) -> list[dict]:
     """
     Копия запроса без файлов истории, лежащих в нём данными: они заменяются
     короткой пометкой. Файлы самой реплики, ради которой ход, остаются; ссылки
     на хранилище, текст и подписи файлов («[Файл ранее присланный: «имя» —
     аудио]») — тоже, так что модель знает, что файлы были.
     """
-    drop = set(_history_positions(messages, extra_ids, refs))
+    drop = set(_history_positions(messages, extra_ids, refs, keep_ids))
     if not drop:
         return messages
     out = []
@@ -605,13 +616,16 @@ async def stream_completion(
         used: list[dict] = []
         ref_mb = 0.0
         hist_ids: set = set()
+        hist_refs: set = set()
+        answered: set = set()
         if media_refs.has_markers(messages):
             built = await media_refs.materialize(messages, params, connection)
-            messages, used, ref_mb, hist_ids = built.messages, built.used, built.ref_mb, built.history_inline
+            messages, used, ref_mb = built.messages, built.used, built.ref_mb
+            hist_ids, hist_refs, answered = built.history_inline, built.history_refs, built.answered
         started = False
         try:
             async for token in _stream_once(messages, params, connection, on_thought, kind,
-                                            ref_mb=ref_mb):
+                                            ref_mb=ref_mb, media=(answered, hist_ids | hist_refs)):
                 started = True
                 yield token
             media_refs.note_success(used, params, connection)
@@ -624,14 +638,15 @@ async def stream_completion(
         bad = await media_refs.handle_ref_error(used, error, params, connection) if used else None
         if bad:
             built = await media_refs.materialize(original, params, connection, exclude_refs=bad)
-            messages, used, ref_mb, hist_ids = built.messages, built.used, built.ref_mb, built.history_inline
+            messages, used, ref_mb = built.messages, built.used, built.ref_mb
+            hist_ids, hist_refs, answered = built.history_inline, built.history_refs, built.answered
             note = (f"Модель не смогла открыть {len(bad)} файл(ов) по ссылке — повторяю, отправив "
                     "их напрямую.")
             logging.getLogger("aichat.llm").warning("%s Исходная ошибка: %s", note, error)
             _notify(on_notice, note)
             try:
                 async for token in _stream_once(messages, params, connection, on_thought, kind,
-                                                ref_mb=ref_mb):
+                                                ref_mb=ref_mb, media=(answered, hist_ids | hist_refs)):
                     started = True
                     yield token
                 media_refs.note_success(used, params, connection)
@@ -647,15 +662,16 @@ async def stream_completion(
             # низкого битрейта могла не влезть в лимит модели. Повтор — без
             # файлов истории вовсе (и ссылок тоже): иначе ход падал бы, пока
             # это сообщение в окне.
-            drop_ids = hist_ids | _history_ref_ids(messages)
+            drop_ids = hist_ids | hist_refs | _history_ref_ids(messages)
             note = "Файлы истории не влезли в лимит модели — повторяю без них."
             logging.getLogger("aichat.llm").warning("%s Исходная ошибка: %s", note, error)
             _notify(on_notice, note)
-            async for token in _stream_once(_strip_history_media(messages, drop_ids, refs=True), params,
-                                            connection, on_thought, kind):
+            async for token in _stream_once(
+                    _strip_history_media(messages, drop_ids, refs=True, keep_ids=answered), params,
+                    connection, on_thought, kind, ref_mb=ref_mb, media=(answered, drop_ids)):
                 yield token
             return
-        dropped = _history_media_count(messages, hist_ids)
+        dropped = _history_media_count(messages, hist_ids, keep_ids=answered)
         if not dropped or not any(sign in text for sign in _HEAVY_REQUEST_ERRORS):
             raise error
         mb = _payload_bytes(messages) / (1024 * 1024)
@@ -666,8 +682,9 @@ async def stream_completion(
                      "файлов у прокси: ⚙ → Генерация → «Файлы для модели».")
         logging.getLogger("aichat.llm").warning("%s Исходная ошибка: %s", note, error)
         _notify(on_notice, note)
-        async for token in _stream_once(_strip_history_media(messages, hist_ids), params, connection,
-                                        on_thought, kind, ref_mb=ref_mb):
+        async for token in _stream_once(_strip_history_media(messages, hist_ids, keep_ids=answered),
+                                        params, connection, on_thought, kind, ref_mb=ref_mb,
+                                        media=(answered, hist_ids | hist_refs)):
             yield token
     finally:
         if user_facing:
@@ -682,6 +699,7 @@ async def _stream_once(
     on_thought=None,
     kind: str = "chat",
     ref_mb: float = 0.0,
+    media=None,
 ) -> AsyncGenerator[str, None]:
     """Одна попытка запроса к модели со стримом (см. stream_completion)."""
     call_kwargs: dict = {
@@ -707,7 +725,7 @@ async def _stream_once(
     # drop_params=True НЕ знает, что прокси-модель поддерживает reasoning_effort —
     # и ТИХО выкидывает его (поэтому «высокие» размышления не доходили до Gemini).
     # allowed_openai_params форсирует проброс параметра в прокси как есть.
-    reasoning = effective_reasoning(params, messages)
+    reasoning = effective_reasoning(params, messages, media)
     allowed_params: list[str] = []
     if reasoning:
         call_kwargs["reasoning_effort"] = reasoning

@@ -175,7 +175,14 @@ def media_tokens(kind: str, mime: str | None, size_bytes: int) -> int:
         return max(300, int(seconds * 300))
     if kind == "pdf":
         return max(258, int(size / _PDF_PAGE_BYTES + 1) * 258)
-    return max(64, size // 4)
+    m = (mime or "").lower()
+    if any(t in m for t in ("word", "officedocument", "opendocument", "rtf", "msword")):
+        # Офисный документ уходит PDF-ом или текстом: оценка — страницами, а не
+        # байтами сжатого файла (docx на 2 МБ с одной фотографией — пара страниц).
+        return max(258, min(int(size / _PDF_PAGE_BYTES + 1) * 258, 20_000))
+    if m.startswith("text/") or any(t in m for t in ("json", "csv", "xml", "markdown", "yaml")):
+        return max(64, min(size // 4, 200_000))       # текст уходит текстом
+    return 64   # прочий двоичный файл модели не шлётся — только пометка
 
 
 def meta_bytes(meta: dict) -> int:
@@ -198,7 +205,12 @@ def block_tokens(block: dict) -> int | None:
         return None
     te = block.get(MARK)
     if isinstance(te, dict):
-        return media_tokens(te.get("kind") or "", te.get("mime"), int(te.get("bytes") or 0))
+        mime = te.get("mime") or ""
+        if not mime and te.get("kind") == "document":
+            import mimetypes
+
+            mime = mimetypes.guess_type(te.get("name") or "")[0] or ""
+        return media_tokens(te.get("kind") or "", mime, int(te.get("bytes") or 0))
     t = block.get("type")
     if t == "image_url":
         iu = block.get("image_url") or {}
@@ -283,13 +295,14 @@ def history_content(text: str, metas, *, current: bool = False, priority: int = 
         )})
     for ph in items:
         te = ph[MARK]
-        if te["kind"] != "document":
-            where = "в этом сообщении" if current else "ранее присланный"
-            label = f"[Файл {where}"
-            if te["name"]:
-                label += f": «{te['name']}»"
-            label += f" — {_KIND_RU.get(te['kind'], 'файл')}]"
-            blocks.append({"type": "text", "text": label})
+        where = "в этом сообщении" if current else "ранее присланный"
+        label = f"[Файл {where}"
+        if te["name"]:
+            label += f": «{te['name']}»"
+        # У документов подпись тоже есть: не уйдёт документ целиком — модель
+        # всё равно знает его имя.
+        label += f" — {_KIND_RU.get(te['kind'], 'документ')}]"
+        blocks.append({"type": "text", "text": label})
         blocks.append(ph)
     if not blocks:
         return text
@@ -456,7 +469,12 @@ async def refresh_caps() -> None:
 
 
 def usable(route: Route | None) -> str:
-    """Семейство хранилища, если ссылки для модели работают, иначе ''."""
+    """
+    Семейство хранилища, если ссылки для модели работают, иначе ''.
+    MEDIA_REFS=false — ссылок нет совсем (как будто хранилища у прокси нет).
+    """
+    if not settings.MEDIA_REFS:
+        return ""
     cap = capability(route)
     if not cap or not cap.get("ok"):
         return ""
@@ -539,8 +557,10 @@ async def _lookup(db, scope: str, blob_ids: list[int]) -> dict[int, dict]:
         for r in rows:
             if r.blob_id not in owners or owners[r.blob_id] != r.blob_owner:
                 continue   # блоб удалён или его id уже занят другим файлом
-            if r.status == "rejected":
+            if r.status == "rejected" and not (r.next_try_at and r.next_try_at <= now):
                 out[r.blob_id] = {"state": "rejected"}
+            elif r.status == "rejected":
+                out[r.blob_id] = {"state": "failed", "next_try_at": None}   # отказ истёк — ещё раз
             elif r.status == "uploading":
                 # Резерв идущей загрузки; просроченный (сервер упал посреди
                 # загрузки) — как сбой, который пора повторить.
@@ -576,12 +596,16 @@ class Plan:
     total: int = 0
 
     def summary(self) -> dict:
+        # «Ждут загрузки» — только то, что правда встанет ссылкой; документы,
+        # файлы сверх MEDIA_UPLOAD_MAX_MB и отвергнутые — «пометкой».
+        waiting = len(self.pending - self.inline - set(self.refs))
         return {
             "total": self.total,
             "refs": len(self.refs),
             "inline": len(self.inline),
             "inline_mb": round(self.inline_chars * 3 / 4 / (1024 * 1024), 1),
-            "pending": self.total - len(self.refs) - len(self.inline),
+            "pending": waiting,
+            "notes": self.total - len(self.refs) - len(self.inline) - waiting,
             "family": self.family,
         }
 
@@ -738,10 +762,12 @@ _DOC_CACHE_BYTES = 64 * 1024 * 1024
 _doc_lock: asyncio.Lock | None = None
 
 
-def _doc_key(te: dict) -> tuple:
-    # Не один blob_id: id удалённого файла SQLite отдаёт новому, и кэш выдал бы
-    # чужой документ. Размер, тип и имя вместе такую подмену ловят.
-    return (te.get("blob_id"), int(te.get("bytes") or 0), te.get("mime") or "", te.get("name") or "")
+def _doc_key(te: dict, data: str) -> tuple:
+    # По СОДЕРЖИМОМУ, а не по blob_id: id удалённого файла SQLite отдаёт
+    # новому, и кэш выдал бы старый документ вместо исправленного. Хэш дёшев
+    # рядом с конвертацией LibreOffice.
+    digest = hashlib.blake2b(data.encode("ascii", "ignore"), digest_size=16).hexdigest()
+    return (digest, te.get("mime") or "", te.get("name") or "")
 
 
 def _convert(te: dict, data: str) -> list[dict]:
@@ -762,7 +788,7 @@ async def _inline_blocks(te: dict, data: str) -> list[dict]:
     global _doc_lock
     if te.get("kind") != "document":
         return _convert(te, data)
-    key = _doc_key(te) if te.get("blob_id") else None
+    key = _doc_key(te, data) if data else None
     if key in _DOC_CACHE:
         weight, blocks = _DOC_CACHE.pop(key)
         _DOC_CACHE[key] = (weight, blocks)   # LRU: недавний — в конец
@@ -788,6 +814,12 @@ class Materialized:
     # запрос, повтор снимет именно их (в группе они приклеены к последней
     # реплике, и «всё до последней реплики» их бы не задело).
     history_inline: set = field(default_factory=set)
+    # id() ссылок на файлы истории (для повтора при превышении лимита токенов).
+    history_refs: set = field(default_factory=set)
+    # id() блоков файлов ОТВЕЧАЕМОЙ реплики (приоритет 2): их не снимают повторы,
+    # и по ним решается авто-режим рассуждений — даже если после них в запросе
+    # есть ещё реплика («Продолжи ответ»).
+    answered: set = field(default_factory=set)
 
     @property
     def ref_mb(self) -> float:
@@ -813,18 +845,22 @@ async def materialize(messages, params=None, connection=None, *, exclude_refs: s
     replace: dict[tuple[int, int], list[dict]] = {}
     used: list[dict] = []
     history_inline: set = set()
+    history_refs: set = set()
+    answered: set = set()
     for i, mk in enumerate(marks):
         te = mk.te
+        is_answered = int(te.get("priority") or 0) >= 2
         if i in p.refs:
             ref = p.refs[i]
-            replace[(mk.mi, mk.bi)] = [ref_block(ref["uri"], ref.get("mime") or norm_mime(te["kind"], te["mime"]))]
+            block = ref_block(ref["uri"], ref.get("mime") or norm_mime(te["kind"], te["mime"]))
+            replace[(mk.mi, mk.bi)] = [block]
             used.append({"uri": ref["uri"], "bytes": ref.get("bytes") or te.get("bytes") or 0})
+            (answered if is_answered else history_refs).add(id(block))
         elif i in p.inline:
             payload = te.get("data") or data.get(te.get("blob_id") or -1, "")
             blocks = (await _inline_blocks(te, payload) if payload
                       else [{"type": "text", "text": "[файл недоступен]"}])
-            if int(te.get("priority") or 0) < 2:
-                history_inline.update(id(b) for b in blocks)
+            (answered if is_answered else history_inline).update(id(b) for b in blocks)
             replace[(mk.mi, mk.bi)] = blocks
         else:
             replace[(mk.mi, mk.bi)] = [{"type": "text", "text": NOTE_PENDING if i in p.pending else NOTE_OVER}]
@@ -844,7 +880,7 @@ async def materialize(messages, params=None, connection=None, *, exclude_refs: s
             else:
                 blocks.append(b)
         out.append({**m, "content": blocks})
-    return Materialized(out, used, p.summary(), history_inline)
+    return Materialized(out, used, p.summary(), history_inline, history_refs, answered)
 
 
 async def preview(messages, params=None, connection=None, db=None) -> dict:
@@ -855,8 +891,8 @@ async def preview(messages, params=None, connection=None, db=None) -> dict:
         return {}
     out = p.summary()
     cap = capability(p.route)
-    out["storage"] = ("direct" if p.route is None else "ok" if p.family
-                      else "unchecked" if cap is None else "off")
+    out["storage"] = ("disabled" if not settings.MEDIA_REFS else "direct" if p.route is None
+                      else "ok" if p.family else "unchecked" if cap is None else "off")
     return out
 
 
@@ -891,7 +927,7 @@ def _ref_forms(uri: str) -> list[str]:
         forms |= {path, quote(path, safe="/"), path.rsplit("/", 1)[-1]}
     elif uri.startswith(FILES_API_PREFIX):
         fid = uri[len(FILES_API_PREFIX):]
-        forms |= {"files/" + fid}
+        forms |= {"files/" + fid, fid}
     return [f for f in forms if len(f) >= 8]
 
 
@@ -937,16 +973,16 @@ async def handle_ref_error(used: list[dict], error, params=None, connection=None
         return named
     if route is not None:
         uploader.enqueue_probe(route, force=True)
-        worn = set()
-        for u in uris:
-            key = (route.cap_key, u)
+        # «Подозрение» — только когда виновник однозначен: в запросе была одна
+        # ссылка. Иначе браковали бы и здоровые ссылки, ехавшие с ней вместе.
+        if len(uris) == 1 and not _PERMISSION_RE.search(text):
+            key = (route.cap_key, uris[0])
             _suspects[key] = _suspects.get(key, 0) + 1
             if _suspects[key] >= _SUSPECT_LIMIT:
-                worn.add(u)
                 _suspects.pop(key, None)
-        if worn:
-            await _update_refs(scope, worn, status="rejected",
-                               error="Модель несколько раз не смогла прочитать файл по ссылке")
+                await _update_refs(scope, set(uris), status="failed",
+                                   error="Модель несколько раз не смогла прочитать файл по ссылке",
+                                   next_try_at=_now() + timedelta(hours=6))
     return set(uris)
 
 
@@ -1043,8 +1079,11 @@ async def _alias_deployments(route: Route) -> list[str] | None:
             data = resp.json().get("data") or []
         except Exception:  # noqa: BLE001
             continue
-        return [((d.get("litellm_params") or {}).get("model") or "")
-                for d in data if isinstance(d, dict) and d.get("model_name") == route.alias]
+        found = [((d.get("litellm_params") or {}).get("model") or "")
+                 for d in data if isinstance(d, dict) and d.get("model_name") == route.alias]
+        # Нет точного совпадения (шаблон «gemini/*», псевдоним группы) — решает
+        # сама проверка загрузкой и чтением.
+        return found or None
     return None
 
 
@@ -1066,28 +1105,79 @@ async def _create_file(route: Route, file, timeout: int):
     raise last
 
 
-async def _delete_remote(route: Route, file_id: str) -> None:
+async def _delete_remote(route: Route, file_id: str) -> bool:
+    """
+    Удаляет копию файла в хранилище. True — дело сделано (удалена, уже не
+    существует или удалить её нельзя в принципе), False — временный сбой,
+    повторить позже.
+    """
     import litellm
 
     try:
         await asyncio.wait_for(litellm.afile_delete(
             file_id=file_id, timeout=60, **_file_kwargs(route)), 75)
-    except Exception as exc:  # noqa: BLE001 — копия в хранилище переживёт, не страшно
-        log.info("Копию файла в хранилище удалить не удалось: %s", _short_error(exc))
+        return True
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        if is_transient(exc):
+            log.info("Копию файла в хранилище удалить пока не удалось: %s", _short_error(_error_text(exc)))
+            return False
+        log.info("Копию файла в хранилище удалить нельзя: %s", _short_error(_error_text(exc)))
+        return True
+
+
+_TRANSIENT_RE = re.compile(
+    r"\b(429|500|502|503|504)\b|rate.?limit|resource.?exhausted|overloaded|unavailable|"
+    r"timed? ?out|timeout|connection|temporarily|try again", re.IGNORECASE)
+
+
+def is_transient(exc) -> bool:
+    """Временный сбой (лимит, перегрузка, сеть, таймаут) — не повод выключать хранилище."""
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError)):
+        return True
+    code = getattr(exc, "status_code", None)
+    if isinstance(code, int) and (code == 429 or code >= 500):
+        return True
+    return bool(_TRANSIENT_RE.search(f"{type(exc).__name__}: {exc}"))
+
+
+def _error_text(exc) -> str:
+    """Текст ошибки для людей: у таймаута asyncio он пустой."""
+    text = str(exc).strip()
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) and not text:
+        return "таймаут"
+    return text or type(exc).__name__
+
+
+async def _probe_retry_soon(route: Route, exc) -> dict:
+    """
+    Проверка упала из-за временного сбоя: прежний итог не трогаем (рабочее
+    хранилище не выключается на 6 часов из-за одного 429), но перепроверяем
+    минут через 15.
+    """
+    prev = capability(route)
+    if prev and prev.get("ok"):
+        prev = dict(prev, checked_at=time.time() - _RECHECK_OK + 900)
+        _caps[route.cap_key] = prev
+        return prev
+    cap = await _set_cap(route, (prev or {}).get("family") or "", ok=False, error=(
+        "Проверка не прошла из-за временного сбоя прокси или провайдера — повторю через "
+        "15 минут. Ответ: " + _short_error(_error_text(exc))), bucket=(prev or {}).get("bucket") or "")
+    cap["until"] = time.time() + 900
+    return cap
 
 
 async def probe(route: Route) -> dict:
     """
     Проверяет хранилище прокси для модели: модель должна быть Gemini, крошечная
     картинка — загрузиться и прочитаться моделью по ссылке. Итог запоминается.
+    Временный сбой (лимит, перегрузка, сеть) итог не портит — см. _probe_retry_soon.
     """
     import litellm
 
     deployments = await _alias_deployments(route)
-    if deployments is not None:
-        if not deployments:
-            return await _set_cap(route, "", ok=False, error=(
-                f"Модели «{route.alias}» нет в списке моделей прокси."))
+    if deployments:
         kinds = {"gcs" if d.startswith("vertex_ai") and "gemini" in d.lower()
                  else "files_api" if d.startswith("gemini/") else "other" for d in deployments}
         if "other" in kinds or len(kinds) > 1:
@@ -1118,25 +1208,41 @@ async def probe(route: Route) -> dict:
                 ]}],
                 max_tokens=64, num_retries=0, timeout=90), 100)
         except Exception as exc:  # noqa: BLE001
+            if is_transient(exc):
+                return await _probe_retry_soon(route, exc)
             return await _set_cap(route, family, ok=False, error=(
-                "Файл загрузился, но модель не смогла прочитать его по ссылке: " + _short_error(exc)
+                "Файл загрузился, но модель не смогла прочитать его по ссылке: "
+                + _short_error(_error_text(exc))
                 + (" Если бакет в другом проекте Google Cloud, дайте сервисному агенту Vertex AI "
                    "право чтения бакета." if family == "gcs" else "")))
         return await _set_cap(route, family, ok=True, bucket=gcs_bucket(uri))
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:  # noqa: BLE001
+        if is_transient(exc) and not _CAPABILITY_RE.search(str(exc)):
+            return await _probe_retry_soon(route, exc)
         return await _set_cap(route, "", ok=False, error=explain(str(exc)) + " Ответ прокси: "
-                              + _short_error(exc))
+                              + _short_error(_error_text(exc)))
     finally:
         if file_id and family_of(uri) == "gcs":
-            await _delete_remote(route, file_id)
+            # В фоне: при остановке сервера проверка не должна ждать удаления.
+            if uploader.running:
+                uploader.enqueue_delete(route, file_id)
+            else:
+                try:
+                    await asyncio.wait_for(_delete_remote(route, file_id), 10)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
 
 
 # ============================ фоновый загрузчик ============================
 
 _LANE_PROBE, _LANE_TURN, _LANE_BACKFILL, _LANE_DELETE = 0, 1, 2, 3
 # Постоянные отказы прокси по самому файлу (размер, формат): повтор не поможет.
-_REJECT_RE = re.compile(r"\b(400|413|415|422)\b|too large|payload|unsupported|not supported|"
+_REJECT_RE = re.compile(r"\b(413|415)\b|too large|unsupported|not supported|"
                         r"invalid (file|mime)|max_file_size", re.IGNORECASE)
+# Отказ по самому файлу не вечен: через неделю (или после смены прокси) — ещё раз.
+_REJECT_TTL = timedelta(days=7)
 _CAPABILITY_RE = re.compile(r"bucket|files_settings|model_list|model not found|managed files|"
                             r"\b401\b|unauthorized|invalid api key|authentication", re.IGNORECASE)
 
@@ -1149,6 +1255,7 @@ class _Job:
     route: Route
     te: dict | None = None
     file_id: str = ""
+    trash_id: int | None = None   # строка корзины: убрать, когда копия удалена
 
 
 class _Uploader:
@@ -1169,6 +1276,8 @@ class _Uploader:
         self._sweep_at = 0.0
         self.current: dict | None = None
         self.waiting = False   # ждёт паузы в ответах модели
+        self._fails = 0         # подряд сбоев связи с прокси
+        self._pause_until = 0.0
         self.done = 0
         self.failed = 0
 
@@ -1214,13 +1323,19 @@ class _Uploader:
             return
         self._put(("probe", route.cap_key), _Job(_LANE_PROBE, 0, "probe", route))
 
-    def enqueue_delete(self, route: Route, file_id: str) -> None:
+    def enqueue_delete(self, route: Route, file_id: str, trash_id: int | None = None) -> None:
         if self.running and file_id:
-            self._put(("del", file_id), _Job(_LANE_DELETE, 0, "delete", route, file_id=file_id))
+            self._put(("del", file_id), _Job(_LANE_DELETE, 0, "delete", route, file_id=file_id,
+                                             trash_id=trash_id))
 
     def drop_scope(self, scope: str) -> None:
         for key in [k for k in self._jobs if k[0] == "up" and k[1] == scope]:
             self._jobs.pop(key, None)
+
+    def pause(self) -> None:
+        """Прокси не отвечает: очередь ждёт 1, 2, 4… минуты (до 30)."""
+        self._fails += 1
+        self._pause_until = time.monotonic() + min(1800, 60 * 2 ** (self._fails - 1))
 
     def sweep_soon(self) -> None:
         """Файлы удалены — уборка через несколько секунд (после commit удаления)."""
@@ -1301,10 +1416,18 @@ class _Uploader:
                     except asyncio.TimeoutError:
                         pass
                     continue
+                wait = self._pause_until - time.monotonic()
+                if wait > 0:
+                    await asyncio.sleep(min(wait, 60))
+                    continue
                 job = self._jobs.get(key)
                 if job is None:
                     continue
                 await self._quiet(job)
+                # Пока ждали тишины, могла прийти задача важнее (проверка,
+                # файл свежей реплики) — берём лучшую на этот момент.
+                if self._next() != key:
+                    continue
                 job = self._jobs.pop(key, None)
                 if job is None:
                     continue
@@ -1314,7 +1437,8 @@ class _Uploader:
                     elif job.kind == "upload":
                         await self._upload(job)
                     elif job.kind == "delete":
-                        await _delete_remote(job.route, job.file_id)
+                        if await _delete_remote(job.route, job.file_id) and job.trash_id:
+                            await _drop_trash([job.trash_id])
                 except asyncio.CancelledError:
                     raise
                 except Exception:  # noqa: BLE001 — загрузчик не падает никогда
@@ -1326,24 +1450,30 @@ class _Uploader:
             pass
 
     async def _sweep(self) -> None:
-        """Удаляет ссылки на файлы, которых больше нет, и их копии в GCS."""
+        """
+        Корзина копий удалённых файлов → задачи удаления в хранилище. Строка
+        корзины уходит, только когда хранилище подтвердило удаление (или его
+        нельзя сделать в принципе): рестарт и сбои прокси копии не теряют.
+        """
         try:
-            gone = await sweep_orphans()
+            trash = await sweep_orphans()
         except Exception:  # noqa: BLE001
             log.exception("Уборка ссылок на удалённые файлы не удалась")
             return
-        if gone:
-            _DOC_CACHE.clear()   # файлы удалялись — их id могут достаться новым
-        for scope, uri in gone:
+        done: list[int] = []
+        for tid, scope, uri in trash:
             if not uri.startswith(GCS_PREFIX):
-                continue   # Files API удалит сам через двое суток
+                done.append(tid)   # Files API удалит сам через двое суток
+                continue
             # Удаляет любая рабочая модель этого прокси с тем же бакетом: модель,
             # через которую файл загружали, могла исчезнуть из конфигурации.
             for cap in list(_caps.values()):
                 route = _route_from_cap(cap)
                 if route is not None and cap.get("ok") and scope_for(route, cap) == scope:
-                    self.enqueue_delete(route, encode_file_id(uri, route.alias))
+                    self.enqueue_delete(route, encode_file_id(uri, route.alias), trash_id=tid)
                     break
+        if done:
+            await _drop_trash(done)
 
     async def _upload(self, job: _Job) -> None:
         import secrets
@@ -1404,7 +1534,7 @@ class _Uploader:
         self.current = {"name": te.get("name") or f"файл #{blob_id}",
                         "mb": round(size / 1048576, 1), "since": time.time()}
         if size > settings.MEDIA_UPLOAD_MAX_MB * 1024 * 1024:
-            await _fail(status="rejected", mime=mime, size=size,
+            await _fail(status="rejected", mime=mime, size=size, next_try_at=_now() + _REJECT_TTL,
                         error=f"Файл больше {settings.MEDIA_UPLOAD_MAX_MB} МБ — ссылкой не отправляется")
             return
         short = _admit(size)
@@ -1425,15 +1555,22 @@ class _Uploader:
                 return
             if size > settings.MEDIA_UPLOAD_MAX_MB * 1024 * 1024:
                 spool.close()
-                await _fail(status="rejected", mime=mime, size=size,
+                await _fail(status="rejected", mime=mime, size=size, next_try_at=_now() + _REJECT_TTL,
                             error=f"Файл больше {settings.MEDIA_UPLOAD_MAX_MB} МБ — ссылкой не отправляется")
                 return
             name = _filename(blob_id, digest, mime)
             uri, file_id = await self._send(route, spool, name, mime, size, family)
         except Exception as exc:  # noqa: BLE001
             self.failed += 1
-            text = str(exc)
+            text = f"{type(exc).__name__}: {_error_text(exc)}"
+            timed_out = isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or bool(
+                re.search(r"timed? ?out|timeout", text, re.IGNORECASE))
             log.warning("Загрузка файла #%s в хранилище не удалась: %s", blob_id, _short_error(text))
+            if is_transient(exc) and re.search(r"connect|refused|reset|unreachable|name or service",
+                                                text, re.IGNORECASE):
+                # Прокси недоступен: не гоняем по кругу чтение и декодирование
+                # каждого файла из очереди — пауза всей очереди.
+                self.pause()
             if _CAPABILITY_RE.search(text):
                 # Сломалось само хранилище — не файл: перепроверим модель позже,
                 # очередь этого хранилища не гоняем впустую.
@@ -1443,13 +1580,15 @@ class _Uploader:
                 await _fail(status="failed", mime=mime, size=size, attempts=attempts,
                             error=_short_error(text), next_try_at=_now() + _RECHECK_FAILED)
                 return
-            if _REJECT_RE.search(text) and not re.search(r"timed? ?out|connection", text, re.IGNORECASE):
-                await _fail(status="rejected", mime=mime, size=size, error=_short_error(text))
+            code = getattr(exc, "status_code", None)
+            if (code in (413, 415) or (_REJECT_RE.search(text) and not is_transient(exc))):
+                await _fail(status="rejected", mime=mime, size=size, error=_short_error(text),
+                            next_try_at=_now() + _REJECT_TTL)
                 return
             attempts += 1
             delay = (timedelta(hours=24) if attempts >= _MAX_ATTEMPTS
                      else min(timedelta(hours=6), timedelta(minutes=2 ** (attempts - 1))))
-            if re.search(r"timed? ?out|cancel", text, re.IGNORECASE):
+            if timed_out:
                 # Файл мог дойти, а ответ — нет: частые повторы плодили бы
                 # копии-сироты в бакете. Не раньше чем через час.
                 delay = max(delay, timedelta(hours=1))
@@ -1461,6 +1600,7 @@ class _Uploader:
             ref_id, token, route, status="ready", mime=mime, size=size, uri=uri, file_id=file_id,
             usable_after=_usable_after(family, te.get("kind") or "", size),
             expires_at=(_now() + _FILES_API_TTL) if family == "files_api" else None)
+        self._fails = 0
         if stored:
             self.done += 1
         elif family == "gcs":
@@ -1557,7 +1697,12 @@ def _decode_to_spool(raw: str):
         # «video/webm;codecs=vp8,opus;base64,…» — запятая бывает и внутри mime.
         j = raw.find(";base64,", 0, 512)
         start = j + 8 if j >= 0 else raw.find(",") + 1
-    spool = tempfile.SpooledTemporaryFile(max_size=64 * 1024 * 1024)
+    import io
+
+    # До 64 МБ — в памяти (BytesIO: httpx берёт размер через seek/tell), крупнее
+    # — сразу на диск: SpooledTemporaryFile переливался бы на диск уже внутри
+    # httpx, в event loop сервера.
+    spool = io.BytesIO() if (len(raw) - start) * 3 // 4 <= 64 * 1024 * 1024 else tempfile.TemporaryFile()
     sha = hashlib.sha256()
     size = 0
     carry = ""
@@ -1721,12 +1866,13 @@ async def _write_ref(ref_id: int, token: str, route: Route | None, *, status: st
         return True
 
 
-async def sweep_orphans() -> list[tuple[str, str]]:
+async def sweep_orphans(limit: int = 200) -> list[tuple[int, str, str]]:
     """
-    Разбирает корзину media_ref_trash (её наполняет триггер при удалении файлов)
-    и на всякий случай удаляет ссылки на файлы, которых больше нет, и ссылки,
-    чей id блоба уже занят другим файлом (базы, где триггера ещё не было).
-    Возвращает [(scope, uri)] — эти копии чистятся в хранилище.
+    Ссылки на файлы, которых больше нет, и ссылки, чей id блоба уже занят
+    другим файлом (базы, где триггера ещё не было), — в корзину. Возвращает
+    до limit строк корзины [(id, scope, uri)]: их копии надо стереть в
+    хранилище. Сами строки корзины здесь НЕ удаляются — только после
+    подтверждённого удаления копии (_drop_trash).
     """
     from sqlalchemy import delete, select
 
@@ -1734,8 +1880,6 @@ async def sweep_orphans() -> list[tuple[str, str]]:
     from backend.models import AttachmentBlob, MediaRef, MediaRefTrash
 
     async with AsyncSessionLocal() as db:
-        trash = (await db.execute(select(MediaRefTrash.id, MediaRefTrash.scope, MediaRefTrash.uri)
-                                  .limit(2000))).all()
         missing = (await db.execute(
             select(MediaRef.id, MediaRef.scope, MediaRef.uri).where(
                 ~MediaRef.blob_id.in_(select(AttachmentBlob.id)))
@@ -1746,22 +1890,38 @@ async def sweep_orphans() -> list[tuple[str, str]]:
             .where(MediaRef.blob_owner.is_distinct_from(AttachmentBlob.message_id))
         )).all()
         refs = list(missing) + list(moved)
-        if not refs and not trash:
-            return []
-        ids = [r[0] for r in refs]
-        for i in range(0, len(ids), 500):
-            await db.execute(delete(MediaRef).where(MediaRef.id.in_(ids[i:i + 500])))
-        tids = [r[0] for r in trash]
-        for i in range(0, len(tids), 500):
-            await db.execute(delete(MediaRefTrash).where(MediaRefTrash.id.in_(tids[i:i + 500])))
+        if refs:
+            for _rid, scope, uri in refs:
+                if uri:
+                    db.add(MediaRefTrash(scope=scope, uri=uri))
+            ids = [r[0] for r in refs]
+            for i in range(0, len(ids), 500):
+                await db.execute(delete(MediaRef).where(MediaRef.id.in_(ids[i:i + 500])))
+            await db.commit()
+        trash = (await db.execute(
+            select(MediaRefTrash.id, MediaRefTrash.scope, MediaRefTrash.uri)
+            .order_by(MediaRefTrash.id).limit(limit))).all()
+    return [(t[0], t[1], t[2]) for t in trash]
+
+
+async def _drop_trash(ids: list[int]) -> None:
+    from sqlalchemy import delete
+
+    from backend.database import AsyncSessionLocal
+    from backend.models import MediaRefTrash
+
+    async with AsyncSessionLocal() as db:
+        await db.execute(delete(MediaRefTrash).where(MediaRefTrash.id.in_(ids)))
         await db.commit()
-    return [(r[1], r[2]) for r in list(trash) + refs if r[2]]
 
 
 # ============================ статус для интерфейса ============================
 
-async def status(db, params=None, connection=None) -> dict:
-    """Состояние хранилища для текущей модели: проверка, счётчики, очередь."""
+async def status(db, params=None, connection=None, private: bool = False) -> dict:
+    """
+    Состояние хранилища для текущей модели: проверка, счётчики, очередь.
+    :param private: не показывать имя загружаемого файла (он может быть чужим).
+    """
     from sqlalchemy import func, select
 
     from backend.models import MediaRef
@@ -1792,7 +1952,8 @@ async def status(db, params=None, connection=None) -> dict:
         "checked_at": (cap or {}).get("checked_at"),
         "counts": counts,
         "queued": uploader.queued(),
-        "uploading": uploader.current,
+        "uploading": (dict(uploader.current, name="файл") if private and uploader.current
+                      else uploader.current),
         "waiting": uploader.waiting,
         "worker": uploader.running,
         "inline_mb": settings.INLINE_FILES_MB,

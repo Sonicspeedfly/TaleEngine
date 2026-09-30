@@ -107,7 +107,7 @@ async def build_knowledge(
     used = 0
     # Размер медиа — для оценки их веса в токенах и лимита «целиком»; у файла
     # базы знаний своей колонки размера нет, поэтому — длина base64 в blob.
-    sizes = await _blob_sizes(db, [f.blob_id for f in files if not f.content and f.blob_id])
+    sizes = await _blob_sizes(db, [(f.id, f.blob_id) for f in files if not f.content and f.blob_id])
     for f in files:
         if f.content:
             chunk = f.content
@@ -122,7 +122,7 @@ async def build_knowledge(
             # backend/media_refs.py. Раньше медиа базы знаний уходили base64-ом
             # в КАЖДОМ запросе без всякого лимита.
             block = placeholder({"type": f.kind if f.kind in ("image", "audio", "video") else "document",
-                                 "mime": f.mime, "name": f.name, "size": sizes.get(f.blob_id, 0),
+                                 "mime": f.mime, "name": f.name, "size": sizes.get(f.id, 0),
                                  "blob_id": f.blob_id}, priority=1)
             if block is None:
                 continue
@@ -140,32 +140,34 @@ async def build_knowledge(
     return knowledge_text, media_msgs
 
 
-# {(blob_id, message_id): размер} — файл базы знаний не меняется, а считать
-# длину base64 на каждом ходу дорого: SQLite length() читает TEXT целиком.
-_SIZE_CACHE: dict[int, int] = {}
+# {(id файла базы знаний, blob_id): размер} — файл базы знаний не меняется, а
+# считать длину base64 на каждом ходу дорого: SQLite length() читает TEXT
+# целиком. Ключ с id файла: id удалённого блоба SQLite отдаёт новому.
+_SIZE_CACHE: dict[tuple[int, int], int] = {}
 _OCTET_LENGTH = __import__("sqlite3").sqlite_version_info >= (3, 43, 0)
 
 
-async def _blob_sizes(db, blob_ids) -> dict[int, int]:
+async def _blob_sizes(db, pairs) -> dict[int, int]:
     """
-    {blob_id: размер файла в байтах} по длине base64. octet_length (SQLite
-    3.43+) берёт длину из заголовка записи, не читая данные; на старом SQLite —
-    length() один раз, дальше из кэша.
+    {id файла базы знаний: размер в байтах} по длине base64 его блоба.
+    octet_length (SQLite 3.43+) берёт длину из заголовка записи, не читая
+    данные; на старом SQLite — length() один раз, дальше из кэша.
     """
     from sqlalchemy import func, select
 
-    ids = sorted({int(i) for i in blob_ids if i})
-    if not ids:
+    pairs = [(int(k), int(b)) for k, b in pairs if b]
+    if not pairs:
         return {}
-    measure = func.octet_length if _OCTET_LENGTH else func.length
-    todo = ids if _OCTET_LENGTH else [i for i in ids if i not in _SIZE_CACHE]
+    todo = pairs if _OCTET_LENGTH else [p for p in pairs if p not in _SIZE_CACHE]
     if todo:
-        rows = (await db.execute(
+        measure = func.octet_length if _OCTET_LENGTH else func.length
+        rows = dict((await db.execute(
             select(models.AttachmentBlob.id, measure(models.AttachmentBlob.data))
-            .where(models.AttachmentBlob.id.in_(todo))
-        )).all()
-        for i, n in rows:
-            _SIZE_CACHE[i] = int((n or 0) * 3 / 4)
-        for i in set(todo) - {r[0] for r in rows}:
-            _SIZE_CACHE.pop(i, None)
-    return {i: _SIZE_CACHE[i] for i in ids if i in _SIZE_CACHE}
+            .where(models.AttachmentBlob.id.in_(sorted({b for _, b in todo})))
+        )).all())
+        for key in todo:
+            if key[1] in rows:
+                _SIZE_CACHE[key] = int((rows[key[1]] or 0) * 3 / 4)
+            else:
+                _SIZE_CACHE.pop(key, None)
+    return {k: _SIZE_CACHE[(k, b)] for k, b in pairs if (k, b) in _SIZE_CACHE}

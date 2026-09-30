@@ -271,6 +271,7 @@ createApp({
       // «Файлы для модели»: хранилище файлов у прокси для текущей модели
       // (GET /api/media/status). null — ещё не загружено.
       mediaStatus: null,
+      mediaStatusError: "",
       mediaProbing: false,
       // Пустая форма записи памяти (тот же объект возвращает метод blankHorae()).
       horaeEdit: { id: null, category: "lore", title: "", content: "", keywords: "", always_on: false, enabled: true, priority: 0, scope: "global" },
@@ -1722,10 +1723,12 @@ createApp({
         const bits = [];
         if (f.refs) bits.push(n(f.refs) + " ссылкой");
         if (f.inline) bits.push(n(f.inline) + " целиком (" + f.inline_mb + " МБ)");
-        if (f.pending) bits.push(n(f.pending) + (f.storage === "ok" ? " ждут загрузки" : " пометкой"));
+        if (f.pending) bits.push(n(f.pending) + " ждут загрузки");
+        if (f.notes) bits.push(n(f.notes) + " пометкой");
         const why = f.storage === "off" ? " · хранилище у прокси не работает (⚙ → Генерация)"
-          : f.storage === "unchecked" ? " · хранилище ещё не проверено" : "";
-        rows.push({ text: "Файлы: " + bits.join(" · ") + why, warn: f.storage === "off" && !!f.pending });
+          : f.storage === "unchecked" ? " · хранилище ещё не проверено"
+          : f.storage === "disabled" ? " · ссылки выключены на сервере" : "";
+        rows.push({ text: "Файлы: " + bits.join(" · ") + why, warn: !!f.notes && f.storage !== "ok" });
       }
       const found = (stats.recalled || []).length;
       const factsOff = mem.facts_enabled === false || mem.facts_mode === "off";
@@ -4617,7 +4620,8 @@ createApp({
       const model = (this.params.model || "").trim();
       try {
         this.mediaStatus = await this.api("/media/status?model=" + encodeURIComponent(model));
-      } catch (e) { this.mediaStatus = null; }
+        this.mediaStatusError = "";
+      } catch (e) { this.mediaStatusError = e.message || "нет ответа сервера"; }
     },
     async probeMediaStorage() {
       this.mediaProbing = true;
@@ -6029,7 +6033,7 @@ createApp({
           <p class="muted" style="margin:2px 0 10px">Это лимит ВЫВОДА (одного ответа), не памяти. Рассуждения 💭 тратят этот же лимит — при «высоких» держите 8000+.</p>
           <div class="hr"></div>
           <h3>💰 Расход квоты</h3>
-          <p class="muted" style="margin:2px 0 8px">Три настройки ниже определяют, сколько токенов уходит провайдеру на КАЖДОМ ходу. Готовые режимы:</p>
+          <p class="muted" style="margin:2px 0 8px">Две настройки ниже (окно контекста и база знаний) определяют, сколько токенов уходит провайдеру на КАЖДОМ ходу. Готовые режимы:</p>
           <div class="row" style="gap:6px; margin:0 0 6px; flex-wrap:wrap">
             <button v-for="m in economyModes" :key="m.id"
                     :class="isEconomyMode(m) ? 'btn-primary' : ''"
@@ -6052,7 +6056,8 @@ createApp({
           <h3 style="margin-top:14px">📎 Файлы для модели</h3>
           <p class="muted" style="margin:2px 0 8px">Модель видит все фото, голосовые, видео и PDF той части чата, что входит в окно контекста. Каждый файл один раз загружается в хранилище Google через ваш LiteLLM-прокси, дальше модель получает короткую ссылку, а не мегабайты в каждом запросе. Оригиналы остаются у вас в чате.</p>
           <div class="media-status" :class="mediaStatusClass()" role="status">
-            <template v-if="!mediaStatus"><span class="muted">Проверяю хранилище…</span></template>
+            <template v-if="!mediaStatus && mediaStatusError"><b>Не удалось получить состояние:</b> {{ mediaStatusError }}</template>
+            <template v-else-if="!mediaStatus"><span class="muted">Проверяю хранилище…</span></template>
             <template v-else-if="mediaStatus.direct"><b>Недоступно:</b> ссылки на файлы работают только через LiteLLM-прокси (вкладка «Подключение»).</template>
             <template v-else-if="!mediaStatus.enabled"><b>Выключено</b> на сервере (MEDIA_REFS=false).</template>
             <template v-else-if="mediaStatus.ok">
@@ -6065,12 +6070,12 @@ createApp({
             </template>
           </div>
           <div class="row" style="gap:6px; margin:6px 0; flex-wrap:wrap">
-            <button @click="probeMediaStorage()" :disabled="mediaProbing || !mediaStatus || mediaStatus.direct || (authStatus.accounts_enabled && !isAdmin)"
+            <button @click="probeMediaStorage()" :disabled="mediaProbing || (mediaStatus && (mediaStatus.direct || !mediaStatus.enabled)) || (authStatus.accounts_enabled && !isAdmin)"
                     :title="authStatus.accounts_enabled && !isAdmin ? 'Проверку запускает администратор' : ''"
                     aria-label="Проверить хранилище файлов у прокси">{{ mediaProbing ? 'Проверяю…' : '🔄 Проверить' }}</button>
             <button @click="loadMediaStatus()" aria-label="Обновить состояние загрузки файлов">Обновить</button>
           </div>
-          <p class="muted" style="margin:2px 0 6px">Пока хранилище не работает (или файл ещё в очереди), файлы уходят целиком — но не больше {{ (mediaStatus && mediaStatus.inline_mb) || 16 }} МБ за запрос, свежие первыми, остальные пометкой с именем файла. Файлы отправляемого сейчас сообщения идут всегда. Вес файлов в токенах входит в окно контекста (не больше половины окна): минута голосового ≈ 2 тыс. токенов, минута видео ≈ 18 тыс.</p>
+          <p class="muted" style="margin:2px 0 6px">Пока хранилище не работает (или файл ещё в очереди), файлы истории уходят целиком — но не больше {{ mediaStatus && mediaStatus.inline_mb != null ? mediaStatus.inline_mb : 16 }} МБ за запрос, свежие первыми, остальные пометкой с именем файла. Файлы сообщения, на которое идёт ответ, уходят всегда. Вес файлов в токенах входит в окно контекста (не больше половины окна): минута голосового ≈ 2 тыс. токенов, минута видео ≈ 18 тыс.</p>
           <details style="margin:0 0 10px">
             <summary>Как включить хранилище у прокси</summary>
             <div class="muted" style="margin-top:6px">

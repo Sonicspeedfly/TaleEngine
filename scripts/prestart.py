@@ -129,8 +129,6 @@ def backup_sqlite(db: Path, backups: Path, *, keep: int = BACKUP_KEEP,
     # База с вложениями весит гигабайты — тогда хватит двух копий.
     if db.stat().st_size > 1024 ** 3:
         keep = min(keep, 2)
-    # Лишние копии убираем ДО новой: на диске не бывает keep + 1 копий сразу.
-    _prune(backups, db, max(0, keep - 1))
     stamp = (now or datetime.now()).strftime("%Y-%m-%d_%H-%M-%S")
     target = backups / f"{db.stem}-{stamp}{db.suffix}"
     n = 1
@@ -168,11 +166,16 @@ def _prune(backups: Path, db: Path, keep: int) -> None:
             pass
 
 
-# Запас свободного места поверх размера копии: SQLite и серверу тоже нужно где писать.
+# Запас свободного места поверх размера копии: SQLite и серверу тоже нужно где
+# писать. Не больше 512 МБ и не меньше 64 МБ — десятая часть копии.
 BACKUP_HEADROOM = 512 * 1024 * 1024
 
 
-def ensure_backup_space(db: Path, backups: Path, *, headroom: int = BACKUP_HEADROOM,
+def _headroom(size: int, cap: int = BACKUP_HEADROOM) -> int:
+    return min(cap, max(64 * 1024 * 1024, size // 10))
+
+
+def ensure_backup_space(db: Path, backups: Path, *, headroom: Optional[int] = None,
                         free: Optional[Callable[[Path], int]] = None) -> bool:
     """
     Хватит ли места на копию базы. Не хватает — удаляются старые копии (они
@@ -186,8 +189,16 @@ def ensure_backup_space(db: Path, backups: Path, *, headroom: int = BACKUP_HEADR
         return shutil.disk_usage(str(probe)).free
 
     free = free or _free
-    need = int(db.stat().st_size * 1.1) + headroom
+    size = db.stat().st_size
+    need = int(size * 1.1) + (_headroom(size) if headroom is None else headroom)
     where = backups if backups.exists() else db.parent
+    # Оборванные копии прошлых запусков (.part) — мёртвый груз: убираем.
+    if backups.exists():
+        for part in backups.glob(f"{db.stem}-*{db.suffix}.part"):
+            try:
+                part.unlink()
+            except OSError:
+                pass
     if free(where) >= need:
         return True
     old = sorted(backups.glob(f"{db.stem}-*{db.suffix}"), key=lambda p: p.stat().st_mtime) \

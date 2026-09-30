@@ -1909,14 +1909,17 @@ _media_probe_at: dict[str, float] = {}
 
 
 @app.get("/api/media/status")
-async def media_status(model: str = "", db: AsyncSession = Depends(get_session)):
+async def media_status(model: str = "", user=Depends(current_user),
+                       db: AsyncSession = Depends(get_session)):
     """
     Состояние хранилища файлов у прокси для модели: работает ли загрузка
     ссылками, почему нет, сколько файлов уже загружено и сколько в очереди.
+    Не-админу в режиме аккаунтов имя загружаемого файла не показываем.
     """
     connection = await get_connection(db)
     params = GenerationParams(model=model.strip() or None)
-    return await media_refs.status(db, params, connection)
+    return await media_refs.status(db, params, connection,
+                                   private=user is not None and user.role != "admin")
 
 
 @app.post("/api/media/probe")
@@ -1930,6 +1933,8 @@ async def media_probe(payload: dict | None = None, user=Depends(current_user),
     connection = await get_connection(db)
     model = str((payload or {}).get("model") or "").strip()
     params = GenerationParams(model=model or None)
+    if not settings.MEDIA_REFS:
+        raise HTTPException(400, "Файлы ссылками выключены на сервере (MEDIA_REFS=false).")
     route = media_refs.route_for(params, connection)
     if route is None:
         raise HTTPException(400, "Ссылки на файлы работают только через LiteLLM-прокси (вкладка «Подключение»).")

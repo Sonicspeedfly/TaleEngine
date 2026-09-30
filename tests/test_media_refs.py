@@ -47,9 +47,11 @@ def _ok_stream(*tokens):
 
 
 @pytest.fixture
-async def db_ready():
+async def db_ready(monkeypatch):
     from backend.database import init_db
 
+    # Ссылки включены (в conftest MEDIA_REFS=0 — чтобы не стартовал загрузчик).
+    monkeypatch.setattr(settings, "MEDIA_REFS", True)
     await init_db()
     mr._caps.clear()
     mr._suspects.clear()
@@ -120,7 +122,7 @@ def test_placeholders_carry_meta_not_data():
     assert all("data" not in m for m in marks)
     labels = [b["text"] for b in content if b.get("type") == "text" and mr.MARK not in b]
     assert "[Файл ранее присланный: «голос.ogg» — аудио]" in labels
-    assert not any("b.docx" in t for t in labels)          # у документов подписи нет, как раньше
+    assert "[Файл ранее присланный: «b.docx» — документ]" in labels   # имя документа не теряется
 
 
 def test_norm_mime_and_names_are_safe():
@@ -258,8 +260,12 @@ async def test_deleting_blob_drops_its_refs_via_trigger(db_ready):
         assert (await db.execute(select(MediaRef).where(MediaRef.blob_id == bid))).first() is None
         trash = (await db.execute(select(MediaRefTrash.uri))).scalars().all()
     assert GS + "-trig" in trash
-    gone = await mr.sweep_orphans()
-    assert (_gcs_scope(), GS + "-trig") in gone
+    trash_rows = await mr.sweep_orphans()
+    assert any(t[1:] == (_gcs_scope(), GS + "-trig") for t in trash_rows)
+    # Строка корзины живёт, пока хранилище не подтвердило удаление копии.
+    assert any(t[1:] == (_gcs_scope(), GS + "-trig") for t in await mr.sweep_orphans())
+    await mr._drop_trash([t[0] for t in trash_rows])
+    assert not any(t[2] == GS + "-trig" for t in await mr.sweep_orphans())
 
 
 # ---------------------------------------------------------------- сбои ссылок
@@ -424,9 +430,23 @@ async def test_upload_is_deferred_when_server_is_short_of_memory(db_ready):
     bid = await _blob(_b64(100))
     job = mr._Job(mr._LANE_BACKFILL, 1, "upload", route,
                   te=mr.placeholder({"type": "image", "mime": "image/png", "size": 100, "blob_id": bid})[mr.MARK])
-    with patch.object(mr, "_mem_available", return_value=10), \
-            patch("litellm.acreate_file", side_effect=AssertionError("не должен грузить")):
+    from sqlalchemy import select
+
+    from backend.database import AsyncSessionLocal
+    from backend.models import MediaRef
+
+    calls = []
+
+    async def fake_create(**kw):
+        calls.append(kw)
+
+    with patch.object(mr, "_mem_available", return_value=10), patch("litellm.acreate_file", new=fake_create):
         await mr.uploader._upload(job)
+    assert calls == []                                        # ничего не грузили
+    async with AsyncSessionLocal() as db:
+        row = (await db.execute(select(MediaRef).where(MediaRef.blob_id == bid))).scalar_one()
+    assert row.status == "failed" and row.attempts == 0      # «не сейчас», а не сбой
+    assert "памяти" in row.error and row.next_try_at > mr._now() + timedelta(minutes=9)
 
 
 async def test_plan_never_enqueues_files_over_upload_cap(db_ready, monkeypatch):
@@ -494,10 +514,13 @@ def test_media_share_of_window_is_capped_and_text_survives():
 # ---------------------------------------------------------------- API и прочее
 
 def test_media_status_endpoint_reports_direct_mode(client):
-    r = client.get("/api/media/status?model=gem")
-    assert r.status_code == 200
-    body = r.json()
-    assert {"ok", "checked", "direct", "counts", "queued", "inline_mb"} <= set(body)
+    with patch("backend.main.get_connection", return_value={"use_proxy": False, "default_model": "gem"}):
+        body = client.get("/api/media/status?model=gem").json()
+    assert body["direct"] is True and body["ok"] is False
+    with patch("backend.main.get_connection", return_value=PROXY):
+        body = client.get("/api/media/status?model=gem").json()
+    assert body["direct"] is False and body["model"] == "gem"
+    assert {"ok", "checked", "counts", "queued", "inline_mb"} <= set(body)
 
 
 def test_stored_size_is_computed_from_data():
@@ -604,6 +627,7 @@ async def test_blob_deleted_during_upload_leaves_no_ref(db_ready):
 
 def test_unsendable_files_become_notes_before_costing(monkeypatch):
     monkeypatch.setattr(settings, "INLINE_FILES_MB", 1)
+    monkeypatch.setattr(settings, "MEDIA_REFS", True)
     hist = _hist([{"type": "video", "mime": "video/mp4", "size": 900_000, "blob_id": 1}]) \
         + _hist([{"type": "video", "mime": "video/mp4", "size": 600_000, "blob_id": 2}])
     route = mr.route_for(None, PROXY)                    # хранилище не проверено
@@ -648,3 +672,37 @@ def test_auto_reasoning_looks_at_current_files_only():
     old_photo = [{"role": "user", "content": [photo]}, {"role": "user", "content": "просто текст"}]
     assert effective_reasoning(p, old_photo) == ""
     assert effective_reasoning(p, [{"role": "user", "content": ["", photo][1:]}]) == "medium"
+
+
+def test_documents_are_costed_by_what_is_sent():
+    """docx на 2 МБ — пара страниц PDF, а не 500 тыс. токенов «текста»."""
+    docx = mr.placeholder({"type": "document", "mime": "", "name": "report.docx", "size": 2_000_000,
+                           "blob_id": 5})
+    assert mr.block_tokens(docx) <= 20_000
+    txt = mr.placeholder({"type": "document", "mime": "text/plain", "name": "a.txt", "size": 4000,
+                          "blob_id": 6})
+    assert mr.block_tokens(txt) == 1000
+    zip_ = mr.placeholder({"type": "document", "mime": "application/zip", "name": "a.zip",
+                           "size": 50_000_000, "blob_id": 7})
+    assert mr.block_tokens(zip_) == 64
+
+
+async def test_transient_probe_failure_keeps_working_storage(db_ready):
+    import litellm
+
+    route = _gcs_ok()
+    uri = "gs://bucket-a/litellm-vertex-files/uploads/p-taleengine-probe.png"
+
+    async def fake_create(**kw):
+        return SimpleNamespace(id=mr.encode_file_id(uri, "gem"))
+
+    async def busy(**kw):
+        raise litellm.RateLimitError("429 RESOURCE_EXHAUSTED", llm_provider="vertex_ai", model="gem")
+
+    with patch.object(mr, "_alias_deployments", return_value=None), \
+            patch("litellm.acreate_file", new=fake_create), patch("litellm.acompletion", new=busy), \
+            patch.object(mr, "_delete_remote", return_value=True):
+        cap = await mr.probe(route)
+    assert cap["ok"] and mr.usable(route) == "gcs"          # 429 не выключает рабочие ссылки
+    assert mr._cap_stale(dict(cap, checked_at=cap["checked_at"] - 1000))   # но скоро перепроверим
+
