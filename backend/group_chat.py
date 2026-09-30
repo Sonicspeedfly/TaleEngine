@@ -279,8 +279,7 @@ async def director_pick(
 
 async def build_group_messages(
     db, session, target_character, token_budget: int, send_avatars: bool = False,
-    history_files_limit: int | None = None, history_files_turns: int | None = None,
-    knowledge_chars: int | None = None,
+    knowledge_chars: int | None = None, params=None, **_legacy,
 ) -> list[dict]:
     """Собирает messages, чтобы target_character ответил как он сам, видя весь диалог.
 
@@ -345,7 +344,33 @@ async def build_group_messages(
             lines.append(f"{persona_name}: {ctext}")
         else:
             lines.append(f"{m.speaker_name or target_character.name}: {m.content}")
-    transcript = _fit_transcript(lines, system, token_budget)
+    # Файлы реплик весят для модели по-настоящему (голосовое на минуту ≈ 2 тыс.
+    # токенов, видео — десятки тысяч): их вес входит в бюджет транскрипта, а
+    # модель получает файлы только тех реплик, что в него вошли.
+    from backend.media_refs import block_tokens, placeholder
+
+    # Файлам — не больше половины бюджета (от свежих к старым), как в личном
+    # чате: иначе одно тяжёлое видео вытеснило бы из транскрипта десятки реплик.
+    # Файлы ПОСЛЕДНЕЙ реплики пользователя идут всегда (как файлы реплики в
+    # личном чате): в долю не входят.
+    newest_user = next((m.id for m in reversed(msgs) if m.role == "user"), None)
+    file_costs = [0] * len(msgs)
+    media_left = token_budget // 2 if token_budget and token_budget > 0 else None
+    skip_files: set[int] = set()
+    for idx in range(len(msgs) - 1, -1, -1):
+        m = msgs[idx]
+        if m.role != "user" or m.id == newest_user:
+            continue
+        cost = sum(block_tokens(ph) or 0 for ph in (placeholder(a) for a in (m.attachments or []))
+                   if ph is not None)
+        if media_left is not None and cost > media_left:
+            skip_files.add(m.id)
+            continue
+        if media_left is not None:
+            media_left -= cost
+        file_costs[idx] = cost
+    start = _transcript_start(lines, system, token_budget, file_costs)
+    transcript = _fit_transcript(lines, system, token_budget, start=start)
 
     messages: list[dict] = [{"role": "system", "content": system}]
     if send_avatars:
@@ -393,9 +418,20 @@ async def build_group_messages(
     # не мог «услышать» голосовое / «увидеть» фото (отвечал по кругу, игнорируя их).
     # Теперь свежие вложения прикладываем к финальной реплике как мультимодал.
     user_content: list = [{"type": "text", "text": transcript + f"\n\n{target_character.name}:"}]
-    att_blocks = await _collect_user_attachments(
-        db, msgs, history_files_limit, history_files_turns
-    )
+    att_blocks = _collect_user_attachments(msgs[start:], skip=skip_files)
+    # Хранилище файлов для модели не работает — файлы сверх лимита «целиком»
+    # заранее становятся пометкой (их вес не нужен транскрипту).
+    try:
+        from backend import media_refs
+        from backend.settings_service import get_connection
+
+        route = media_refs.route_for(params, await get_connection(db))
+        att_blocks = media_refs.prune_unsendable(
+            [{"role": "user", "content": att_blocks}], route)[0]["content"]
+    except Exception:  # noqa: BLE001 — отбор файлов не роняет ход
+        import logging
+
+        logging.getLogger("aichat.media").exception("Отбор файлов группы не удался")
     if att_blocks:
         user_content = [{"type": "text", "text": transcript}] + att_blocks + [
             {"type": "text", "text": (
@@ -468,7 +504,22 @@ async def _group_recalled(db, session, msgs) -> str:
         return ""
 
 
-def _fit_transcript(lines: list[str], system: str, token_budget: int) -> str:
+def _transcript_start(lines: list[str], system: str, token_budget: int,
+                      extra: list[int] | None = None) -> int:
+    """
+    С какой строки транскрипт группы влезает в бюджет (0 — целиком).
+    :param extra: добавочный вес строк (файлы реплик), по индексам lines.
+    """
+    from backend.horae_memory import estimate_tokens, stable_trim_start
+
+    if not token_budget or token_budget <= 0:
+        return 0
+    costs = [estimate_tokens(ln) + ((extra[i] if extra and i < len(extra) else 0))
+             for i, ln in enumerate(lines)]
+    return stable_trim_start(costs, token_budget, reserved=estimate_tokens(system))
+
+
+def _fit_transcript(lines: list[str], system: str, token_budget: int, start: int | None = None) -> str:
     """
     Обрезает транскрипт группы под бюджет контекста — с конца (свежее важнее).
 
@@ -477,13 +528,8 @@ def _fit_transcript(lines: list[str], system: str, token_budget: int) -> str:
     промпта провайдера (скидка 75–90% на вход). Что выпало — не теряется: суть
     старых событий держит авто-сводка сюжета.
     """
-    from backend.horae_memory import estimate_tokens, stable_trim_start
-
-    if not token_budget or token_budget <= 0:
-        return "\n".join(lines)
-
-    costs = [estimate_tokens(ln) for ln in lines]
-    start = stable_trim_start(costs, token_budget, reserved=estimate_tokens(system))
+    if start is None:
+        start = _transcript_start(lines, system, token_budget)
     if start <= 0:
         return "\n".join(lines)
     return "\n".join(
@@ -491,48 +537,40 @@ def _fit_transcript(lines: list[str], system: str, token_budget: int) -> str:
     )
 
 
-async def _collect_user_attachments(
-    db, msgs, files_limit_chars: int | None, files_turns: int | None = None
-) -> list[dict]:
+def _collect_user_attachments(msgs, skip: set | None = None) -> list[dict]:
     """
-    Собирает мультимодальные блоки вложений из реплик ПОЛЬЗОВАТЕЛЯ группового чата
-    (от свежих к старым, в пределах лимита по объёму и возрастного окна). Данные
-    тянутся из blob-таблицы точечно. Возвращает список content-блоков
-    (image_url/input_audio), помеченных именем файла.
+    Файлы из реплик ПОЛЬЗОВАТЕЛЯ группового чата, вошедших в транскрипт
+    (хронологически), — подписи с именем и заготовки (media_refs.placeholder).
+    Ссылкой, целиком или пометкой их сделает stream_completion; данные здесь
+    не читаются.
 
-    В группе эти блоки уходят КАЖДОМУ отвечающему персонажу отдельным запросом,
-    поэтому лишний файл здесь стоит не одну, а N пересылок за ход.
+    В группе эти блоки уходят КАЖДОМУ отвечающему персонажу отдельным запросом —
+    со ссылками это дёшево для сети, а целиком их ограничивает INLINE_FILES_MB.
     """
-    from backend.attachments import load_history_attachments
-    from backend.llm_gateway import _content_from_attachment, _media_kind_ru
-    from backend.schemas import AttachmentIn
+    from backend.media_refs import MARK, placeholder
 
     user_msgs = [m for m in msgs if m.role == "user"]
     if not user_msgs:
         return []
-    att_map = await load_history_attachments(db, user_msgs, files_limit_chars, files_turns)
-    if not att_map:
-        return []
+    skip = skip or set()
+    kinds = {"image": "изображение", "video": "видео", "audio": "аудио", "pdf": "документ"}
+    from backend.horae_memory import NOTE_MEDIA_WINDOW
+
     blocks: list[dict] = []
     newest_id = user_msgs[-1].id
     for m in user_msgs:  # хронологический порядок
-        for a in att_map.get(m.id, []):
-            try:
-                att = AttachmentIn(
-                    type=a.get("type") or "document", data=a.get("data") or "",
-                    mime=a.get("mime"), name=a.get("name"),
-                )
-            except Exception:  # noqa: BLE001
+        for a in (m.attachments or []):
+            # Файлы последней реплики — «отвечаемые» (priority 2): идут всегда.
+            ph = placeholder(a, priority=2 if m.id == newest_id else 0)
+            if ph is None:
                 continue
+            te = ph[MARK]
             where = "в ПОСЛЕДНЕМ сообщении" if m.id == newest_id else "ранее"
-            name = (att.name or "").strip()
             label = f"[Файл {where}"
-            if name:
-                label += f": «{name}»"
-            label += f" — {_media_kind_ru(att)}]"
+            if te["name"]:
+                label += f": «{te['name']}»"
+            label += f" — {kinds.get(te['kind'], 'файл')}]"
             blocks.append({"type": "text", "text": label})
-            try:
-                blocks.append(_content_from_attachment(att))
-            except Exception:  # noqa: BLE001 — битый файл не должен рушить ход
-                blocks.pop()  # убираем осиротевшую подпись
+            # Не вошёл в долю окна под файлы — подпись остаётся, данные нет.
+            blocks.append({"type": "text", "text": NOTE_MEDIA_WINDOW} if m.id in skip else ph)
     return blocks

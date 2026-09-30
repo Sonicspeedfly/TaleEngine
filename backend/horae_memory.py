@@ -146,20 +146,25 @@ def estimate_tokens(text: str) -> int:
 def estimate_content_tokens(content) -> int:
     """
     Оценка токенов для контента, который может быть мультимодальным (список блоков).
-    Для картинок/аудио НЕ считаем длину base64 как текст (это дало бы гигантскую
-    оценку и выбросило всю историю) — берём грубую фиксированную стоимость блока.
+    Файлы считаются по виду и размеру (media_refs.block_tokens): фото ~1100
+    токенов, аудио — 32 токена в секунду, видео — ~300 в секунду. Длину base64
+    как текст не считаем — это дало бы гигантскую оценку. Раньше любой файл
+    стоил 400 токенов (аудио 1500), и часовая запись, весящая для модели ~115
+    тыс. токенов, в бюджете окна почти не занимала места.
     """
     if isinstance(content, list):
+        from backend.media_refs import block_tokens
+
         total = 0
         for b in content:
             if not isinstance(b, dict):
                 continue
-            t = b.get("type")
-            if t == "text":
+            media = block_tokens(b)
+            if media is not None:
+                total += media
+            elif b.get("type") == "text":
                 total += estimate_tokens(b.get("text", ""))
-            elif t == "input_audio":
-                total += 1500   # аудио заметно дороже картинки
-            else:                # image_url / document / прочее
+            else:
                 total += 400
         return total
     return estimate_tokens(str(content or ""))
@@ -204,12 +209,64 @@ def stable_trim_start(costs: list[int], budget: int, reserved: int = 0) -> int:
     return stepped if stepped < len(costs) else start
 
 
-# Сколько байт base64-вложений из ИСТОРИИ разрешаем включить в один запрос. Сверх
-# этого — вложение заменяется текстовой пометкой. Держим НЕБОЛЬШИМ: тяжёлое аудио
-# (14 МБ → ~19 МБ base64) не должно гоняться в контексте КАЖДЫЙ ход — иначе запросы
-# к Vertex раздуваются и подвисают. Картинки (сотни КБ) при этом спокойно остаются
-# видимыми модели и дальше, а крупное аудио — только на своём ходу (потом пометка).
-_MAX_HISTORY_ATT_BYTES = 5 * 1024 * 1024
+# Пометка вместо файла истории, который не вошёл в долю окна под файлы.
+NOTE_MEDIA_WINDOW = ("[содержимое файла в этот запрос не вошло: файлы истории заняли "
+                     "свою долю окна контекста]")
+
+
+# Сколько последних реплик истории модель видит всегда, даже если бюджет окна
+# целиком занят несжимаемой частью хода.
+_MIN_HISTORY_TAIL = 4
+
+
+def cap_history_media(history: list[dict], media_budget: int, step: int = _TRIM_STEP) -> list[dict]:
+    """
+    Файлы-заготовки истории (media_refs.MARK) в пределах media_budget токенов,
+    от свежих к старым; у сообщений старше границы файлы идут пометкой
+    (подпись с именем файла и текст сообщения остаются). Граница квантуется
+    ступенью step, как обрезка истории (stable_trim_start): тогда начало
+    запроса не меняется с каждым новым файлом и кэш провайдера попадает.
+    Бюджет <= 0 — без ограничения. Возвращает копию, если что-то снято.
+    """
+    from backend.media_refs import MARK, block_tokens
+
+    if media_budget <= 0:
+        return history
+    used = 0
+    cut = -1   # сообщения с индексом <= cut несут файлы пометкой
+    for i in range(len(history) - 1, -1, -1):
+        c = history[i].get("content")
+        if not isinstance(c, list):
+            continue
+        cost = sum(block_tokens(b) or 0 for b in c if isinstance(b, dict) and MARK in b)
+        if used + cost > media_budget:
+            cut = i
+            break
+        used += cost
+    if cut < 0:
+        return history
+    step = max(1, int(step or 1))
+    stepped = ((cut + step) // step) * step - 1
+    # Как у stable_trim_start: если ступень сняла бы файлы у всех сообщений,
+    # граница остаётся точной.
+    if stepped < len(history) - 1:
+        cut = stepped
+    drop: set[tuple[int, int]] = {
+        (i, j) for i in range(cut + 1) if isinstance(history[i].get("content"), list)
+        for j, b in enumerate(history[i]["content"]) if isinstance(b, dict) and MARK in b
+    }
+    if not drop:
+        return history
+    out = []
+    for i, m in enumerate(history):
+        c = m.get("content")
+        if isinstance(c, list) and any((i, j) in drop for j in range(len(c))):
+            m = {**m, "content": [
+                {"type": "text", "text": NOTE_MEDIA_WINDOW} if (i, j) in drop else b
+                for j, b in enumerate(c)
+            ]}
+        out.append(m)
+    return out
 
 
 def _att_label(a: dict) -> str:
@@ -228,73 +285,49 @@ def _att_label(a: dict) -> str:
 def messages_to_history(msgs, att_map: dict | None = None) -> list[dict]:
     """
     Превращает ORM-сообщения в историю для контекста, СОХРАНЯЯ вложения (картинки,
-    аудио, документы) — чтобы модель «видела» присланный ранее файл и на последующих
-    ходах (раньше вложения из истории терялись, и файл был виден только на своём ходу).
+    аудио, видео, документы) — модель видит файлы всего чата, который видит.
 
-    Вложения включаем от свежих к старым, пока суммарный объём не превысит лимит; что
-    не влезло — заменяем текстовой пометкой «[изображение]/[аудио]/…», чтобы модель хотя
-    бы знала о факте вложения. Мультимодальный контент собираем только для реплик
-    пользователя (у ассистента вложений в норме нет, а image в assistant часть
-    провайдеров не принимает).
+    Данные файлов здесь НЕ читаются: вместо каждого файла реплики пользователя
+    ставится заготовка (media_refs.placeholder) с метой. Перед запросом
+    stream_completion превратит её в ссылку на копию в хранилище провайдера,
+    в сам файл (пока файлы истории укладываются в INLINE_FILES_MB) или в
+    пометку. Поэтому история чата с гигабайтом вложений собирается мгновенно, а
+    в запрос попадают только файлы сообщений, переживших обрезку окна.
 
-    :param att_map: {message_id: [att dict С data]} — вложения, уже отобранные под
-        лимит и гидратированные из blob-таблицы (см. attachments.load_history_attachments).
-        None — легаси-режим: данные берутся прямо из сообщений (инлайн base64).
+    У ассистента вложений в норме нет (а image в assistant часть провайдеров не
+    принимает) — его файлы остаются текстовой пометкой «[изображение]/…».
+
+    :param att_map: устаревший параметр (вложения, отобранные под лимит); не
+        используется — оставлен ради совместимости вызовов.
     """
-    from backend.llm_gateway import build_user_content
-    from backend.schemas import AttachmentIn
-
-    if att_map is None:
-        # Легаси: инлайн-данные в самих сообщениях (старые БД, юнит-тесты).
-        att_map = {}
-        used = 0
-        for m in reversed(msgs):
-            atts = [a for a in (m.attachments or []) if isinstance(a, dict) and a.get("data")]
-            size = sum(len(a.get("data") or "") for a in atts)
-            if atts and used + size <= _MAX_HISTORY_ATT_BYTES:
-                att_map[m.id] = atts
-                used += size
+    from backend.media_refs import history_content
 
     out: list[dict] = []
     for m in msgs:
         all_atts = [a for a in (m.attachments or []) if isinstance(a, dict)]
-        kept = att_map.get(m.id)
-        if kept and m.role == "user":
-            try:
-                content = build_user_content(m.content or "", [
-                    AttachmentIn(
-                        type=a.get("type") or "document", data=a.get("data") or "",
-                        mime=a.get("mime"), name=a.get("name"),
-                    )
-                    for a in kept
-                ])
-            except Exception:  # noqa: BLE001 — битое вложение не должно рушить контекст
+        content = None
+        if all_atts and m.role == "user":
+            content = history_content(m.content or "", all_atts)
+            if content == (m.content or "") and not isinstance(content, list):
+                content = None   # у вложений нет данных — ниже пометка
+        if content is None:
+            if all_atts:
+                note = " ".join(f"[{_att_label(a)}]" for a in all_atts)
+                content = f"{m.content} {note}".strip() if m.content else note
+            else:
                 content = m.content or ""
-        elif all_atts:
-            note = " ".join(f"[{_att_label(a)}]" for a in all_atts)
-            content = f"{m.content} {note}".strip() if m.content else note
-        else:
-            content = m.content or ""
         out.append({"role": m.role, "content": content})
     return out
 
 
-async def messages_to_history_db(
-    db, msgs, files_limit_chars: int | None = None, files_turns: int | None = None
-) -> list[dict]:
+async def messages_to_history_db(db, msgs, *_legacy, **_legacy_kw) -> list[dict]:
     """
-    То же, что messages_to_history, но данные вложений подтягиваются из
-    blob-таблицы ТОЧЕЧНО и только когда нужны.
-
-    :param files_limit_chars: лимит файлов истории в символах base64;
-        None — БЕЗ лимита по объёму.
-    :param files_turns: возрастное окно — файлы несут только N последних
-        сообщений; None/0 — без ограничения по возрасту.
+    История для контекста из ORM-сообщений (см. messages_to_history). Данные
+    вложений не читаются — это делает stream_completion для файлов, которые
+    реально уйдут в запрос. Лишние аргументы (старые лимиты файлов истории)
+    принимаются и игнорируются.
     """
-    from backend.attachments import load_history_attachments
-
-    att_map = await load_history_attachments(db, msgs, files_limit_chars, files_turns)
-    return messages_to_history(msgs, att_map)
+    return messages_to_history(msgs)
 
 
 @dataclass
@@ -407,7 +440,8 @@ def _plain_text(content) -> str:
     if isinstance(content, list):
         return " ".join(
             b.get("text", "") for b in content
-            if isinstance(b, dict) and b.get("type") == "text"
+            # Заготовки файлов (media_refs.MARK) — служебные пометки, не текст реплики.
+            if isinstance(b, dict) and b.get("type") == "text" and "_te" not in b
         )
     return ""
 
@@ -664,21 +698,37 @@ def _attachment_manifest(history: list[dict], current_content) -> str:
     Манифест приложенных файлов: короткий список того, что физически есть в
     контексте (по типам). Модель видит, что «файлы реально приложены», и понимает,
     что к ним можно обращаться — а не отвечать «файла не вижу».
+    Считает и заготовки файлов истории (media_refs.placeholder): перед запросом
+    они станут ссылкой или самим файлом.
     """
+    from backend.media_refs import MARK
+
     counts = {"image": 0, "video": 0, "audio": 0, "document": 0}
+    kinds = {"image": "image", "video": "video", "audio": "audio", "pdf": "document"}
+
     def _scan(content):
         if not isinstance(content, list):
             return
         for b in content:
             if not isinstance(b, dict):
                 continue
+            te = b.get(MARK)
+            if isinstance(te, dict):
+                key = kinds.get(te.get("kind") or "")
+                if key:
+                    counts[key] += 1
+                continue
             t = b.get("type")
             if t == "image_url":
-                url = ((b.get("image_url") or {}).get("url")) or ""
-                if url.startswith("data:application/pdf") or "pdf" in url[:40]:
+                iu = b.get("image_url") or {}
+                url = (iu.get("url") or "")[:40].lower()
+                fmt = (iu.get("format") or "").lower()
+                if url.startswith("data:application/pdf") or "pdf" in fmt or "pdf" in url:
                     counts["document"] += 1
-                elif url.startswith("data:video"):
+                elif url.startswith("data:video") or fmt.startswith("video/"):
                     counts["video"] += 1
+                elif url.startswith("data:audio") or fmt.startswith("audio/"):
+                    counts["audio"] += 1
                 else:
                     counts["image"] += 1
             elif t == "input_audio":
@@ -881,8 +931,10 @@ def _static_tail(character: dict, *, character_avatar, persona_avatar, send_avat
     # может «утопить» свежую реплику и начать выдумывать то, что уже прислано
     # (например, сочинять текст песни, которая ЕСТЬ в сообщении). Явно велим
     # опираться на само сообщение и приложенные к нему материалы.
+    # Файлы реплики — данными или заготовками (перегенерация, «Продолжить»).
     has_current_media = isinstance(user_attachments_content, list) and any(
-        isinstance(b, dict) and b.get("type") in ("image_url", "input_audio")
+        isinstance(b, dict) and (b.get("type") in ("image_url", "input_audio")
+                                 or (isinstance(b.get("_te"), dict) and b["_te"].get("kind") != "document"))
         for b in user_attachments_content
     )
     if ooc:
@@ -1060,6 +1112,11 @@ def assemble_context(
     )
     # База знаний — ДО истории и явно ОТДЕЛЕНА от диалога (см. knowledge_block).
     # Список тоже держим отдельно: в Tier 1 монитора он идёт целиком.
+    # Медиа базы знаний — не больше четверти окна (час аудио в справочнике
+    # иначе вытеснил бы всю историю на каждом ходу). До knowledge_block: и
+    # резерв бюджета, и сам запрос считают уже урезанный список.
+    if knowledge_media:
+        knowledge_media = cap_history_media(list(knowledge_media), token_budget // 4, step=1)
     knowledge_msgs = knowledge_block(knowledge_text, knowledge_media)
     # Хвост — в два приёма: блок снимка первым, статичные блоки последними, а
     # между ними после обрезки встанут факты и манифест (порядок хвоста прежний).
@@ -1097,11 +1154,22 @@ def assemble_context(
 
     # 4. Обрезаем историю под бюджет: свежие сообщения важнее старых.
     #
+    # Файлы истории весят для модели по-настоящему (минута голосового ≈ 2 тыс.
+    # токенов, видео — десятки тысяч), и одно тяжёлое видео вытеснило бы из
+    # окна текст десятков сообщений. Поэтому файлам — не больше половины
+    # бюджета: от свежих к старым, дальше вместо файла пометка, а текст
+    # сообщения остаётся.
+    history = cap_history_media(history, token_budget // 2)
+    #
     # ЭКОНОМИЯ: граница обрезки квантуется по ступеням (см. stable_trim_start) —
     # тогда начало запроса не меняется от хода к ходу и попадает в кэш промпта
     # провайдера со скидкой 75–90%. Что выпало — держит авто-сводка сюжета.
     costs = [estimate_content_tokens(m.get("content")) for m in history]
     start = stable_trim_start(costs, token_budget, reserved=reserved)
+    # Несжимаемая часть (крупный файл реплики, база знаний) могла съесть весь
+    # бюджет — последние реплики диалога модель видит всё равно, иначе она
+    # отвечала бы без контекста вовсе.
+    start = min(start, max(0, len(history) - _MIN_HISTORY_TAIL))
     trimmed_history: list[dict] = [
         {"role": m["role"], "content": m["content"]} for m in history[start:]
     ]
@@ -1353,19 +1421,22 @@ async def build_context_from_db(
     token_budget: int,
     history: list[dict] | None = None,
     send_avatars: bool = False,
-    history_files_limit: int | None = None,
     web_access: bool = False,
-    history_files_turns: int | None = None,
     knowledge_chars: int | None = None,
     global_instructions: str = "",
     assistant_mode: bool = False,
     report: dict | None = None,
     history_ids: list[int | None] | None = None,
     horae_tags: bool = True,
+    params=None,
 ) -> list[dict]:
     """
     Достаёт из БД память Horae, персону, заметку автора и историю сообщений,
     после чего вызывает чистую assemble_context().
+
+    :param params: параметры генерации хода — по модели из них видно, работает
+        ли хранилище файлов (media_refs). Не работает — файлы, которые всё равно
+        уйдут пометкой, заранее становятся пометкой и не занимают окно.
 
     :param horae_tags: False — путь, где модель не должна писать теги Horae
         (канвас): правила и напоминание не добавляются, блок состояния — да.
@@ -1425,11 +1496,9 @@ async def build_context_from_db(
             .order_by(Message.id)
         )
         msgs = (await session_db.execute(hq)).scalars().all()
-        # СОХРАНЯЕМ вложения истории — данные тянутся из blob-таблицы точечно,
-        # в пределах лимита по объёму И возрастного окна (см. load_history_attachments).
-        history = await messages_to_history_db(
-            session_db, msgs, history_files_limit, history_files_turns
-        )
+        # Вложения истории — заготовками (данные не читаются): ссылками, целиком
+        # или пометкой их сделает stream_completion (см. backend/media_refs.py).
+        history = await messages_to_history_db(session_db, msgs)
         history_ids = [m.id for m in msgs]
     elif history_ids is None or len(history_ids) != len(history):
         # id переданной истории неизвестны. Угадывать их («первые N сообщений
@@ -1444,6 +1513,21 @@ async def build_context_from_db(
     history, history_ids, recalled, squeeze = await _long_memory(
         session_db, session, history, history_ids, user_message, report
     )
+    # Хранилище файлов для модели этого хода не работает — файлы сверх лимита
+    # «целиком» уйдут пометкой; решаем это сейчас, чтобы их вес в токенах не
+    # занимал окно зря (тот же отбор, что сделает stream_completion).
+    try:
+        from backend import media_refs
+        from backend.settings_service import get_connection as _get_conn
+
+        route = media_refs.route_for(params, await _get_conn(session_db))
+        if not media_refs.usable(route):
+            both = media_refs.prune_unsendable(list(knowledge_media or []) + list(history), route)
+            knowledge_media, history = both[:len(knowledge_media or [])], both[len(knowledge_media or []):]
+    except Exception:  # noqa: BLE001 — оценка файлов не роняет ход
+        import logging
+
+        logging.getLogger("aichat.media").exception("Отбор файлов хода не удался")
     records = await _load_horae_records(
         session_db, session.id, getattr(character, "id", None)
     )

@@ -49,12 +49,17 @@ def summarize_messages(messages: list[dict]) -> list[dict]:
                     iu = b.get("image_url") or {}
                     fmt = (iu.get("format") or "").lower()
                     url = (iu.get("url") or "")[:40].lower()
+                    # Файл по ссылке на хранилище (gs:// или Files API) — «🔗»:
+                    # в запрос ушла ссылка, а не сам файл (см. media_refs).
+                    link = " 🔗" if not url.startswith("data:") else ""
                     if "video" in fmt or url.startswith("data:video"):
-                        parts.append("🎬 video")
+                        parts.append("🎬 video" + link)
+                    elif "audio" in fmt or url.startswith("data:audio"):
+                        parts.append("🎤 audio" + link)
                     elif "pdf" in fmt or "pdf" in url:
-                        parts.append("📄 pdf")
+                        parts.append("📄 pdf" + link)
                     else:
-                        parts.append("🖼 image")
+                        parts.append("🖼 image" + link)
                 elif t == "input_audio":
                     fmt = (b.get("input_audio") or {}).get("format") or ""
                     parts.append(f"🎤 audio/{fmt}" if fmt else "🎤 audio")

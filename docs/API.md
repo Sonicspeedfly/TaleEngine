@@ -99,7 +99,7 @@ HTTP Basic Auth поверх всего нужен ещё заголовок `Au
 | POST | `/api/sessions/{id}/memory/cancel` | Остановить задание: начатый запрос к модели доводится, паузы (между запросами и перед повтором) обрываются сразу, слитый пакет сохраняется; из очереди — сразу. Буфер остановленной пересборки помечается `paused` и ждёт `resume: true` → `{ok, job}`; `ok: false` — останавливать нечего |
 | DELETE | `/api/sessions/{id}/memory` | Сброс: остановить задание и идущий ежеходный проход (после текущего запроса к модели), удалить снимок (с буфером) и все атомарные факты чата; сообщения остаются → `{snapshot_deleted, facts_deleted}` |
 | GET | `/api/sessions/{id}/memory/export?facts=1` | Снимок `.md`-файлом (`text/markdown; charset=utf-8`, `Content-Disposition: attachment`, имя `memory-<название>-<id>.md`); `facts=1` — с приложением атомарных фактов. Снимка нет → 404 |
-| GET | `/api/sessions/{id}/context` | Инспектор хода: что уйдёт в модель на следующем ходу (ход не выполняется). В отчёте — блоки, `tail` (у каждого блока хвоста `key`), `memory`, `recalled` и `tiers` — монитор токенов; у группового чата `tiers: null` и `tiers_unavailable: "group"` |
+| GET | `/api/sessions/{id}/context` | Инспектор хода: что уйдёт в модель на следующем ходу (ход не выполняется). В отчёте — блоки, `tail` (у каждого блока хвоста `key`), `memory`, `recalled`, `files` (файлы хода: `total`, `refs` — ссылкой, `inline`/`inline_mb` — целиком, `pending` — ждут загрузки или пометкой, `storage` `ok\|off\|unchecked\|direct`) и `tiers` — монитор токенов; у группового чата `tiers: null` и `tiers_unavailable: "group"` |
 
 Эндпоинты `/memory*` проверяют доступ как у чата (`_can_access_session`): нет
 чата → 404, чужой → 403. Задание идёт в фоне; ответ `rebuild` приходит сразу, а
@@ -204,6 +204,8 @@ HTTP Basic Auth поверх всего нужен ещё заголовок `Au
 | POST | `/api/presets/{id}/default` | Сделать пресет дефолтным |
 | GET/PUT | `/api/settings/connection` | Подключение к LiteLLM (ключ маскируется не-админам). Поля `fallback_model`/`auto_fallback` — запасная модель на случай сбоя основной |
 | GET | `/api/models` | Прокси `/v1/models` LiteLLM |
+| GET | `/api/media/status?model=` | «Файлы для модели»: работает ли хранилище файлов у прокси для модели (`ok`, `family` `gcs\|files_api`, `bucket`, `error`, `checked`, `direct`), счётчики `counts` (`ready`, `ready_mb`, `failed`, `rejected`), `queued`, `uploading`, `waiting`, `inline_mb` |
+| POST | `/api/media/probe` `{model}` | Проверить хранилище сейчас: тестовая картинка загружается и читается моделью по ссылке. Ответ — как у статуса; 400 — прямой режим без прокси, 403 — не админ (режим аккаунтов), 429 — проверка шла меньше 10 с назад |
 | GET/PUT | `/api/settings/ui` | Серверные UI-предпочтения (параметры по умолчанию) |
 
 ## Друзья и шаринг (режим аккаунтов)

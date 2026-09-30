@@ -29,6 +29,9 @@ os.environ.setdefault("MEMORY_DELAY_MS", "0")
 # чья подменная модель падает нарочно, шёл бы полминуты. Повторы ядра
 # проверяются в tests/test_hierarchical_memory.py с явным MemoryConfig.
 os.environ.setdefault("MEMORY_MAX_RETRIES", "0")
+# Фоновый загрузчик файлов в хранилище модели (backend/media_refs.py) в тестах
+# не запускается: он ходил бы в прокси. Тесты ссылок включают его явно.
+os.environ.setdefault("MEDIA_REFS", "0")
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402

@@ -181,8 +181,6 @@ createApp({
         // Окно контекста («память»). 200к — под границей, за которой Gemini
         // тарифицирует ВЕСЬ вход вдвое дороже. Раньше здесь стоял 1 млн.
         context_tokens: 200000,
-        history_files_mb: 8,       // файлы истории: сколько МБ вложений уходит модели за ход
-        history_files_turns: 12,   // и из скольких ПОСЛЕДНИХ сообщений (0 = без ограничения)
         knowledge_chars: 60000,    // потолок текста базы знаний в контексте (0 = без лимита)
         // Стандартная фильтрация по умолчанию. Существующие профили не
         // затрагиваются: loadUiPrefs кладёт сохранённые параметры поверх.
@@ -259,16 +257,22 @@ createApp({
       // --- Расход токенов (кнопка 📊) ---
       usageOpen: false,
       usage: null,
-      // Готовые наборы «сколько платим за ход». Меняют три настройки разом:
-      // окно контекста, пересылку прежних файлов и объём базы знаний.
+      // Готовые наборы «сколько платим за ход». Меняют две настройки разом:
+      // окно контекста и объём базы знаний. (Файлы истории модель видит все —
+      // ссылками на хранилище, их вес входит в окно контекста.)
       economyModes: [
-        { id: "eco", label: "🪙 Экономия", hint: "Минимум токенов на ход: короткая память, файлы только из свежих сообщений",
-          v: { context_tokens: 64000, history_files_mb: 3, history_files_turns: 6, knowledge_chars: 20000 } },
-        { id: "balance", label: "⚖️ Баланс", hint: "Рекомендуется: почти полная память, но без удвоенного тарифа и вечной пересылки файлов",
-          v: { context_tokens: 200000, history_files_mb: 8, history_files_turns: 12, knowledge_chars: 60000 } },
-        { id: "max", label: "🔥 Максимум", hint: "Прежнее поведение: помнит всё и пересылает все файлы каждый ход. Дорого!",
-          v: { context_tokens: 1000000, history_files_mb: 0, history_files_turns: 0, knowledge_chars: 0 } },
+        { id: "eco", label: "🪙 Экономия", hint: "Минимум токенов на ход: короткая память и короткий справочник",
+          v: { context_tokens: 64000, knowledge_chars: 20000 } },
+        { id: "balance", label: "⚖️ Баланс", hint: "Рекомендуется: почти полная память без удвоенного тарифа Gemini",
+          v: { context_tokens: 200000, knowledge_chars: 60000 } },
+        { id: "max", label: "🔥 Максимум", hint: "Помнит всё (1 млн токенов) и весь справочник. Дорого!",
+          v: { context_tokens: 1000000, knowledge_chars: 0 } },
       ],
+      // «Файлы для модели»: хранилище файлов у прокси для текущей модели
+      // (GET /api/media/status). null — ещё не загружено.
+      mediaStatus: null,
+      mediaStatusError: "",
+      mediaProbing: false,
       // Пустая форма записи памяти (тот же объект возвращает метод blankHorae()).
       horaeEdit: { id: null, category: "lore", title: "", content: "", keywords: "", always_on: false, enabled: true, priority: 0, scope: "global" },
 
@@ -1712,6 +1716,19 @@ createApp({
       if (h.trimmed) {
         rows.push({ text: "Обрезано бюджетом: " + n(h.trimmed) + " " + this.plural(h.trimmed, "реплика", "реплики", "реплик")
           + " (−" + n(h.tokens_trimmed) + " ток.)", warn: true });
+      }
+      // Файлы хода (2.8.0): ссылкой на хранилище, целиком или ждут загрузки.
+      const f = stats.files;
+      if (f && f.total) {
+        const bits = [];
+        if (f.refs) bits.push(n(f.refs) + " ссылкой");
+        if (f.inline) bits.push(n(f.inline) + " целиком (" + f.inline_mb + " МБ)");
+        if (f.pending) bits.push(n(f.pending) + " ждут загрузки");
+        if (f.notes) bits.push(n(f.notes) + " пометкой");
+        const why = f.storage === "off" ? " · хранилище у прокси не работает (⚙ → Генерация)"
+          : f.storage === "unchecked" ? " · хранилище ещё не проверено"
+          : f.storage === "disabled" ? " · ссылки выключены на сервере" : "";
+        rows.push({ text: "Файлы: " + bits.join(" · ") + why, warn: !!f.notes && f.storage !== "ok" });
       }
       const found = (stats.recalled || []).length;
       const factsOff = mem.facts_enabled === false || mem.facts_mode === "off";
@@ -3765,7 +3782,7 @@ createApp({
       // Сработала ли разовая миграция: тогда её флаг надо записать сразу, а не
       // ждать, пока человек сам что-нибудь поменяет (флаги пишет saveUiPrefs).
       let migrated = false;
-      if (applyParams && ui && ui.params) this.params = { ...this.params, ...ui.params };
+      if (applyParams && ui && ui.params) this.params = this._stripLegacyParams({ ...this.params, ...ui.params });
       // Мягкая миграция старых сохранённых настроек.
       if (applyParams) {
         // Прежний дефолт max_tokens=1024 резал ответы (особенно с рассуждениями).
@@ -3782,7 +3799,6 @@ createApp({
           migrated = true;
         }
         // Новые настройки экономии могли не сохраниться в старых профилях.
-        if (this.params.history_files_turns == null) this.params.history_files_turns = 12;
         if (this.params.knowledge_chars == null) this.params.knowledge_chars = 60000;
         // Настройки обхода цензуры (появились в 1.13.0). Порог доставляем только
         // тем, у кого Zero-Censorship РЕАЛЬНО включён: иначе эта строка молча
@@ -3967,7 +3983,15 @@ createApp({
       this.presetName = "";
       await this.loadPresets();
     },
-    applyPreset(p) { this.params = { ...this.params, ...p.params }; },
+    applyPreset(p) { this.params = this._stripLegacyParams({ ...this.params, ...p.params }); },
+    // Убранные настройки (2.8.0): «Файлы в памяти диалога» и возрастное окно
+    // файлов. В старых профилях и пресетах ключи остались — выбрасываем их,
+    // чтобы не сохранялись снова (сервер их и так игнорирует).
+    _stripLegacyParams(params) {
+      delete params.history_files_mb;
+      delete params.history_files_turns;
+      return params;
+    },
     async deletePreset(p) { await this.api("/presets/" + p.id, { method: "DELETE" }); await this.loadPresets(); },
     async setDefaultPreset(p) {
       await this.api("/presets/" + p.id + "/default", { method: "POST" });
@@ -4591,6 +4615,34 @@ createApp({
     async toggleDebugScope() { this.debugAll = !this.debugAll; await this.loadDebug(); },
 
     // ---------- Расход токенов ----------
+    // ---------- Файлы для модели (хранилище файлов у прокси) ----------
+    async loadMediaStatus() {
+      const model = (this.params.model || "").trim();
+      try {
+        this.mediaStatus = await this.api("/media/status?model=" + encodeURIComponent(model));
+        this.mediaStatusError = "";
+      } catch (e) { this.mediaStatusError = e.message || "нет ответа сервера"; }
+    },
+    async probeMediaStorage() {
+      this.mediaProbing = true;
+      try {
+        this.mediaStatus = await this.api("/media/probe", {
+          method: "POST", body: JSON.stringify({ model: (this.params.model || "").trim() }),
+        });
+        this.showToast(this.mediaStatus && this.mediaStatus.ok
+          ? "✅ Хранилище файлов работает" : "⚠ Хранилище файлов не работает — причина в «Генерации»");
+      } catch (e) {
+        this.showToast("Проверка не удалась: " + e.message);
+      } finally {
+        this.mediaProbing = false;
+      }
+    },
+    mediaStatusClass() {
+      const st = this.mediaStatus;
+      if (!st) return "";
+      if (st.ok) return "ok";
+      return st.checked && !st.direct ? "warn" : "";
+    },
     async loadUsage() {
       try { this.usage = await this.api("/usage?days=7"); } catch (e) { this.usage = null; }
     },
@@ -4938,6 +4990,12 @@ createApp({
     // на неё сам), поэтому статус грузим по факту смены вкладки. Монитор
     // токенов — тоже: отчёт снят после прошлого хода, а с тех пор могли
     // смениться окно, бюджет или снимок.
+    // Сменили модель в «Генерации» — состояние хранилища файлов у неё своё.
+    "params.model"() {
+      if (this.drawerTab !== "generation") return;
+      clearTimeout(this._mediaTimer);
+      this._mediaTimer = setTimeout(() => this.loadMediaStatus(), 600);
+    },
     drawerTab(tab) {
       // «Хроники» отдельной вкладкой больше нет — она внутри «Памяти».
       if (tab === "horae") {
@@ -4949,6 +5007,7 @@ createApp({
         this.loadCtxStats();
         this.loadHoraeGlobal();
       }
+      if (tab === "generation") this.loadMediaStatus();
     },
     // Ввод в палитре: поиск по репликам идёт на сервер с дебаунсом, чтобы не
     // слать запрос на каждую букву.
@@ -5974,7 +6033,7 @@ createApp({
           <p class="muted" style="margin:2px 0 10px">Это лимит ВЫВОДА (одного ответа), не памяти. Рассуждения 💭 тратят этот же лимит — при «высоких» держите 8000+.</p>
           <div class="hr"></div>
           <h3>💰 Расход квоты</h3>
-          <p class="muted" style="margin:2px 0 8px">Три настройки ниже определяют, сколько токенов уходит провайдеру на КАЖДОМ ходу. Готовые режимы:</p>
+          <p class="muted" style="margin:2px 0 8px">Две настройки ниже (окно контекста и база знаний) определяют, сколько токенов уходит провайдеру на КАЖДОМ ходу. Готовые режимы:</p>
           <div class="row" style="gap:6px; margin:0 0 6px; flex-wrap:wrap">
             <button v-for="m in economyModes" :key="m.id"
                     :class="isEconomyMode(m) ? 'btn-primary' : ''"
@@ -5991,32 +6050,46 @@ createApp({
           </div>
           <p class="muted" style="margin:2px 0 10px">Сколько ИСТОРИИ чата видит модель на каждый ход. <b>Важно про цену:</b> у Gemini вход свыше ~200 тыс. токенов тарифицируется <b>вдвое дороже — целиком</b>, поэтому 200к выгоднее 1 млн почти без потери памяти. Что не влезло — сохранит авто-сводка (вкладка «Память»).</p>
 
-          <!-- Своё число вместо четырёх готовых: у кого чат из десятков фото,
-               тому 8 МБ мало, а 20 уже дорого. Поле пишет значение по change,
-               а не по вводу: пустое поле посреди набора не должно улетать на
-               сервер (см. numFromInput). Кнопки — прежние варианты в один клик. -->
-          <label>📎 Файлы в памяти диалога (МБ на ход) <span class="range-val">{{ params.history_files_mb ? 'до ' + params.history_files_mb + ' МБ' : 'все файлы' }}</span>
-            <input type="number" min="0" max="1000" step="1" inputmode="numeric"
-                   :value="params.history_files_mb"
-                   @change="params.history_files_mb = numFromInput($event, 1000, params.history_files_mb)" /></label>
-          <div class="row" style="gap:6px; margin:-4px 0 6px; flex-wrap:wrap">
-            <button v-for="p in [[3,'3 МБ'],[8,'8 МБ'],[20,'20 МБ'],[0,'все файлы']]" :key="'mb' + p[0]"
-                    :class="params.history_files_mb === p[0] ? 'btn-primary' : ''"
-                    :aria-pressed="params.history_files_mb === p[0] ? 'true' : 'false'"
-                    @click="params.history_files_mb = p[0]">{{ p[1] }}</button>
+          <!-- Файлы для модели (2.8.0): вместо лимитов «Файлы в памяти диалога».
+               Файл один раз загружается в хранилище Google через прокси, и
+               модель видит ВСЕ файлы чата, который видит, — ссылками. -->
+          <h3 style="margin-top:14px">📎 Файлы для модели</h3>
+          <p class="muted" style="margin:2px 0 8px">Модель видит все фото, голосовые, видео и PDF той части чата, что входит в окно контекста. Каждый файл один раз загружается в хранилище Google через ваш LiteLLM-прокси, дальше модель получает короткую ссылку, а не мегабайты в каждом запросе. Оригиналы остаются у вас в чате.</p>
+          <div class="media-status" :class="mediaStatusClass()" role="status">
+            <template v-if="!mediaStatus && mediaStatusError"><b>Не удалось получить состояние:</b> {{ mediaStatusError }}</template>
+            <template v-else-if="!mediaStatus"><span class="muted">Проверяю хранилище…</span></template>
+            <template v-else-if="mediaStatus.direct"><b>Недоступно:</b> ссылки на файлы работают только через LiteLLM-прокси (вкладка «Подключение»).</template>
+            <template v-else-if="!mediaStatus.enabled"><b>Выключено</b> на сервере (MEDIA_REFS=false).</template>
+            <template v-else-if="mediaStatus.ok">
+              <b>✅ Работает</b> — {{ mediaStatus.family === 'gcs' ? 'Google Cloud Storage' + (mediaStatus.bucket ? ' (' + mediaStatus.bucket + ')' : '') : 'Gemini Files API' }} для модели <code>{{ mediaStatus.model }}</code>.
+              <div class="muted" style="margin-top:4px">Загружено: {{ mediaStatus.counts.ready || 0 }}<span v-if="mediaStatus.counts.ready"> ({{ mediaStatus.counts.ready_mb >= 0.1 ? mediaStatus.counts.ready_mb + ' МБ' : 'меньше 0,1 МБ' }})</span><span v-if="mediaStatus.queued"> · в очереди: {{ mediaStatus.queued }}</span><span v-if="mediaStatus.uploading"> · сейчас: «{{ mediaStatus.uploading.name }}» ({{ mediaStatus.uploading.mb }} МБ)</span><span v-if="mediaStatus.waiting"> · ждёт паузы в ответах</span><span v-if="mediaStatus.counts.failed"> · с ошибкой: {{ mediaStatus.counts.failed }} (повторю позже)</span><span v-if="mediaStatus.counts.rejected"> · не подходят для ссылки: {{ mediaStatus.counts.rejected }}</span></div>
+            </template>
+            <template v-else-if="!mediaStatus.checked"><b>Ещё не проверено</b> для модели <code>{{ mediaStatus.model }}</code> — проверка пройдёт сама при первом ответе с файлами, или нажмите «Проверить».</template>
+            <template v-else>
+              <b>⚠ Не работает</b> для модели <code>{{ mediaStatus.model }}</code>: {{ mediaStatus.error }}
+            </template>
           </div>
-          <label>📎 …и только из последних сообщений — ваших и ответов, каждое по отдельности <span class="range-val">{{ params.history_files_turns ? params.history_files_turns + ' сообщ.' : 'без ограничения' }}</span>
-            <input type="number" min="0" max="1000" step="1" inputmode="numeric"
-                   :value="params.history_files_turns"
-                   @change="params.history_files_turns = numFromInput($event, 1000, params.history_files_turns)" /></label>
-          <div class="row" style="gap:6px; margin:-4px 0 6px; flex-wrap:wrap">
-            <button v-for="p in [[6,'6'],[12,'12'],[24,'24'],[0,'все']]" :key="'turns' + p[0]"
-                    :class="params.history_files_turns === p[0] ? 'btn-primary' : ''"
-                    :aria-pressed="params.history_files_turns === p[0] ? 'true' : 'false'"
-                    @click="params.history_files_turns = p[0]">{{ p[1] }}</button>
+          <div class="row" style="gap:6px; margin:6px 0; flex-wrap:wrap">
+            <button @click="probeMediaStorage()" :disabled="mediaProbing || (mediaStatus && (mediaStatus.direct || !mediaStatus.enabled)) || (authStatus.accounts_enabled && !isAdmin)"
+                    :title="authStatus.accounts_enabled && !isAdmin ? 'Проверку запускает администратор' : ''"
+                    aria-label="Проверить хранилище файлов у прокси">{{ mediaProbing ? 'Проверяю…' : '🔄 Проверить' }}</button>
+            <button @click="loadMediaStatus()" aria-label="Обновить состояние загрузки файлов">Обновить</button>
           </div>
-          <p class="muted" style="margin:2px 0 10px">0 в любом из двух полей — без ограничения (дорого). По умолчанию 8 МБ из последних 12 сообщений: 12 сообщений — это примерно 6 ваших реплик с ответами. Файлы отправляемого сейчас сообщения идут всегда, в этот счёт не входят.</p>
-          <p class="muted" style="margin:2px 0 10px"><b>Главная статья расхода в долгих чатах.</b> Прежние фото/аудио/видео пересылаются модели заново на КАЖДОМ ходу — она их «видит», а не вспоминает по пометкам. Одно видео без ограничений = десятки тысяч токенов входа в каждом ходу до конца чата. Файл вне окна модель по-прежнему знает по пометке <code>[видео: имя]</code>.</p>
+          <p class="muted" style="margin:2px 0 6px">Пока хранилище не работает (или файл ещё в очереди), файлы истории уходят целиком — но не больше {{ mediaStatus && mediaStatus.inline_mb != null ? mediaStatus.inline_mb : 16 }} МБ за запрос, свежие первыми, остальные пометкой с именем файла. Файлы сообщения, на которое идёт ответ, уходят всегда. Вес файлов в токенах входит в окно контекста (не больше половины окна): минута голосового ≈ 2 тыс. токенов, минута видео ≈ 18 тыс.</p>
+          <details style="margin:0 0 10px">
+            <summary>Как включить хранилище у прокси</summary>
+            <div class="muted" style="margin-top:6px">
+              <p><b>Vertex AI</b> (модели <code>vertex_ai/gemini-…</code>):</p>
+              <ol style="margin:4px 0 8px 18px; padding:0">
+                <li>Создайте бакет в том же проекте Google Cloud: <code>gcloud storage buckets create gs://ИМЯ --location=us-central1</code> (регион — как у моделей).</li>
+                <li>Дайте сервисному аккаунту прокси роль <b>Storage Object User</b> на бакет (создание, чтение и удаление объектов): <code>gcloud storage buckets add-iam-policy-binding gs://ИМЯ --member=serviceAccount:АККАУНТ --role=roles/storage.objectUser</code>. Если бакет в другом проекте, чем модели, — ещё роль Storage Object Viewer сервисному агенту Vertex AI.</li>
+                <li>Задайте процессу прокси переменную окружения <code>GCS_BUCKET_NAME=ИМЯ</code> и перезапустите прокси.</li>
+                <li>Нажмите «Проверить».</li>
+              </ol>
+              <p><b>Gemini API</b> (модели <code>gemini/…</code>): отдельно ничего не нужно — используется ключ этого развёртывания в конфиге прокси (у модели должно быть одно развёртывание). Файлы там живут 48 часов и загружаются заново, когда нужны.</p>
+              <p>Нужен LiteLLM-прокси с загрузкой файлов по модели (версии 2025 года и новее). Проверка загружает картинку 1×1 пиксель и просит модель прочитать её по ссылке.</p>
+            </div>
+          </details>
 
           <label>📚 База знаний в контексте
             <select v-model.number="params.knowledge_chars">

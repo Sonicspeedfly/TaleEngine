@@ -91,10 +91,8 @@ async def build_knowledge(
         символов ≈ 50 тыс. токенов входа на каждом ходу. None — дефолт из
         настроек (KNOWLEDGE_TEXT_CHARS); 0 — без ограничения.
     """
-    from backend.attachments import load_blob
     from backend.config import settings
-    from backend.llm_gateway import _content_from_attachment
-    from backend.schemas import AttachmentIn
+    from backend.media_refs import placeholder
 
     files = await list_files(db, session_id)
     if not files:
@@ -107,6 +105,9 @@ async def build_knowledge(
     text_parts: list[str] = []
     media_msgs: list[dict] = []
     used = 0
+    # Размер медиа — для оценки их веса в токенах и лимита «целиком»; у файла
+    # базы знаний своей колонки размера нет, поэтому — длина base64 в blob.
+    sizes = await _blob_sizes(db, [(f.id, f.blob_id) for f in files if not f.content and f.blob_id])
     for f in files:
         if f.content:
             chunk = f.content
@@ -116,15 +117,14 @@ async def build_knowledge(
                 text_parts.append(f"[Файл «{f.name}»]\n{chunk}")
                 used += len(chunk)
         elif f.blob_id:
-            data = await load_blob(db, f.blob_id)
-            if not data:
-                continue
-            try:
-                block = _content_from_attachment(
-                    AttachmentIn(type=(f.kind if f.kind != "document" else "document"),
-                                 data=data, mime=f.mime, name=f.name)
-                )
-            except Exception:  # noqa: BLE001 — битый файл не должен рушить контекст
+            # Заготовка, а не данные: ссылкой на копию в хранилище модели (или
+            # целиком, пока влезает) файл сделает stream_completion — см.
+            # backend/media_refs.py. Раньше медиа базы знаний уходили base64-ом
+            # в КАЖДОМ запросе без всякого лимита.
+            block = placeholder({"type": f.kind if f.kind in ("image", "audio", "video") else "document",
+                                 "mime": f.mime, "name": f.name, "size": sizes.get(f.id, 0),
+                                 "blob_id": f.blob_id}, priority=1)
+            if block is None:
                 continue
             media_msgs.append({
                 "role": "user",
@@ -138,3 +138,36 @@ async def build_knowledge(
     if text_parts:
         knowledge_text = "\n\n".join(text_parts)
     return knowledge_text, media_msgs
+
+
+# {(id файла базы знаний, blob_id): размер} — файл базы знаний не меняется, а
+# считать длину base64 на каждом ходу дорого: SQLite length() читает TEXT
+# целиком. Ключ с id файла: id удалённого блоба SQLite отдаёт новому.
+_SIZE_CACHE: dict[tuple[int, int], int] = {}
+_OCTET_LENGTH = __import__("sqlite3").sqlite_version_info >= (3, 43, 0)
+
+
+async def _blob_sizes(db, pairs) -> dict[int, int]:
+    """
+    {id файла базы знаний: размер в байтах} по длине base64 его блоба.
+    octet_length (SQLite 3.43+) берёт длину из заголовка записи, не читая
+    данные; на старом SQLite — length() один раз, дальше из кэша.
+    """
+    from sqlalchemy import func, select
+
+    pairs = [(int(k), int(b)) for k, b in pairs if b]
+    if not pairs:
+        return {}
+    todo = pairs if _OCTET_LENGTH else [p for p in pairs if p not in _SIZE_CACHE]
+    if todo:
+        measure = func.octet_length if _OCTET_LENGTH else func.length
+        rows = dict((await db.execute(
+            select(models.AttachmentBlob.id, measure(models.AttachmentBlob.data))
+            .where(models.AttachmentBlob.id.in_(sorted({b for _, b in todo})))
+        )).all())
+        for key in todo:
+            if key[1] in rows:
+                _SIZE_CACHE[key] = int((rows[key[1]] or 0) * 3 / 4)
+            else:
+                _SIZE_CACHE.pop(key, None)
+    return {k: _SIZE_CACHE[(k, b)] for k, b in pairs if (k, b) in _SIZE_CACHE}

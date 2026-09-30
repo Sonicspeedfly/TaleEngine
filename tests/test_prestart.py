@@ -14,6 +14,16 @@ prestart = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(prestart)
 
 
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _enough_disk(monkeypatch, request):
+    """Тесты копии не зависят от свободного места на машине, где идут."""
+    if "low_disk" not in request.keywords:
+        monkeypatch.setattr(prestart, "ensure_backup_space", lambda *a, **kw: True)
+
+
 class FakePip:
     def __init__(self, code=0):
         self.code = code
@@ -215,3 +225,20 @@ def test_real_migration_upgrades_old_database(tmp_path, monkeypatch):
     assert "horae" in cols
     assert {"horae_chat_state", "horae_memory_docs"} <= tables
     assert len(list((tmp_path / "backups").iterdir())) == 1
+
+
+@pytest.mark.low_disk
+def test_low_disk_updates_without_backup_instead_of_refusing(tmp_path, monkeypatch):
+    """Копия не влезает на диск — предупреждение и миграция без копии, а не отказ запуска."""
+    db = tmp_path / "aichat.db"
+    _make_db(db)
+    (tmp_path / "backups").mkdir()
+    stale = tmp_path / "backups" / "aichat-2026-01-01.db.part"
+    stale.write_bytes(b"x" * 100)
+    monkeypatch.setattr("shutil.disk_usage", lambda p: type("U", (), {"free": 1, "total": 10})())
+    migrated = []
+    ok = prestart.prepare_database(db, lambda: migrated.append(1), fingerprint="v9", state_dir=tmp_path)
+    assert ok and migrated == [1]
+    assert not stale.exists()                              # оборванная копия убрана
+    assert not list((tmp_path / "backups").glob("*.db"))   # копии нет — и запуск не сорван
+

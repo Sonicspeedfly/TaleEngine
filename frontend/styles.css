@@ -2203,3 +2203,15 @@ input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
   .h-dl { grid-template-columns: minmax(72px, max-content) minmax(0, 1fr); }
   .h-rrow-del { margin-top: 14px; }
 }
+
+/* «Файлы для модели» (⚙ → Генерация): состояние хранилища файлов у прокси. */
+.media-status {
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin: 4px 0;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.media-status.ok { border-color: var(--ok); background: var(--ok-subtle); }
+.media-status.warn { border-color: var(--warn); background: var(--warn-subtle); }
