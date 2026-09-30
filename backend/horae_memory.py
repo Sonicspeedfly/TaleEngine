@@ -916,8 +916,10 @@ def _static_tail(character: dict, *, character_avatar, persona_avatar, send_avat
     # может «утопить» свежую реплику и начать выдумывать то, что уже прислано
     # (например, сочинять текст песни, которая ЕСТЬ в сообщении). Явно велим
     # опираться на само сообщение и приложенные к нему материалы.
+    # Файлы реплики — данными или заготовками (перегенерация, «Продолжить»).
     has_current_media = isinstance(user_attachments_content, list) and any(
-        isinstance(b, dict) and b.get("type") in ("image_url", "input_audio")
+        isinstance(b, dict) and (b.get("type") in ("image_url", "input_audio")
+                                 or (isinstance(b.get("_te"), dict) and b["_te"].get("kind") != "document"))
         for b in user_attachments_content
     )
     if ooc:

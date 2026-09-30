@@ -537,3 +537,34 @@ def test_prestart_prunes_old_copies_only_when_that_helps(tmp_path):
     assert prestart.ensure_backup_space(db, backups, headroom=300, free=fake_free) is True
     left = sorted(p.name for p in backups.glob("*.db"))
     assert left == ["aichat-2026-01-02.db", "aichat-2026-01-03.db"]
+
+
+def test_regenerate_sends_files_of_the_answered_message(client):
+    """Раньше перегенерация теряла файлы реплики, на которую отвечает; теперь они идут."""
+    captured = {}
+
+    async def fake(**kw):
+        captured["messages"] = kw["messages"]
+        return _ok_stream("Ок")
+
+    cid = client.post("/api/characters", json={"name": "Реген"}).json()["id"]
+    sid = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]
+    raw = b"regen-photo" * 30
+    with patch("backend.llm_gateway.litellm.acompletion", new=fake):
+        with client.websocket_connect(f"/ws/chat/{sid}") as ws:
+            ws.send_json({"type": "user_message", "content": "что на фото?", "attachments": [
+                {"type": "image", "data": "data:image/png;base64," + base64.b64encode(raw).decode(),
+                 "mime": "image/png", "name": "p.png"}]})
+            for _ in range(50):
+                if ws.receive_json()["type"] in ("done", "error"):
+                    break
+            captured.clear()
+            ws.send_json({"type": "regenerate"})
+            for _ in range(50):
+                if ws.receive_json()["type"] in ("done", "error"):
+                    break
+    last = captured["messages"][-1]["content"]
+    assert isinstance(last, list)
+    assert any(base64.b64encode(raw).decode() in ((b.get("image_url") or {}).get("url") or "") for b in last)
+    assert any("[Файл в этом сообщении: «p.png» — изображение]" == b.get("text") for b in last)
+    assert not mr.has_markers(captured["messages"])
