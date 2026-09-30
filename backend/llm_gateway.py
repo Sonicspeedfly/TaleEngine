@@ -224,15 +224,19 @@ def _request_timeout(messages: list[dict], ref_mb: float = 0.0) -> int:
 
 
 def _has_media_blocks(messages: list[dict]) -> bool:
-    """Есть ли в запросе вложения (image_url/input_audio — фото, видео, PDF, аудио)."""
-    for m in messages:
-        c = m.get("content")
-        if isinstance(c, list) and any(
-            isinstance(b, dict) and b.get("type") in ("image_url", "input_audio")
-            for b in c
-        ):
-            return True
-    return False
+    """
+    Есть ли файлы у ТЕКУЩЕЙ реплики (последнее сообщение пользователя):
+    image_url/input_audio — фото, видео, PDF, аудио, данными или ссылкой.
+
+    Файлы истории не в счёт: модель теперь видит файлы всего окна, и одно фото
+    где-то в чате включало бы платные рассуждения на КАЖДОМ ходу.
+    """
+    last = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+    c = (last or {}).get("content")
+    return isinstance(c, list) and any(
+        isinstance(b, dict) and (b.get("type") in ("image_url", "input_audio") or "_te" in b)
+        for b in c
+    )
 
 
 def effective_reasoning(params: Optional[GenerationParams], messages: list[dict]) -> str:
@@ -464,7 +468,22 @@ def _is_inline_media(b) -> bool:
     return False
 
 
-def _history_positions(messages: list[dict], extra_ids=None) -> list[tuple[int, int]]:
+# Запрос длиннее лимита модели по токенам.
+_TOKEN_LIMIT_ERRORS = ("maximum number of tokens", "input token count", "context length",
+                       "context_length_exceeded", "too many tokens", "token limit")
+
+
+def _history_ref_ids(messages: list[dict]) -> set:
+    """id() блоков-ссылок на хранилище до последней реплики пользователя."""
+    last_user = max((i for i, m in enumerate(messages) if m.get("role") == "user"), default=-1)
+    return {
+        id(b) for m in messages[:max(last_user, 0)] if isinstance(m.get("content"), list)
+        for b in m["content"] if isinstance(b, dict) and b.get("type") == "image_url"
+        and not _is_inline_media(b)
+    }
+
+
+def _history_positions(messages: list[dict], extra_ids=None, refs: bool = False) -> list[tuple[int, int]]:
     """
     Где в запросе лежат данными файлы ИСТОРИИ: все файлы сообщений до
     последней реплики пользователя плюс блоки из extra_ids (файлы истории,
@@ -479,7 +498,8 @@ def _history_positions(messages: list[dict], extra_ids=None) -> list[tuple[int, 
         if not isinstance(c, list):
             continue
         for j, b in enumerate(c):
-            if _is_inline_media(b) and (i < last_user or id(b) in ids):
+            media = _is_inline_media(b) or (refs and isinstance(b, dict) and b.get("type") == "image_url")
+            if media and (i < last_user or id(b) in ids):
                 out.append((i, j))
     return out
 
@@ -489,14 +509,14 @@ def _history_media_count(messages: list[dict], extra_ids=None) -> int:
     return len(_history_positions(messages, extra_ids))
 
 
-def _strip_history_media(messages: list[dict], extra_ids=None) -> list[dict]:
+def _strip_history_media(messages: list[dict], extra_ids=None, refs: bool = False) -> list[dict]:
     """
     Копия запроса без файлов истории, лежащих в нём данными: они заменяются
     короткой пометкой. Файлы самой реплики, ради которой ход, остаются; ссылки
     на хранилище, текст и подписи файлов («[Файл ранее присланный: «имя» —
     аудио]») — тоже, так что модель знает, что файлы были.
     """
-    drop = set(_history_positions(messages, extra_ids))
+    drop = set(_history_positions(messages, extra_ids, refs))
     if not drop:
         return messages
     out = []
@@ -621,8 +641,21 @@ async def stream_completion(
                     raise
                 error = exc
 
-        dropped = _history_media_count(messages, hist_ids)
         text = str(error).lower()
+        if used and any(sign in text for sign in _TOKEN_LIMIT_ERRORS):
+            # Вес файлов по ссылке оценивается по размеру, и длинная запись
+            # низкого битрейта могла не влезть в лимит модели. Повтор — без
+            # файлов истории вовсе (и ссылок тоже): иначе ход падал бы, пока
+            # это сообщение в окне.
+            drop_ids = hist_ids | _history_ref_ids(messages)
+            note = "Файлы истории не влезли в лимит модели — повторяю без них."
+            logging.getLogger("aichat.llm").warning("%s Исходная ошибка: %s", note, error)
+            _notify(on_notice, note)
+            async for token in _stream_once(_strip_history_media(messages, drop_ids, refs=True), params,
+                                            connection, on_thought, kind):
+                yield token
+            return
+        dropped = _history_media_count(messages, hist_ids)
         if not dropped or not any(sign in text for sign in _HEAVY_REQUEST_ERRORS):
             raise error
         mb = _payload_bytes(messages) / (1024 * 1024)

@@ -30,7 +30,10 @@ async def store_attachments(db, message_id: int, attachments) -> list[dict]:
         d = a if isinstance(a, dict) else a.model_dump()
         data = d.get("data") or ""
         if not data:
-            metas.append({k: v for k, v in d.items() if k != "data"})
+            # Мета без данных приходит только из импорта. Чужой blob_id в ней —
+            # ссылка на ЧУЖОЙ файл этой базы (его отдали бы и в браузер, и модели
+            # ссылкой): такой id не принимаем, остаётся пометка о файле.
+            metas.append({k: v for k, v in d.items() if k not in ("data", "blob_id")})
             continue
         blob = models.AttachmentBlob(message_id=message_id, data=data)
         db.add(blob)

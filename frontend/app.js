@@ -6065,7 +6065,8 @@ createApp({
             </template>
           </div>
           <div class="row" style="gap:6px; margin:6px 0; flex-wrap:wrap">
-            <button @click="probeMediaStorage()" :disabled="mediaProbing || !mediaStatus || mediaStatus.direct"
+            <button @click="probeMediaStorage()" :disabled="mediaProbing || !mediaStatus || mediaStatus.direct || (authStatus.accounts_enabled && !isAdmin)"
+                    :title="authStatus.accounts_enabled && !isAdmin ? 'Проверку запускает администратор' : ''"
                     aria-label="Проверить хранилище файлов у прокси">{{ mediaProbing ? 'Проверяю…' : '🔄 Проверить' }}</button>
             <button @click="loadMediaStatus()" aria-label="Обновить состояние загрузки файлов">Обновить</button>
           </div>

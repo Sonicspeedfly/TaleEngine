@@ -53,6 +53,8 @@ async def db_ready():
     await init_db()
     mr._caps.clear()
     mr._suspects.clear()
+    # Проверки хранилища тесты кладут в кэш сами — не перечитывать его из базы.
+    mr._caps_read_at = float("inf")
     yield
     mr._caps.clear()
     mr._suspects.clear()
@@ -171,25 +173,26 @@ async def test_inline_budget_is_per_request_newest_first(db_ready, monkeypatch):
     assert mr.NOTE_OVER in [b.get("text") for b in built.messages[0]["content"]]
     assert not mr.has_markers(built.messages)
 
-    # Файл отвечаемой реплики уже лежит в запросе данными и съедает лимит.
+    # Файл текущей реплики лимит истории НЕ меняет: иначе набор файлов истории
+    # скакал бы от хода к ходу и сбивал кэш провайдера.
     current = {"role": "user", "content": [
         {"type": "text", "text": "и это"},
         {"type": "image_url", "image_url": {"url": "data:image/png;base64," + _b64(700_000)}}]}
-    built = await mr.materialize(hist + [current], connection={"use_proxy": False})
-    assert built.summary["inline"] == 0 and built.summary["pending"] == 2
+    again = await mr.materialize(hist + [current], connection={"use_proxy": False})
+    assert again.messages[:4] == built.messages
 
 
 async def test_regenerate_files_and_knowledge_go_first(db_ready, monkeypatch):
     monkeypatch.setattr(settings, "INLINE_FILES_MB", 1)
-    kb = await _blob(_b64(300_000, b"k"))
-    cur = await _blob(_b64(300_000, b"c"))
-    hist_b = await _blob(_b64(300_000, b"h"))
+    kb = await _blob(_b64(500_000, b"k"))
+    cur = await _blob(_b64(900_000, b"c"))     # больше лимита — но это файл отвечаемой реплики
+    hist_b = await _blob(_b64(500_000, b"h"))
     msgs = [
         {"role": "user", "content": [mr.placeholder(
-            {"type": "image", "mime": "image/png", "size": 300_000, "blob_id": kb}, priority=1)]},
-        *_hist([{"type": "image", "mime": "image/png", "size": 300_000, "blob_id": hist_b}]),
+            {"type": "image", "mime": "image/png", "size": 500_000, "blob_id": kb}, priority=1)]},
+        *_hist([{"type": "image", "mime": "image/png", "size": 500_000, "blob_id": hist_b}]),
         {"role": "user", "content": mr.history_content(
-            "перегенерируй", [{"type": "image", "mime": "image/png", "size": 300_000, "blob_id": cur}],
+            "перегенерируй", [{"type": "image", "mime": "image/png", "size": 900_000, "blob_id": cur}],
             current=True, priority=2)},
     ]
     built = await mr.materialize(msgs, connection={"use_proxy": False})
@@ -198,6 +201,7 @@ async def test_regenerate_files_and_knowledge_go_first(db_ready, monkeypatch):
             if b.get("type") == "image_url"}
     assert urls == {b"c", b"k"}                              # история — третьей, не влезла
     assert "[Файл в этом сообщении" in str(built.messages[-1]["content"])
+    assert "ВНИМАНИЕ" in str(built.messages[-1]["content"])   # как в исходном ходе
 
 
 # ---------------------------------------------------------------- ссылки
@@ -568,3 +572,79 @@ def test_regenerate_sends_files_of_the_answered_message(client):
     assert any(base64.b64encode(raw).decode() in ((b.get("image_url") or {}).get("url") or "") for b in last)
     assert any("[Файл в этом сообщении: «p.png» — изображение]" == b.get("text") for b in last)
     assert not mr.has_markers(captured["messages"])
+
+
+async def test_blob_deleted_during_upload_leaves_no_ref(db_ready):
+    """Файл удалили посреди загрузки — ссылка не достаётся новому файлу с тем же id."""
+    from sqlalchemy import delete, select
+
+    from backend.database import AsyncSessionLocal
+    from backend.models import AttachmentBlob, MediaRef
+
+    route = _gcs_ok()
+    bid = await _blob(_b64(500))
+    deletes = []
+
+    async def fake_create(**kw):
+        async with AsyncSessionLocal() as db:   # пока файл «летит», его удаляют
+            await db.execute(delete(AttachmentBlob).where(AttachmentBlob.id == bid))
+            await db.commit()
+        uri = "gs://bucket-a/litellm-vertex-files/uploads/z-" + kw["file"][0]
+        return SimpleNamespace(id=mr.encode_file_id(uri, "gem"), bytes=500)
+
+    job = mr._Job(mr._LANE_TURN, 1, "upload", route,
+                  te=mr.placeholder({"type": "image", "mime": "image/png", "size": 500, "blob_id": bid})[mr.MARK])
+    with patch("litellm.acreate_file", new=fake_create), \
+            patch.object(mr.uploader, "enqueue_delete", side_effect=lambda r, f: deletes.append(f)):
+        await mr.uploader._upload(job)
+    async with AsyncSessionLocal() as db:
+        assert (await db.execute(select(MediaRef).where(MediaRef.blob_id == bid))).first() is None
+    assert deletes and mr.decode_file_id(deletes[0]).startswith("gs://bucket-a/")
+
+
+def test_unsendable_files_become_notes_before_costing(monkeypatch):
+    monkeypatch.setattr(settings, "INLINE_FILES_MB", 1)
+    hist = _hist([{"type": "video", "mime": "video/mp4", "size": 900_000, "blob_id": 1}]) \
+        + _hist([{"type": "video", "mime": "video/mp4", "size": 600_000, "blob_id": 2}])
+    route = mr.route_for(None, PROXY)                    # хранилище не проверено
+    pruned = mr.prune_unsendable(hist, route)
+    assert mr.NOTE_OVER in [b.get("text") for b in pruned[0]["content"]]   # старое не влезло
+    assert any(mr.MARK in b for b in pruned[2]["content"])                  # свежее осталось
+    _gcs_ok()
+    try:
+        assert mr.prune_unsendable(hist, route) is hist   # хранилище есть — всё пойдёт ссылкой
+    finally:
+        mr._caps.clear()
+
+
+async def test_token_limit_error_retries_without_history_refs(db_ready):
+    from backend.llm_gateway import stream_completion
+
+    _gcs_ok()
+    bid = await _blob(_b64(1000))
+    await _ref(bid, GS)
+    calls = []
+
+    async def fake(**kw):
+        calls.append(kw["messages"])
+        if len(calls) == 1:
+            raise RuntimeError("400 The input token count (1300000) exceeds the maximum number of tokens")
+        return _ok_stream("ок")
+
+    msgs = [*_hist([{"type": "audio", "mime": "audio/ogg", "size": 1000, "blob_id": bid}]),
+            {"role": "user", "content": "дальше"}]
+    with patch("backend.llm_gateway.litellm.acompletion", new=fake):
+        out = [t async for t in stream_completion(msgs, None, PROXY)]
+    assert "".join(out) == "ок" and len(calls) == 2
+    assert not any(b.get("type") == "image_url" for b in calls[1][0]["content"])
+
+
+def test_auto_reasoning_looks_at_current_files_only():
+    from backend.llm_gateway import effective_reasoning
+    from backend.schemas import GenerationParams
+
+    p = GenerationParams(disable_safety=False, file_reasoning=True)
+    photo = {"type": "image_url", "image_url": {"url": GS, "format": "image/png"}}
+    old_photo = [{"role": "user", "content": [photo]}, {"role": "user", "content": "просто текст"}]
+    assert effective_reasoning(p, old_photo) == ""
+    assert effective_reasoning(p, [{"role": "user", "content": ["", photo][1:]}]) == "medium"

@@ -290,7 +290,7 @@ async def _generate_reply(session_id: int, text: str, attachments: list[Attachme
         # целиком в пределах INLINE_FILES_MB (см. backend/media_refs.py).
         messages = await build_context_from_db(
             db, sess, character, text, user_content, settings.CONTEXT_TOKEN_BUDGET,
-            knowledge_chars=settings.KNOWLEDGE_TEXT_CHARS,
+            knowledge_chars=settings.KNOWLEDGE_TEXT_CHARS, params=_bot_params(),
         )
         msg = models.Message(session_id=session_id, role="user", content=text, attachments=[])
         db.add(msg)
@@ -367,7 +367,7 @@ async def _generate_group_reply(
             rsess = await db.get(models.ChatSession, session_id)
             gmsgs = await group_chat.build_group_messages(
                 db, rsess, character, settings.CONTEXT_TOKEN_BUDGET,
-                knowledge_chars=settings.KNOWLEDGE_TEXT_CHARS,
+                knowledge_chars=settings.KNOWLEDGE_TEXT_CHARS, params=params,
             )
         reply = await complete(gmsgs, params, connection, kind="chat")
         async with AsyncSessionLocal() as db:

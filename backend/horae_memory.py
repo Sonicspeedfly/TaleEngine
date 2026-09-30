@@ -214,32 +214,47 @@ NOTE_MEDIA_WINDOW = ("[содержимое файла в этот запрос 
                      "свою долю окна контекста]")
 
 
-def cap_history_media(history: list[dict], media_budget: int) -> list[dict]:
+# Сколько последних реплик истории модель видит всегда, даже если бюджет окна
+# целиком занят несжимаемой частью хода.
+_MIN_HISTORY_TAIL = 4
+
+
+def cap_history_media(history: list[dict], media_budget: int, step: int = _TRIM_STEP) -> list[dict]:
     """
-    Файлы-заготовки истории (media_refs.MARK) в пределах media_budget токенов:
-    от свежих к старым; не влезшие — пометкой (подпись с именем файла и текст
-    сообщения остаются). Бюджет <= 0 — без ограничения. Возвращает копию, если
-    что-то снято, иначе тот же список.
+    Файлы-заготовки истории (media_refs.MARK) в пределах media_budget токенов,
+    от свежих к старым; у сообщений старше границы файлы идут пометкой
+    (подпись с именем файла и текст сообщения остаются). Граница квантуется
+    ступенью step, как обрезка истории (stable_trim_start): тогда начало
+    запроса не меняется с каждым новым файлом и кэш провайдера попадает.
+    Бюджет <= 0 — без ограничения. Возвращает копию, если что-то снято.
     """
     from backend.media_refs import MARK, block_tokens
 
     if media_budget <= 0:
         return history
     used = 0
-    drop: set[tuple[int, int]] = set()
+    cut = -1   # сообщения с индексом <= cut несут файлы пометкой
     for i in range(len(history) - 1, -1, -1):
         c = history[i].get("content")
         if not isinstance(c, list):
             continue
-        for j in range(len(c) - 1, -1, -1):
-            b = c[j]
-            if not (isinstance(b, dict) and MARK in b):
-                continue
-            cost = block_tokens(b) or 0
-            if used + cost > media_budget:
-                drop.add((i, j))
-            else:
-                used += cost
+        cost = sum(block_tokens(b) or 0 for b in c if isinstance(b, dict) and MARK in b)
+        if used + cost > media_budget:
+            cut = i
+            break
+        used += cost
+    if cut < 0:
+        return history
+    step = max(1, int(step or 1))
+    stepped = ((cut + step) // step) * step - 1
+    # Как у stable_trim_start: если ступень сняла бы файлы у всех сообщений,
+    # граница остаётся точной.
+    if stepped < len(history) - 1:
+        cut = stepped
+    drop: set[tuple[int, int]] = {
+        (i, j) for i in range(cut + 1) if isinstance(history[i].get("content"), list)
+        for j, b in enumerate(history[i]["content"]) if isinstance(b, dict) and MARK in b
+    }
     if not drop:
         return history
     out = []
@@ -1140,12 +1155,20 @@ def assemble_context(
     # бюджета: от свежих к старым, дальше вместо файла пометка, а текст
     # сообщения остаётся.
     history = cap_history_media(history, token_budget // 2)
+    # База знаний с медиа тоже не больше четверти окна (час аудио в справочнике
+    # иначе вытеснил бы всю историю на каждом ходу).
+    if knowledge_media:
+        knowledge_media = cap_history_media(list(knowledge_media), token_budget // 4, step=1)
     #
     # ЭКОНОМИЯ: граница обрезки квантуется по ступеням (см. stable_trim_start) —
     # тогда начало запроса не меняется от хода к ходу и попадает в кэш промпта
     # провайдера со скидкой 75–90%. Что выпало — держит авто-сводка сюжета.
     costs = [estimate_content_tokens(m.get("content")) for m in history]
     start = stable_trim_start(costs, token_budget, reserved=reserved)
+    # Несжимаемая часть (крупный файл реплики, база знаний) могла съесть весь
+    # бюджет — последние реплики диалога модель видит всё равно, иначе она
+    # отвечала бы без контекста вовсе.
+    start = min(start, max(0, len(history) - _MIN_HISTORY_TAIL))
     trimmed_history: list[dict] = [
         {"role": m["role"], "content": m["content"]} for m in history[start:]
     ]
@@ -1404,10 +1427,15 @@ async def build_context_from_db(
     report: dict | None = None,
     history_ids: list[int | None] | None = None,
     horae_tags: bool = True,
+    params=None,
 ) -> list[dict]:
     """
     Достаёт из БД память Horae, персону, заметку автора и историю сообщений,
     после чего вызывает чистую assemble_context().
+
+    :param params: параметры генерации хода — по модели из них видно, работает
+        ли хранилище файлов (media_refs). Не работает — файлы, которые всё равно
+        уйдут пометкой, заранее становятся пометкой и не занимают окно.
 
     :param horae_tags: False — путь, где модель не должна писать теги Horae
         (канвас): правила и напоминание не добавляются, блок состояния — да.
@@ -1484,6 +1512,21 @@ async def build_context_from_db(
     history, history_ids, recalled, squeeze = await _long_memory(
         session_db, session, history, history_ids, user_message, report
     )
+    # Хранилище файлов для модели этого хода не работает — файлы сверх лимита
+    # «целиком» уйдут пометкой; решаем это сейчас, чтобы их вес в токенах не
+    # занимал окно зря (тот же отбор, что сделает stream_completion).
+    try:
+        from backend import media_refs
+        from backend.settings_service import get_connection as _get_conn
+
+        route = media_refs.route_for(params, await _get_conn(session_db))
+        if not media_refs.usable(route):
+            both = media_refs.prune_unsendable(list(knowledge_media or []) + list(history), route)
+            knowledge_media, history = both[:len(knowledge_media or [])], both[len(knowledge_media or []):]
+    except Exception:  # noqa: BLE001 — оценка файлов не роняет ход
+        import logging
+
+        logging.getLogger("aichat.media").exception("Отбор файлов хода не удался")
     records = await _load_horae_records(
         session_db, session.id, getattr(character, "id", None)
     )

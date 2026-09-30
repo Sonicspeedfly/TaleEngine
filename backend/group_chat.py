@@ -279,7 +279,7 @@ async def director_pick(
 
 async def build_group_messages(
     db, session, target_character, token_budget: int, send_avatars: bool = False,
-    knowledge_chars: int | None = None, **_legacy,
+    knowledge_chars: int | None = None, params=None, **_legacy,
 ) -> list[dict]:
     """Собирает messages, чтобы target_character ответил как он сам, видя весь диалог.
 
@@ -351,12 +351,15 @@ async def build_group_messages(
 
     # Файлам — не больше половины бюджета (от свежих к старым), как в личном
     # чате: иначе одно тяжёлое видео вытеснило бы из транскрипта десятки реплик.
+    # Файлы ПОСЛЕДНЕЙ реплики пользователя идут всегда (как файлы реплики в
+    # личном чате): в долю не входят.
+    newest_user = next((m.id for m in reversed(msgs) if m.role == "user"), None)
     file_costs = [0] * len(msgs)
     media_left = token_budget // 2 if token_budget and token_budget > 0 else None
     skip_files: set[int] = set()
     for idx in range(len(msgs) - 1, -1, -1):
         m = msgs[idx]
-        if m.role != "user":
+        if m.role != "user" or m.id == newest_user:
             continue
         cost = sum(block_tokens(ph) or 0 for ph in (placeholder(a) for a in (m.attachments or []))
                    if ph is not None)
@@ -416,6 +419,19 @@ async def build_group_messages(
     # Теперь свежие вложения прикладываем к финальной реплике как мультимодал.
     user_content: list = [{"type": "text", "text": transcript + f"\n\n{target_character.name}:"}]
     att_blocks = _collect_user_attachments(msgs[start:], skip=skip_files)
+    # Хранилище файлов для модели не работает — файлы сверх лимита «целиком»
+    # заранее становятся пометкой (их вес не нужен транскрипту).
+    try:
+        from backend import media_refs
+        from backend.settings_service import get_connection
+
+        route = media_refs.route_for(params, await get_connection(db))
+        att_blocks = media_refs.prune_unsendable(
+            [{"role": "user", "content": att_blocks}], route)[0]["content"]
+    except Exception:  # noqa: BLE001 — отбор файлов не роняет ход
+        import logging
+
+        logging.getLogger("aichat.media").exception("Отбор файлов группы не удался")
     if att_blocks:
         user_content = [{"type": "text", "text": transcript}] + att_blocks + [
             {"type": "text", "text": (
@@ -538,13 +554,14 @@ def _collect_user_attachments(msgs, skip: set | None = None) -> list[dict]:
         return []
     skip = skip or set()
     kinds = {"image": "изображение", "video": "видео", "audio": "аудио", "pdf": "документ"}
+    from backend.horae_memory import NOTE_MEDIA_WINDOW
+
     blocks: list[dict] = []
     newest_id = user_msgs[-1].id
     for m in user_msgs:  # хронологический порядок
-        if m.id in skip:
-            continue   # файлы не вошли в долю бюджета под файлы
         for a in (m.attachments or []):
-            ph = placeholder(a)
+            # Файлы последней реплики — «отвечаемые» (priority 2): идут всегда.
+            ph = placeholder(a, priority=2 if m.id == newest_id else 0)
             if ph is None:
                 continue
             te = ph[MARK]
@@ -554,5 +571,6 @@ def _collect_user_attachments(msgs, skip: set | None = None) -> list[dict]:
                 label += f": «{te['name']}»"
             label += f" — {kinds.get(te['kind'], 'файл')}]"
             blocks.append({"type": "text", "text": label})
-            blocks.append(ph)
+            # Не вошёл в долю окна под файлы — подпись остаётся, данные нет.
+            blocks.append({"type": "text", "text": NOTE_MEDIA_WINDOW} if m.id in skip else ph)
     return blocks

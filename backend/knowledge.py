@@ -140,15 +140,32 @@ async def build_knowledge(
     return knowledge_text, media_msgs
 
 
+# {(blob_id, message_id): размер} — файл базы знаний не меняется, а считать
+# длину base64 на каждом ходу дорого: SQLite length() читает TEXT целиком.
+_SIZE_CACHE: dict[int, int] = {}
+_OCTET_LENGTH = __import__("sqlite3").sqlite_version_info >= (3, 43, 0)
+
+
 async def _blob_sizes(db, blob_ids) -> dict[int, int]:
-    """{blob_id: размер файла в байтах} по длине base64 (данные в Python не читаются)."""
+    """
+    {blob_id: размер файла в байтах} по длине base64. octet_length (SQLite
+    3.43+) берёт длину из заголовка записи, не читая данные; на старом SQLite —
+    length() один раз, дальше из кэша.
+    """
     from sqlalchemy import func, select
 
     ids = sorted({int(i) for i in blob_ids if i})
     if not ids:
         return {}
-    rows = (await db.execute(
-        select(models.AttachmentBlob.id, func.length(models.AttachmentBlob.data))
-        .where(models.AttachmentBlob.id.in_(ids))
-    )).all()
-    return {i: int((n or 0) * 3 / 4) for i, n in rows}
+    measure = func.octet_length if _OCTET_LENGTH else func.length
+    todo = ids if _OCTET_LENGTH else [i for i in ids if i not in _SIZE_CACHE]
+    if todo:
+        rows = (await db.execute(
+            select(models.AttachmentBlob.id, measure(models.AttachmentBlob.data))
+            .where(models.AttachmentBlob.id.in_(todo))
+        )).all()
+        for i, n in rows:
+            _SIZE_CACHE[i] = int((n or 0) * 3 / 4)
+        for i in set(todo) - {r[0] for r in rows}:
+            _SIZE_CACHE.pop(i, None)
+    return {i: _SIZE_CACHE[i] for i in ids if i in _SIZE_CACHE}

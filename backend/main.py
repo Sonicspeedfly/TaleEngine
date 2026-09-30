@@ -69,7 +69,6 @@ from backend.attachments import (
     attachment_data,
     delete_message_blobs,
     hydrate_export_attachments,
-    message_attachments_in,
     store_attachments,
 )
 from backend.characters import (
@@ -1065,6 +1064,7 @@ async def inspect_context(
         knowledge_chars=_kb_chars(params),
         assistant_mode=bool(params and params.assistant_mode),
         report=report,
+        params=params,
     )
     # Файлы хода: сколько пойдёт ссылкой, сколько целиком и сколько ждёт
     # загрузки в хранилище модели — по мете, данные файлов не читаются.
@@ -1920,8 +1920,13 @@ async def media_status(model: str = "", db: AsyncSession = Depends(get_session))
 
 
 @app.post("/api/media/probe")
-async def media_probe(payload: dict | None = None, db: AsyncSession = Depends(get_session)):
+async def media_probe(payload: dict | None = None, user=Depends(current_user),
+                      db: AsyncSession = Depends(get_session)):
     """«Проверить снова»: загрузка тестовой картинки и её чтение моделью по ссылке."""
+    # Проверка — загрузка в хранилище и платный запрос к модели: в режиме
+    # аккаунтов её запускает только администратор (как и смену подключения).
+    if user is not None and user.role != "admin":
+        raise HTTPException(403, "Только администратор")
     connection = await get_connection(db)
     model = str((payload or {}).get("model") or "").strip()
     params = GenerationParams(model=model or None)
@@ -1929,9 +1934,9 @@ async def media_probe(payload: dict | None = None, db: AsyncSession = Depends(ge
     if route is None:
         raise HTTPException(400, "Ссылки на файлы работают только через LiteLLM-прокси (вкладка «Подключение»).")
     now = time.monotonic()
-    if now - _media_probe_at.get(route.cap_key, 0) < 20:
+    if now - _media_probe_at.get("any", 0) < 10:
         raise HTTPException(429, "Проверка уже шла только что — подождите немного.")
-    _media_probe_at[route.cap_key] = now
+    _media_probe_at["any"] = now
     await media_refs.probe(route)
     return await media_refs.status(db, params, connection)
 
@@ -2590,11 +2595,21 @@ async def canvas_generate(
     await db.flush()
     user_msg.attachments = await store_attachments(db, user_msg.id, attachments)
     await db.commit()
+    media_refs.enqueue_message(user_msg.attachments, params, connection)
 
-    # 2. Генерация (нестриминговая): просим ПОЛНЫЙ документ/код.
+    # 2. Генерация (нестриминговая): просим ПОЛНЫЙ документ/код. История — ДО
+    # только что сохранённой реплики: иначе её файлы ушли бы дважды (в истории
+    # и текущим сообщением) и дважды съели бы окно.
+    prior = (await db.execute(
+        select(models.Message)
+        .where(models.Message.session_id == session_id, models.Message.id < user_msg.id)
+        .order_by(models.Message.id)
+    )).scalars().all()
     user_content = build_user_content(prompt, attachments, current=True)
     messages = await build_context_from_db(
         db, sess, character, prompt, user_content, _ctx_budget(params),
+        history=await messages_to_history_db(db, prior), history_ids=[m.id for m in prior],
+        params=params,
         knowledge_chars=_kb_chars(params),
         assistant_mode=bool(params and params.assistant_mode),
         horae_tags=False,   # документ Канваса — не ход сюжета, теги Horae ему не нужны
@@ -2954,7 +2969,7 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
                 messages = await group_chat.build_group_messages(
                     rdb, rsess, character, _ctx_budget(params),
                     send_avatars=bool(params and params.send_avatars),
-                    knowledge_chars=_kb_chars(params),
+                    knowledge_chars=_kb_chars(params), params=params,
                 )
             text = ""
             _thought = lambda t: job.broadcast({"type": "thought", "content": t})  # noqa: E731
@@ -3013,6 +3028,7 @@ async def _start_user_turn(session_id, content, attachments, params, db, reply_t
         knowledge_chars=_kb_chars(params),
         web_access=bool(params and params.web_access),
         assistant_mode=bool(params and params.assistant_mode),
+        params=params,
     )
     msg = models.Message(
         session_id=session_id,
@@ -3092,6 +3108,7 @@ async def _start_regenerate(session_id, params, db) -> str:
         knowledge_chars=_kb_chars(params),
         web_access=bool(params and params.web_access),
         assistant_mode=bool(params and params.assistant_mode),
+        params=params,
     )
 
     job_id = uuid.uuid4().hex
@@ -3143,6 +3160,7 @@ async def _start_continue(session_id, params, db) -> str:
         knowledge_chars=_kb_chars(params),
         web_access=bool(params and params.web_access),
         assistant_mode=bool(params and params.assistant_mode),
+        params=params,
     )
     # Уже написанный ответ + явная просьба продолжить именно его.
     messages.append({"role": "assistant", "content": target.content})
@@ -3190,9 +3208,10 @@ async def _start_retry(session_id, params, db) -> str:
 
     character = await db.get(models.Character, sess.character_id)
     connection = await get_connection(db)
-    # ПОЛНЫЕ вложения повторяемой реплики (данные — из blob-таблицы).
-    atts = await message_attachments_in(db, last)
-    user_content = build_user_content(last.content, atts, current=True)
+    # Файлы повторяемой реплики — заготовками: готовая ссылка на хранилище
+    # (если сбой был из-за размера, повтор с ней лёгкий), иначе целиком, как в
+    # исходном ходе. Данные читает stream_completion.
+    user_content = media_refs.history_content(last.content, last.attachments, current=True, priority=2)
     # Контекст: история ДО последней реплики + сама реплика как текущее сообщение —
     # ровно то же, что видел бы _start_user_turn, но без повторного сохранения.
     prior = [m for m in msgs if m.id < last.id]
@@ -3204,6 +3223,7 @@ async def _start_retry(session_id, params, db) -> str:
         knowledge_chars=_kb_chars(params),
         web_access=bool(params and params.web_access),
         assistant_mode=bool(params and params.assistant_mode),
+        params=params,
     )
     job_id = uuid.uuid4().hex
     await generation_manager.start(

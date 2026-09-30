@@ -202,6 +202,11 @@ class MediaRef(Base):
     # Files API обрабатывает загруженное видео/аудио не мгновенно (PROCESSING →
     # ACTIVE): до этого момента ссылку не используем.
     usable_after: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Резерв загрузки (status «uploading»): строка создаётся ДО чтения файла, и
+    # результат пишется, только если токен совпал. Удалили файл во время
+    # загрузки — триггер снёс резерв, и ссылка не достанется новому файлу с
+    # тем же id.
+    upload_token: Mapped[str] = mapped_column(String(40), default="")
     # Files API хранит файл 48 часов; у GCS срока нет (NULL).
     expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     error: Mapped[str] = mapped_column(Text, default="")
