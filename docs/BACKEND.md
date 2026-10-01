@@ -94,8 +94,9 @@ Pydantic-DTO для валидации запросов/ответов: `Generat
 ### `media_refs.py` — файлы для модели ссылкой
 Модель видит все файлы той части чата, что входит в окно, а сервер не гоняет их
 base64-ом в каждом запросе: файл ОДИН раз загружается в хранилище провайдера
-через LiteLLM-прокси (`litellm.acreate_file`, `custom_llm_provider="litellm_proxy"`,
-маршрут по модели — заголовок `x-litellm-model` и поле `model`), дальше в запрос
+через LiteLLM-прокси (OpenAI SDK `AsyncOpenAI(base_url=<прокси>).files.create` — не
+`litellm.acreate_file`: клиент LiteLLM многих версий не грузит файлы через
+`litellm_proxy`; маршрут по модели — заголовок `x-litellm-model` и поле `model`), дальше в запрос
 уходит `{"type": "image_url", "image_url": {"url": <ссылка>, "format": <mime>}}`,
 который прокси превращает в `file_data` Gemini.
 - **Хранилища.** Vertex AI → GCS (`gs://…`, не истекает; у прокси нужен
@@ -162,7 +163,7 @@ base64-ом в каждом запросе: файл ОДИН раз загру�
   текстовые — по длине, прочие двоичные — 64 (уходит пометка).
 - **Удаление.** Триггер SQLite `media_refs_blob_gone` (см. `database.py`) убирает
   ссылки удалённого файла сразу, копию кладёт в `media_ref_trash`; загрузчик
-  стирает копии GCS (`afile_delete`) и раз в 30 минут подчищает сирот.
+  стирает копии GCS (`files.delete` того же клиента) и раз в 30 минут подчищает сирот.
 - `status()` → `GET /api/media/status`; `preview()` → строка «Файлы» в инспекторе.
 
 ### `generation.py`

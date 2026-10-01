@@ -1032,27 +1032,11 @@ def explain(error: str) -> str:
                 "не умеет загрузку по модели (нужен LiteLLM новее) или модели нет в model_list.")
     if "managed" in low:
         return "Прокси требует managed files (enterprise) — загрузка по модели выключена."
-    if "doesn't support" in low and "create_file" in low:
-        return ("Клиент LiteLLM на сервере TaleEngine слишком старый для загрузки файлов через "
-                "прокси: обновите его (.venv/bin/pip install -U litellm) и перезапустите сервер.")
     if "401" in low or "unauthorized" in low or "api key" in low:
         return "Прокси не принял ключ доступа."
     if "403" in low or "permission" in low or "forbidden" in low:
         return "Нет прав: у сервисного аккаунта прокси нет доступа к бакету (нужна роль Storage Object User)."
     return "Прокси не принял загрузку файла."
-
-
-def _file_kwargs(route: Route) -> dict:
-    kw = {
-        "custom_llm_provider": "litellm_proxy",
-        "api_base": route.base_url,
-        "api_key": route.api_key,
-        # Никаких автоповторов SDK: повтор заново гонит файл целиком через прокси.
-        "max_retries": 0,
-    }
-    if route.alias.isascii():
-        kw["extra_headers"] = {"x-litellm-model": route.alias}
-    return kw
 
 
 # Картинка 1×1 PNG: двоичные байты (0x89…) проверяют, что прокси не портит
@@ -1087,22 +1071,39 @@ async def _alias_deployments(route: Route) -> list[str] | None:
     return None
 
 
-async def _create_file(route: Route, file, timeout: int):
-    import litellm
+def _files_client(route: Route, timeout: float):
+    """
+    Клиент OpenAI SDK к /files прокси. Не через litellm.acreate_file: клиент
+    LiteLLM многих версий не умеет загружать файлы через litellm_proxy («LiteLLM
+    doesn't support litellm_proxy for 'create_file'»), а прокси говорит на
+    OpenAI-совместимом /files — пакет openai стоит вместе с LiteLLM всегда.
+    max_retries=0: повтор SDK заново гонит файл целиком через прокси.
+    """
+    from openai import AsyncOpenAI
 
-    last = None
-    for purpose in ("user_data", "assistants"):
-        try:
-            return await asyncio.wait_for(litellm.acreate_file(
-                file=file, purpose=purpose, timeout=timeout, extra_body={"model": route.alias},
-                **_file_kwargs(route)), timeout + 30)
-        except Exception as exc:  # noqa: BLE001
-            last = exc
-            if "purpose" not in str(exc).lower():
-                raise
-            if hasattr(file[1], "seek"):
-                file[1].seek(0)
-    raise last
+    headers = {"x-litellm-model": route.alias} if route.alias.isascii() else {}
+    return AsyncOpenAI(base_url=route.base_url, api_key=route.api_key, max_retries=0,
+                       timeout=timeout, default_headers=headers)
+
+
+async def _create_file(route: Route, file, timeout: int):
+    """Загрузка файла через прокси по модели (заголовок x-litellm-model и поле model)."""
+    client = _files_client(route, timeout)
+    try:
+        last = None
+        for purpose in ("user_data", "assistants"):
+            try:
+                return await asyncio.wait_for(client.files.create(
+                    file=file, purpose=purpose, extra_body={"model": route.alias}), timeout + 30)
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+                if "purpose" not in str(exc).lower():
+                    raise
+                if hasattr(file[1], "seek"):
+                    file[1].seek(0)
+        raise last
+    finally:
+        await client.close()
 
 
 async def _delete_remote(route: Route, file_id: str) -> bool:
@@ -1111,11 +1112,9 @@ async def _delete_remote(route: Route, file_id: str) -> bool:
     существует или удалить её нельзя в принципе), False — временный сбой,
     повторить позже.
     """
-    import litellm
-
+    client = _files_client(route, 60)
     try:
-        await asyncio.wait_for(litellm.afile_delete(
-            file_id=file_id, timeout=60, **_file_kwargs(route)), 75)
+        await asyncio.wait_for(client.files.delete(file_id), 75)
         return True
     except asyncio.CancelledError:
         raise
@@ -1125,6 +1124,8 @@ async def _delete_remote(route: Route, file_id: str) -> bool:
             return False
         log.info("Копию файла в хранилище удалить нельзя: %s", _short_error(_error_text(exc)))
         return True
+    finally:
+        await client.close()
 
 
 _TRANSIENT_RE = re.compile(

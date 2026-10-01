@@ -4,7 +4,8 @@
 
 Проверяем без сети: заготовки в истории, лимит «целиком» на запрос, ссылки из
 таблицы media_refs, разбор ошибок чтения ссылок, фоновую загрузку (подменный
-acreate_file), проверку хранилища, триггер удаления и доли окна под файлы.
+клиент OpenAI SDK к /files прокси), проверку хранилища, триггер удаления и доли
+окна под файлы.
 """
 import base64
 import os
@@ -83,6 +84,41 @@ async def _ref(blob_id: int, uri: str, *, scope=None, owner=None, status="ready"
                         uri=uri, file_id=mr.encode_file_id(uri, "gem"), mime=mime, bytes=1000,
                         status=status, **extra))
         await db.commit()
+
+
+def _fake_openai(create=None, delete=None, seen=None):
+    """
+    Подменный openai.AsyncOpenAI: файлы грузятся через OpenAI SDK к /files
+    прокси. create(**kw) получает file/purpose/extra_body, как files.create.
+    """
+    class _Files:
+        async def create(self, **kw):
+            if seen is not None:
+                seen.setdefault("calls", []).append(kw)
+            return await create(**kw)
+
+        async def delete(self, file_id):
+            return await (delete(file_id) if delete else _none())
+
+    async def _none():
+        return None
+
+    class _Client:
+        def __init__(self, **kw):
+            if seen is not None:
+                seen["client"] = kw
+            self.files = _Files()
+
+        async def close(self):
+            pass
+
+    return patch("openai.AsyncOpenAI", _Client)
+
+
+def _raising(exc):
+    async def f(**kw):
+        raise exc
+    return f
 
 
 def _route():
@@ -371,18 +407,21 @@ async def test_upload_writes_ready_ref_with_unique_name(db_ready):
 
     async def fake_create(**kw):
         name, fh, mime = kw["file"]
-        seen.update(name=name, body=fh.read(), mime=mime, headers=kw.get("extra_headers"),
-                    retries=kw.get("max_retries"), body_model=(kw.get("extra_body") or {}).get("model"))
+        seen.update(name=name, body=fh.read(), mime=mime,
+                    body_model=(kw.get("extra_body") or {}).get("model"))
         uri = f"gs://bucket-a/litellm-vertex-files/uploads/u-{name}"
         return SimpleNamespace(id=mr.encode_file_id(uri, "gem"), bytes=len(raw))
 
     job = mr._Job(mr._LANE_TURN, 1, "upload", route,
                   te=mr.placeholder({"type": "audio", "mime": "audio/ogg", "size": 3000, "blob_id": bid})[mr.MARK])
-    with patch("litellm.acreate_file", new=fake_create):
+    with _fake_openai(fake_create, seen=seen):
         await mr.uploader._upload(job)
-    assert seen["body"] == raw and seen["mime"] == "audio/ogg" and seen["retries"] == 0
+    assert seen["body"] == raw and seen["mime"] == "audio/ogg"
     assert seen["name"].startswith(f"te-{bid}-") and seen["name"].endswith(".ogg")
-    assert seen["headers"] == {"x-litellm-model": "gem"} and seen["body_model"] == "gem"
+    assert seen["body_model"] == "gem"
+    client = seen["client"]                                  # прямо к /files прокси, без повторов
+    assert client["base_url"] == PROXY["base_url"] and client["api_key"] == "sk-test"
+    assert client["max_retries"] == 0 and client["default_headers"] == {"x-litellm-model": "gem"}
     async with AsyncSessionLocal() as db:
         row = (await db.execute(select(MediaRef).where(MediaRef.blob_id == bid))).scalar_one()
     assert row.status == "ready" and row.uri.startswith("gs://bucket-a/") and row.bytes == 3000
@@ -407,20 +446,20 @@ async def test_upload_errors_are_classified(db_ready):
 
     # 413 — файл не примут никогда: «rejected», без повторов.
     a = await _blob(_b64(100))
-    with patch("litellm.acreate_file", side_effect=RuntimeError("413 Request Entity Too Large")):
+    with _fake_openai(_raising(RuntimeError("413 Request Entity Too Large"))):
         await mr.uploader._upload(_job(a))
     assert (await _status(a)).status == "rejected"
 
     # Обрыв сети — временный сбой: повтор позже.
     b = await _blob(_b64(100))
-    with patch("litellm.acreate_file", side_effect=RuntimeError("Connection reset by peer")):
+    with _fake_openai(_raising(RuntimeError("Connection reset by peer"))):
         await mr.uploader._upload(_job(b))
     row = await _status(b)
     assert row.status == "failed" and row.attempts == 1 and row.next_try_at > mr._now()
 
     # Бакет пропал — ломается хранилище целиком: модель выключается до перепроверки.
     c = await _blob(_b64(100))
-    with patch("litellm.acreate_file", side_effect=RuntimeError("500 GCS bucket_name is required")):
+    with _fake_openai(_raising(RuntimeError("500 GCS bucket_name is required"))):
         await mr.uploader._upload(_job(c))
     assert mr.usable(route) == "" and "GCS_BUCKET_NAME" in mr.capability(route)["error"]
 
@@ -440,7 +479,7 @@ async def test_upload_is_deferred_when_server_is_short_of_memory(db_ready):
     async def fake_create(**kw):
         calls.append(kw)
 
-    with patch.object(mr, "_mem_available", return_value=10), patch("litellm.acreate_file", new=fake_create):
+    with patch.object(mr, "_mem_available", return_value=10), _fake_openai(fake_create):
         await mr.uploader._upload(job)
     assert calls == []                                        # ничего не грузили
     async with AsyncSessionLocal() as db:
@@ -475,7 +514,7 @@ async def test_probe_marks_gemini_on_vertex_as_working(db_ready):
 
     deleted = []
     with patch.object(mr, "_alias_deployments", return_value=["vertex_ai/gemini-2.5-pro"]), \
-            patch("litellm.acreate_file", new=fake_create), \
+            _fake_openai(fake_create), \
             patch("litellm.acompletion", new=fake_chat), \
             patch.object(mr, "_delete_remote", side_effect=lambda r, f: deleted.append(f)):
         cap = await mr.probe(route)
@@ -491,7 +530,7 @@ async def test_probe_rejects_non_gemini_and_explains_missing_bucket(db_ready):
         cap = await mr.probe(route)
     assert not cap["ok"] and "Gemini" in cap["error"]
     with patch.object(mr, "_alias_deployments", return_value=None), \
-            patch("litellm.acreate_file", side_effect=RuntimeError("GCS bucket_name is required")):
+            _fake_openai(_raising(RuntimeError("GCS bucket_name is required"))):
         cap = await mr.probe(route)
     assert not cap["ok"] and "GCS_BUCKET_NAME" in cap["error"]
 
@@ -617,7 +656,7 @@ async def test_blob_deleted_during_upload_leaves_no_ref(db_ready):
 
     job = mr._Job(mr._LANE_TURN, 1, "upload", route,
                   te=mr.placeholder({"type": "image", "mime": "image/png", "size": 500, "blob_id": bid})[mr.MARK])
-    with patch("litellm.acreate_file", new=fake_create), \
+    with _fake_openai(fake_create), \
             patch.object(mr.uploader, "enqueue_delete", side_effect=lambda r, f: deletes.append(f)):
         await mr.uploader._upload(job)
     async with AsyncSessionLocal() as db:
@@ -700,7 +739,7 @@ async def test_transient_probe_failure_keeps_working_storage(db_ready):
         raise litellm.RateLimitError("429 RESOURCE_EXHAUSTED", llm_provider="vertex_ai", model="gem")
 
     with patch.object(mr, "_alias_deployments", return_value=None), \
-            patch("litellm.acreate_file", new=fake_create), patch("litellm.acompletion", new=busy), \
+            _fake_openai(fake_create), patch("litellm.acompletion", new=busy), \
             patch.object(mr, "_delete_remote", return_value=True):
         cap = await mr.probe(route)
     assert cap["ok"] and mr.usable(route) == "gcs"          # 429 не выключает рабочие ссылки
