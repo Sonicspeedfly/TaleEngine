@@ -90,10 +90,23 @@ HTTP Basic Auth поверх всего нужен ещё заголовок `Au
 
 | Метод | Путь | Назначение |
 |------|------|-----------|
-| GET | `/api/horae?session_id=` | Записи (scope по доступу; глобальный лор — всем) |
-| POST | `/api/horae` | Создать запись (session_id / character_id / глобально) |
-| PATCH | `/api/horae/{id}` | Обновить |
+| GET | `/api/horae?session_id=&for_session=` | Записи (по доступу). `session_id` — только записи этого чата; `for_session` — всё, что действует в чате: его записи, «во всех чатах» и лорбук его персонажа (участников группы) |
+| POST | `/api/horae` | Создать запись (session_id / character_id / во всех чатах — в режиме аккаунтов только админ) |
+| PATCH | `/api/horae/{id}` | Обновить; `{scope: "session", session_id}` / `{scope: "global"}` — перенести в чат / во все чаты |
 | DELETE | `/api/horae/{id}` | Удалить |
+
+## Память о пользователе
+
+Всё — для текущего владельца (аккаунт или `local`), см. [HORAE.md](HORAE.md#память-о-пользователе-обо-мне).
+
+| Метод | Путь | Назначение |
+|------|------|-----------|
+| GET | `/api/user-memory` | `{profile, settings: {enabled, auto, instant}, categories: [{key, label, single}], items: [{id, category, content, status: active\|candidate, enabled, source: auto\|manual, locked, hits, chats, quote, updated_at}], block}` — `block` — текст, который уходит модели |
+| PUT | `/api/user-memory/settings` | `{enabled?, auto?, instant?}` → настройки |
+| POST | `/api/user-memory` | Ручная запись `{category, content}` — действует сразу, в категории с одним значением заменяет прежнее |
+| PATCH | `/api/user-memory/{id}` | `{content?, category?, enabled?, status: "active"}` — правка (409 — такая запись уже есть) или подтверждение кандидата |
+| DELETE | `/api/user-memory/{id}` | Удалить запись |
+| DELETE | `/api/user-memory` | Стереть всё о себе |
 | GET | `/api/sessions/{id}/memory` | Статус мастер-памяти чата: `compression` (кто сжимает историю чата: `engine` — `snapshot` / `horae` / `off`, `summary_layer` — где задан `summary_enabled` Хроники: `chat` / `character` / `global` / `default`; см. [HORAE.md](HORAE.md#кто-сжимает-историю-мастер-снимок-или-свёртки-хроники)), `job` (последнее задание или `null`), `snapshot` (`exists`, `tokens`, `budget`, `covered_upto`, `schema`, `structured`, `updated_at`, `over_budget`, `warnings`, `last_error`, `retry_after`), `staging` (буфер пересборки или `null`: `last_message_id`, `tokens`, `manual`, `started_at`, `paused`), `backlog` (`pending`, `window`, `messages_total`), `facts.count`, `settings` (`batch_size`, `delay_ms`, `snapshot_tokens`, `max_snapshot_tokens`) |
 | POST | `/api/sessions/{id}/memory/rebuild` | Задание памяти `{mode: "rebuild" \| "catchup", resume?, batch_size? 1–200, delay_ms? 0–60000}` → 202 `{job}`. `rebuild` — собрать снимок с нуля в буфер (`resume: true` — продолжить прерванную или остановленную пересборку), `catchup` — свернуть бэклог в цель записи: живой снимок, а при незаконченной (не остановленной) пересборке или сводке до 2.4.0 — её буфер с подменой в конце. 409 — у чата уже есть задание в очереди или в работе. Заданий в работе на процесс — одно, остальные ждут в `queued` |
 | POST | `/api/sessions/{id}/memory/cancel` | Остановить задание: начатый запрос к модели доводится, паузы (между запросами и перед повтором) обрываются сразу, слитый пакет сохраняется; из очереди — сразу. Буфер остановленной пересборки помечается `paused` и ждёт `resume: true` → `{ok, job}`; `ok: false` — останавливать нечего |

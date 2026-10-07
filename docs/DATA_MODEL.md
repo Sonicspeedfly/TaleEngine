@@ -24,7 +24,9 @@ ORM-модели в `backend/models.py` — **единственный исто�
 `timezone` (часовой пояс пользователя ДЛЯ ЭТОГО чата: IANA-имя `Europe/Moscow` или
 смещение `+03:00`; нейросеть видит по нему текущее время собеседника, метки времени
 в UI показываются в нём же; настраивается во вкладке «Персона», по умолчанию —
-автоматически из браузера).
+автоматически из браузера), `profile_upto` (до какого сообщения реплики чата
+просмотрены «Памятью о пользователе»; ветке и продолжению ставится сразу на конец
+скопированного).
 
 ### `messages` — `Message`
 Сообщение. `role` = `user|assistant|system`, `content` (зеркалит активный свайп),
@@ -73,7 +75,7 @@ Vertex одного бакета; `files_api:<прокси>:<модель>` — 
 `blob_id` (данные медиа/PDF в `attachment_blobs`). См. `backend/knowledge.py`.
 
 ### `horae_entries` — `HoraeEntry`
-Запись памяти Horae. `session_id` (NULL = глобальный лор) и/или `character_id`
+Запись памяти Horae. `session_id` (NULL и без `character_id` — запись «во всех чатах») и/или `character_id`
 (лорбук из карточки). Поля: `category`, `title`, `content`, `keywords` (JSON),
 `always_on` (подмешивать всегда), `enabled`, `priority`, `meta` (JSON, служебное).
 У авто-сводки «📜 Память чата (авто)» (`category="summary"`) в `meta`:
@@ -111,6 +113,17 @@ Vertex одного бакета; `files_api:<прокси>:<модель>` — 
 из прошлого чата), `origin`, `doc_hash`, `document` (события, место,
 персонажи, дата ответа), `content` и `brief` (для перенесённых — текст ответа
 и краткая мета), `embedding` + `embed_model`.
+
+### `user_memory` — `UserMemory`
+«Память о пользователе» — общие сведения о человеке для всех его чатов (см.
+[HORAE.md](HORAE.md#память-о-пользователе-обо-мне)). `profile_key` (`u:<id>` /
+`tg:<id>` / `local`), `category` (`name|address|lang|work|skills|interests|style|limits`),
+`content`, `norm_key` (уникален в паре с `profile_key`), `status`
+(`active` — в промпте, `candidate` — ждёт подтверждения), `enabled`, `source`
+(`auto|manual`), `locked` (правил или подтвердил человек — авто не трогает),
+`hits`, `sessions_seen` (JSON, id чатов), `meta` (JSON: ключи цитат `quotes`,
+последняя цитата `quote`), `created_at`, `updated_at`. С удалением чата не
+удаляется: сведения о человеке переживают чаты.
 
 ### `personas` — `Persona`
 Персона пользователя (кем он отыгрывает): `name`, `description`, `avatar_path`, `owner_id`.
