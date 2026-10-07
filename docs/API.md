@@ -98,10 +98,14 @@ HTTP Basic Auth поверх всего нужен ещё заголовок `Au
 ## Память о пользователе
 
 Всё — для текущего владельца (аккаунт или `local`), см. [HORAE.md](HORAE.md#память-о-пользователе-обо-мне).
+Админ (и пользователь без режима аккаунтов) может добавить `?profile=local` или
+`?profile=tg:<id>` к любому запросу ниже — профили, которыми больше некому
+управлять; чужой `u:<id>` — 403.
 
 | Метод | Путь | Назначение |
 |------|------|-----------|
 | GET | `/api/user-memory` | `{profile, settings: {enabled, auto, instant}, categories: [{key, label, single}], items: [{id, category, content, status: active\|candidate, enabled, source: auto\|manual, locked, hits, chats, quote, updated_at}], block}` — `block` — текст, который уходит модели |
+| GET | `/api/user-memory/profiles` | Профили, которые можно открыть: `[{key, own, count, label}]` |
 | PUT | `/api/user-memory/settings` | `{enabled?, auto?, instant?}` → настройки |
 | POST | `/api/user-memory` | Ручная запись `{category, content}` — действует сразу, в категории с одним значением заменяет прежнее |
 | PATCH | `/api/user-memory/{id}` | `{content?, category?, enabled?, status: "active"}` — правка (409 — такая запись уже есть) или подтверждение кандидата |

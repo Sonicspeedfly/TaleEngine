@@ -12,6 +12,7 @@
   * список лорбука: показывал записи всех чатов (for_session отдаёт только те,
     что действуют в открытом чате).
 """
+import json
 from unittest.mock import patch
 
 
@@ -175,3 +176,43 @@ def test_lorebook_for_session_lists_only_entries_of_that_chat(client):
     finally:
         for i in (mine, theirs, char, other_char, everywhere):
             client.delete(f"/api/horae/{i}")
+
+
+def test_shared_table_survives_ai_grown_rows_and_unrelated_locks(client):
+    """Ревью 2.9.0: удаление строки, дописанной ИИ, не падает; замок не переносит заголовки ИИ."""
+    cid, chat_a = _chat(client, name="Растущий")
+    _, chat_b = _chat(client, cid)
+    tid = client.post(f"/api/sessions/{chat_a}/horae/tables",
+                      json={"name": "Планы", "rows": 3, "cols": 3, "scope": "global"}).json()["id"]
+    try:
+        client.patch(f"/api/sessions/{chat_a}/horae/tables/{tid}", json={"cell": {"r": 0, "c": 1, "value": "Цель"}})
+        _turn(client, chat_a, "Ок.\n<horaetable:Планы>\n0,2:Порты JSON для D&D\n3,0:Вор\n4,0:Бард\n</horaetable>")
+        assert _state_table(client, chat_a, tid)["rows"] >= 5
+        # Строка, которой нет в шаблоне, удаляется без 500.
+        r = client.patch(f"/api/sessions/{chat_a}/horae/tables/{tid}",
+                         json={"structure": {"op": "delete_row", "index": 4}})
+        assert r.status_code == 200, r.text
+        # Неверный индекс — 400, а не 500.
+        assert client.patch(f"/api/sessions/{chat_a}/horae/tables/{tid}",
+                            json={"structure": {"op": "delete_row", "index": 0}}).status_code == 400
+        # Замок на посторонней ячейке не уносит заголовок столбца, вписанный ИИ.
+        client.patch(f"/api/sessions/{chat_a}/horae/tables/{tid}",
+                     json={"lock": {"type": "cell", "r": 2, "c": 2, "locked": True}})
+        b = _state_table(client, chat_b, tid)["data"]
+        assert b.get("0,1") == "Цель" and "0,2" not in b and "3,0" not in b
+    finally:
+        client.delete(f"/api/sessions/{chat_a}/horae/tables/{tid}")
+
+
+def test_lorebook_entry_with_chat_and_character_stays_in_its_chat(client):
+    cid, chat_a = _chat(client, name="Двойной")
+    _, chat_b = _chat(client, cid)
+    eid = client.post("/api/horae", json={"title": "только A", "content": "Скинет порты в JSON",
+                                          "session_id": chat_a, "character_id": cid, "always_on": True}).json()["id"]
+    try:
+        def ctx(sid):
+            return json.dumps(client.get(f"/api/sessions/{sid}/context").json(), ensure_ascii=False)
+        assert "Скинет порты" in ctx(chat_a)
+        assert "Скинет порты" not in ctx(chat_b)
+    finally:
+        client.delete(f"/api/horae/{eid}")

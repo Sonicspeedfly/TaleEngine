@@ -29,6 +29,12 @@ def test_horae_privacy_scoped_by_owner(client):
         "/api/horae",
         json={"category": "lore", "title": "Лор мира", "content": "общий для всех", "session_id": None},
     ).json()
+    # Общий персонаж (без владельца), глобальная таблица и память «local» — тоже до аккаунтов.
+    public = client.post("/api/characters", json={"name": "HoraePublic"}).json()
+    pub_chat = client.post(f"/api/sessions?character_id={public['id']}").json()["session_id"]
+    gtable = client.post(f"/api/sessions/{pub_chat}/horae/tables",
+                         json={"name": "Мир", "rows": 2, "cols": 2, "scope": "global"}).json()["id"]
+    client.post("/api/user-memory", json={"category": "work", "content": "Хирург в городской больнице"})
 
     client.put("/api/admin/security", json={"accounts_enabled": True, "admin_password": "horae_pw"})
     try:
@@ -76,6 +82,22 @@ def test_horae_privacy_scoped_by_owner(client):
         moved = client.patch(f"/api/horae/{own_h['id']}", json={"scope": "session", "session_id": shared},
                              headers=bh)
         assert moved.status_code == 200 and moved.json()["session_id"] == shared
+        # Запись с чужим чатом и своим персонажем всё равно попала бы в чужой чат.
+        assert client.post("/api/horae", json={"title": "в чужой чат", "session_id": priv,
+                                               "character_id": char_b["id"]}, headers=bh).status_code == 403
+        # Лорбук общего персонажа уходит в чаты всех, кто с ним говорит, — только админ.
+        assert client.post("/api/horae", json={"title": "в общего", "character_id": public["id"]},
+                           headers=bh).status_code == 403
+        # Заголовок глобальной таблицы виден во всех чатах — его правит только админ.
+        b_pub = client.post(f"/api/sessions?character_id={public['id']}", headers=bh)
+        assert b_pub.status_code == 200
+        assert client.patch(f"/api/sessions/{b_pub.json()['session_id']}/horae/tables/{gtable}",
+                            json={"cell": {"r": 0, "c": 1, "value": "B_WAS_HERE"}},
+                            headers=bh).status_code == 403
+        # Токен в адресе — тот же пользователь, а не «никто» с чужой памятью «local».
+        mem = client.get(f"/api/user-memory?token={b['token']}").json()
+        assert mem["profile"].startswith("u:") and not mem["items"]
+        assert client.get("/api/user-memory?profile=local", headers=bh).status_code == 403
 
         # B видит у себя только глобальный лор и расшаренную сессию.
         b_ids = {h["id"] for h in client.get("/api/horae", headers=bh).json()}

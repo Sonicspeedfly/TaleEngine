@@ -348,16 +348,32 @@ def build_router(current_user, can_access_session) -> APIRouter:
             character.horae_profile = profile
         await he.save_chat_data(db, sess.id, data)
 
-    def _check_scope(scope: str, user) -> None:
-        if scope == "global" and not _is_admin(user):
-            raise HTTPException(403, "Глобальные таблицы меняет только администратор")
+    async def _can_edit_template(db, sess, scope: str, user) -> bool:
+        """
+        Может ли пользователь менять общий шаблон таблицы: его видят чаты других
+        людей. Глобальный — только админ; персонажа — его владелец или админ
+        (общего персонажа, без владельца, — только админ, как put_profile).
+        """
+        if scope == "global":
+            return _is_admin(user)
+        if scope == "character":
+            if _is_admin(user):
+                return True
+            character = await db.get(models.Character, sess.character_id) if sess.character_id else None
+            return character is not None and character.owner_id == user.id
+        return True
+
+    async def _check_scope(db, sess, scope: str, user) -> None:
+        if not await _can_edit_template(db, sess, scope, user):
+            raise HTTPException(403, "Глобальные таблицы меняет только администратор" if scope == "global"
+                                else "Таблицы персонажа меняет только его владелец")
 
     @router.post("/sessions/{session_id}/horae/tables")
     async def create_table(session_id: int, payload: dict = Body(...), user=Depends(current_user),
                            db: AsyncSession = Depends(get_session)):
         sess = await chat(db, session_id, user)
         scope = payload.get("scope") if payload.get("scope") in ("local", "global", "character") else "local"
-        _check_scope(scope, user)
+        await _check_scope(db, sess, scope, user)
         name = (payload.get("name") or "").strip()[:100]
         if not name:
             raise HTTPException(400, "Нужно название таблицы")
@@ -397,7 +413,7 @@ def build_router(current_user, can_access_session) -> APIRouter:
             scope = table.get("scope") or "local"
             structural = any(k in payload for k in ("name", "prompt", "structure", "lock"))
             if structural:
-                _check_scope(scope, user)
+                await _check_scope(db, sess, scope, user)
             # Заголовки общего шаблона ведём отдельно от данных чата: current
             # содержит и то, что ИИ вписал в этом чате (имена в столбце 0 и т.п.),
             # а шаблон видят все чаты. В шаблон уходят только явные правки
@@ -422,8 +438,13 @@ def build_router(current_user, can_access_session) -> APIRouter:
                 cell = payload["cell"]
                 r, c = int(cell.get("r") or 0), int(cell.get("c") or 0)
                 value = str(cell.get("value") or "")[:2000]
-                table = horae_tables.set_cell(table, current, r, c, value, anchor)
+                try:
+                    table = horae_tables.set_cell(table, current, r, c, value, anchor)
+                except ValueError as exc:
+                    raise HTTPException(400, str(exc)) from exc
                 if shared is not None and horae_tables.is_shared_header(shared, table, r, c):
+                    # Заголовок общего шаблона виден в чатах других людей.
+                    await _check_scope(db, sess, scope, user)
                     if value.strip():
                         shared[f"{r},{c}"] = value
                     else:
@@ -432,23 +453,30 @@ def build_router(current_user, can_access_session) -> APIRouter:
                 st = payload["structure"]
                 op, index = st.get("op") or "", int(st.get("index") or 0)
                 before = table
-                table = horae_tables.structure(table, current, op, index, anchor)
-                if shared is not None:
-                    shared = horae_tables.shift_headers(shared, before, op, index)
+                try:
+                    table = horae_tables.structure(table, current, op, index, anchor)
+                    if shared is not None:
+                        shared = horae_tables.shift_headers(shared, before, op, index, current)
+                except ValueError as exc:
+                    raise HTTPException(400, str(exc)) from exc
             if isinstance(payload.get("lock"), dict):
                 lk = payload["lock"]
-                table = horae_tables.set_lock(table, lk.get("type") or "cell", int(lk.get("r") or 0),
-                                              int(lk.get("c") or 0), bool(lk.get("locked")))
+                kind, lr, lc = lk.get("type") or "cell", int(lk.get("r") or 0), int(lk.get("c") or 0)
+                try:
+                    table = horae_tables.set_lock(table, kind, lr, lc, bool(lk.get("locked")))
+                except ValueError as exc:
+                    raise HTTPException(400, str(exc)) from exc
                 if shared is not None and lk.get("locked"):
-                    # Закреплённая подпись строки становится частью шаблона.
-                    for k, v in horae_tables.promotable_headers(table, current).items():
+                    # Закреплённая подпись строки становится частью шаблона —
+                    # только та, что под новым замком.
+                    for k, v in horae_tables.locked_labels(current, kind, lr, lc).items():
                         shared.setdefault(k, v)
             if payload.get("clear"):
                 table = horae_tables.clear_data(table, current, anchor)
             new_scope = payload.get("scope")
             if new_scope in ("local", "global", "character") and new_scope != scope:
-                _check_scope(new_scope, user)
-                _check_scope(scope, user)
+                await _check_scope(db, sess, new_scope, user)
+                await _check_scope(db, sess, scope, user)
                 await _remove_table(db, sess, table)
                 table = {**table, "scope": new_scope, "base": dict(current), "base_anchor": anchor}
                 if new_scope == "local":
@@ -468,7 +496,7 @@ def build_router(current_user, can_access_session) -> APIRouter:
             table = next((t for t in comp.tables if t["id"] == table_id), None)
             if table is None:
                 raise HTTPException(404, "Таблица не найдена")
-            _check_scope(table.get("scope") or "local", user)
+            await _check_scope(db, sess, table.get("scope") or "local", user)
             await _remove_table(db, sess, table)
             await db.commit()
         return {"ok": True}

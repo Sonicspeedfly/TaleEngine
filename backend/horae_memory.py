@@ -1372,7 +1372,10 @@ async def _load_horae_records(session_db, session_id: int, character_id=None) ->
         and_(HoraeEntry.session_id.is_(None), HoraeEntry.character_id.is_(None)),
     ]
     if character_id is not None:
-        conds.append(HoraeEntry.character_id == character_id)
+        # Лорбук персонажа — записи без чата. Запись с чатом И персонажем
+        # действует только в своём чате (как её показывает список лорбука),
+        # а не во всех чатах этого персонажа.
+        conds.append(and_(HoraeEntry.session_id.is_(None), HoraeEntry.character_id == character_id))
 
     q = select(HoraeEntry).where(
         HoraeEntry.enabled == True,  # noqa: E712

@@ -102,6 +102,9 @@ class ChatSession(Base):
     # реплики этого чата уже просмотрены. Ветка и продолжение начинают с копий
     # старых реплик — им указатель ставится сразу на конец копии.
     profile_upto: Mapped[int] = mapped_column(Integer, default=0)
+    # Разговор, копией которого чат начался (ветка, продолжение): повтор
+    # сведения в нём — тот же разговор, а не «другой чат». 0 — сам себе корень.
+    profile_root: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     character = relationship("Character", back_populates="sessions")

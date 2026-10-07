@@ -210,8 +210,13 @@ createApp({
       // «Обо мне» — память о пользователе для всех его чатов (GET /api/user-memory):
       // { settings, categories, items, block } или null, пока не загружена.
       userMem: null,
+      userMemError: "",
       userMemNew: { category: "style", content: "" },
       userMemEdit: { id: null, content: "" },
+      // Чей профиль открыт: "" — свой; админ может открыть "local" и "tg:<id>"
+      // (Telegram без аккаунтов) — ими больше некому управлять.
+      userMemProfile: "",
+      userMemProfiles: [],
       // Мастер-снимок: каждые summaryEvery сообщений ИИ дописывает в него то,
       // что вышло из окна. Ложь — снимок не обновляется (см. memoryEngine).
       autoSummary: true,
@@ -279,7 +284,8 @@ createApp({
       mediaStatusError: "",
       mediaProbing: false,
       // Пустая форма записи памяти (тот же объект возвращает метод blankHorae()).
-      horaeEdit: { id: null, category: "lore", title: "", content: "", keywords: "", always_on: false, enabled: true, priority: 0, scope: "session", origScope: "session" },
+      // Без открытого чата — «во всех чатах» (как blankHorae); открыли чат — «только этот».
+      horaeEdit: { id: null, category: "lore", title: "", content: "", keywords: "", always_on: false, enabled: true, priority: 0, scope: "global", origScope: "global" },
 
       // --- Персоны и заметка автора (вкладка Persona) ---
       personas: [],
@@ -2303,6 +2309,7 @@ createApp({
       // Пока чат переключается, сокет ещё смотрит в прежний чат — отправка
       // ждёт (send() проверяет флаг), иначе реплика ушла бы не туда.
       this.switchingChat = true;
+      const seq = (this._openSeq = (this._openSeq || 0) + 1);
       this.sessionId = s.id;
       this._clearPending(s.id); // открыли чат — снимаем метку «пришёл ответ»
       // Метаданные берём из переданного объекта, а недостающее дотягиваем из
@@ -2321,8 +2328,11 @@ createApp({
       try {
         await this.loadMessages(true);   // свежее открытие — грузим последнюю порцию
       } finally {
-        this.connectWs();
-        this.switchingChat = false;
+        // Быстро открыли ещё один чат — сокет и флаг за ним, не за этим.
+        if (seq === this._openSeq) {
+          this.connectWs();
+          this.switchingChat = false;
+        }
       }
     },
     // Сохранить/восстановить последний открытый чат (чтобы после F5 сразу писать).
@@ -2373,6 +2383,8 @@ createApp({
       this._handoffStreaming();
       this.sharedView = s;
       this.replyToId = null;   // ответ — только в пределах чата (см. openSession)
+      this.switchingChat = true;   // отправка ждёт новый сокет (см. openSession)
+      const seq = (this._openSeq = (this._openSeq || 0) + 1);
       this.sessionId = s.id;
       this._clearPending(s.id);
       this.authorNote = "";
@@ -2381,8 +2393,14 @@ createApp({
       this.sessionTimezone = s.timezone || ""; // чужой чат: пояс владельца, не перезаписываем
       this.closeSidebarOnMobile();
       this.notifOpen = false;
-      await this.loadMessages(true);   // свежее открытие — грузим последнюю порцию
-      this.connectWs();
+      try {
+        await this.loadMessages(true);   // свежее открытие — грузим последнюю порцию
+      } finally {
+        if (seq === this._openSeq) {
+          this.connectWs();
+          this.switchingChat = false;
+        }
+      }
     },
     // Перевести идущую генерацию текущего чата в фон: она досчитается на сервере,
     // мы поймаем «готово» через SSE и подсветим тот чат (а не свежеоткрытый).
@@ -2674,7 +2692,10 @@ createApp({
       // Окно = столько же, сколько уже показано (сохраняем прокрутку вверх), но не всё:
       // на открытии — msgPageSize (настройка), максимум 400.
       const limit = Math.min(400, Math.max(this.msgPageSize, this.messages.length + 2));
-      const rows = await this.api("/sessions/" + this.sessionId + "/messages?limit=" + limit);
+      const sid = this.sessionId;
+      const rows = await this.api("/sessions/" + sid + "/messages?limit=" + limit);
+      // Пока ждали, открыли другой чат — эти сообщения уже не его.
+      if (sid !== this.sessionId) return;
       this.messages = rows;
       this.noMoreMessages = rows.length < limit; // получили меньше лимита → старых нет
       if (wasNearBottom) this.scrollDown();
@@ -2688,10 +2709,12 @@ createApp({
       const el = this.$refs.messages;
       const prevH = el ? el.scrollHeight : 0;
       const page = this.msgPageSize;
+      const sid = this.sessionId;
       try {
         const older = await this.api(
-          "/sessions/" + this.sessionId + "/messages?before=" + oldest.id + "&limit=" + page
+          "/sessions/" + sid + "/messages?before=" + oldest.id + "&limit=" + page
         );
+        if (sid !== this.sessionId) return;   // открыли другой чат, пока ждали
         if (older.length < page) this.noMoreMessages = true;
         if (older.length) {
           this.messages = older.concat(this.messages);
@@ -3136,6 +3159,9 @@ createApp({
       const content = this.input.trim();
       if ((!content && this.pendingAttachments.length === 0) || !this.connected || this.streaming) return;
       if (this.switchingChat) return;   // сокет ещё от прежнего чата (см. openSession)
+      // Чат, в котором нажали «Отправить»: пока дочитываются файлы, человек мог
+      // перейти в другой — тогда не отправляем (текст и файлы остаются в поле).
+      const sid = this.sessionId;
       // Дожидаемся дочитывания ВСЕХ файлов сообщения, прежде чем отправлять — иначе
       // сообщение могло уйти без ещё не загруженного вложения (гонка с FileReader).
       if (this.attachmentsLoading) {
@@ -3143,6 +3169,7 @@ createApp({
         await this._awaitAttachments();
         this.waitingFiles = false;
         if (!this.connected || this.streaming) return; // состояние изменилось, пока ждали
+        if (this.switchingChat || this.sessionId !== sid) return;
       }
       this._dropBadAttachments(); // выкидываем не прочитавшиеся вложения
       if (!content && this.pendingAttachments.length === 0) return; // всё отвалилось
@@ -3213,7 +3240,7 @@ createApp({
         }));
         for (const a of bigList) fd.append("files", attFiles[a.id], a.name || "file");
         for (const a of bigList) delete attFiles[a.id];
-        this._postWithProgress("/sessions/" + this.sessionId + "/send_form", fd).then((r) => {
+        this._postWithProgress("/sessions/" + sid + "/send_form", fd).then((r) => {
           this.currentJobId = r.job_id;
           this.processingNote = true; // файл на сервере — дальше работает нейросеть
           // HTTP-ход не получает события «job» по сокету: реплика сохранена,
@@ -3227,7 +3254,7 @@ createApp({
       } else if (attachments.length) {
         // Вложения (особенно аудио/видео) не влезают в WebSocket-кадр (~16 МБ) —
         // отправляем ход по HTTP с ПРОГРЕССОМ загрузки, ответ слушаем по SSE.
-        this._postWithProgress("/sessions/" + this.sessionId + "/send", {
+        this._postWithProgress("/sessions/" + sid + "/send", {
           content, attachments, params: this.params, reply_to_message_id: replyTo,
         }).then((r) => {
           this.currentJobId = r.job_id;
@@ -4082,75 +4109,120 @@ createApp({
         enabled: h.enabled, priority: h.priority, scope, origScope: scope,
       };
     },
+    // Запись «во всех чатах» в режиме аккаунтов меняет только админ (её видят все).
+    horaeLocked(h) { return !this.isAdmin && this.horaeScope(h) === "global"; },
     async saveHorae() {
       const h = this.horaeEdit;
+      if (h.scope === "session" && !this.sessionId) {
+        this.showToast("Откройте чат, чтобы добавить запись только для него");
+        return;
+      }
       const payload = {
         category: h.category, title: h.title, content: h.content,
         keywords: h.keywords.split(",").map((s) => s.trim()).filter(Boolean),
         always_on: h.always_on, enabled: h.enabled, priority: Number(h.priority) || 0,
       };
-      if (h.id) {
-        if (h.scope !== h.origScope && h.scope !== "character") {
-          payload.scope = h.scope;
-          if (h.scope === "session") payload.session_id = this.sessionId;
+      try {
+        if (h.id) {
+          if (h.scope !== h.origScope && h.scope !== "character") {
+            payload.scope = h.scope;
+            if (h.scope === "session") payload.session_id = this.sessionId;
+          }
+          await this.api("/horae/" + h.id, { method: "PATCH", body: JSON.stringify(payload) });
+        } else {
+          payload.session_id = h.scope === "session" ? this.sessionId : null;
+          await this.api("/horae", { method: "POST", body: JSON.stringify(payload) });
         }
-        await this.api("/horae/" + h.id, { method: "PATCH", body: JSON.stringify(payload) });
-      } else {
-        payload.session_id = h.scope === "session" ? this.sessionId : null;
-        await this.api("/horae", { method: "POST", body: JSON.stringify(payload) });
+      } catch (e) {
+        this.showToast("Лорбук: " + e.message);   // форму не сбрасываем — текст не теряется
+        return;
       }
       this.horaeEdit = this.blankHorae();
       await this.loadHorae();
     },
-    async deleteHorae(h) { await this.api("/horae/" + h.id, { method: "DELETE" }); await this.loadHorae(); },
+    async deleteHorae(h) {
+      try { await this.api("/horae/" + h.id, { method: "DELETE" }); } catch (e) { this.showToast("Лорбук: " + e.message); }
+      await this.loadHorae();
+    },
 
     // ---------- «Обо мне»: память о пользователе (все чаты) ----------
+    _umq(path) {
+      return "/user-memory" + path + (this.userMemProfile ? "?profile=" + encodeURIComponent(this.userMemProfile) : "");
+    },
     async loadUserMemory() {
-      try { this.userMem = await this.api("/user-memory"); } catch (e) { this.userMem = null; }
+      try {
+        this.userMem = await this.api(this._umq(""));
+        this.userMemError = "";
+      } catch (e) {
+        // Прежний список не стираем: сбой перечитывания не должен его прятать.
+        this.userMemError = e.message || "нет связи";
+      }
+      if (this.isAdmin) {
+        try { this.userMemProfiles = await this.api("/user-memory/profiles"); } catch (e) { this.userMemProfiles = []; }
+      }
+    },
+    async switchUserMemProfile(key) {
+      this.userMemProfile = key;
+      this.userMemEdit = { id: null, content: "" };
+      await this.loadUserMemory();
     },
     userMemLabel(cat) {
       const c = ((this.userMem && this.userMem.categories) || []).find((x) => x.key === cat);
       return c ? c.label : cat;
     },
+    // Запрос к памяти о пользователе → true при успехе. Ошибку показываем
+    // тостом; формы вызывающий сбрасывает только при успехе.
     async _userMemCall(path, opts, okText) {
+      let ok = true;
       try {
-        await this.api(path, opts);
+        await this.api(this._umq(path), opts);
         if (okText) this.showToast(okText);
       } catch (e) {
+        ok = false;
         this.showToast("Память о вас: " + e.message);
       }
       await this.loadUserMemory();
       this.loadCtxStats();
+      return ok;
     },
-    async saveUserMemSettings(patch) {
-      await this._userMemCall("/user-memory/settings", { method: "PUT", body: JSON.stringify(patch) });
+    // Флажки шлют то, что видно на экране; не сохранилось — возвращаем как было.
+    async saveUserMemSettings(key, ev) {
+      const want = ev.target.checked;
+      if (!(await this._userMemCall("/settings", { method: "PUT", body: JSON.stringify({ [key]: want }) }))) {
+        ev.target.checked = !want;
+      }
     },
     async addUserMem() {
       const n = this.userMemNew;
       if (!n.content.trim()) return;
-      await this._userMemCall("/user-memory", { method: "POST", body: JSON.stringify(n) });
-      this.userMemNew = { category: n.category, content: "" };
+      if (await this._userMemCall("", { method: "POST", body: JSON.stringify(n) })) {
+        this.userMemNew = { category: n.category, content: "" };
+      }
     },
     async confirmUserMem(it) {
-      await this._userMemCall("/user-memory/" + it.id, { method: "PATCH", body: JSON.stringify({ status: "active" }) });
+      await this._userMemCall("/" + it.id, { method: "PATCH", body: JSON.stringify({ status: "active" }) });
     },
-    async toggleUserMem(it) {
-      await this._userMemCall("/user-memory/" + it.id, { method: "PATCH", body: JSON.stringify({ enabled: !it.enabled }) });
+    async toggleUserMem(it, ev) {
+      const want = ev.target.checked;
+      if (!(await this._userMemCall("/" + it.id, { method: "PATCH", body: JSON.stringify({ enabled: want }) }))) {
+        ev.target.checked = !want;
+      }
     },
     startEditUserMem(it) { this.userMemEdit = { id: it.id, content: it.content }; },
     async saveEditUserMem() {
       const e = this.userMemEdit;
       if (!e.id || !e.content.trim()) return;
-      await this._userMemCall("/user-memory/" + e.id, { method: "PATCH", body: JSON.stringify({ content: e.content }) });
-      this.userMemEdit = { id: null, content: "" };
+      if (await this._userMemCall("/" + e.id, { method: "PATCH", body: JSON.stringify({ content: e.content }) })) {
+        this.userMemEdit = { id: null, content: "" };
+      }
     },
     async deleteUserMem(it) {
-      await this._userMemCall("/user-memory/" + it.id, { method: "DELETE" });
+      await this._userMemCall("/" + it.id, { method: "DELETE" });
     },
     async clearUserMem() {
       const ok = await this.askConfirm("Стереть всё, что система запомнила о вас? Чаты и их память это не затронет.",
         { title: "Очистить «Обо мне»", okText: "Стереть" });
-      if (ok) await this._userMemCall("/user-memory", { method: "DELETE" }, "Память о вас очищена");
+      if (ok) await this._userMemCall("", { method: "DELETE" }, "Память о вас очищена");
     },
 
     // ---------- Вкладка «Память»: раздел и чем сжимать историю ----------
@@ -6590,8 +6662,9 @@ createApp({
                 <span class="scope-tag global">🌐 все чаты</span> — в каждом разговоре, с любым персонажем.
                 Здесь показаны записи, которые действуют в этом чате. При импорте чата из SillyTavern сюда попадает снимок состояния (💬, always_on).</p>
               <p v-if="horaeGlobalCount" class="field-hint">🌐 {{ horaeGlobalCount }} {{ plural(horaeGlobalCount, 'запись подмешивается', 'записи подмешиваются', 'записей подмешиваются') }}
-                во все чаты. Если чат «вспоминает» то, чего в нём не было, — проверьте их и перенесите в нужный чат (✎ → «только этот чат»).
-                Сведения о вас самих лучше хранить в разделе «Обо мне».</p>
+                во все чаты. Если чат «вспоминает» то, чего в нём не было, — <template v-if="isAdmin">проверьте их и
+                перенесите в нужный чат (✎ → «только этот чат»)</template><template v-else>попросите администратора
+                проверить их: такие записи меняет только он</template>. Сведения о вас самих лучше хранить в разделе «Обо мне».</p>
               <div class="card">
                 <input v-model="horaeEdit.title" placeholder="Заголовок" style="margin-bottom:6px" />
                 <textarea v-model="horaeEdit.content" rows="3" placeholder="Содержимое" style="margin-bottom:6px"></textarea>
@@ -6616,7 +6689,8 @@ createApp({
                   разговор, с любым персонажем. То, что относится только к этому чату, лучше оставить «только этот чат».</p>
                 <p v-else-if="horaeEdit.scope === 'character'" class="field-hint">Запись из карточки персонажа: действует во всех его чатах.</p>
                 <div class="row">
-                  <button class="btn-primary" @click="saveHorae">{{ horaeEdit.id ? 'Обновить' : 'Добавить' }}</button>
+                  <button class="btn-primary" @click="saveHorae"
+                          :disabled="!horaeEdit.id && horaeEdit.scope === 'global' && !isAdmin">{{ horaeEdit.id ? 'Обновить' : 'Добавить' }}</button>
                   <button v-if="horaeEdit.id" @click="horaeEdit = blankHorae()">Отмена</button>
                 </div>
               </div>
@@ -6626,8 +6700,10 @@ createApp({
                   <span style="display:inline-flex; align-items:center; gap:4px">
                     <span class="scope-tag" :class="horaeScope(h)">{{ horaeScopeLabel(h) }}</span>
                     <span class="tag">{{ h.always_on ? 'always' : ((h.keywords || []).join(',') || h.category) }}</span>
-                    <button class="btn-icon" @click="editHorae(h)" :aria-label="'Изменить запись памяти: ' + (h.title || h.category)">✎</button>
-                    <button class="btn-danger" @click="deleteHorae(h)" :aria-label="'Удалить запись памяти: ' + (h.title || h.category)">🗑</button>
+                    <template v-if="!horaeLocked(h)">
+                      <button class="btn-icon" @click="editHorae(h)" :aria-label="'Изменить запись памяти: ' + (h.title || h.category)">✎</button>
+                      <button class="btn-danger" @click="deleteHorae(h)" :aria-label="'Удалить запись памяти: ' + (h.title || h.category)">🗑</button>
+                    </template>
                   </span>
                 </div>
                 <!-- Мастер-снимок (категория summary) — до 12 000 токенов с разделами
@@ -6648,17 +6724,26 @@ createApp({
                 к вам обращаться, на каком языке писать, чем вы занимаетесь, что умеете и любите, какие ответы вам удобны.
                 Темы разговоров, планы («скину файл»), события сюжета и то, что вы отыгрываете, сюда <b>не</b> попадают — они
                 остаются в своём чате.</p>
-              <p v-if="!userMem" class="muted">Загружаю…</p>
-              <template v-else>
+              <div v-if="userMemProfiles.length > 1" class="row" style="margin-bottom:8px">
+                <label>Чья память
+                  <select :value="userMemProfile" @change="switchUserMemProfile($event.target.value)">
+                    <option v-for="p in userMemProfiles" :key="p.key" :value="p.own ? '' : p.key">{{ p.label }} ({{ p.count }})</option>
+                  </select>
+                </label>
+              </div>
+              <p v-if="userMemError" class="field-hint danger-text">Не удалось загрузить: {{ userMemError }}
+                <button class="btn-icon" @click="loadUserMemory" aria-label="Повторить загрузку">↻</button></p>
+              <p v-if="!userMem && !userMemError" class="muted">Загружаю…</p>
+              <template v-if="userMem">
                 <div class="card">
                   <label class="check"><input type="checkbox" :checked="userMem.settings.enabled"
-                    @change="saveUserMemSettings({ enabled: $event.target.checked })" /> Учитывать в чатах</label>
+                    @change="saveUserMemSettings('enabled', $event)" /> Учитывать в чатах</label>
                   <label class="check"><input type="checkbox" :checked="userMem.settings.auto"
-                    @change="saveUserMemSettings({ auto: $event.target.checked })" /> Замечать новое в моих репликах</label>
+                    @change="saveUserMemSettings('auto', $event)" /> Замечать новое в моих репликах</label>
                   <p class="field-hint">Раз в несколько ваших реплик модель памяти (как для сжатия) читает только их — не ответы
                     персонажа — и предлагает сведения с цитатой. Чаты, открытые друзьям, не читаются.</p>
                   <label class="check"><input type="checkbox" :checked="userMem.settings.instant"
-                    @change="saveUserMemSettings({ instant: $event.target.checked })" /> Применять сразу, без подтверждения</label>
+                    @change="saveUserMemSettings('instant', $event)" /> Применять сразу, без подтверждения</label>
                   <p class="field-hint">Выключено — новое сначала ждёт ниже. Само включается, если вы скажете это ещё
                     в одном чате другими словами или вне роли — ((…)) или /ooc.</p>
                 </div>
@@ -6687,7 +6772,7 @@ createApp({
                     <span><span class="tag">{{ userMemLabel(it.category) }}</span> {{ it.content }}</span>
                     <span style="display:inline-flex; gap:4px; align-items:center">
                       <label class="check" style="margin:0" :title="it.enabled ? 'Учитывается' : 'Выключено'">
-                        <input type="checkbox" :checked="it.enabled" @change="toggleUserMem(it)" :aria-label="'Учитывать: ' + it.content" /></label>
+                        <input type="checkbox" :checked="it.enabled" @change="toggleUserMem(it, $event)" :aria-label="'Учитывать: ' + it.content" /></label>
                       <button class="btn-icon" @click="startEditUserMem(it)" :aria-label="'Изменить: ' + it.content">✎</button>
                       <button class="btn-danger" @click="deleteUserMem(it)" :aria-label="'Удалить: ' + it.content">🗑</button>
                     </span>

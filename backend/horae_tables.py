@@ -514,9 +514,35 @@ def promotable_headers(table: dict, data: dict) -> dict[str, str]:
             if is_shared_header({}, table, *_parse_key(k))}
 
 
-def shift_headers(headers: dict[str, str], table: dict, op: str, index: int) -> dict[str, str]:
-    """Сдвинуть заголовки шаблона той же правкой структуры, что и таблицу (table — до правки)."""
-    return _headers_of(structure(table, headers, op, index, 0)["base"])
+def locked_labels(data: dict, kind: str, r: int, c: int) -> dict[str, str]:
+    """
+    Подписи строк (столбец 0), которые закрывает новый замок: строки r,
+    ячейки (r, 0) или всего столбца 0. Строку 0 замок в шаблон не переносит —
+    заголовки столбцов уходят туда только явной правкой.
+    """
+    cells = _headers_of(data or {})
+    if kind == "row" and r > 0:
+        keys = {_key(r, 0)}
+    elif kind == "cell" and c == 0 and r > 0:
+        keys = {_key(r, 0)}
+    elif kind == "col" and c == 0:
+        keys = {k for k in cells if _parse_key(k)[0] > 0}
+    else:
+        keys = set()
+    return {k: v for k, v in cells.items() if k in keys and v.strip()}
+
+
+def shift_headers(headers: dict[str, str], table: dict, op: str, index: int,
+                  data: dict | None = None) -> dict[str, str]:
+    """
+    Сдвинуть заголовки шаблона той же правкой структуры, что и таблицу.
+    table — таблица до правки, data — её данные: размер берётся по ним (ИИ мог
+    дописать строки сверх шаблона), иначе удаление такой строки не прошло бы
+    проверку границ, а вставка встала бы не туда.
+    """
+    rows, cols = _dims(table.get("rows"), table.get("cols"), _norm_cells(data or {}))
+    sized = {**table, "rows": rows, "cols": cols}
+    return _headers_of(structure(sized, headers, op, index, 0)["base"])
 
 
 def split_effective(table: dict, headers: dict | None = None) -> tuple[dict | None, dict]:

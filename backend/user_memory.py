@@ -43,7 +43,7 @@ from sqlalchemy import func, select
 from backend import llm_gateway, models
 from backend.config import settings
 from backend.database import AsyncSessionLocal
-from backend.horae_recall import _norm_key, terms
+from backend.horae_recall import _STOPWORDS, _norm_key, terms
 
 logger = logging.getLogger("aichat.user_memory")
 
@@ -120,13 +120,20 @@ BLOCK_HEADER = (
 
 # Планы, время, обсуждения и разовые просьбы — признак темы чата, а не человека.
 _TRANSIENT_RE = re.compile(
-    r"\b(?:буд(?:у|ет|ем|ете|ут)|собира\w*|планир\w*|пришл\w*|прислат\w*|скин\w*|отправ\w*|"
-    r"обеща\w*|сегодня|завтра|вчера|на днях|скоро|в этом чате|обсужда\w*|"
-    r"спросил\w*|попросил\w*|хотел\w* бы получить|will|going to|today|tomorrow|yesterday)\b",
+    r"\b(?:буд(?:у|ет|ем|ете|ут)|собира(?:юсь|ется|емся|етесь|ются|лся|лась|лись)|"
+    r"планиру(?:ю|ет|ем|ете|ют)|пришл\w*|прислат\w*|скин\w*|кин(?:у|ет|ем|ете|ут)|вылож\w*|"
+    r"отправ\w*|покаж(?:у|ет|ем|ете|ут)|поделит\w*|обеща\w*|сегодня|завтра|вчера|на днях|скоро|"
+    r"в этом чате|обсужда\w*|спросил\w*|хотел\w* бы получить|today|tomorrow|yesterday|tonight)\b",
     re.IGNORECASE,
 )
-_CODE_RE = re.compile(r"(?:://|www\.|```|[{}<>\[\]`]|\b\w+\.(?:json|txt|py|js|csv|md|pdf|docx?|xlsx?|png|jpe?g)\b)",
-                      re.IGNORECASE)
+# Код, ссылки и файлы. Имена технологий вида Node.js — не файлы.
+_CODE_RE = re.compile(
+    r"(?:://|www\.|```|[{}<>\[\]`]|\b(?!(?:node|vue|next|nuxt|react|three|express|d3|angular|svelte|"
+    r"solid|ember|backbone|deno|bun|chart|socket)\.js\b)\w+\.(?:json|txt|py|js|csv|md|pdf|docx?|xlsx?|png|jpe?g)\b)",
+    re.IGNORECASE)
+# Отрицание и «ты/вы» меняют смысл при тех же словах: «на ты» ≠ «на вы».
+_POLARITY_RE = re.compile(r"\b(?:не|ни|нет|без|no|not|never|ты|вы)\b", re.IGNORECASE)
+_NAME_ENDINGS = r"(?:а|я|ы|и|е|у|ю|о|ой|ей|ою|ею|ам|ям|ах|ях)?"
 _LONG_TERM_RE = re.compile(
     r"\b(?:давно|много лет|с детства|всю жизнь|годами|всегда|постоянно|обожаю|увлекаюсь|"
     r"профессионально|по профессии|years|always|for a long time)\b", re.IGNORECASE)
@@ -208,12 +215,21 @@ def _quote_found(quote: str, source_norm: str, source_terms: set[str]) -> bool:
 
 
 def _names_pattern(names) -> re.Pattern | None:
-    """Имена персонажей и персоны с падежными окончаниями («Джеми», «Артура»)."""
-    words = {w for n in names or [] for w in _norm_key(n).split() if len(w) >= 3}
+    """
+    Имена персонажей и персоны с падежными окончаниями: «Артура», «Лиру»,
+    «Катей», «Еву». Служебные слова из имён («The Narrator») не берём.
+    """
+    words = {w for n in names or [] for w in _norm_key(n).split() if len(w) >= 3 and w not in _STOPWORDS}
     if not words:
         return None
-    alts = [re.escape(w[:-1]) + r"\w{0,3}" if len(w) >= 5 else re.escape(w) + r"\w{0,2}"
-            for w in sorted(words, key=len, reverse=True)]
+    alts = []
+    for w in sorted(words, key=len, reverse=True):
+        if len(w) >= 5:
+            alts.append(re.escape(w[:-1]) + r"\w{0,3}")
+        elif w[-1] in "аяоеиыуюьй":
+            alts.append(re.escape(w[:-1]) + _NAME_ENDINGS)   # «Лира» → «Лиру», «Катя» → «Катей»
+        else:
+            alts.append(re.escape(w) + _NAME_ENDINGS)        # «Ян» → «Яна», «Олег» → «Олегу»
     return re.compile(r"\b(?:" + "|".join(alts) + r")\b", re.IGNORECASE)
 
 
@@ -229,7 +245,7 @@ def screen(item, source_norm: str, source_terms: set[str], names_re) -> dict | N
     quote = _clean(item.get("quote"))
     if cat not in CATEGORIES or not text or not quote:
         return None
-    if len(text) > MAX_TEXT or len(text.split()) < 1 or len(text) < 3:
+    if len(text) > MAX_TEXT or len(text) < (2 if cat == "name" else 3):
         return None
     if _TRANSIENT_RE.search(text) or _CODE_RE.search(text):
         return None
@@ -260,7 +276,14 @@ def parse_reply(text: str) -> dict:
     return {"add": add[:12], "drop": drop[:6]}
 
 
+def _polarity(text: str) -> set[str]:
+    return {m.lower() for m in _POLARITY_RE.findall(_norm_key(text))}
+
+
 def _similar(a: str, b: str) -> bool:
+    """Одно ли это сведение другими словами (для категорий с несколькими значениями)."""
+    if _polarity(a) != _polarity(b):
+        return False
     ta, tb = terms(a), terms(b)
     if not ta or not tb:
         return _norm_key(a) == _norm_key(b)
@@ -279,90 +302,118 @@ def _quotes(rec) -> list[str]:
 
 
 def _confirmed_elsewhere(rec) -> bool:
-    """Повтор в другом чате другой фразой — сведение общее, а не тема разговора."""
+    """
+    Повтор в другом разговоре другой фразой — сведение общее, а не тема.
+    sessions_seen хранит корни разговоров (ветка и продолжение — тот же).
+    """
     return len(set(_seen(rec))) >= 2 and len(set(_quotes(rec))) >= 2
 
 
-async def _activate(db, rec, profile_key: str) -> None:
-    """Сделать запись действующей; в категории с одним значением — заменить прежнюю."""
+async def _activate(db, rec, profile_key: str) -> list:
+    """
+    Сделать запись действующей; в категории с одним значением — заменить
+    прежнюю. Возвращает удалённые записи (вызывающий убирает их из своих списков).
+    """
     rec.status = "active"
     single = CATEGORIES.get(rec.category, ("", False, 6))[1]
     if not single:
-        return
+        return []
     olds = (await db.execute(select(models.UserMemory).where(
         models.UserMemory.profile_key == profile_key, models.UserMemory.category == rec.category,
         models.UserMemory.status == "active", models.UserMemory.id != rec.id,
     ))).scalars().all()
-    for old in olds:
-        if old.locked:
-            rec.status = "candidate"   # человек сам задал значение — авто его не меняет
-            return
+    if any(old.locked for old in olds):
+        rec.status = "candidate"   # человек сам задал значение — авто его не меняет
+        return []
     for old in olds:
         await db.delete(old)
+    await db.flush()
+    return list(olds)
 
 
-async def _enforce_caps(db, profile_key: str) -> None:
+async def _enforce_caps(db, profile_key: str, keep: set[int] = frozenset()) -> None:
+    """
+    Потолки записей. Вытесняются самые слабые (реже встречались, давно не
+    подтверждались) — но не закреплённые человеком и не включённые только что
+    (keep): иначе явная реплика вне роли исчезала бы тут же.
+    """
     rows = (await db.execute(select(models.UserMemory).where(
         models.UserMemory.profile_key == profile_key))).scalars().all()
 
     def weak_first(r):
         return (r.hits or 0, r.updated_at or datetime.min, r.id)
 
+    def evictable(r):
+        return not r.locked and r.id not in keep
+
     active = [r for r in rows if r.status == "active"]
     for cat, (_label, _single, cap) in CATEGORIES.items():
-        mine = sorted([r for r in active if r.category == cat and not r.locked], key=weak_first)
+        mine = sorted([r for r in active if r.category == cat and evictable(r)], key=weak_first)
         extra = len([r for r in active if r.category == cat]) - cap
         for r in mine[:max(0, extra)]:
             await db.delete(r)
             active.remove(r)
     extra = len(active) - MAX_ACTIVE
-    for r in sorted([r for r in active if not r.locked], key=weak_first)[:max(0, extra)]:
+    for r in sorted([r for r in active if evictable(r)], key=weak_first)[:max(0, extra)]:
         await db.delete(r)
-    cands = sorted([r for r in rows if r.status == "candidate"], key=weak_first)
-    for r in cands[:max(0, len(cands) - MAX_CANDIDATES)]:
+    cands = sorted([r for r in rows if r.status == "candidate" and r.id not in keep], key=weak_first)
+    extra = len([r for r in rows if r.status == "candidate"]) - MAX_CANDIDATES
+    for r in cands[:max(0, extra)]:
         await db.delete(r)
 
 
-async def apply(db, profile_key: str, session_id: int, found: list[dict], drops: list[int],
+async def apply(db, profile_key: str, conversation: int, found: list[dict], drops: list[int],
                 *, out_of_role: set[str] | None = None, instant: bool = False) -> dict:
     """
-    Записать отобранные сведения. found — результат screen(); drops — id
-    записей, которые пользователь опроверг (цитата уже проверена).
-    out_of_role — нормализованные цитаты из реплик вне роли: такие сведения
-    действуют сразу. Возвращает счётчики для журнала и тестов.
+    Записать отобранные сведения. conversation — корень разговора (см.
+    conversation_of): повтор считается «в другом чате», только если корни
+    разные. found — результат screen(); drops — id записей, которые
+    пользователь опроверг (цитата уже проверена). out_of_role —
+    нормализованные реплики вне роли: сведения из них действуют сразу.
+    Возвращает счётчики для журнала и тестов.
     """
     stats = {"added": 0, "bumped": 0, "activated": 0, "dropped": 0}
-    rows = (await db.execute(select(models.UserMemory).where(
-        models.UserMemory.profile_key == profile_key))).scalars().all()
+    rows = list((await db.execute(select(models.UserMemory).where(
+        models.UserMemory.profile_key == profile_key))).scalars().all())
     for rid in drops:
         rec = next((r for r in rows if r.id == rid), None)
         if rec is not None and not rec.locked and rec.source == "auto":
             await db.delete(rec)
             rows.remove(rec)
             stats["dropped"] += 1
+    # Удаление — до вставок: иначе INSERT записи с тем же ключом ушёл бы раньше
+    # DELETE и нарушил уникальность.
+    await db.flush()
     now = datetime.utcnow()
+    touched: set[int] = set()
     for item in found:
         cat, text, qkey = item["cat"], item["text"], _norm_key(item["quote"])
         key = norm_key(cat, text)
-        rec = next((r for r in rows if r.norm_key == key), None) or next(
-            (r for r in rows if r.category == cat and _similar(r.content, text)), None)
+        rec = next((r for r in rows if r.norm_key == key), None)
+        if rec is None and not CATEGORIES[cat][1]:
+            # Другие слова того же сведения. В категориях с одним значением —
+            # только точное совпадение: «на ты» и «на вы» — разные значения.
+            rec = next((r for r in rows if r.category == cat and _similar(r.content, text)), None)
         ooc = len(qkey) >= 5 and any(qkey in o for o in out_of_role or ())
         if rec is not None:
             seen, quotes = _seen(rec), _quotes(rec)
-            if session_id in seen and qkey in quotes:
+            if conversation in seen and qkey in quotes:
                 continue
-            rec.sessions_seen = (seen + ([session_id] if session_id not in seen else []))[-20:]
+            rec.sessions_seen = (seen + ([conversation] if conversation not in seen else []))[-20:]
             rec.meta = {**(rec.meta or {}), "quotes": (quotes + ([qkey] if qkey not in quotes else []))[-10:]}
             rec.hits = (rec.hits or 0) + 1
             rec.updated_at = now
             stats["bumped"] += 1
             if rec.status == "candidate" and (ooc or instant or _confirmed_elsewhere(rec)):
-                await _activate(db, rec, profile_key)
-                stats["activated"] += rec.status == "active"
+                for gone in await _activate(db, rec, profile_key):
+                    if gone in rows:
+                        rows.remove(gone)
+                if rec.status == "active":
+                    touched.add(rec.id)
             continue
         rec = models.UserMemory(
             profile_key=profile_key, category=cat, content=text, norm_key=key, status="candidate",
-            enabled=True, source="auto", locked=False, hits=1, sessions_seen=[session_id],
+            enabled=True, source="auto", locked=False, hits=1, sessions_seen=[conversation],
             meta={"quotes": [qkey], "quote": item["quote"][:200]}, updated_at=now,
         )
         db.add(rec)
@@ -370,10 +421,15 @@ async def apply(db, profile_key: str, session_id: int, found: list[dict], drops:
         rows.append(rec)
         stats["added"] += 1
         if ooc or instant:
-            await _activate(db, rec, profile_key)
-            stats["activated"] += rec.status == "active"
+            for gone in await _activate(db, rec, profile_key):
+                if gone in rows:
+                    rows.remove(gone)
+            if rec.status == "active":
+                touched.add(rec.id)
     await db.flush()
-    await _enforce_caps(db, profile_key)
+    await _enforce_caps(db, profile_key, keep=touched)
+    await db.flush()
+    stats["activated"] = len([r for r in rows if r.id in touched and r.status == "active"])
     return stats
 
 
@@ -474,7 +530,13 @@ async def _update(session_id: int, force: bool) -> dict | None:
         pkey = key_for_session(sess)
         conf = await get_settings(db, pkey)
         if not conf["auto"] or await is_shared(db, session_id):
+            # Сбор выключен или чат открыт другу: эти реплики не читаем и
+            # потом — указатель уходит в конец, иначе после «включить» или
+            # закрытия доступа они (и реплики друга) ушли бы в разбор.
+            await skip_to_end(db, session_id)
+            await db.commit()
             return None
+        conversation = conversation_of(sess)
         upto = int(sess.profile_upto or 0)
         msgs = (await db.execute(
             select(models.Message).where(models.Message.session_id == session_id,
@@ -530,7 +592,10 @@ async def _update(session_id: int, force: bool) -> dict | None:
         if sess is None:
             return None
         conf = await get_settings(db, pkey)
-        stats = await apply(db, pkey, session_id, found, drops, out_of_role=ooc, instant=conf["instant"])
+        if conf["auto"]:   # сбор выключили, пока шёл запрос, — разобранное не пишем
+            stats = await apply(db, pkey, conversation, found, drops, out_of_role=ooc, instant=conf["instant"])
+        else:
+            stats = {"added": 0, "bumped": 0, "activated": 0, "dropped": 0}
         sess.profile_upto = max(int(sess.profile_upto or 0), last_id)
         await db.commit()
     _failed_at.pop(session_id, None)
@@ -539,13 +604,44 @@ async def _update(session_id: int, force: bool) -> dict | None:
     return stats
 
 
-async def mark_copied(db, session_id: int) -> None:
-    """Ветка/продолжение: скопированные реплики — не новые слова человека."""
+def conversation_of(sess) -> int:
+    """Корень разговора: ветка и продолжение — тот же разговор, что и исходный чат."""
+    return int(getattr(sess, "profile_root", 0) or 0) or sess.id
+
+
+async def skip_to_end(db, session_id: int) -> None:
+    """Не разбирать то, что уже есть в чате: указатель — на последнее сообщение."""
     sess = await db.get(models.ChatSession, session_id)
     if sess is not None:
         last = (await db.execute(select(func.max(models.Message.id)).where(
             models.Message.session_id == session_id))).scalar()
-        sess.profile_upto = int(last or 0)
+        sess.profile_upto = max(int(sess.profile_upto or 0), int(last or 0))
+
+
+async def mark_copied(db, session_id: int, source=None) -> None:
+    """
+    Чат начат с копии (ветка, продолжение, импорт): скопированные реплики —
+    не новые слова человека. source — исходный чат: новое в копии считается
+    тем же разговором и повтором «в другом чате» не будет.
+    """
+    await skip_to_end(db, session_id)
+    sess = await db.get(models.ChatSession, session_id)
+    if sess is not None and source is not None:
+        sess.profile_root = conversation_of(source)
+
+
+async def clamp_pointer(db, session_id: int) -> None:
+    """
+    Удалили свежие сообщения — указатель прижимается к оставшимся: SQLite
+    отдаёт их id новым сообщениям, и те сошли бы за уже разобранные.
+    """
+    sess = await db.get(models.ChatSession, session_id)
+    if sess is None or not sess.profile_upto:
+        return
+    top = (await db.execute(select(func.max(models.Message.id)).where(
+        models.Message.session_id == session_id))).scalar() or 0
+    if sess.profile_upto > top:
+        sess.profile_upto = int(top)
 
 
 # ============================================================================
@@ -603,6 +699,28 @@ def build_router(current_user):
 
     router = APIRouter(prefix="/api/user-memory")
 
+    def _manager(user) -> bool:
+        """Видит чужие безхозные профили: админ или единственный пользователь."""
+        return user is None or getattr(user, "role", "") == "admin"
+
+    def _pkey(user, profile: str = "") -> str:
+        """
+        Чей профиль. По умолчанию свой. Админ (и единственный пользователь без
+        аккаунтов) может открыть профили, которыми больше некому управлять:
+        "local" и Telegram без аккаунтов ("tg:<id>"). Чужой "u:<id>" — никогда.
+        """
+        from backend import admin_service
+
+        if user is None and admin_service.security_cache().get("accounts_enabled"):
+            raise HTTPException(401, "Требуется вход")
+        own = key_for_user(user)
+        profile = (profile or "").strip()
+        if not profile or profile == own:
+            return own
+        if _manager(user) and (profile == "local" or re.fullmatch(r"tg:\d+", profile)):
+            return profile
+        raise HTTPException(403, "Это не ваша память")
+
     async def _rows(db, pkey):
         return (await db.execute(select(models.UserMemory).where(
             models.UserMemory.profile_key == pkey).order_by(models.UserMemory.id))).scalars().all()
@@ -624,20 +742,35 @@ def build_router(current_user):
         }
 
     @router.get("")
-    async def get_memory(user=Depends(current_user), db: AsyncSession = Depends(get_session)):
-        return await _state(db, key_for_user(user))
+    async def get_memory(profile: str = "", user=Depends(current_user),
+                         db: AsyncSession = Depends(get_session)):
+        return await _state(db, _pkey(user, profile))
+
+    @router.get("/profiles")
+    async def list_profiles(user=Depends(current_user), db: AsyncSession = Depends(get_session)):
+        """Профили, которые можно открыть: свой и (для админа) безхозные "local" / "tg:<id>"."""
+        own = _pkey(user)
+        counts = dict((await db.execute(
+            select(models.UserMemory.profile_key, func.count(models.UserMemory.id))
+            .group_by(models.UserMemory.profile_key))).all())
+        keys = [own]
+        if _manager(user):
+            keys += sorted(k for k in counts if k != own and (k == "local" or k.startswith("tg:")))
+        return [{"key": k, "own": k == own, "count": int(counts.get(k, 0)),
+                 "label": "Вы" if k == own else ("Веб без аккаунта" if k == "local" else "Telegram " + k[3:])}
+                for k in keys]
 
     @router.put("/settings")
-    async def put_settings(payload: dict = Body(...), user=Depends(current_user),
+    async def put_settings(payload: dict = Body(...), profile: str = "", user=Depends(current_user),
                            db: AsyncSession = Depends(get_session)):
-        conf = await set_settings(db, key_for_user(user), payload)
+        conf = await set_settings(db, _pkey(user, profile), payload)
         await db.commit()
         return conf
 
     @router.post("")
-    async def add_item(payload: dict = Body(...), user=Depends(current_user),
+    async def add_item(payload: dict = Body(...), profile: str = "", user=Depends(current_user),
                        db: AsyncSession = Depends(get_session)):
-        pkey = key_for_user(user)
+        pkey = _pkey(user, profile)
         cat = str(payload.get("category") or "").strip()
         text = _clean(payload.get("content"))[:300]
         if cat not in CATEGORIES or not text:
@@ -666,9 +799,9 @@ def build_router(current_user):
                 await db.delete(old)
 
     @router.patch("/{item_id}")
-    async def patch_item(item_id: int, payload: dict = Body(...), user=Depends(current_user),
+    async def patch_item(item_id: int, payload: dict = Body(...), profile: str = "", user=Depends(current_user),
                          db: AsyncSession = Depends(get_session)):
-        pkey = key_for_user(user)
+        pkey = _pkey(user, profile)
         async with _locks.setdefault(pkey, asyncio.Lock()):
             rec = await _own(db, item_id, pkey)
             if "content" in payload or "category" in payload:
@@ -681,6 +814,8 @@ def build_router(current_user):
                 if dup is not None:
                     raise HTTPException(409, "Такая запись уже есть")
                 rec.category, rec.content, rec.norm_key, rec.locked = cat, text, key, True
+                if rec.status == "active":
+                    await _replace_single(db, rec, pkey)
             if "enabled" in payload:
                 rec.enabled = bool(payload["enabled"])
             if payload.get("status") == "active" and rec.status != "active":
@@ -692,16 +827,17 @@ def build_router(current_user):
         return _item(rec)
 
     @router.delete("/{item_id}")
-    async def delete_item(item_id: int, user=Depends(current_user), db: AsyncSession = Depends(get_session)):
-        pkey = key_for_user(user)
+    async def delete_item(item_id: int, profile: str = "", user=Depends(current_user),
+                          db: AsyncSession = Depends(get_session)):
+        pkey = _pkey(user, profile)
         rec = await _own(db, item_id, pkey)
         await db.delete(rec)
         await db.commit()
         return {"ok": True}
 
     @router.delete("")
-    async def clear(user=Depends(current_user), db: AsyncSession = Depends(get_session)):
-        pkey = key_for_user(user)
+    async def clear(profile: str = "", user=Depends(current_user), db: AsyncSession = Depends(get_session)):
+        pkey = _pkey(user, profile)
         for rec in await _rows(db, pkey):
             await db.delete(rec)
         await db.commit()

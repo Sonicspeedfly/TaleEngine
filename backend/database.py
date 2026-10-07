@@ -182,6 +182,18 @@ def _cleanup_orphans(sync_conn) -> None:
             "DELETE FROM horae_entries WHERE session_id IS NOT NULL "
             "AND session_id NOT IN (SELECT id FROM chat_sessions)"
         ))
+        # Лорбук удалённого персонажа (до 2.9.0 удаление его не трогало): SQLite
+        # отдаёт освободившийся id новому персонажу, и тот унаследовал бы чужие
+        # записи. Записи с живым чатом остаются при чате, без персонажа.
+        if "characters" in tables:
+            sync_conn.execute(text(
+                "DELETE FROM horae_entries WHERE session_id IS NULL AND character_id IS NOT NULL "
+                "AND character_id NOT IN (SELECT id FROM characters)"
+            ))
+            sync_conn.execute(text(
+                "UPDATE horae_entries SET character_id = NULL WHERE character_id IS NOT NULL "
+                "AND character_id NOT IN (SELECT id FROM characters)"
+            ))
     if "attachment_blobs" in tables:  # данные вложений удалённых сообщений
         sync_conn.execute(text(
             "DELETE FROM attachment_blobs WHERE message_id IS NOT NULL "
@@ -216,6 +228,7 @@ def _sqlite_add_missing_columns(sync_conn) -> None:
             "scenario": "TEXT DEFAULT ''",
             "timezone": "VARCHAR(64) DEFAULT ''",
             "profile_upto": "INTEGER DEFAULT 0",
+            "profile_root": "INTEGER DEFAULT 0",
         },
         "messages": {
             "swipes": "JSON",

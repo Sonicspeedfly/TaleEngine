@@ -238,3 +238,135 @@ def test_pointer_skips_old_backlog_and_threshold(client, clean_memory):
             return (await db.get(models.ChatSession, sid)).profile_upto
 
     assert client.portal.call(upto) == last_user
+
+
+# ---------------------------------------------------------------- ревью 2.9.0
+def test_filters_respect_meaning_names_and_tech():
+    assert not um._similar("Просит обращаться на «ты»", "Просит обращаться на «вы»")
+    assert not um._similar("Любит длинные ответы", "Не любит длинные ответы")
+    assert um._similar("Любит длинные подробные ответы", "Любит подробные длинные ответы")
+    names = um._names_pattern(["Лира", "Катя", "Ева", "The Narrator"])
+    for text in ("Обнимает Лиру", "Гуляет с Катей", "Влюблён в Еву"):
+        assert names.search(um._norm_key(text)), text
+    assert not names.search(um._norm_key("Likes the sea"))
+    src = "я пишу на node.js и vue.js, собираю марки, зовут меня ян"
+    sn, st = um._norm_key(src), um.terms(src)
+    assert um.screen({"cat": "skills", "text": "Знает Node.js и Vue.js", "quote": "пишу на node.js и vue.js"}, sn, st, None)
+    assert um.screen({"cat": "interests", "text": "Собирает марки", "quote": "собираю марки"}, sn, st, None)
+    assert um.screen({"cat": "name", "text": "Ян", "quote": "зовут меня ян"}, sn, st, None)
+    assert um.screen({"cat": "interests", "text": "Выложит порты в JSON", "quote": "собираю марки"}, sn, st, None) is None
+
+
+def _apply(client, conversation, found, drops=(), **kw):
+    from backend.database import AsyncSessionLocal
+
+    async def go():
+        async with AsyncSessionLocal() as db:
+            stats = await um.apply(db, "local", conversation, found, list(drops), **kw)
+            await db.commit()
+            return stats
+    return client.portal.call(go)
+
+
+def test_single_value_is_not_merged_and_drop_plus_add_is_safe(client, clean_memory):
+    _apply(client, 901, [{"cat": "address", "text": "Просит обращаться на «ты»", "quote": "давай на ты"}], instant=True)
+    _apply(client, 902, [{"cat": "address", "text": "Просит обращаться на «вы»", "quote": "обращайтесь на вы"}],
+           out_of_role={"обращайтесь на вы пожалуйста"})
+    addr = [i for i in _items(client) if i["category"] == "address" and i["status"] == "active"]
+    assert [i["content"] for i in addr] == ["Просит обращаться на «вы»"]
+    # Опровержение и то же сведение в одном ответе не роняют запись.
+    rid = next(i["id"] for i in _items(client) if i["category"] == "address")
+    stats = _apply(client, 903, [{"cat": "address", "text": "Просит обращаться на «вы»", "quote": "на вы же"}],
+                   drops=[rid])
+    assert stats["dropped"] == 1 and stats["added"] == 1
+
+
+def test_new_explicit_fact_is_not_evicted_by_full_category(client, clean_memory):
+    for n, hobby in enumerate(["Шахматы", "Рыбалка", "Фотография", "Гитара", "Астрономия", "Велоспорт"]):
+        _apply(client, 910, [{"cat": "interests", "text": hobby, "quote": f"цитата {n}"}], instant=True)
+    stats = _apply(client, 911, [{"cat": "interests", "text": "Скалолазание", "quote": "увлекаюсь скалолазанием"}],
+                   out_of_role={"увлекаюсь скалолазанием давно"})
+    active = [i["content"] for i in _items(client) if i["category"] == "interests" and i["status"] == "active"]
+    assert stats["activated"] == 1 and "Скалолазание" in active and len(active) == 6
+
+
+def test_fork_continuation_is_the_same_conversation(client, clean_memory):
+    _, sid = _chat(client)
+    _say(client, sid, "выкладываю моды для скайрима")
+    _scan(client, sid, {"add": [{"cat": "interests", "text": "Делает моды для Skyrim", "quote": "моды для скайрима"}]})
+    first = [m for m in client.get(f"/api/sessions/{sid}/messages").json() if m["role"] == "user"][0]
+    fork = client.post(f"/api/sessions/{sid}/fork", json={"message_id": first["id"]}).json()["session_id"]
+    _say(client, fork, "мои моды для скайрима опять")
+    _scan(client, fork, {"add": [{"cat": "interests", "text": "Делает моды для Skyrim",
+                                  "quote": "мои моды для скайрима"}]})
+    item = next(i for i in _items(client) if i["category"] == "interests")
+    assert item["status"] == "candidate" and item["chats"] == 1   # ветка — тот же разговор
+
+
+def test_lines_written_while_shared_or_paused_are_never_read(client, clean_memory):
+    from backend import models
+    from backend.database import AsyncSessionLocal
+
+    _, sid = _chat(client)
+
+    async def share(on):
+        async with AsyncSessionLocal() as db:
+            if on:
+                db.add(models.SessionShare(session_id=sid, user_id=1))
+            else:
+                for row in (await db.execute(models.SessionShare.__table__.select().where(
+                        models.SessionShare.session_id == sid))).all():
+                    await db.execute(models.SessionShare.__table__.delete().where(models.SessionShare.id == row.id))
+            await db.commit()
+
+    client.portal.call(share, True)
+    _say(client, sid, "((меня зовут Борис, я ветеринар))")
+    assert _scan(client, sid, {"add": []}) is None
+    client.portal.call(share, False)
+    client.put("/api/user-memory/settings", json={"auto": False})
+    _say(client, sid, "я учитель истории в школе")
+    assert _scan(client, sid, {"add": []}) is None
+    client.put("/api/user-memory/settings", json={"auto": True})
+    _say(client, sid, "ок")
+    seen = []
+    _scan(client, sid, {"add": [{"cat": "name", "text": "Борис", "quote": "меня зовут Борис"}]}, seen=seen)
+    asked = "\n".join(m[1]["content"] for kind, m in seen if kind == "profile")
+    assert "Борис" not in asked and "учитель" not in asked
+    assert not _items(client)
+
+
+def test_deleting_newest_messages_lowers_pointer(client, clean_memory):
+    _, sid = _chat(client)
+    _say(client, sid, "привет")
+    _scan(client, sid, {"add": []})
+    for m in client.get(f"/api/sessions/{sid}/messages").json():
+        client.delete(f"/api/messages/{m['id']}")
+    _say(client, sid, "я python-разработчик")
+    stats = _scan(client, sid, {"add": [{"cat": "work", "text": "Python-разработчик", "quote": "я python-разработчик"}]})
+    assert stats and stats["added"] == 1
+
+
+def test_admin_manages_telegram_profile(client, clean_memory):
+    from backend import models
+    from backend.database import AsyncSessionLocal
+
+    cid, _ = _chat(client)
+
+    async def tg_chat():
+        async with AsyncSessionLocal() as db:
+            s = models.ChatSession(character_id=cid, user_key="tg:4242", title="tg")
+            db.add(s)
+            await db.commit()
+            return s.id
+
+    sid = client.portal.call(tg_chat)
+    client.post("/api/user-memory?profile=tg:4242", json={"category": "name", "content": "Тимур"})
+    assert "Тимур" in _system_of(client, sid)
+    assert not any(i["content"] == "Тимур" for i in _items(client))   # своя память — отдельно
+    profiles = {p["key"]: p for p in client.get("/api/user-memory/profiles").json()}
+    assert profiles["tg:4242"]["count"] == 1 and profiles["local"]["own"]
+    client.put("/api/user-memory/settings?profile=tg:4242", json={"enabled": False})
+    assert _system_of(client, sid) == ""
+    client.delete("/api/user-memory?profile=tg:4242")
+    assert client.get("/api/user-memory?profile=tg:4242").json()["items"] == []
+    assert client.get("/api/user-memory?profile=u:1").status_code == 403

@@ -269,14 +269,20 @@ class AccessMiddleware(BaseHTTPMiddleware):
 
 
 async def current_user(
+    request: Request,
     x_user_token: str | None = Header(default=None),
     db: AsyncSession = Depends(get_session),
 ):
-    """Текущий пользователь (или None, если режим аккаунтов выключен / не вошёл)."""
+    """
+    Текущий пользователь (или None, если режим аккаунтов выключен / не вошёл).
+    Токен — из заголовка или ?token=, как его принимает AccessMiddleware: иначе
+    запрос с токеном в адресе проходил middleware, а здесь становился «никем»
+    (None = полный доступ режима без аккаунтов).
+    """
     if not admin_service.security_cache().get("accounts_enabled"):
         debug_log.set_owner(None)
         return None
-    u = await accounts.user_from_token(db, x_user_token)
+    u = await accounts.user_from_token(db, x_user_token or request.query_params.get("token", ""))
     # Помечаем контекст владельцем ЗДЕСЬ: это единственное место, через которое
     # проходит опознание на всех HTTP-путях. Фоновые задачи генерации создаются
     # уже внутри запроса и наследуют пометку вместе с контекстом, поэтому
@@ -1245,7 +1251,7 @@ async def fork_session(
     # Состояние Horae ветки: правки и свёртки до развилки, с новыми id.
     await horae_engine.copy_to_fork(db, session_id, fork.id, id_map, pivot.id)
     # Реплики ветки — копии уже сказанного: память о пользователе их не разбирает.
-    await user_memory.mark_copied(db, fork.id)
+    await user_memory.mark_copied(db, fork.id, src)
     # Группа без участников перестала бы быть группой.
     if src.is_group:
         members = (await db.execute(
@@ -1738,6 +1744,7 @@ async def delete_message(message_id: int, db: AsyncSession = Depends(get_session
         # сводки прижимается к оставшимся СЕЙЧАС, до того как новые сообщения
         # займут эти id и сойдут за уже учтённые (см. memory_service.clamp_summary_pointer).
         await memory_service.clamp_summary_pointer(db, session_id)
+        await user_memory.clamp_pointer(db, session_id)
         # Horae: свёртки, доходящие до удалённого, снимаются; якоря правок и
         # таблиц прижимаются; документ поиска удаляется.
         await horae_engine.on_messages_deleted(db, session_id, [message_id])
@@ -2217,6 +2224,8 @@ async def _import_native_chat(db, data: dict, owner_id, user) -> dict:
             )
         )
         horae_count += 1
+    # Импортированные реплики — копия уже сказанного, а не новые слова.
+    await user_memory.mark_copied(db, sess.id)
     await db.commit()
 
     return {
@@ -2348,6 +2357,7 @@ async def import_chat(
                 priority=5,
             )
         )
+    await user_memory.mark_copied(db, sess.id)
     await db.commit()
     return {
         "session_id": sess.id,
@@ -3718,24 +3728,25 @@ async def _can_access_horae(db, entry, user, write: bool = False) -> bool:
         ВСЕХ пользователей, и запись одного не должна всплывать у другого;
       * привязка к сессии — доступ, если есть доступ к этой сессии
         (владелец / шара / админ, см. _can_access_session);
-      * привязка к персонажу — доступ, если персонаж общий (owner_id NULL) или
-        принадлежит пользователю.
-    Запись с несколькими привязками доступна, если доступна хотя бы одна из них
-    (так же, как такая запись попадает в контекст в _load_horae_records).
+      * привязка к персонажу — чтение, если персонаж общий (owner_id NULL) или
+        принадлежит пользователю; запись — только своего персонажа: лорбук
+        общего уходит в чаты всех, кто с ним говорит (как put_profile).
+    Чтение: доступна хотя бы одна привязка. Запись: доступны ВСЕ — иначе запись
+    с чужим чатом и своим персонажем попадала бы в чужой чат.
     """
     if user is None or user.role == "admin":
         return True
     if entry.session_id is None and entry.character_id is None:
         return not write
+    oks = []
     if entry.session_id is not None:
         sess = await db.get(models.ChatSession, entry.session_id)
-        if await _can_access_session(db, sess, user):
-            return True
+        oks.append(await _can_access_session(db, sess, user))
     if entry.character_id is not None:
         char = await db.get(models.Character, entry.character_id)
-        if char is not None and (char.owner_id is None or char.owner_id == user.id):
-            return True
-    return False
+        owner = getattr(char, "owner_id", None)
+        oks.append(char is not None and (owner == user.id or (owner is None and not write)))
+    return all(oks) if write else any(oks)
 
 
 @app.get("/api/sessions/{session_id}/shares")
@@ -3797,6 +3808,9 @@ async def unshare_session(session_id: int, uid: int, user=Depends(current_user),
     ).scalars().first()
     if sh:
         await db.delete(sh)
+        # Реплики времени доступа писал не только владелец (у сообщений нет
+        # автора) — память о пользователе их не разберёт и после.
+        await user_memory.skip_to_end(db, session_id)
         await db.commit()
     return {"ok": True}
 
