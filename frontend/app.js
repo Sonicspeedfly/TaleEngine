@@ -274,7 +274,7 @@ createApp({
       mediaStatusError: "",
       mediaProbing: false,
       // Пустая форма записи памяти (тот же объект возвращает метод blankHorae()).
-      horaeEdit: { id: null, category: "lore", title: "", content: "", keywords: "", always_on: false, enabled: true, priority: 0, scope: "global" },
+      horaeEdit: { id: null, category: "lore", title: "", content: "", keywords: "", always_on: false, enabled: true, priority: 0, scope: "session", origScope: "session" },
 
       // --- Персоны и заметка автора (вкладка Persona) ---
       personas: [],
@@ -322,6 +322,7 @@ createApp({
 
       // --- Ответ на конкретное сообщение ---
       replyToId: null,
+      switchingChat: false,   // идёт переключение чата — отправка ждёт (openSession)
 
       // --- Звуковое уведомление ---
       soundOn: true,
@@ -2278,6 +2279,13 @@ createApp({
       if (s.id === this.sessionId && !this.sharedView) return; // уже открыт
       this._handoffStreaming();  // текущую генерацию (если есть) доигрываем в фоне
       this.sharedView = null;   // это мой собственный чат, а не «чужой»
+      // «Ответить на сообщение» — только в пределах чата. Не сброшенный выбор
+      // уводил в новый чат цитату из старого: плашки не видно (сообщения тут
+      // нет), а модель получала «(В ответ на …)» с чужим текстом.
+      this.replyToId = null;
+      // Пока чат переключается, сокет ещё смотрит в прежний чат — отправка
+      // ждёт (send() проверяет флаг), иначе реплика ушла бы не туда.
+      this.switchingChat = true;
       this.sessionId = s.id;
       this._clearPending(s.id); // открыли чат — снимаем метку «пришёл ответ»
       // Метаданные берём из переданного объекта, а недостающее дотягиваем из
@@ -2293,8 +2301,12 @@ createApp({
       this.closeSidebarOnMobile(); // на мобильном прячем сайдбар после выбора
       // Запоминаем последний открытый чат — восстановим при перезагрузке страницы.
       this._rememberLastChat();
-      await this.loadMessages(true);   // свежее открытие — грузим последнюю порцию
-      this.connectWs();
+      try {
+        await this.loadMessages(true);   // свежее открытие — грузим последнюю порцию
+      } finally {
+        this.connectWs();
+        this.switchingChat = false;
+      }
     },
     // Сохранить/восстановить последний открытый чат (чтобы после F5 сразу писать).
     _rememberLastChat() {
@@ -2343,6 +2355,7 @@ createApp({
     async openSharedSession(s) {
       this._handoffStreaming();
       this.sharedView = s;
+      this.replyToId = null;   // ответ — только в пределах чата (см. openSession)
       this.sessionId = s.id;
       this._clearPending(s.id);
       this.authorNote = "";
@@ -3105,6 +3118,7 @@ createApp({
     async send() {
       const content = this.input.trim();
       if ((!content && this.pendingAttachments.length === 0) || !this.connected || this.streaming) return;
+      if (this.switchingChat) return;   // сокет ещё от прежнего чата (см. openSession)
       // Дожидаемся дочитывания ВСЕХ файлов сообщения, прежде чем отправлять — иначе
       // сообщение могло уйти без ещё не загруженного вложения (гонка с FileReader).
       if (this.attachmentsLoading) {
@@ -3148,7 +3162,8 @@ createApp({
       const attFiles = this._attFiles || {};
       const bigList = pend.filter((a) => !a.data && attFiles[a.id]); // файлы для multipart
       const attachments = this._cleanAtts(pend);                     // инлайновые (data:URI)
-      const replyTo = this.replyToId;
+      // Ответ — только на сообщение ЭТОГО чата (выбор из другого чата не уходит).
+      const replyTo = this.messages.some((m) => m.id === this.replyToId) ? this.replyToId : null;
       // Оптимистично показываем своё сообщение сразу; для больших файлов
       // в пузыре работает лёгкое превью (objectURL), а не base64.
       const displayAtts = pend.map((a) => ({
@@ -4024,16 +4039,30 @@ createApp({
     },
 
     // ---------- Лорбук (записи памяти, таблица horae_entries) ----------
+    // Новая запись по умолчанию — только для этого чата: «во всех чатах» она
+    // всплывала бы в любом другом разговоре, а это пользователь выбирает сам.
     blankHorae() {
-      return { id: null, category: "lore", title: "", content: "", keywords: "", always_on: false, enabled: true, priority: 0, scope: "global" };
+      const scope = this.sessionId ? "session" : "global";
+      return { id: null, category: "lore", title: "", content: "", keywords: "", always_on: false, enabled: true, priority: 0, scope, origScope: scope };
     },
-    async loadHorae() { this.horae = await this.api("/horae"); },
+    // Список — записи, что действуют в открытом чате: его собственные, общие
+    // для всех чатов и лорбук его персонажа. Снимки и записи других чатов
+    // здесь не показываем — они к этому разговору не относятся.
+    async loadHorae() {
+      const sid = this.sessionId;
+      const rows = await this.api(sid ? "/horae?for_session=" + sid : "/horae");
+      if (sid === this.sessionId) this.horae = rows;
+    },
+    horaeScope(h) { return h.session_id ? "session" : (h.character_id ? "character" : "global"); },
+    horaeScopeLabel(h) {
+      return { session: "💬 этот чат", character: "🎭 персонаж", global: "🌐 все чаты" }[this.horaeScope(h)];
+    },
     editHorae(h) {
+      const scope = this.horaeScope(h);
       this.horaeEdit = {
         id: h.id, category: h.category, title: h.title, content: h.content,
         keywords: (h.keywords || []).join(", "), always_on: h.always_on,
-        enabled: h.enabled, priority: h.priority,
-        scope: h.session_id ? "session" : "global",
+        enabled: h.enabled, priority: h.priority, scope, origScope: scope,
       };
     },
     async saveHorae() {
@@ -4044,6 +4073,10 @@ createApp({
         always_on: h.always_on, enabled: h.enabled, priority: Number(h.priority) || 0,
       };
       if (h.id) {
+        if (h.scope !== h.origScope && h.scope !== "character") {
+          payload.scope = h.scope;
+          if (h.scope === "session") payload.session_id = this.sessionId;
+        }
         await this.api("/horae/" + h.id, { method: "PATCH", body: JSON.stringify(payload) });
       } else {
         payload.session_id = h.scope === "session" ? this.sessionId : null;
@@ -4981,6 +5014,9 @@ createApp({
     sessionId() {
       this.ctxStats = null;
       this.loadCtxStats();
+      // Лорбук — записи открытого чата; форма правки прежнего чата тут не к месту.
+      this.horaeEdit = this.blankHorae();
+      this.loadHorae().catch(() => {});
       this._stopMemPoll();
       this.memStatus = null;
       this.memPollFails = 0;
@@ -6482,10 +6518,10 @@ createApp({
             </template>
             <template #lore>
               <p class="muted">Лорбук — записи, которые вы ведёте сами. <b>always_on</b> — подмешивается в КАЖДЫЙ запрос (состояние, инвентарь, факты); иначе срабатывает по ключевым словам, как World Info. Области:
-                <span class="scope-tag global">🌐 глоб.</span> во всех чатах,
-                <span class="scope-tag session">💬 чат</span> только в этом,
-                <span class="scope-tag character">🎭 перс.</span> из карточки персонажа.
-                Записи сохраняются автоматически в БД. При импорте чата из SillyTavern сюда попадает снимок состояния (💬, always_on).</p>
+                <span class="scope-tag session">💬 этот чат</span> — только здесь,
+                <span class="scope-tag character">🎭 персонаж</span> — во всех чатах с этим персонажем (из карточки),
+                <span class="scope-tag global">🌐 все чаты</span> — в каждом разговоре, с любым персонажем.
+                Здесь показаны записи, которые действуют в этом чате. При импорте чата из SillyTavern сюда попадает снимок состояния (💬, always_on).</p>
               <div class="card">
                 <input v-model="horaeEdit.title" placeholder="Заголовок" style="margin-bottom:6px" />
                 <textarea v-model="horaeEdit.content" rows="3" placeholder="Содержимое" style="margin-bottom:6px"></textarea>
@@ -6500,9 +6536,15 @@ createApp({
                 </div>
                 <label class="check"><input type="checkbox" v-model="horaeEdit.always_on" /> always_on</label>
                 <label class="check"><input type="checkbox" v-model="horaeEdit.enabled" /> включено</label>
-                <div class="row" v-if="!horaeEdit.id">
-                  <select v-model="horaeEdit.scope" aria-label="Область видимости записи"><option value="global">глобально</option><option value="session">только этот чат</option></select>
+                <div class="row" v-if="horaeEdit.scope !== 'character'">
+                  <select v-model="horaeEdit.scope" aria-label="Где действует запись">
+                    <option value="session" :disabled="!sessionId">💬 только этот чат</option>
+                    <option value="global" :disabled="!isAdmin && horaeEdit.origScope !== 'global'">🌐 во всех чатах</option>
+                  </select>
                 </div>
+                <p v-if="horaeEdit.scope === 'global' && horaeEdit.origScope !== 'global'" class="field-hint">Запись попадёт в каждый
+                  разговор, с любым персонажем. То, что относится только к этому чату, лучше оставить «только этот чат».</p>
+                <p v-else-if="horaeEdit.scope === 'character'" class="field-hint">Запись из карточки персонажа: действует во всех его чатах.</p>
                 <div class="row">
                   <button class="btn-primary" @click="saveHorae">{{ horaeEdit.id ? 'Обновить' : 'Добавить' }}</button>
                   <button v-if="horaeEdit.id" @click="horaeEdit = blankHorae()">Отмена</button>
@@ -6512,7 +6554,7 @@ createApp({
                 <div class="row-between">
                   <b>{{ h.title || h.category }}</b>
                   <span style="display:inline-flex; align-items:center; gap:4px">
-                    <span class="scope-tag" :class="h.session_id ? 'session' : (h.character_id ? 'character' : 'global')">{{ h.session_id ? '💬 чат' : (h.character_id ? '🎭 перс.' : '🌐 глоб.') }}</span>
+                    <span class="scope-tag" :class="horaeScope(h)">{{ horaeScopeLabel(h) }}</span>
                     <span class="tag">{{ h.always_on ? 'always' : ((h.keywords || []).join(',') || h.category) }}</span>
                     <button class="btn-icon" @click="editHorae(h)" :aria-label="'Изменить запись памяти: ' + (h.title || h.category)">✎</button>
                     <button class="btn-danger" @click="deleteHorae(h)" :aria-label="'Удалить запись памяти: ' + (h.title || h.category)">🗑</button>
@@ -7055,6 +7097,7 @@ createApp({
             <p v-if="!ctxStats.horae.length" class="muted ins-note">Ни одна запись не сработала на этом ходу.</p>
             <div v-for="(h, i) in ctxStats.horae" :key="'h'+i" class="ins-horae">
               <span class="grow">{{ h.title }}</span>
+              <span v-if="h.scope" class="scope-tag" :class="h.scope">{{ { session: '💬 этот чат', character: '🎭 персонаж', global: '🌐 все чаты' }[h.scope] }}</span>
               <span class="tag">{{ h.always_on ? 'always' : (h.keywords.join(', ') || h.category) }}</span>
               <span class="ins-w">{{ h.tokens }}</span>
             </div>

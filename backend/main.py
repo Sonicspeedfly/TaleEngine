@@ -42,7 +42,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import delete as sql_delete
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -641,6 +641,9 @@ async def update_character(
 async def delete_character(character_id: int, db: AsyncSession = Depends(get_session)):
     char = await db.get(models.Character, character_id)
     if char:
+        # Лорбук персонажа — вместе с ним: SQLite отдаёт id удалённой строки
+        # следующему новому персонажу, и тот унаследовал бы чужой лорбук.
+        await db.execute(sql_delete(models.HoraeEntry).where(models.HoraeEntry.character_id == character_id))
         await db.delete(char)
         await db.commit()
     return {"ok": True}
@@ -1741,12 +1744,33 @@ async def delete_message(message_id: int, db: AsyncSession = Depends(get_session
 @app.get("/api/horae", response_model=list[HoraeEntryRead])
 async def list_horae(
     session_id: int | None = None,
+    for_session: int | None = None,
     user=Depends(current_user),
     db: AsyncSession = Depends(get_session),
 ):
+    """
+    Записи лорбука. session_id — только записи этого чата; for_session — все,
+    что действуют в этом чате: глобальные, его собственные и лорбук его
+    персонажа (участников группы). Без фильтров — все доступные, в том числе
+    снимки и записи других чатов.
+    """
     q = select(models.HoraeEntry)
     if session_id is not None:
         q = q.where(models.HoraeEntry.session_id == session_id)
+    if for_session is not None:
+        sess = await db.get(models.ChatSession, for_session)
+        char_ids = ({c.id for c in await group_chat.load_members(db, for_session)}
+                    if sess is not None and sess.is_group else set())
+        if sess is not None and sess.character_id:
+            char_ids.add(sess.character_id)
+        conds = [
+            models.HoraeEntry.session_id == for_session,
+            and_(models.HoraeEntry.session_id.is_(None), models.HoraeEntry.character_id.is_(None)),
+        ]
+        if char_ids:
+            conds.append(and_(models.HoraeEntry.session_id.is_(None),
+                              models.HoraeEntry.character_id.in_(char_ids)))
+        q = q.where(or_(*conds))
     rows = (await db.execute(q)).scalars().all()
     # В режиме аккаунтов прячем чужую память (см. _can_access_horae). Глобальный
     # лор (без привязки к сессии/персонажу) виден всем; user is None / админ — всё.
@@ -1761,8 +1785,10 @@ async def create_horae(
 ):
     entry = models.HoraeEntry(**payload.model_dump())
     # Нельзя привязать запись к чужой сессии или чужому персонажу.
-    if not await _can_access_horae(db, entry, user):
-        raise HTTPException(403, "Нет доступа к этой сессии или персонажу")
+    if not await _can_access_horae(db, entry, user, write=True):
+        raise HTTPException(403, "Нет доступа к этой сессии или персонажу"
+                            if entry.session_id or entry.character_id
+                            else "Записи для всех чатов добавляет только администратор")
     db.add(entry)
     await db.commit()
     await db.refresh(entry)
@@ -1779,9 +1805,21 @@ async def update_horae(
     entry = await db.get(models.HoraeEntry, entry_id)
     if not entry:
         raise HTTPException(404, "Запись памяти не найдена")
-    if not await _can_access_horae(db, entry, user):
+    if not await _can_access_horae(db, entry, user, write=True):
         raise HTTPException(403, "Нет доступа к этой записи памяти")
-    for key, value in payload.model_dump(exclude_none=True).items():
+    data = payload.model_dump(exclude_none=True)
+    scope = data.pop("scope", None)
+    target = data.pop("session_id", None)
+    if scope == "global":
+        entry.session_id, entry.character_id = None, None
+    elif scope == "session":
+        if target is None or await db.get(models.ChatSession, target) is None:
+            raise HTTPException(400, "Не указан чат для записи")
+        entry.session_id, entry.character_id = target, None
+    if scope and not await _can_access_horae(db, entry, user, write=True):
+        raise HTTPException(403, "Нет доступа к этому чату"
+                            if entry.session_id else "Записи для всех чатов меняет только администратор")
+    for key, value in data.items():
         setattr(entry, key, value)
     await db.commit()
     await db.refresh(entry)
@@ -1796,7 +1834,7 @@ async def delete_horae(
 ):
     entry = await db.get(models.HoraeEntry, entry_id)
     if entry:
-        if not await _can_access_horae(db, entry, user):
+        if not await _can_access_horae(db, entry, user, write=True):
             raise HTTPException(403, "Нет доступа к этой записи памяти")
         await db.delete(entry)
         await db.commit()
@@ -2871,6 +2909,7 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
     save_user=False — повтор хода (retry): реплика уже в БД, второй раз не сохраняем.
     """
     sess = await db.get(models.ChatSession, session_id)
+    reply_to_message_id = await _own_reply_id(db, session_id, reply_to_message_id)
     members = await group_chat.load_members(db, session_id)
     connection = await get_connection(db)
     director = sess.director
@@ -3002,13 +3041,35 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
     return job_id
 
 
-async def _reply_prefix(db, reply_to_message_id) -> str:
+async def _own_reply_id(db, session_id: int, reply_to_message_id) -> int | None:
+    """
+    id сообщения, на которое отвечают, — только если оно из ЭТОГО чата.
+
+    Браузер мог прислать id из другого чата: «Ответить» нажали в одном чате,
+    перешли в другой, и выбор ответа не сбросился (плашка не видна — сообщения
+    в этом чате нет). Тогда цитата чужого чата незаметно уходила модели
+    приставкой «(В ответ на …)» и дальше жила в истории — модель «вспоминала»
+    то, что обсуждалось совсем в другом чате.
+    """
+    if not reply_to_message_id:
+        return None
+    try:
+        rid = int(reply_to_message_id)
+    except (TypeError, ValueError):
+        return None
+    rep = await db.get(models.Message, rid)
+    return rid if rep is not None and rep.session_id == session_id else None
+
+
+async def _reply_prefix(db, reply_to_message_id, session_id: int | None = None) -> str:
     """Текст-приставка «(В ответ на …)» — чтобы модель поняла, к чему обращаются."""
     if not reply_to_message_id:
         return ""
     rep = await db.get(models.Message, reply_to_message_id)
     if not rep or not rep.content:
         return ""
+    if session_id is not None and rep.session_id != session_id:
+        return ""   # сообщение другого чата — не подмешиваем (см. _own_reply_id)
     who = rep.speaker_name or ("твоё сообщение" if rep.role == "assistant" else "сообщение пользователя")
     return f"(В ответ на {who}: «{rep.content[:300]}»)\n"
 
@@ -3018,13 +3079,14 @@ async def _start_user_turn(session_id, content, attachments, params, db, reply_t
     sess = await db.get(models.ChatSession, session_id)
     if not sess:
         raise HTTPException(404, "Сессия не найдена")
+    reply_to_message_id = await _own_reply_id(db, session_id, reply_to_message_id)
     if sess.is_group:
         return await _start_group_turn(session_id, content, attachments, params, db, reply_to_message_id)
     character = await db.get(models.Character, sess.character_id)
     connection = await get_connection(db)
 
     # Для модели добавляем ссылку на сообщение, на которое отвечает пользователь.
-    model_text = (await _reply_prefix(db, reply_to_message_id)) + content
+    model_text = (await _reply_prefix(db, reply_to_message_id, session_id)) + content
     user_content = build_user_content(model_text, attachments, current=True)
     # Контекст строим ДО сохранения нового сообщения (иначе оно задвоится).
     messages = await build_context_from_db(
@@ -3639,13 +3701,14 @@ async def _can_access_session(db, sess, user) -> bool:
     return bool(sh)
 
 
-async def _can_access_horae(db, entry, user) -> bool:
+async def _can_access_horae(db, entry, user, write: bool = False) -> bool:
     """
     Доступ к записи памяти Horae в режиме аккаунтов. Владелец у записи не хранится
     напрямую — он определяется по привязке (как и при сборке контекста):
       * user is None (режим выключен) либо админ — полный доступ;
       * глобальная запись (session_id и character_id оба NULL) — общий лор мира,
-        видна всем;
+        видна всем, а менять её (write) может только админ: она уходит в чаты
+        ВСЕХ пользователей, и запись одного не должна всплывать у другого;
       * привязка к сессии — доступ, если есть доступ к этой сессии
         (владелец / шара / админ, см. _can_access_session);
       * привязка к персонажу — доступ, если персонаж общий (owner_id NULL) или
@@ -3656,7 +3719,7 @@ async def _can_access_horae(db, entry, user) -> bool:
     if user is None or user.role == "admin":
         return True
     if entry.session_id is None and entry.character_id is None:
-        return True
+        return not write
     if entry.session_id is not None:
         sess = await db.get(models.ChatSession, entry.session_id)
         if await _can_access_session(db, sess, user):

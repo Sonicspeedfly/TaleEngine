@@ -343,6 +343,9 @@ class HoraeRecord:
     always_on: bool
     enabled: bool
     priority: int
+    # Где действует запись: "session" (этот чат), "character" (лорбук
+    # персонажа) или "global" (все чаты) — для инспектора хода.
+    scope: str = ""
 
 
 import re as _re
@@ -1078,7 +1081,7 @@ def assemble_context(
         report["horae"] = [
             {"title": r.title or r.category, "category": r.category,
              "always_on": bool(r.always_on), "priority": r.priority,
-             "keywords": list(r.keywords or []),
+             "keywords": list(r.keywords or []), "scope": r.scope,
              "tokens": _w(r.content)}
             for r in activated
         ]
@@ -1377,6 +1380,7 @@ async def _load_horae_records(session_db, session_id: int, character_id=None) ->
             always_on=r.always_on,
             enabled=r.enabled,
             priority=r.priority,
+            scope="session" if r.session_id else ("character" if r.character_id else "global"),
         )
         for r in rows
     ]

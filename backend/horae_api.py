@@ -286,9 +286,28 @@ def build_router(current_user, can_access_session) -> APIRouter:
         comp = await he.compute(db, sess)
         return comp
 
-    async def _save_table(db, sess, table: dict) -> None:
-        """Разложить действующую таблицу обратно: шаблон — по его месту, данные — в чат."""
-        template, overlay = horae_tables.split_effective(table)
+    def _tpl_key(t: dict) -> str:
+        # Тем же ключом шаблон адресует horae_tables.resolve: id, а без него — имя.
+        return t.get("id") or str(t.get("name") or "").strip()
+
+    async def _stored_template(db, sess, table: dict) -> dict | None:
+        """Сохранённый общий шаблон таблицы (global/character) или None."""
+        scope = table.get("scope") or "local"
+        if scope == "global":
+            templates = (await he.library(db)).get("global_tables") or []
+        elif scope == "character" and sess.character_id:
+            character = await db.get(models.Character, sess.character_id)
+            templates = ((character.horae_profile or {}) if character else {}).get("tables") or []
+        else:
+            return None
+        return next((t for t in templates if isinstance(t, dict) and _tpl_key(t) == table["id"]), None)
+
+    async def _save_table(db, sess, table: dict, headers: dict | None = None) -> None:
+        """
+        Разложить действующую таблицу обратно: шаблон — по его месту, данные — в чат.
+        headers — заголовки общего шаблона (см. patch_table); без них они берутся из base.
+        """
+        template, overlay = horae_tables.split_effective(table, headers)
         scope = table.get("scope") or "local"
         data = await he.load_chat_data(db, sess.id)
         if template is None:
@@ -299,15 +318,15 @@ def build_router(current_user, can_access_session) -> APIRouter:
             data.setdefault("table_overlays", {})[table["id"]] = overlay
             if scope == "global":
                 lib = await he.library(db)
-                lib["global_tables"] = [template if t.get("id") == table["id"] else t for t in lib["global_tables"]]
-                if not any(t.get("id") == table["id"] for t in lib["global_tables"]):
+                lib["global_tables"] = [template if _tpl_key(t) == table["id"] else t for t in lib["global_tables"]]
+                if not any(_tpl_key(t) == table["id"] for t in lib["global_tables"]):
                     lib["global_tables"].append(template)
                 await he.save_library(db, lib)
             else:
                 character = await db.get(models.Character, sess.character_id)
                 profile = copy.deepcopy(character.horae_profile or {})
-                tables = [template if t.get("id") == table["id"] else t for t in profile.get("tables") or []]
-                if not any(t.get("id") == table["id"] for t in tables):
+                tables = [template if _tpl_key(t) == table["id"] else t for t in profile.get("tables") or []]
+                if not any(_tpl_key(t) == table["id"] for t in tables):
                     tables.append(template)
                 profile["tables"] = tables
                 character.horae_profile = profile
@@ -379,6 +398,15 @@ def build_router(current_user, can_access_session) -> APIRouter:
             structural = any(k in payload for k in ("name", "prompt", "structure", "lock"))
             if structural:
                 _check_scope(scope, user)
+            # Заголовки общего шаблона ведём отдельно от данных чата: current
+            # содержит и то, что ИИ вписал в этом чате (имена в столбце 0 и т.п.),
+            # а шаблон видят все чаты. В шаблон уходят только явные правки
+            # заголовков (см. horae_tables.is_shared_header) и сдвиги структуры.
+            shared = None
+            if scope in ("global", "character"):
+                stored = await _stored_template(db, sess, table)
+                shared = (horae_tables.template_headers(stored) if stored is not None
+                          else horae_tables.promotable_headers(table, current))
             if "name" in payload or "lock" in payload:
                 # Данные таблицы = база + вклады ИИ после базы. Новый замок или
                 # имя применились бы к повтору задним числом: замок отсёк бы уже
@@ -392,15 +420,29 @@ def build_router(current_user, can_access_session) -> APIRouter:
                 table = {**table, "prompt": (payload.get("prompt") or "")[:2000]}
             if isinstance(payload.get("cell"), dict):
                 cell = payload["cell"]
-                table = horae_tables.set_cell(table, current, int(cell.get("r") or 0), int(cell.get("c") or 0),
-                                              str(cell.get("value") or "")[:2000], anchor)
+                r, c = int(cell.get("r") or 0), int(cell.get("c") or 0)
+                value = str(cell.get("value") or "")[:2000]
+                table = horae_tables.set_cell(table, current, r, c, value, anchor)
+                if shared is not None and horae_tables.is_shared_header(shared, table, r, c):
+                    if value.strip():
+                        shared[f"{r},{c}"] = value
+                    else:
+                        shared.pop(f"{r},{c}", None)
             if isinstance(payload.get("structure"), dict):
                 st = payload["structure"]
-                table = horae_tables.structure(table, current, st.get("op") or "", int(st.get("index") or 0), anchor)
+                op, index = st.get("op") or "", int(st.get("index") or 0)
+                before = table
+                table = horae_tables.structure(table, current, op, index, anchor)
+                if shared is not None:
+                    shared = horae_tables.shift_headers(shared, before, op, index)
             if isinstance(payload.get("lock"), dict):
                 lk = payload["lock"]
                 table = horae_tables.set_lock(table, lk.get("type") or "cell", int(lk.get("r") or 0),
                                               int(lk.get("c") or 0), bool(lk.get("locked")))
+                if shared is not None and lk.get("locked"):
+                    # Закреплённая подпись строки становится частью шаблона.
+                    for k, v in horae_tables.promotable_headers(table, current).items():
+                        shared.setdefault(k, v)
             if payload.get("clear"):
                 table = horae_tables.clear_data(table, current, anchor)
             new_scope = payload.get("scope")
@@ -409,7 +451,11 @@ def build_router(current_user, can_access_session) -> APIRouter:
                 _check_scope(scope, user)
                 await _remove_table(db, sess, table)
                 table = {**table, "scope": new_scope, "base": dict(current), "base_anchor": anchor}
-            await _save_table(db, sess, table)
+                if new_scope == "local":
+                    shared = None
+                elif shared is None:
+                    shared = horae_tables.promotable_headers(table, current)
+            await _save_table(db, sess, table, shared)
             await db.commit()
         return {"ok": True}
 
