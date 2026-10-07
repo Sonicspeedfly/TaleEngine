@@ -32,6 +32,9 @@ os.environ.setdefault("MEMORY_MAX_RETRIES", "0")
 # Фоновый загрузчик файлов в хранилище модели (backend/media_refs.py) в тестах
 # не запускается: он ходил бы в прокси. Тесты ссылок включают его явно.
 os.environ.setdefault("MEDIA_REFS", "0")
+# Память о пользователе разбирает реплики фоновым запросом к модели после хода:
+# подменные модели тестов получили бы лишний вызов. Её тесты включают явно.
+os.environ.setdefault("USER_MEMORY", "0")
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402

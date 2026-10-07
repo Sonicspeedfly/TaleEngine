@@ -330,8 +330,11 @@ async def build_group_messages(
     from backend.horae_memory import BEHAVIOR_GUIDE
     horae_parts = await _group_horae(db, session, target_character, msgs)
     horae_rules = horae_parts.rules if horae_parts is not None and not horae_parts.rules_in_tail else ""
+    from backend import user_memory
+
+    about_user = await user_memory.prompt_block(db, session)
     system = "\n\n".join(
-        p for p in [char_block, _render_persona_block(persona), scene_block, group_instr,
+        p for p in [char_block, _render_persona_block(persona), about_user, scene_block, group_instr,
                     _render_horae_block(activated), BEHAVIOR_GUIDE, horae_rules] if p
     )
 

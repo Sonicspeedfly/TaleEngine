@@ -990,6 +990,7 @@ def assemble_context(
     history_ids: list | None = None,
     report: dict | None = None,
     horae=None,
+    user_memory: str = "",
 ) -> list[dict]:
     """
     ЧИСТАЯ функция сборки контекста. Возвращает messages для LiteLLM:
@@ -1022,6 +1023,10 @@ def assemble_context(
         (хвост, после мастер-снимка), кандидаты воспоминаний (отсев — после
         обрезки истории, как у фактов) и напоминание формата (перед фокусом).
 
+    :param user_memory: блок «Память о пользователе» (user_memory.prompt_block):
+        общие сведения о самом собеседнике для всех его чатов. Идёт в системный
+        промпт сразу после персоны — он стабилен, и кэш промпта не страдает.
+
     :param report: если передан словарь, функция складывает в него разбор хода:
         вес каждого блока, сработавшие записи памяти и что срезал бюджет. Заполняется
         ПО ХОДУ сборки теми же значениями, что уходят в модель, поэтому инспектор
@@ -1040,6 +1045,7 @@ def assemble_context(
     # 2. Системный промпт = паспорт персонажа + персона + лор Horae + правила поведения.
     part_character = _render_character_block(character)
     part_persona = _render_persona_block(persona)
+    part_user_memory = (user_memory or "").strip()
     part_horae = _render_horae_block(lore_recs)
     part_behaviour = ASSISTANT_GUIDE if ooc else BEHAVIOR_GUIDE
     part_style = ASSISTANT_STYLE_GUIDE if ooc else STYLE_GUIDE
@@ -1050,8 +1056,8 @@ def assemble_context(
         # служебные теги Horae как HTML и «послушно» их не писала.
         part_style = part_style + HORAE_STYLE_NOTE
     part_horae_rules = horae_rules if (horae_rules and not rules_in_tail) else ""
-    system_parts = [part_character, part_persona, part_horae, part_behaviour, part_style,
-                    part_horae_rules]
+    system_parts = [part_character, part_persona, part_user_memory, part_horae, part_behaviour,
+                    part_style, part_horae_rules]
     system_prompt = "\n\n".join(p for p in system_parts if p)
 
     if report is not None:
@@ -1066,6 +1072,8 @@ def assemble_context(
              "tokens": _w(part_character), "text": part_character},
             {"key": "persona", "label": "Персона пользователя",
              "tokens": _w(part_persona), "text": part_persona},
+            {"key": "user_memory", "label": "Память о пользователе (все чаты)",
+             "tokens": _w(part_user_memory), "text": part_user_memory},
             {"key": "horae", "label": "Память Horae (лор)",
              "tokens": _w(part_horae), "text": part_horae},
             {"key": "guides", "label": "Инструкции поведения и стиля",
@@ -1476,6 +1484,9 @@ async def build_context_from_db(
         user_message = clean_message
 
     persona, author_note = await _load_persona_and_note(session_db, session)
+    from backend import user_memory as _user_memory
+
+    about_user = await _user_memory.prompt_block(session_db, session)
     # База знаний чата (справочные файлы) — доступна модели в каждом ходе.
     from backend.knowledge import build_knowledge
 
@@ -1573,6 +1584,7 @@ async def build_context_from_db(
         history_ids=history_ids,
         report=report,
         horae=horae_parts,
+        user_memory=about_user,
     )
 
 

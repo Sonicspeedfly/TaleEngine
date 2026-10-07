@@ -64,6 +64,7 @@ from backend import (
     native_io,
     telegram_runtime,
     usage_stats,
+    user_memory,
 )
 from backend.attachments import (
     attachment_data,
@@ -534,6 +535,8 @@ def _make_persist_new(model_used: str):
         # Ход завершён — возможно, пора освежить авто-сводку (фоном, не ждём).
         _spawn_bg(_maybe_update_summary(session_id))
         _spawn_bg(horae_tasks.after_turn(session_id, [message_id]))
+        if user_memory.schedule(session_id):
+            _spawn_bg(user_memory.maybe_update(session_id))
 
     return cb
 
@@ -1241,6 +1244,8 @@ async def fork_session(
         id_map[m.id] = copy_msg.id
     # Состояние Horae ветки: правки и свёртки до развилки, с новыми id.
     await horae_engine.copy_to_fork(db, session_id, fork.id, id_map, pivot.id)
+    # Реплики ветки — копии уже сказанного: память о пользователе их не разбирает.
+    await user_memory.mark_copied(db, fork.id)
     # Группа без участников перестала бы быть группой.
     if src.is_group:
         members = (await db.execute(
@@ -3035,6 +3040,8 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
         # Ход группы завершён — освежаем авто-сводку сюжета (фоном).
         _spawn_bg(_maybe_update_summary(session_id))
         _spawn_bg(horae_tasks.after_turn(session_id, list(saved_ids)))
+        if user_memory.schedule(session_id):
+            _spawn_bg(user_memory.maybe_update(session_id))
 
     job_id = uuid.uuid4().hex
     await generation_manager.start_runner(job_id, session_id, runner)
@@ -4021,6 +4028,7 @@ def _localize_cdn(html: str, vendor: set[str]) -> str:
 # Эндпоинты Horae State Engine — ДО раздачи статики: mount на «/» ниже
 # перехватил бы их пути.
 app.include_router(horae_api.build_router(current_user, _can_access_session))
+app.include_router(user_memory.build_router(current_user))
 
 
 if _frontend_dir.exists():

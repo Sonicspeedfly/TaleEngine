@@ -215,6 +215,7 @@ def _sqlite_add_missing_columns(sync_conn) -> None:
             "pinned_at": "DATETIME",
             "scenario": "TEXT DEFAULT ''",
             "timezone": "VARCHAR(64) DEFAULT ''",
+            "profile_upto": "INTEGER DEFAULT 0",
         },
         "messages": {
             "swipes": "JSON",

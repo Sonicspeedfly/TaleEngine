@@ -278,6 +278,11 @@ async def _horae_after(session_id: int, after_id: int) -> None:
             await horae_tasks.after_turn(session_id, list(ids))
     except Exception:  # noqa: BLE001 — память не должна мешать боту
         logging.getLogger("aichat.horae").exception("Horae после ответа бота не отработал")
+    # Память о пользователе — общая с вебом для привязанного аккаунта.
+    from backend import user_memory
+
+    if user_memory.schedule(session_id):
+        await user_memory.maybe_update(session_id)
 
 
 async def _generate_reply(session_id: int, text: str, attachments: list[AttachmentIn]) -> str:
