@@ -139,6 +139,10 @@ class HoraeEntryRead(HoraeEntryBase):
     id: int
 
 
+class HoraeEntryListed(HoraeEntryRead):
+    can_write: bool = True
+
+
 class CharacterUpdate(BaseModel):
     """Частичное обновление персонажа (все поля опциональны)."""
     # Закрепить наверху списка. Внутри это дата (pinned_at), снаружи — флаг.
@@ -164,6 +168,9 @@ class HoraeEntryUpdate(BaseModel):
     always_on: Optional[bool] = None
     enabled: Optional[bool] = None
     priority: Optional[int] = None
+    # Перенос записи: "global" — во все чаты, "session" — только в чат session_id.
+    scope: Optional[Literal["global", "session"]] = None
+    session_id: Optional[int] = None
 
 
 # ----- Настройки подключения к LiteLLM (редактируются в UI) -----

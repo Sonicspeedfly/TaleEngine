@@ -132,6 +132,7 @@
   /* ---- Полоса весов контекста: шесть категорий, различимых и по светлоте ---- */
   --seg-character: #8aa3ff;
   --seg-persona: #5ccf8d;
+  --seg-user_memory: #c79af2;
   --seg-horae: #deb35b;
   --seg-guides: #a2a9b4;
   --seg-history: #6f7a8e;
@@ -207,6 +208,7 @@
   --scope-character-border: #7d5a0e;
   --seg-character: #2f47b8;
   --seg-persona: #166b43;
+  --seg-user_memory: #6b2fa0;
   --seg-horae: #7d5a0e;
   --seg-guides: #5a6270;
   --seg-history: #39414d;
@@ -268,6 +270,7 @@
     --scope-character-border: #7d5a0e;
     --seg-character: #2f47b8;
     --seg-persona: #166b43;
+    --seg-user_memory: #6b2fa0;
     --seg-horae: #7d5a0e;
     --seg-guides: #5a6270;
     --seg-history: #39414d;
@@ -806,6 +809,7 @@ label.btn:focus-within, label.btn-primary:focus-within, label.btn-icon:focus-wit
 .ins-dot { width: 10px; height: 10px; border-radius: 50%; flex: none; background: var(--text-tertiary); }
 .seg-character { background: var(--seg-character); }
 .seg-persona   { background: var(--seg-persona); }
+.seg-user_memory { background: var(--seg-user_memory); }
 .seg-horae     { background: var(--seg-horae); }
 .seg-guides    { background: var(--seg-guides); }
 .seg-history   { background: var(--seg-history); }

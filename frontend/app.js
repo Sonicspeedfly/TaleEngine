@@ -151,7 +151,7 @@ createApp({
       // Вкладка «Память» — панель Хроники из horae.js; свои разделы (сжатие
       // истории, лорбук) app.js рисует в её слотах. memoryTabReq — переход на
       // раздел извне ({ tab, n }, см. openMemory).
-      memoryExtraTabs: [["compress", "Сжатие истории"], ["lore", "Лорбук"]],
+      memoryExtraTabs: [["compress", "Сжатие истории"], ["lore", "Лорбук"], ["about", "Обо мне"]],
       memoryTabReq: null,
       // Глобальный summary_enabled Хроники (GET /horae/settings): вместе с
       // autoSummary он задаёт, чем по умолчанию сжимается история (memoryEngine).
@@ -207,6 +207,16 @@ createApp({
 
       // --- Память: лорбук и сжатие истории (вкладка Memory) ---
       horae: [],
+      // «Обо мне» — память о пользователе для всех его чатов (GET /api/user-memory):
+      // { settings, categories, items, block } или null, пока не загружена.
+      userMem: null,
+      userMemError: "",
+      userMemNew: { category: "style", content: "" },
+      userMemEdit: { id: null, content: "" },
+      // Чей профиль открыт: "" — свой; админ может открыть "local" и "tg:<id>"
+      // (Telegram без аккаунтов) — ими больше некому управлять.
+      userMemProfile: "",
+      userMemProfiles: [],
       // Мастер-снимок: каждые summaryEvery сообщений ИИ дописывает в него то,
       // что вышло из окна. Ложь — снимок не обновляется (см. memoryEngine).
       autoSummary: true,
@@ -274,7 +284,8 @@ createApp({
       mediaStatusError: "",
       mediaProbing: false,
       // Пустая форма записи памяти (тот же объект возвращает метод blankHorae()).
-      horaeEdit: { id: null, category: "lore", title: "", content: "", keywords: "", always_on: false, enabled: true, priority: 0, scope: "global" },
+      // Без открытого чата — «во всех чатах» (как blankHorae); открыли чат — «только этот».
+      horaeEdit: { id: null, category: "lore", title: "", content: "", keywords: "", always_on: false, enabled: true, priority: 0, scope: "global", origScope: "global" },
 
       // --- Персоны и заметка автора (вкладка Persona) ---
       personas: [],
@@ -322,6 +333,7 @@ createApp({
 
       // --- Ответ на конкретное сообщение ---
       replyToId: null,
+      switchingChat: false,   // идёт переключение чата — отправка ждёт (openSession)
 
       // --- Звуковое уведомление ---
       soundOn: true,
@@ -505,6 +517,18 @@ createApp({
   },
 
   computed: {
+    // «Обо мне»: действующие сведения и кандидаты, ждущие подтверждения.
+    userMemActive() {
+      return ((this.userMem && this.userMem.items) || []).filter((i) => i.status === "active");
+    },
+    userMemCandidates() {
+      return ((this.userMem && this.userMem.items) || []).filter((i) => i.status !== "active");
+    },
+    // Записи лорбука «во всех чатах»: их стоит проверить, если чат «вспоминает»
+    // то, чего в нём не было.
+    horaeGlobalCount() {
+      return (this.horae || []).filter((h) => !h.session_id && !h.character_id).length;
+    },
     selectedCharacter() {
       return this.characters.find((c) => c.id === this.selectedCharacterId) || null;
     },
@@ -2278,6 +2302,14 @@ createApp({
       if (s.id === this.sessionId && !this.sharedView) return; // уже открыт
       this._handoffStreaming();  // текущую генерацию (если есть) доигрываем в фоне
       this.sharedView = null;   // это мой собственный чат, а не «чужой»
+      // «Ответить на сообщение» — только в пределах чата. Не сброшенный выбор
+      // уводил в новый чат цитату из старого: плашки не видно (сообщения тут
+      // нет), а модель получала «(В ответ на …)» с чужим текстом.
+      this.replyToId = null;
+      // Пока чат переключается, сокет ещё смотрит в прежний чат — отправка
+      // ждёт (send() проверяет флаг), иначе реплика ушла бы не туда.
+      this.switchingChat = true;
+      const seq = (this._openSeq = (this._openSeq || 0) + 1);
       this.sessionId = s.id;
       this._clearPending(s.id); // открыли чат — снимаем метку «пришёл ответ»
       // Метаданные берём из переданного объекта, а недостающее дотягиваем из
@@ -2293,8 +2325,15 @@ createApp({
       this.closeSidebarOnMobile(); // на мобильном прячем сайдбар после выбора
       // Запоминаем последний открытый чат — восстановим при перезагрузке страницы.
       this._rememberLastChat();
-      await this.loadMessages(true);   // свежее открытие — грузим последнюю порцию
-      this.connectWs();
+      try {
+        await this.loadMessages(true);   // свежее открытие — грузим последнюю порцию
+      } finally {
+        // Быстро открыли ещё один чат — сокет и флаг за ним, не за этим.
+        if (seq === this._openSeq) {
+          this.connectWs();
+          this.switchingChat = false;
+        }
+      }
     },
     // Сохранить/восстановить последний открытый чат (чтобы после F5 сразу писать).
     _rememberLastChat() {
@@ -2343,6 +2382,9 @@ createApp({
     async openSharedSession(s) {
       this._handoffStreaming();
       this.sharedView = s;
+      this.replyToId = null;   // ответ — только в пределах чата (см. openSession)
+      this.switchingChat = true;   // отправка ждёт новый сокет (см. openSession)
+      const seq = (this._openSeq = (this._openSeq || 0) + 1);
       this.sessionId = s.id;
       this._clearPending(s.id);
       this.authorNote = "";
@@ -2351,8 +2393,14 @@ createApp({
       this.sessionTimezone = s.timezone || ""; // чужой чат: пояс владельца, не перезаписываем
       this.closeSidebarOnMobile();
       this.notifOpen = false;
-      await this.loadMessages(true);   // свежее открытие — грузим последнюю порцию
-      this.connectWs();
+      try {
+        await this.loadMessages(true);   // свежее открытие — грузим последнюю порцию
+      } finally {
+        if (seq === this._openSeq) {
+          this.connectWs();
+          this.switchingChat = false;
+        }
+      }
     },
     // Перевести идущую генерацию текущего чата в фон: она досчитается на сервере,
     // мы поймаем «готово» через SSE и подсветим тот чат (а не свежеоткрытый).
@@ -2644,7 +2692,10 @@ createApp({
       // Окно = столько же, сколько уже показано (сохраняем прокрутку вверх), но не всё:
       // на открытии — msgPageSize (настройка), максимум 400.
       const limit = Math.min(400, Math.max(this.msgPageSize, this.messages.length + 2));
-      const rows = await this.api("/sessions/" + this.sessionId + "/messages?limit=" + limit);
+      const sid = this.sessionId;
+      const rows = await this.api("/sessions/" + sid + "/messages?limit=" + limit);
+      // Пока ждали, открыли другой чат — эти сообщения уже не его.
+      if (sid !== this.sessionId) return;
       this.messages = rows;
       this.noMoreMessages = rows.length < limit; // получили меньше лимита → старых нет
       if (wasNearBottom) this.scrollDown();
@@ -2658,10 +2709,12 @@ createApp({
       const el = this.$refs.messages;
       const prevH = el ? el.scrollHeight : 0;
       const page = this.msgPageSize;
+      const sid = this.sessionId;
       try {
         const older = await this.api(
-          "/sessions/" + this.sessionId + "/messages?before=" + oldest.id + "&limit=" + page
+          "/sessions/" + sid + "/messages?before=" + oldest.id + "&limit=" + page
         );
+        if (sid !== this.sessionId) return;   // открыли другой чат, пока ждали
         if (older.length < page) this.noMoreMessages = true;
         if (older.length) {
           this.messages = older.concat(this.messages);
@@ -2943,6 +2996,7 @@ createApp({
       this.processingNote = false;
       this.groupWaiting = 0;
       // Сервер — источник истины: перечитываем сообщения (там уже новый ответ/свайп).
+      const sid = this.sessionId;
       await this.loadMessages();
       // Ответ разобран на сервере — открытая «Хроника» перечитает состояние.
       this.horaeTick += 1;
@@ -2955,7 +3009,10 @@ createApp({
       this.currentThought = "";
       this.liveBubbles = [];
       // «Дописать»: остановленный ответ убираем, текст дописываем к реплике и
-      // запускаем ответ заново — без звука и плашки, ответа ещё нет.
+      // запускаем ответ заново — без звука и плашки, ответа ещё нет. Пока
+      // перечитывали, открыли другой чат — правка ушла бы в него: текст
+      // возвращаем в поле ввода.
+      if (append && this.sessionId !== sid) { this.input = append; return; }
       if (append) return this._applyAppend(append);
       if (this.soundOn) this.playChime();
       if (answered) this.showToast("✅ Ответ получен", () => this._scrollToLastReply());
@@ -3105,6 +3162,10 @@ createApp({
     async send() {
       const content = this.input.trim();
       if ((!content && this.pendingAttachments.length === 0) || !this.connected || this.streaming) return;
+      if (this.switchingChat) return;   // сокет ещё от прежнего чата (см. openSession)
+      // Чат, в котором нажали «Отправить»: пока дочитываются файлы, человек мог
+      // перейти в другой — тогда не отправляем (текст и файлы остаются в поле).
+      const sid = this.sessionId;
       // Дожидаемся дочитывания ВСЕХ файлов сообщения, прежде чем отправлять — иначе
       // сообщение могло уйти без ещё не загруженного вложения (гонка с FileReader).
       if (this.attachmentsLoading) {
@@ -3112,6 +3173,7 @@ createApp({
         await this._awaitAttachments();
         this.waitingFiles = false;
         if (!this.connected || this.streaming) return; // состояние изменилось, пока ждали
+        if (this.switchingChat || this.sessionId !== sid) return;
       }
       this._dropBadAttachments(); // выкидываем не прочитавшиеся вложения
       if (!content && this.pendingAttachments.length === 0) return; // всё отвалилось
@@ -3148,7 +3210,8 @@ createApp({
       const attFiles = this._attFiles || {};
       const bigList = pend.filter((a) => !a.data && attFiles[a.id]); // файлы для multipart
       const attachments = this._cleanAtts(pend);                     // инлайновые (data:URI)
-      const replyTo = this.replyToId;
+      // Ответ — только на сообщение ЭТОГО чата (выбор из другого чата не уходит).
+      const replyTo = this.messages.some((m) => m.id === this.replyToId) ? this.replyToId : null;
       // Оптимистично показываем своё сообщение сразу; для больших файлов
       // в пузыре работает лёгкое превью (objectURL), а не base64.
       const displayAtts = pend.map((a) => ({
@@ -3181,7 +3244,7 @@ createApp({
         }));
         for (const a of bigList) fd.append("files", attFiles[a.id], a.name || "file");
         for (const a of bigList) delete attFiles[a.id];
-        this._postWithProgress("/sessions/" + this.sessionId + "/send_form", fd).then((r) => {
+        this._postWithProgress("/sessions/" + sid + "/send_form", fd).then((r) => {
           this.currentJobId = r.job_id;
           this.processingNote = true; // файл на сервере — дальше работает нейросеть
           // HTTP-ход не получает события «job» по сокету: реплика сохранена,
@@ -3195,7 +3258,7 @@ createApp({
       } else if (attachments.length) {
         // Вложения (особенно аудио/видео) не влезают в WebSocket-кадр (~16 МБ) —
         // отправляем ход по HTTP с ПРОГРЕССОМ загрузки, ответ слушаем по SSE.
-        this._postWithProgress("/sessions/" + this.sessionId + "/send", {
+        this._postWithProgress("/sessions/" + sid + "/send", {
           content, attachments, params: this.params, reply_to_message_id: replyTo,
         }).then((r) => {
           this.currentJobId = r.job_id;
@@ -4024,35 +4087,154 @@ createApp({
     },
 
     // ---------- Лорбук (записи памяти, таблица horae_entries) ----------
+    // Новая запись по умолчанию — только для этого чата: «во всех чатах» она
+    // всплывала бы в любом другом разговоре, а это пользователь выбирает сам.
     blankHorae() {
-      return { id: null, category: "lore", title: "", content: "", keywords: "", always_on: false, enabled: true, priority: 0, scope: "global" };
+      const scope = this.sessionId ? "session" : "global";
+      return { id: null, category: "lore", title: "", content: "", keywords: "", always_on: false, enabled: true, priority: 0, scope, origScope: scope };
     },
-    async loadHorae() { this.horae = await this.api("/horae"); },
+    // Список — записи, что действуют в открытом чате: его собственные, общие
+    // для всех чатов и лорбук его персонажа. Снимки и записи других чатов
+    // здесь не показываем — они к этому разговору не относятся.
+    async loadHorae() {
+      const sid = this.sessionId;
+      const rows = await this.api(sid ? "/horae?for_session=" + sid : "/horae");
+      if (sid === this.sessionId) this.horae = rows;
+    },
+    horaeScope(h) { return h.session_id ? "session" : (h.character_id ? "character" : "global"); },
+    horaeScopeLabel(h) {
+      return { session: "💬 этот чат", character: "🎭 персонаж", global: "🌐 все чаты" }[this.horaeScope(h)];
+    },
     editHorae(h) {
+      const scope = this.horaeScope(h);
       this.horaeEdit = {
         id: h.id, category: h.category, title: h.title, content: h.content,
         keywords: (h.keywords || []).join(", "), always_on: h.always_on,
-        enabled: h.enabled, priority: h.priority,
-        scope: h.session_id ? "session" : "global",
+        enabled: h.enabled, priority: h.priority, scope, origScope: scope,
       };
     },
+    // Запись «во всех чатах» в режиме аккаунтов меняет только админ (её видят все).
+    horaeLocked(h) { return h.can_write === false || (!this.isAdmin && this.horaeScope(h) === "global"); },
     async saveHorae() {
       const h = this.horaeEdit;
+      if (h.scope === "session" && !this.sessionId) {
+        this.showToast("Откройте чат, чтобы добавить запись только для него");
+        return;
+      }
       const payload = {
         category: h.category, title: h.title, content: h.content,
         keywords: h.keywords.split(",").map((s) => s.trim()).filter(Boolean),
         always_on: h.always_on, enabled: h.enabled, priority: Number(h.priority) || 0,
       };
-      if (h.id) {
-        await this.api("/horae/" + h.id, { method: "PATCH", body: JSON.stringify(payload) });
-      } else {
-        payload.session_id = h.scope === "session" ? this.sessionId : null;
-        await this.api("/horae", { method: "POST", body: JSON.stringify(payload) });
+      try {
+        if (h.id) {
+          if (h.scope !== h.origScope && h.scope !== "character") {
+            payload.scope = h.scope;
+            if (h.scope === "session") payload.session_id = this.sessionId;
+          }
+          await this.api("/horae/" + h.id, { method: "PATCH", body: JSON.stringify(payload) });
+        } else {
+          payload.session_id = h.scope === "session" ? this.sessionId : null;
+          await this.api("/horae", { method: "POST", body: JSON.stringify(payload) });
+        }
+      } catch (e) {
+        this.showToast("Лорбук: " + e.message);   // форму не сбрасываем — текст не теряется
+        return;
       }
       this.horaeEdit = this.blankHorae();
       await this.loadHorae();
     },
-    async deleteHorae(h) { await this.api("/horae/" + h.id, { method: "DELETE" }); await this.loadHorae(); },
+    async deleteHorae(h) {
+      try { await this.api("/horae/" + h.id, { method: "DELETE" }); } catch (e) { this.showToast("Лорбук: " + e.message); }
+      await this.loadHorae();
+    },
+
+    // ---------- «Обо мне»: память о пользователе (все чаты) ----------
+    _umq(path) {
+      return "/user-memory" + path + (this.userMemProfile ? "?profile=" + encodeURIComponent(this.userMemProfile) : "");
+    },
+    async loadUserMemory() {
+      const prof = this.userMemProfile;
+      try {
+        const data = await this.api(this._umq(""));
+        if (prof !== this.userMemProfile) return;   // пока ждали, выбрали другой профиль
+        this.userMem = data;
+        this.userMemError = "";
+      } catch (e) {
+        if (prof !== this.userMemProfile) return;
+        // Прежний список не стираем: сбой перечитывания не должен его прятать.
+        this.userMemError = e.message || "нет связи";
+      }
+      if (this.isAdmin) {
+        try { this.userMemProfiles = await this.api("/user-memory/profiles"); } catch (e) { this.userMemProfiles = []; }
+      }
+    },
+    async switchUserMemProfile(key) {
+      this.userMemProfile = key;
+      // Список прежнего профиля не показываем под новым: действия ушли бы не туда.
+      this.userMem = null;
+      this.userMemError = "";
+      this.userMemEdit = { id: null, content: "" };
+      await this.loadUserMemory();
+    },
+    userMemLabel(cat) {
+      const c = ((this.userMem && this.userMem.categories) || []).find((x) => x.key === cat);
+      return c ? c.label : cat;
+    },
+    // Запрос к памяти о пользователе → true при успехе. Ошибку показываем
+    // тостом; формы вызывающий сбрасывает только при успехе.
+    async _userMemCall(path, opts, okText) {
+      let ok = true;
+      try {
+        await this.api(this._umq(path), opts);
+        if (okText) this.showToast(okText);
+      } catch (e) {
+        ok = false;
+        this.showToast("Память о вас: " + e.message);
+      }
+      await this.loadUserMemory();
+      this.loadCtxStats();
+      return ok;
+    },
+    // Флажки шлют то, что видно на экране; не сохранилось — возвращаем как было.
+    async saveUserMemSettings(key, ev) {
+      const want = ev.target.checked;
+      if (!(await this._userMemCall("/settings", { method: "PUT", body: JSON.stringify({ [key]: want }) }))) {
+        ev.target.checked = !want;
+      }
+    },
+    async addUserMem() {
+      const n = this.userMemNew;
+      if (!n.content.trim()) return;
+      if (await this._userMemCall("", { method: "POST", body: JSON.stringify(n) })) {
+        this.userMemNew = { category: n.category, content: "" };
+      }
+    },
+    async confirmUserMem(it) {
+      await this._userMemCall("/" + it.id, { method: "PATCH", body: JSON.stringify({ status: "active" }) });
+    },
+    async toggleUserMem(it, ev) {
+      const want = ev.target.checked;
+      if (!(await this._userMemCall("/" + it.id, { method: "PATCH", body: JSON.stringify({ enabled: want }) }))) {
+        ev.target.checked = !want;
+      }
+    },
+    startEditUserMem(it) { this.userMemEdit = { id: it.id, content: it.content }; },
+    async saveEditUserMem() {
+      const e = this.userMemEdit;
+      if (!e.id || !e.content.trim()) return;
+      if (await this._userMemCall("/" + e.id, { method: "PATCH", body: JSON.stringify({ content: e.content }) })) {
+        this.userMemEdit = { id: null, content: "" };
+      }
+    },
+    async deleteUserMem(it) {
+      await this._userMemCall("/" + it.id, { method: "DELETE" });
+    },
+    async clearUserMem() {
+      const ok = await this.askConfirm("Стереть всё, что система запомнила о вас? Чаты и их память это не затронет.",
+        { title: "Очистить «Обо мне»", okText: "Стереть" });
+      if (ok) await this._userMemCall("", { method: "DELETE" }, "Память о вас очищена");
+    },
 
     // ---------- Вкладка «Память»: раздел и чем сжимать историю ----------
     // Открыть «Память» на разделе: импорт чата показывает, что легло в Хронику
@@ -4981,6 +5163,9 @@ createApp({
     sessionId() {
       this.ctxStats = null;
       this.loadCtxStats();
+      // Лорбук — записи открытого чата; форма правки прежнего чата тут не к месту.
+      this.horaeEdit = this.blankHorae();
+      this.loadHorae().catch(() => {});
       this._stopMemPoll();
       this.memStatus = null;
       this.memPollFails = 0;
@@ -5006,6 +5191,7 @@ createApp({
         this.loadMemStatus();
         this.loadCtxStats();
         this.loadHoraeGlobal();
+        this.loadUserMemory();
       }
       if (tab === "generation") this.loadMediaStatus();
     },
@@ -6482,10 +6668,14 @@ createApp({
             </template>
             <template #lore>
               <p class="muted">Лорбук — записи, которые вы ведёте сами. <b>always_on</b> — подмешивается в КАЖДЫЙ запрос (состояние, инвентарь, факты); иначе срабатывает по ключевым словам, как World Info. Области:
-                <span class="scope-tag global">🌐 глоб.</span> во всех чатах,
-                <span class="scope-tag session">💬 чат</span> только в этом,
-                <span class="scope-tag character">🎭 перс.</span> из карточки персонажа.
-                Записи сохраняются автоматически в БД. При импорте чата из SillyTavern сюда попадает снимок состояния (💬, always_on).</p>
+                <span class="scope-tag session">💬 этот чат</span> — только здесь,
+                <span class="scope-tag character">🎭 персонаж</span> — во всех чатах с этим персонажем (из карточки),
+                <span class="scope-tag global">🌐 все чаты</span> — в каждом разговоре, с любым персонажем.
+                Здесь показаны записи, которые действуют в этом чате. При импорте чата из SillyTavern сюда попадает снимок состояния (💬, always_on).</p>
+              <p v-if="horaeGlobalCount" class="field-hint">🌐 {{ horaeGlobalCount }} {{ plural(horaeGlobalCount, 'запись подмешивается', 'записи подмешиваются', 'записей подмешиваются') }}
+                во все чаты. Если чат «вспоминает» то, чего в нём не было, — <template v-if="isAdmin">проверьте их и
+                перенесите в нужный чат (✎ → «только этот чат»)</template><template v-else>попросите администратора
+                проверить их: такие записи меняет только он</template>. Сведения о вас самих лучше хранить в разделе «Обо мне».</p>
               <div class="card">
                 <input v-model="horaeEdit.title" placeholder="Заголовок" style="margin-bottom:6px" />
                 <textarea v-model="horaeEdit.content" rows="3" placeholder="Содержимое" style="margin-bottom:6px"></textarea>
@@ -6500,11 +6690,18 @@ createApp({
                 </div>
                 <label class="check"><input type="checkbox" v-model="horaeEdit.always_on" /> always_on</label>
                 <label class="check"><input type="checkbox" v-model="horaeEdit.enabled" /> включено</label>
-                <div class="row" v-if="!horaeEdit.id">
-                  <select v-model="horaeEdit.scope" aria-label="Область видимости записи"><option value="global">глобально</option><option value="session">только этот чат</option></select>
+                <div class="row" v-if="horaeEdit.scope !== 'character'">
+                  <select v-model="horaeEdit.scope" aria-label="Где действует запись">
+                    <option value="session" :disabled="!sessionId">💬 только этот чат</option>
+                    <option value="global" :disabled="!isAdmin && horaeEdit.origScope !== 'global'">🌐 во всех чатах</option>
+                  </select>
                 </div>
+                <p v-if="horaeEdit.scope === 'global' && horaeEdit.origScope !== 'global'" class="field-hint">Запись попадёт в каждый
+                  разговор, с любым персонажем. То, что относится только к этому чату, лучше оставить «только этот чат».</p>
+                <p v-else-if="horaeEdit.scope === 'character'" class="field-hint">Запись из карточки персонажа: действует во всех его чатах.</p>
                 <div class="row">
-                  <button class="btn-primary" @click="saveHorae">{{ horaeEdit.id ? 'Обновить' : 'Добавить' }}</button>
+                  <button class="btn-primary" @click="saveHorae"
+                          :disabled="!horaeEdit.id && horaeEdit.scope === 'global' && !isAdmin">{{ horaeEdit.id ? 'Обновить' : 'Добавить' }}</button>
                   <button v-if="horaeEdit.id" @click="horaeEdit = blankHorae()">Отмена</button>
                 </div>
               </div>
@@ -6512,10 +6709,12 @@ createApp({
                 <div class="row-between">
                   <b>{{ h.title || h.category }}</b>
                   <span style="display:inline-flex; align-items:center; gap:4px">
-                    <span class="scope-tag" :class="h.session_id ? 'session' : (h.character_id ? 'character' : 'global')">{{ h.session_id ? '💬 чат' : (h.character_id ? '🎭 перс.' : '🌐 глоб.') }}</span>
+                    <span class="scope-tag" :class="horaeScope(h)">{{ horaeScopeLabel(h) }}</span>
                     <span class="tag">{{ h.always_on ? 'always' : ((h.keywords || []).join(',') || h.category) }}</span>
-                    <button class="btn-icon" @click="editHorae(h)" :aria-label="'Изменить запись памяти: ' + (h.title || h.category)">✎</button>
-                    <button class="btn-danger" @click="deleteHorae(h)" :aria-label="'Удалить запись памяти: ' + (h.title || h.category)">🗑</button>
+                    <template v-if="!horaeLocked(h)">
+                      <button class="btn-icon" @click="editHorae(h)" :aria-label="'Изменить запись памяти: ' + (h.title || h.category)">✎</button>
+                      <button class="btn-danger" @click="deleteHorae(h)" :aria-label="'Удалить запись памяти: ' + (h.title || h.category)">🗑</button>
+                    </template>
                   </span>
                 </div>
                 <!-- Мастер-снимок (категория summary) — до 12 000 токенов с разделами
@@ -6531,12 +6730,97 @@ createApp({
                 <div v-else class="muted">{{ h.content }}</div>
               </div>
             </template>
+            <template #about>
+              <p class="muted">Здесь то, что система знает о <b>вас</b> — во всех чатах, с любым персонажем: как вас зовут и как
+                к вам обращаться, на каком языке писать, чем вы занимаетесь, что умеете и любите, какие ответы вам удобны.
+                Темы разговоров, планы («скину файл»), события сюжета и то, что вы отыгрываете, сюда <b>не</b> попадают — они
+                остаются в своём чате.</p>
+              <div v-if="userMemProfiles.length > 1 || userMemProfile" class="row" style="margin-bottom:8px">
+                <label>Чья память
+                  <select :value="userMemProfile" @change="switchUserMemProfile($event.target.value)">
+                    <option v-for="p in userMemProfiles" :key="p.key" :value="p.own ? '' : p.key">{{ p.label }} ({{ p.count }})</option>
+                    <option v-if="userMemProfile && !userMemProfiles.some((p) => p.key === userMemProfile)"
+                            :value="userMemProfile">{{ userMemProfile }}</option>
+                  </select>
+                </label>
+              </div>
+              <p v-if="userMemProfile" class="field-hint">Открыта память другого профиля
+                ({{ userMemProfile === 'local' ? 'веб без аккаунта' : 'Telegram ' + userMemProfile.slice(3) }}) — правки уйдут туда.</p>
+              <p v-if="userMemError" class="field-hint danger-text">Не удалось загрузить: {{ userMemError }}
+                <button class="btn-icon" @click="loadUserMemory" aria-label="Повторить загрузку">↻</button></p>
+              <p v-if="!userMem && !userMemError" class="muted">Загружаю…</p>
+              <template v-if="userMem">
+                <div class="card">
+                  <label class="check"><input type="checkbox" :checked="userMem.settings.enabled"
+                    @change="saveUserMemSettings('enabled', $event)" /> Учитывать в чатах</label>
+                  <label class="check"><input type="checkbox" :checked="userMem.settings.auto"
+                    @change="saveUserMemSettings('auto', $event)" /> Замечать новое в моих репликах</label>
+                  <p class="field-hint">Раз в несколько ваших реплик модель памяти (как для сжатия) читает только их — не ответы
+                    персонажа — и предлагает сведения с цитатой. Чаты, открытые друзьям, не читаются.</p>
+                  <label class="check"><input type="checkbox" :checked="userMem.settings.instant"
+                    @change="saveUserMemSettings('instant', $event)" /> Применять сразу, без подтверждения</label>
+                  <p class="field-hint">Выключено — новое сначала ждёт ниже. Само включается, если вы скажете это ещё
+                    в одном чате другими словами или вне роли — ((…)) или /ooc.</p>
+                </div>
+
+                <h4 v-if="userMemCandidates.length">Ждут подтверждения ({{ userMemCandidates.length }})</h4>
+                <div class="card" v-for="it in userMemCandidates" :key="'umc' + it.id">
+                  <div class="row-between">
+                    <span><span class="tag">{{ userMemLabel(it.category) }}</span> {{ it.content }}</span>
+                    <span style="display:inline-flex; gap:4px">
+                      <button class="btn-icon" @click="confirmUserMem(it)" :aria-label="'Подтвердить: ' + it.content" title="Верно, запомнить">✓</button>
+                      <button class="btn-danger" @click="deleteUserMem(it)" :aria-label="'Отклонить: ' + it.content" title="Неверно, забыть">✕</button>
+                    </span>
+                  </div>
+                  <div v-if="it.quote" class="muted" style="font-size:12px">«{{ it.quote }}»</div>
+                </div>
+
+                <h4>Что система помнит о вас</h4>
+                <p v-if="!userMemActive.length" class="muted">Пока ничего. Добавьте сами или подтвердите предложенное.</p>
+                <div class="card" v-for="it in userMemActive" :key="'uma' + it.id" :class="{ 'muted': !it.enabled }">
+                  <div v-if="userMemEdit.id === it.id" class="row">
+                    <input v-model="userMemEdit.content" @keydown.enter="saveEditUserMem" :aria-label="'Изменить: ' + it.content" />
+                    <button class="btn-primary" @click="saveEditUserMem">Сохранить</button>
+                    <button @click="userMemEdit = { id: null, content: '' }">Отмена</button>
+                  </div>
+                  <div v-else class="row-between">
+                    <span><span class="tag">{{ userMemLabel(it.category) }}</span> {{ it.content }}</span>
+                    <span style="display:inline-flex; gap:4px; align-items:center">
+                      <label class="check" style="margin:0" :title="it.enabled ? 'Учитывается' : 'Выключено'">
+                        <input type="checkbox" :checked="it.enabled" @change="toggleUserMem(it, $event)" :aria-label="'Учитывать: ' + it.content" /></label>
+                      <button class="btn-icon" @click="startEditUserMem(it)" :aria-label="'Изменить: ' + it.content">✎</button>
+                      <button class="btn-danger" @click="deleteUserMem(it)" :aria-label="'Удалить: ' + it.content">🗑</button>
+                    </span>
+                  </div>
+                </div>
+
+                <div class="card">
+                  <div class="row">
+                    <select v-model="userMemNew.category" aria-label="Что это за сведение">
+                      <option v-for="c in userMem.categories" :key="c.key" :value="c.key">{{ c.label }}</option>
+                    </select>
+                    <input v-model="userMemNew.content" @keydown.enter="addUserMem" placeholder="Например: Отвечай коротко, без вступлений"
+                           aria-label="Сведение о вас" />
+                    <button class="btn-primary" @click="addUserMem">Добавить</button>
+                  </div>
+                </div>
+                <details v-if="userMem.block" class="mem-snapshot">
+                  <summary>Как это видит модель</summary>
+                  <div class="muted mem-snapshot-text">{{ userMem.block }}</div>
+                </details>
+                <div class="row" style="margin-top:8px" v-if="userMem.items.length">
+                  <button class="btn-danger" @click="clearUserMem">Стереть всё о себе</button>
+                </div>
+              </template>
+            </template>
           </horae-panel>
         </div>
 
         <!-- ВКЛАДКА: Персона + Author's Note -->
         <div v-if="drawerTab==='persona'" id="drawer-panel-persona" role="tabpanel" aria-labelledby="drawer-tab-persona">
           <h3>Персона пользователя</h3>
+          <p class="field-hint">Персона — кого вы отыгрываете в этом чате. Что система знает о вас самих во всех чатах —
+            <a href="#" @click.prevent="openMemory('about')">«Память» → «Обо мне»</a>.</p>
           <label>Активная персона в этом чате
             <select v-model="sessionPersonaId" @change="applySessionMeta({ persona_id: sessionPersonaId })">
               <option :value="null">— нет —</option>
@@ -7055,6 +7339,7 @@ createApp({
             <p v-if="!ctxStats.horae.length" class="muted ins-note">Ни одна запись не сработала на этом ходу.</p>
             <div v-for="(h, i) in ctxStats.horae" :key="'h'+i" class="ins-horae">
               <span class="grow">{{ h.title }}</span>
+              <span v-if="h.scope" class="scope-tag" :class="h.scope">{{ { session: '💬 этот чат', character: '🎭 персонаж', global: '🌐 все чаты' }[h.scope] }}</span>
               <span class="tag">{{ h.always_on ? 'always' : (h.keywords.join(', ') || h.category) }}</span>
               <span class="ins-w">{{ h.tokens }}</span>
             </div>

@@ -882,6 +882,11 @@ async def carryover(session_id: int, *, keep: int = 5, vectors: bool = True, use
             else:
                 new_data["table_overlays"][table["id"]] = overlay
         await he.save_chat_data(db, dst.id, new_data)
+        # Перенесённые реплики уже сказаны в исходном чате — память о
+        # пользователе их не разбирает второй раз (и не примет за повтор).
+        from backend import user_memory
+
+        await user_memory.mark_copied(db, dst.id, src)
         if vectors:
             from backend import horae_vector
 

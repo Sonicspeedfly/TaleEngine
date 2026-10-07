@@ -42,7 +42,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import delete as sql_delete
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -64,6 +64,7 @@ from backend import (
     native_io,
     telegram_runtime,
     usage_stats,
+    user_memory,
 )
 from backend.attachments import (
     attachment_data,
@@ -99,6 +100,7 @@ from backend.schemas import (
     ConnectionSettings,
     GenerationParams,
     HoraeEntryCreate,
+    HoraeEntryListed,
     HoraeEntryRead,
     GroupCreate,
     HoraeEntryUpdate,
@@ -268,14 +270,20 @@ class AccessMiddleware(BaseHTTPMiddleware):
 
 
 async def current_user(
+    request: Request,
     x_user_token: str | None = Header(default=None),
     db: AsyncSession = Depends(get_session),
 ):
-    """Текущий пользователь (или None, если режим аккаунтов выключен / не вошёл)."""
+    """
+    Текущий пользователь (или None, если режим аккаунтов выключен / не вошёл).
+    Токен — из заголовка или ?token=, как его принимает AccessMiddleware: иначе
+    запрос с токеном в адресе проходил middleware, а здесь становился «никем»
+    (None = полный доступ режима без аккаунтов).
+    """
     if not admin_service.security_cache().get("accounts_enabled"):
         debug_log.set_owner(None)
         return None
-    u = await accounts.user_from_token(db, x_user_token)
+    u = await accounts.user_from_token(db, x_user_token or request.query_params.get("token", ""))
     # Помечаем контекст владельцем ЗДЕСЬ: это единственное место, через которое
     # проходит опознание на всех HTTP-путях. Фоновые задачи генерации создаются
     # уже внутри запроса и наследуют пометку вместе с контекстом, поэтому
@@ -534,6 +542,8 @@ def _make_persist_new(model_used: str):
         # Ход завершён — возможно, пора освежить авто-сводку (фоном, не ждём).
         _spawn_bg(_maybe_update_summary(session_id))
         _spawn_bg(horae_tasks.after_turn(session_id, [message_id]))
+        if user_memory.schedule(session_id):
+            _spawn_bg(user_memory.maybe_update(session_id))
 
     return cb
 
@@ -618,16 +628,32 @@ async def create_character(
     return char
 
 
+def _can_write_character(char, user) -> bool:
+    """
+    Менять персонажа (карточку, лорбук) может владелец; общего (owner_id NULL) —
+    только админ: его карточка уходит в чаты всех, кто с ним говорит.
+    """
+    if user is None or user.role == "admin":
+        return True
+    return char.owner_id is not None and char.owner_id == user.id
+
+
 @app.patch("/api/characters/{character_id}", response_model=CharacterRead)
 async def update_character(
     character_id: int,
     payload: CharacterUpdate,
+    user=Depends(current_user),
     db: AsyncSession = Depends(get_session),
 ):
     char = await db.get(models.Character, character_id)
     if not char:
         raise HTTPException(404, "Персонаж не найден")
     data = payload.model_dump(exclude_none=True)
+    if user is not None and user.role != "admin" and char.owner_id not in (None, user.id):
+        raise HTTPException(403, "Нет доступа к этому персонажу")
+    # Закрепить в списке можно и общего персонажа; править его — только админ.
+    if set(data) - {"pinned"} and not _can_write_character(char, user):
+        raise HTTPException(403, "Общего персонажа меняет только администратор")
     if "pinned" in data:  # флаг снаружи -> дата внутри (см. update_session)
         char.pinned_at = _utcnow() if data.pop("pinned") else None
     for key, value in data.items():
@@ -638,9 +664,15 @@ async def update_character(
 
 
 @app.delete("/api/characters/{character_id}")
-async def delete_character(character_id: int, db: AsyncSession = Depends(get_session)):
+async def delete_character(character_id: int, user=Depends(current_user),
+                           db: AsyncSession = Depends(get_session)):
     char = await db.get(models.Character, character_id)
     if char:
+        if not _can_write_character(char, user):
+            raise HTTPException(403, "Удалить можно только своего персонажа")
+        # Лорбук персонажа — вместе с ним: SQLite отдаёт id удалённой строки
+        # следующему новому персонажу, и тот унаследовал бы чужой лорбук.
+        await db.execute(sql_delete(models.HoraeEntry).where(models.HoraeEntry.character_id == character_id))
         await db.delete(char)
         await db.commit()
     return {"ok": True}
@@ -1238,6 +1270,8 @@ async def fork_session(
         id_map[m.id] = copy_msg.id
     # Состояние Horae ветки: правки и свёртки до развилки, с новыми id.
     await horae_engine.copy_to_fork(db, session_id, fork.id, id_map, pivot.id)
+    # Реплики ветки — копии уже сказанного: память о пользователе их не разбирает.
+    await user_memory.mark_copied(db, fork.id, src)
     # Группа без участников перестала бы быть группой.
     if src.is_group:
         members = (await db.execute(
@@ -1730,6 +1764,7 @@ async def delete_message(message_id: int, db: AsyncSession = Depends(get_session
         # сводки прижимается к оставшимся СЕЙЧАС, до того как новые сообщения
         # займут эти id и сойдут за уже учтённые (см. memory_service.clamp_summary_pointer).
         await memory_service.clamp_summary_pointer(db, session_id)
+        await user_memory.clamp_pointer(db, session_id)
         # Horae: свёртки, доходящие до удалённого, снимаются; якоря правок и
         # таблиц прижимаются; документ поиска удаляется.
         await horae_engine.on_messages_deleted(db, session_id, [message_id])
@@ -1738,19 +1773,47 @@ async def delete_message(message_id: int, db: AsyncSession = Depends(get_session
 
 
 # ============================ ПАМЯТЬ HORAE ============================
-@app.get("/api/horae", response_model=list[HoraeEntryRead])
+@app.get("/api/horae", response_model=list[HoraeEntryListed])
 async def list_horae(
     session_id: int | None = None,
+    for_session: int | None = None,
     user=Depends(current_user),
     db: AsyncSession = Depends(get_session),
 ):
+    """
+    Записи лорбука. session_id — только записи этого чата; for_session — все,
+    что действуют в этом чате: глобальные, его собственные и лорбук его
+    персонажа (участников группы). Без фильтров — все доступные, в том числе
+    снимки и записи других чатов.
+    """
     q = select(models.HoraeEntry)
     if session_id is not None:
         q = q.where(models.HoraeEntry.session_id == session_id)
+    if for_session is not None:
+        sess = await db.get(models.ChatSession, for_session)
+        char_ids = ({c.id for c in await group_chat.load_members(db, for_session)}
+                    if sess is not None and sess.is_group else set())
+        if sess is not None and sess.character_id:
+            char_ids.add(sess.character_id)
+        conds = [
+            models.HoraeEntry.session_id == for_session,
+            and_(models.HoraeEntry.session_id.is_(None), models.HoraeEntry.character_id.is_(None)),
+        ]
+        if char_ids:
+            conds.append(and_(models.HoraeEntry.session_id.is_(None),
+                              models.HoraeEntry.character_id.in_(char_ids)))
+        q = q.where(or_(*conds))
     rows = (await db.execute(q)).scalars().all()
     # В режиме аккаунтов прячем чужую память (см. _can_access_horae). Глобальный
     # лор (без привязки к сессии/персонажу) виден всем; user is None / админ — всё.
-    return [r for r in rows if await _can_access_horae(db, r, user)]
+    # can_write — можно ли её менять (интерфейс прячет ✎/🗑 у чужого).
+    out = []
+    for r in rows:
+        if await _can_access_horae(db, r, user):
+            item = HoraeEntryRead.model_validate(r).model_dump()
+            item["can_write"] = await _can_access_horae(db, r, user, write=True)
+            out.append(item)
+    return out
 
 
 @app.post("/api/horae", response_model=HoraeEntryRead)
@@ -1761,8 +1824,10 @@ async def create_horae(
 ):
     entry = models.HoraeEntry(**payload.model_dump())
     # Нельзя привязать запись к чужой сессии или чужому персонажу.
-    if not await _can_access_horae(db, entry, user):
-        raise HTTPException(403, "Нет доступа к этой сессии или персонажу")
+    if not await _can_access_horae(db, entry, user, write=True):
+        raise HTTPException(403, "Нет доступа к этой сессии или персонажу"
+                            if entry.session_id or entry.character_id
+                            else "Записи для всех чатов добавляет только администратор")
     db.add(entry)
     await db.commit()
     await db.refresh(entry)
@@ -1779,9 +1844,21 @@ async def update_horae(
     entry = await db.get(models.HoraeEntry, entry_id)
     if not entry:
         raise HTTPException(404, "Запись памяти не найдена")
-    if not await _can_access_horae(db, entry, user):
+    if not await _can_access_horae(db, entry, user, write=True):
         raise HTTPException(403, "Нет доступа к этой записи памяти")
-    for key, value in payload.model_dump(exclude_none=True).items():
+    data = payload.model_dump(exclude_none=True)
+    scope = data.pop("scope", None)
+    target = data.pop("session_id", None)
+    if scope == "global":
+        entry.session_id, entry.character_id = None, None
+    elif scope == "session":
+        if target is None or await db.get(models.ChatSession, target) is None:
+            raise HTTPException(400, "Не указан чат для записи")
+        entry.session_id, entry.character_id = target, None
+    if scope and not await _can_access_horae(db, entry, user, write=True):
+        raise HTTPException(403, "Нет доступа к этому чату"
+                            if entry.session_id else "Записи для всех чатов меняет только администратор")
+    for key, value in data.items():
         setattr(entry, key, value)
     await db.commit()
     await db.refresh(entry)
@@ -1796,7 +1873,7 @@ async def delete_horae(
 ):
     entry = await db.get(models.HoraeEntry, entry_id)
     if entry:
-        if not await _can_access_horae(db, entry, user):
+        if not await _can_access_horae(db, entry, user, write=True):
             raise HTTPException(403, "Нет доступа к этой записи памяти")
         await db.delete(entry)
         await db.commit()
@@ -2174,6 +2251,8 @@ async def _import_native_chat(db, data: dict, owner_id, user) -> dict:
             )
         )
         horae_count += 1
+    # Импортированные реплики — копия уже сказанного, а не новые слова.
+    await user_memory.mark_copied(db, sess.id)
     await db.commit()
 
     return {
@@ -2305,6 +2384,7 @@ async def import_chat(
                 priority=5,
             )
         )
+    await user_memory.mark_copied(db, sess.id)
     await db.commit()
     return {
         "session_id": sess.id,
@@ -2871,6 +2951,7 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
     save_user=False — повтор хода (retry): реплика уже в БД, второй раз не сохраняем.
     """
     sess = await db.get(models.ChatSession, session_id)
+    reply_to_message_id = await _own_reply_id(db, session_id, reply_to_message_id)
     members = await group_chat.load_members(db, session_id)
     connection = await get_connection(db)
     director = sess.director
@@ -2996,19 +3077,58 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
         # Ход группы завершён — освежаем авто-сводку сюжета (фоном).
         _spawn_bg(_maybe_update_summary(session_id))
         _spawn_bg(horae_tasks.after_turn(session_id, list(saved_ids)))
+        if user_memory.schedule(session_id):
+            _spawn_bg(user_memory.maybe_update(session_id))
 
     job_id = uuid.uuid4().hex
     await generation_manager.start_runner(job_id, session_id, runner)
     return job_id
 
 
-async def _reply_prefix(db, reply_to_message_id) -> str:
+async def _foreign_turn(session_id: int, user) -> None:
+    """
+    Реплику написал не владелец чата (друг, админ в чужом чате): у сообщений нет
+    автора, и память о пользователе владельца приписала бы её владельцу —
+    указатель уходит за неё.
+    """
+    if user is None:
+        return
+    async with AsyncSessionLocal() as db:
+        sess = await db.get(models.ChatSession, session_id)
+        if sess is not None and sess.owner_id != user.id:
+            await user_memory.skip_to_end(db, session_id)
+            await db.commit()
+
+
+async def _own_reply_id(db, session_id: int, reply_to_message_id) -> int | None:
+    """
+    id сообщения, на которое отвечают, — только если оно из ЭТОГО чата.
+
+    Браузер мог прислать id из другого чата: «Ответить» нажали в одном чате,
+    перешли в другой, и выбор ответа не сбросился (плашка не видна — сообщения
+    в этом чате нет). Тогда цитата чужого чата незаметно уходила модели
+    приставкой «(В ответ на …)» и дальше жила в истории — модель «вспоминала»
+    то, что обсуждалось совсем в другом чате.
+    """
+    if not reply_to_message_id:
+        return None
+    try:
+        rid = int(reply_to_message_id)
+    except (TypeError, ValueError):
+        return None
+    rep = await db.get(models.Message, rid)
+    return rid if rep is not None and rep.session_id == session_id else None
+
+
+async def _reply_prefix(db, reply_to_message_id, session_id: int | None = None) -> str:
     """Текст-приставка «(В ответ на …)» — чтобы модель поняла, к чему обращаются."""
     if not reply_to_message_id:
         return ""
     rep = await db.get(models.Message, reply_to_message_id)
     if not rep or not rep.content:
         return ""
+    if session_id is not None and rep.session_id != session_id:
+        return ""   # сообщение другого чата — не подмешиваем (см. _own_reply_id)
     who = rep.speaker_name or ("твоё сообщение" if rep.role == "assistant" else "сообщение пользователя")
     return f"(В ответ на {who}: «{rep.content[:300]}»)\n"
 
@@ -3018,13 +3138,14 @@ async def _start_user_turn(session_id, content, attachments, params, db, reply_t
     sess = await db.get(models.ChatSession, session_id)
     if not sess:
         raise HTTPException(404, "Сессия не найдена")
+    reply_to_message_id = await _own_reply_id(db, session_id, reply_to_message_id)
     if sess.is_group:
         return await _start_group_turn(session_id, content, attachments, params, db, reply_to_message_id)
     character = await db.get(models.Character, sess.character_id)
     connection = await get_connection(db)
 
     # Для модели добавляем ссылку на сообщение, на которое отвечает пользователь.
-    model_text = (await _reply_prefix(db, reply_to_message_id)) + content
+    model_text = (await _reply_prefix(db, reply_to_message_id, session_id)) + content
     user_content = build_user_content(model_text, attachments, current=True)
     # Контекст строим ДО сохранения нового сообщения (иначе оно задвоится).
     messages = await build_context_from_db(
@@ -3283,6 +3404,8 @@ async def ws_chat(websocket: WebSocket, session_id: int):
                 return
         debug_log.set_owner(None)  # режим без аккаунтов: владелец один
 
+    if not sec.get("accounts_enabled"):
+        ws_user = None
     await websocket.accept()
     current_job_id: str | None = None
     forward_task: asyncio.Task | None = None
@@ -3319,6 +3442,14 @@ async def ws_chat(websocket: WebSocket, session_id: int):
                     generation_manager.cancel(current_job_id)
                 continue
 
+            # Доступ проверяем на каждом ходе, а не только при подключении:
+            # владелец мог закрыть доступ, пока у друга открыта вкладка.
+            if ws_user is not None:
+                async with AsyncSessionLocal() as db:
+                    if not await _can_access_session(db, await db.get(models.ChatSession, session_id), ws_user):
+                        await websocket.close(code=4403)
+                        return
+
             # Останавливаем предыдущую пересылку (если вдруг ещё идёт).
             if forward_task and not forward_task.done():
                 forward_task.cancel()
@@ -3340,6 +3471,7 @@ async def ws_chat(websocket: WebSocket, session_id: int):
                         session_id, msg.content, msg.attachments, msg.params, db,
                         reply_to_message_id=msg.reply_to_message_id,
                     )
+                    await _foreign_turn(session_id, ws_user)
 
             await websocket.send_json({"type": "job", "job_id": current_job_id})
             job = generation_manager.get(current_job_id)
@@ -3388,6 +3520,7 @@ async def http_send(
         session_id, msg.content, msg.attachments, msg.params, db,
         reply_to_message_id=msg.reply_to_message_id,
     )
+    await _foreign_turn(session_id, user)
     return {"job_id": job_id}
 
 
@@ -3441,6 +3574,7 @@ async def http_send_form(
         session_id, (data.get("content") or ""), attachments, params, db,
         reply_to_message_id=data.get("reply_to_message_id"),
     )
+    await _foreign_turn(session_id, user)
     return {"job_id": job_id}
 
 
@@ -3639,33 +3773,35 @@ async def _can_access_session(db, sess, user) -> bool:
     return bool(sh)
 
 
-async def _can_access_horae(db, entry, user) -> bool:
+async def _can_access_horae(db, entry, user, write: bool = False) -> bool:
     """
     Доступ к записи памяти Horae в режиме аккаунтов. Владелец у записи не хранится
     напрямую — он определяется по привязке (как и при сборке контекста):
       * user is None (режим выключен) либо админ — полный доступ;
       * глобальная запись (session_id и character_id оба NULL) — общий лор мира,
-        видна всем;
+        видна всем, а менять её (write) может только админ: она уходит в чаты
+        ВСЕХ пользователей, и запись одного не должна всплывать у другого;
       * привязка к сессии — доступ, если есть доступ к этой сессии
         (владелец / шара / админ, см. _can_access_session);
-      * привязка к персонажу — доступ, если персонаж общий (owner_id NULL) или
-        принадлежит пользователю.
-    Запись с несколькими привязками доступна, если доступна хотя бы одна из них
-    (так же, как такая запись попадает в контекст в _load_horae_records).
+      * привязка к персонажу — чтение, если персонаж общий (owner_id NULL) или
+        принадлежит пользователю; запись — только своего персонажа: лорбук
+        общего уходит в чаты всех, кто с ним говорит (как put_profile).
+    Чтение: доступна хотя бы одна привязка. Запись: доступны ВСЕ — иначе запись
+    с чужим чатом и своим персонажем попадала бы в чужой чат.
     """
     if user is None or user.role == "admin":
         return True
     if entry.session_id is None and entry.character_id is None:
-        return True
+        return not write
+    oks = []
     if entry.session_id is not None:
         sess = await db.get(models.ChatSession, entry.session_id)
-        if await _can_access_session(db, sess, user):
-            return True
+        oks.append(await _can_access_session(db, sess, user))
     if entry.character_id is not None:
         char = await db.get(models.Character, entry.character_id)
-        if char is not None and (char.owner_id is None or char.owner_id == user.id):
-            return True
-    return False
+        owner = getattr(char, "owner_id", None)
+        oks.append(char is not None and (owner == user.id or (owner is None and not write)))
+    return all(oks) if write else any(oks)
 
 
 @app.get("/api/sessions/{session_id}/shares")
@@ -3727,6 +3863,9 @@ async def unshare_session(session_id: int, uid: int, user=Depends(current_user),
     ).scalars().first()
     if sh:
         await db.delete(sh)
+        # Реплики времени доступа писал не только владелец (у сообщений нет
+        # автора) — память о пользователе их не разберёт и после.
+        await user_memory.skip_to_end(db, session_id)
         await db.commit()
     return {"ok": True}
 
@@ -3958,6 +4097,7 @@ def _localize_cdn(html: str, vendor: set[str]) -> str:
 # Эндпоинты Horae State Engine — ДО раздачи статики: mount на «/» ниже
 # перехватил бы их пути.
 app.include_router(horae_api.build_router(current_user, _can_access_session))
+app.include_router(user_memory.build_router(current_user))
 
 
 if _frontend_dir.exists():

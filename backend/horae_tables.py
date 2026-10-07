@@ -481,15 +481,86 @@ def set_lock(table: dict, kind: str, r: int, c: int, locked: bool) -> dict:
     return out
 
 
-def split_effective(table: dict) -> tuple[dict | None, dict]:
+def template_headers(tpl: dict | None) -> dict[str, str]:
+    """Заголовки, которые хранит общий шаблон (как их читает _effective_from_template)."""
+    t = tpl or {}
+    return _headers_of(t.get("headers") or {}) or _headers_of(t.get("base") or t.get("data") or {})
+
+
+def is_shared_header(shared: dict[str, str], table: dict, r: int, c: int) -> bool:
+    """
+    Уходит ли правка заголовка пользователем в общий шаблон.
+
+    Строка 0 — схема столбцов, она общая всегда. Подпись строки (столбец 0)
+    общая, только если шаблон её уже задаёт или она закреплена (замок строки,
+    ячейки или всего столбца 0): иначе это данные чата — имена, которые ИИ
+    вписал в этом чате, — и в чужих чатах им не место.
+    """
+    if not _is_header(r, c):
+        return False
+    if r == 0:
+        return True
+    locked_rows, locked_cols, locked_cells = _locks(table)
+    return (bool(str(shared.get(_key(r, c)) or "").strip())
+            or r in locked_rows or 0 in locked_cols or _key(r, c) in locked_cells)
+
+
+def promotable_headers(table: dict, data: dict) -> dict[str, str]:
+    """
+    Заголовки таблицы, которую делают общей: строка 0 и закреплённые подписи
+    строк. Незакреплённые подписи строк остаются данными этого чата.
+    """
+    return {k: v for k, v in _headers_of(data or {}).items()
+            if is_shared_header({}, table, *_parse_key(k))}
+
+
+def locked_labels(data: dict, kind: str, r: int, c: int) -> dict[str, str]:
+    """
+    Подписи строк (столбец 0), которые закрывает новый замок: строки r,
+    ячейки (r, 0) или всего столбца 0. Строку 0 замок в шаблон не переносит —
+    заголовки столбцов уходят туда только явной правкой.
+    """
+    cells = _headers_of(data or {})
+    if kind == "row" and r > 0:
+        keys = {_key(r, 0)}
+    elif kind == "cell" and c == 0 and r > 0:
+        keys = {_key(r, 0)}
+    elif kind == "col" and c == 0:
+        keys = {k for k in cells if _parse_key(k)[0] > 0}
+    else:
+        keys = set()
+    return {k: v for k, v in cells.items() if k in keys and v.strip()}
+
+
+def shift_headers(headers: dict[str, str], table: dict, op: str, index: int,
+                  data: dict | None = None) -> dict[str, str]:
+    """
+    Сдвинуть заголовки шаблона той же правкой структуры, что и таблицу.
+    table — таблица до правки, data — её данные: размер берётся по ним (ИИ мог
+    дописать строки сверх шаблона), иначе удаление такой строки не прошло бы
+    проверку границ, а вставка встала бы не туда.
+    """
+    rows, cols = _dims(table.get("rows"), table.get("cols"), _norm_cells(data or {}))
+    sized = {**table, "rows": rows, "cols": cols}
+    return _headers_of(structure(sized, headers, op, index, 0)["base"])
+
+
+def split_effective(table: dict, headers: dict | None = None) -> tuple[dict | None, dict]:
     """
     Эффективная таблица → (шаблон, оверлей) для global/character или
-    (None, вся таблица) для local. Так правка структуры/заголовков доходит до
-    шаблона, а данные остаются в чате.
+    (None, вся таблица) для local. Так правка структуры доходит до шаблона,
+    а данные остаются в чате.
+
+    headers — заголовки шаблона, если их посчитал вызывающий (правка
+    пользователя в общей таблице). Без них заголовки берутся из base, и
+    тогда base не должна содержать данных чата — её увидят все чаты.
     """
     if (table or {}).get("scope") not in ("global", "character"):
         return None, copy.deepcopy(table)
-    template = make_template({k: v for k, v in table.items() if k != "data"})
+    src = {k: v for k, v in table.items() if k != "data"}
+    if headers is not None:
+        src = {**src, "base": {}, "headers": _headers_of(headers)}
+    template = make_template(src)
     template["id"] = table.get("id") or template["id"]
     template["scope"] = table["scope"]
     overlay = {

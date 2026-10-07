@@ -98,6 +98,13 @@ class ChatSession(Base):
     # можно упорядочить между собой (последний закреплённый — сверху), а «не
     # закреплён» это просто NULL.
     pinned_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Память о пользователе (backend/user_memory.py): до какого сообщения
+    # реплики этого чата уже просмотрены. Ветка и продолжение начинают с копий
+    # старых реплик — им указатель ставится сразу на конец копии.
+    profile_upto: Mapped[int] = mapped_column(Integer, default=0)
+    # Разговор, копией которого чат начался (ветка, продолжение): повтор
+    # сведения в нём — тот же разговор, а не «другой чат». 0 — сам себе корень.
+    profile_root: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     character = relationship("Character", back_populates="sessions")
@@ -320,6 +327,38 @@ class HoraeFact(Base):
     # свежесть и отсекаются факты, чей источник и так лежит в активном окне.
     source_message_id: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class UserMemory(Base):
+    """
+    Память о пользователе — общие сведения о реальном человеке (имя, обращение,
+    язык, род занятий, предпочтения ответа), одна на владельца для ВСЕХ его
+    чатов. Темы, планы и события чатов сюда не попадают (см. user_memory.py).
+
+    profile_key — владелец: "u:<id>" (аккаунт), "tg:<id>" (Telegram без
+    аккаунтов) или "local" (один пользователь). status: "active" — уходит в
+    промпт, "candidate" — ждёт подтверждения (пользователем или повтором в
+    другом чате). locked — запись правил человек: авто её не трогает.
+    """
+    __tablename__ = "user_memory"
+    __table_args__ = (UniqueConstraint("profile_key", "norm_key", name="uq_user_memory_key"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    profile_key: Mapped[str] = mapped_column(String(100), index=True)
+    category: Mapped[str] = mapped_column(String(30), default="interests")
+    content: Mapped[str] = mapped_column(Text, default="")
+    norm_key: Mapped[str] = mapped_column(String(400), default="")
+    status: Mapped[str] = mapped_column(String(20), default="candidate")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    source: Mapped[str] = mapped_column(String(20), default="auto")
+    locked: Mapped[bool] = mapped_column(Boolean, default=False)
+    hits: Mapped[int] = mapped_column(Integer, default=1)
+    # Чаты, где сведение встречалось, и ключи цитат: повтор засчитывается,
+    # только если это другая фраза в другом чате (копия ветки — не повтор).
+    sessions_seen: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    meta: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
 class HoraeChatState(Base):
