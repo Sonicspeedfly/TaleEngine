@@ -151,7 +151,7 @@ createApp({
       // Вкладка «Память» — панель Хроники из horae.js; свои разделы (сжатие
       // истории, лорбук) app.js рисует в её слотах. memoryTabReq — переход на
       // раздел извне ({ tab, n }, см. openMemory).
-      memoryExtraTabs: [["compress", "Сжатие истории"], ["lore", "Лорбук"]],
+      memoryExtraTabs: [["compress", "Сжатие истории"], ["lore", "Лорбук"], ["about", "Обо мне"]],
       memoryTabReq: null,
       // Глобальный summary_enabled Хроники (GET /horae/settings): вместе с
       // autoSummary он задаёт, чем по умолчанию сжимается история (memoryEngine).
@@ -207,6 +207,11 @@ createApp({
 
       // --- Память: лорбук и сжатие истории (вкладка Memory) ---
       horae: [],
+      // «Обо мне» — память о пользователе для всех его чатов (GET /api/user-memory):
+      // { settings, categories, items, block } или null, пока не загружена.
+      userMem: null,
+      userMemNew: { category: "style", content: "" },
+      userMemEdit: { id: null, content: "" },
       // Мастер-снимок: каждые summaryEvery сообщений ИИ дописывает в него то,
       // что вышло из окна. Ложь — снимок не обновляется (см. memoryEngine).
       autoSummary: true,
@@ -506,6 +511,18 @@ createApp({
   },
 
   computed: {
+    // «Обо мне»: действующие сведения и кандидаты, ждущие подтверждения.
+    userMemActive() {
+      return ((this.userMem && this.userMem.items) || []).filter((i) => i.status === "active");
+    },
+    userMemCandidates() {
+      return ((this.userMem && this.userMem.items) || []).filter((i) => i.status !== "active");
+    },
+    // Записи лорбука «во всех чатах»: их стоит проверить, если чат «вспоминает»
+    // то, чего в нём не было.
+    horaeGlobalCount() {
+      return (this.horae || []).filter((h) => !h.session_id && !h.character_id).length;
+    },
     selectedCharacter() {
       return this.characters.find((c) => c.id === this.selectedCharacterId) || null;
     },
@@ -4087,6 +4104,55 @@ createApp({
     },
     async deleteHorae(h) { await this.api("/horae/" + h.id, { method: "DELETE" }); await this.loadHorae(); },
 
+    // ---------- «Обо мне»: память о пользователе (все чаты) ----------
+    async loadUserMemory() {
+      try { this.userMem = await this.api("/user-memory"); } catch (e) { this.userMem = null; }
+    },
+    userMemLabel(cat) {
+      const c = ((this.userMem && this.userMem.categories) || []).find((x) => x.key === cat);
+      return c ? c.label : cat;
+    },
+    async _userMemCall(path, opts, okText) {
+      try {
+        await this.api(path, opts);
+        if (okText) this.showToast(okText);
+      } catch (e) {
+        this.showToast("Память о вас: " + e.message);
+      }
+      await this.loadUserMemory();
+      this.loadCtxStats();
+    },
+    async saveUserMemSettings(patch) {
+      await this._userMemCall("/user-memory/settings", { method: "PUT", body: JSON.stringify(patch) });
+    },
+    async addUserMem() {
+      const n = this.userMemNew;
+      if (!n.content.trim()) return;
+      await this._userMemCall("/user-memory", { method: "POST", body: JSON.stringify(n) });
+      this.userMemNew = { category: n.category, content: "" };
+    },
+    async confirmUserMem(it) {
+      await this._userMemCall("/user-memory/" + it.id, { method: "PATCH", body: JSON.stringify({ status: "active" }) });
+    },
+    async toggleUserMem(it) {
+      await this._userMemCall("/user-memory/" + it.id, { method: "PATCH", body: JSON.stringify({ enabled: !it.enabled }) });
+    },
+    startEditUserMem(it) { this.userMemEdit = { id: it.id, content: it.content }; },
+    async saveEditUserMem() {
+      const e = this.userMemEdit;
+      if (!e.id || !e.content.trim()) return;
+      await this._userMemCall("/user-memory/" + e.id, { method: "PATCH", body: JSON.stringify({ content: e.content }) });
+      this.userMemEdit = { id: null, content: "" };
+    },
+    async deleteUserMem(it) {
+      await this._userMemCall("/user-memory/" + it.id, { method: "DELETE" });
+    },
+    async clearUserMem() {
+      const ok = await this.askConfirm("Стереть всё, что система запомнила о вас? Чаты и их память это не затронет.",
+        { title: "Очистить «Обо мне»", okText: "Стереть" });
+      if (ok) await this._userMemCall("/user-memory", { method: "DELETE" }, "Память о вас очищена");
+    },
+
     // ---------- Вкладка «Память»: раздел и чем сжимать историю ----------
     // Открыть «Память» на разделе: импорт чата показывает, что легло в Хронику
     // («state») или в лорбук («lore»). n растёт — тот же раздел дважды тоже.
@@ -5042,6 +5108,7 @@ createApp({
         this.loadMemStatus();
         this.loadCtxStats();
         this.loadHoraeGlobal();
+        this.loadUserMemory();
       }
       if (tab === "generation") this.loadMediaStatus();
     },
@@ -6522,6 +6589,9 @@ createApp({
                 <span class="scope-tag character">🎭 персонаж</span> — во всех чатах с этим персонажем (из карточки),
                 <span class="scope-tag global">🌐 все чаты</span> — в каждом разговоре, с любым персонажем.
                 Здесь показаны записи, которые действуют в этом чате. При импорте чата из SillyTavern сюда попадает снимок состояния (💬, always_on).</p>
+              <p v-if="horaeGlobalCount" class="field-hint">🌐 {{ horaeGlobalCount }} {{ plural(horaeGlobalCount, 'запись подмешивается', 'записи подмешиваются', 'записей подмешиваются') }}
+                во все чаты. Если чат «вспоминает» то, чего в нём не было, — проверьте их и перенесите в нужный чат (✎ → «только этот чат»).
+                Сведения о вас самих лучше хранить в разделе «Обо мне».</p>
               <div class="card">
                 <input v-model="horaeEdit.title" placeholder="Заголовок" style="margin-bottom:6px" />
                 <textarea v-model="horaeEdit.content" rows="3" placeholder="Содержимое" style="margin-bottom:6px"></textarea>
@@ -6573,12 +6643,84 @@ createApp({
                 <div v-else class="muted">{{ h.content }}</div>
               </div>
             </template>
+            <template #about>
+              <p class="muted">Здесь то, что система знает о <b>вас</b> — во всех чатах, с любым персонажем: как вас зовут и как
+                к вам обращаться, на каком языке писать, чем вы занимаетесь, что умеете и любите, какие ответы вам удобны.
+                Темы разговоров, планы («скину файл»), события сюжета и то, что вы отыгрываете, сюда <b>не</b> попадают — они
+                остаются в своём чате.</p>
+              <p v-if="!userMem" class="muted">Загружаю…</p>
+              <template v-else>
+                <div class="card">
+                  <label class="check"><input type="checkbox" :checked="userMem.settings.enabled"
+                    @change="saveUserMemSettings({ enabled: $event.target.checked })" /> Учитывать в чатах</label>
+                  <label class="check"><input type="checkbox" :checked="userMem.settings.auto"
+                    @change="saveUserMemSettings({ auto: $event.target.checked })" /> Замечать новое в моих репликах</label>
+                  <p class="field-hint">Раз в несколько ваших реплик модель памяти (как для сжатия) читает только их — не ответы
+                    персонажа — и предлагает сведения с цитатой. Чаты, открытые друзьям, не читаются.</p>
+                  <label class="check"><input type="checkbox" :checked="userMem.settings.instant"
+                    @change="saveUserMemSettings({ instant: $event.target.checked })" /> Применять сразу, без подтверждения</label>
+                  <p class="field-hint">Выключено — новое сначала ждёт ниже. Само включается, если вы скажете это ещё
+                    в одном чате другими словами или вне роли — ((…)) или /ooc.</p>
+                </div>
+
+                <h4 v-if="userMemCandidates.length">Ждут подтверждения ({{ userMemCandidates.length }})</h4>
+                <div class="card" v-for="it in userMemCandidates" :key="'umc' + it.id">
+                  <div class="row-between">
+                    <span><span class="tag">{{ userMemLabel(it.category) }}</span> {{ it.content }}</span>
+                    <span style="display:inline-flex; gap:4px">
+                      <button class="btn-icon" @click="confirmUserMem(it)" :aria-label="'Подтвердить: ' + it.content" title="Верно, запомнить">✓</button>
+                      <button class="btn-danger" @click="deleteUserMem(it)" :aria-label="'Отклонить: ' + it.content" title="Неверно, забыть">✕</button>
+                    </span>
+                  </div>
+                  <div v-if="it.quote" class="muted" style="font-size:12px">«{{ it.quote }}»</div>
+                </div>
+
+                <h4>Что система помнит о вас</h4>
+                <p v-if="!userMemActive.length" class="muted">Пока ничего. Добавьте сами или подтвердите предложенное.</p>
+                <div class="card" v-for="it in userMemActive" :key="'uma' + it.id" :class="{ 'muted': !it.enabled }">
+                  <div v-if="userMemEdit.id === it.id" class="row">
+                    <input v-model="userMemEdit.content" @keydown.enter="saveEditUserMem" :aria-label="'Изменить: ' + it.content" />
+                    <button class="btn-primary" @click="saveEditUserMem">Сохранить</button>
+                    <button @click="userMemEdit = { id: null, content: '' }">Отмена</button>
+                  </div>
+                  <div v-else class="row-between">
+                    <span><span class="tag">{{ userMemLabel(it.category) }}</span> {{ it.content }}</span>
+                    <span style="display:inline-flex; gap:4px; align-items:center">
+                      <label class="check" style="margin:0" :title="it.enabled ? 'Учитывается' : 'Выключено'">
+                        <input type="checkbox" :checked="it.enabled" @change="toggleUserMem(it)" :aria-label="'Учитывать: ' + it.content" /></label>
+                      <button class="btn-icon" @click="startEditUserMem(it)" :aria-label="'Изменить: ' + it.content">✎</button>
+                      <button class="btn-danger" @click="deleteUserMem(it)" :aria-label="'Удалить: ' + it.content">🗑</button>
+                    </span>
+                  </div>
+                </div>
+
+                <div class="card">
+                  <div class="row">
+                    <select v-model="userMemNew.category" aria-label="Что это за сведение">
+                      <option v-for="c in userMem.categories" :key="c.key" :value="c.key">{{ c.label }}</option>
+                    </select>
+                    <input v-model="userMemNew.content" @keydown.enter="addUserMem" placeholder="Например: Отвечай коротко, без вступлений"
+                           aria-label="Сведение о вас" />
+                    <button class="btn-primary" @click="addUserMem">Добавить</button>
+                  </div>
+                </div>
+                <details v-if="userMem.block" class="mem-snapshot">
+                  <summary>Как это видит модель</summary>
+                  <div class="muted mem-snapshot-text">{{ userMem.block }}</div>
+                </details>
+                <div class="row" style="margin-top:8px" v-if="userMem.items.length">
+                  <button class="btn-danger" @click="clearUserMem">Стереть всё о себе</button>
+                </div>
+              </template>
+            </template>
           </horae-panel>
         </div>
 
         <!-- ВКЛАДКА: Персона + Author's Note -->
         <div v-if="drawerTab==='persona'" id="drawer-panel-persona" role="tabpanel" aria-labelledby="drawer-tab-persona">
           <h3>Персона пользователя</h3>
+          <p class="field-hint">Персона — кого вы отыгрываете в этом чате. Что система знает о вас самих во всех чатах —
+            <a href="#" @click.prevent="openMemory('about')">«Память» → «Обо мне»</a>.</p>
           <label>Активная персона в этом чате
             <select v-model="sessionPersonaId" @change="applySessionMeta({ persona_id: sessionPersonaId })">
               <option :value="null">— нет —</option>
