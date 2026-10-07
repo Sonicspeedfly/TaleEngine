@@ -302,15 +302,20 @@ def build_router(current_user, can_access_session) -> APIRouter:
             return None
         return next((t for t in templates if isinstance(t, dict) and _tpl_key(t) == table["id"]), None)
 
-    async def _save_table(db, sess, table: dict, headers: dict | None = None) -> None:
+    async def _save_table(db, sess, table: dict, headers: dict | None = None,
+                          overlay_only: bool = False) -> None:
         """
         Разложить действующую таблицу обратно: шаблон — по его месту, данные — в чат.
         headers — заголовки общего шаблона (см. patch_table); без них они берутся из base.
+        overlay_only — шаблон не трогать (правит тот, кому общий шаблон менять нельзя:
+        его размер и заголовки видят чаты других людей).
         """
         template, overlay = horae_tables.split_effective(table, headers)
         scope = table.get("scope") or "local"
         data = await he.load_chat_data(db, sess.id)
-        if template is None:
+        if template is not None and overlay_only:
+            data.setdefault("table_overlays", {})[table["id"]] = overlay
+        elif template is None:
             data["tables"] = [overlay if t.get("id") == table["id"] else t for t in data.get("tables") or []]
             if not any(t.get("id") == table["id"] for t in data["tables"]):
                 data["tables"].append(overlay)
@@ -483,7 +488,8 @@ def build_router(current_user, can_access_session) -> APIRouter:
                     shared = None
                 elif shared is None:
                     shared = horae_tables.promotable_headers(table, current)
-            await _save_table(db, sess, table, shared)
+            owner = await _can_edit_template(db, sess, table.get("scope") or "local", user)
+            await _save_table(db, sess, table, shared, overlay_only=not owner)
             await db.commit()
         return {"ok": True}
 

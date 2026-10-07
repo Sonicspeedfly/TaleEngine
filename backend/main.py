@@ -100,6 +100,7 @@ from backend.schemas import (
     ConnectionSettings,
     GenerationParams,
     HoraeEntryCreate,
+    HoraeEntryListed,
     HoraeEntryRead,
     GroupCreate,
     HoraeEntryUpdate,
@@ -627,16 +628,32 @@ async def create_character(
     return char
 
 
+def _can_write_character(char, user) -> bool:
+    """
+    Менять персонажа (карточку, лорбук) может владелец; общего (owner_id NULL) —
+    только админ: его карточка уходит в чаты всех, кто с ним говорит.
+    """
+    if user is None or user.role == "admin":
+        return True
+    return char.owner_id is not None and char.owner_id == user.id
+
+
 @app.patch("/api/characters/{character_id}", response_model=CharacterRead)
 async def update_character(
     character_id: int,
     payload: CharacterUpdate,
+    user=Depends(current_user),
     db: AsyncSession = Depends(get_session),
 ):
     char = await db.get(models.Character, character_id)
     if not char:
         raise HTTPException(404, "Персонаж не найден")
     data = payload.model_dump(exclude_none=True)
+    if user is not None and user.role != "admin" and char.owner_id not in (None, user.id):
+        raise HTTPException(403, "Нет доступа к этому персонажу")
+    # Закрепить в списке можно и общего персонажа; править его — только админ.
+    if set(data) - {"pinned"} and not _can_write_character(char, user):
+        raise HTTPException(403, "Общего персонажа меняет только администратор")
     if "pinned" in data:  # флаг снаружи -> дата внутри (см. update_session)
         char.pinned_at = _utcnow() if data.pop("pinned") else None
     for key, value in data.items():
@@ -647,9 +664,12 @@ async def update_character(
 
 
 @app.delete("/api/characters/{character_id}")
-async def delete_character(character_id: int, db: AsyncSession = Depends(get_session)):
+async def delete_character(character_id: int, user=Depends(current_user),
+                           db: AsyncSession = Depends(get_session)):
     char = await db.get(models.Character, character_id)
     if char:
+        if not _can_write_character(char, user):
+            raise HTTPException(403, "Удалить можно только своего персонажа")
         # Лорбук персонажа — вместе с ним: SQLite отдаёт id удалённой строки
         # следующему новому персонажу, и тот унаследовал бы чужой лорбук.
         await db.execute(sql_delete(models.HoraeEntry).where(models.HoraeEntry.character_id == character_id))
@@ -1753,7 +1773,7 @@ async def delete_message(message_id: int, db: AsyncSession = Depends(get_session
 
 
 # ============================ ПАМЯТЬ HORAE ============================
-@app.get("/api/horae", response_model=list[HoraeEntryRead])
+@app.get("/api/horae", response_model=list[HoraeEntryListed])
 async def list_horae(
     session_id: int | None = None,
     for_session: int | None = None,
@@ -1786,7 +1806,14 @@ async def list_horae(
     rows = (await db.execute(q)).scalars().all()
     # В режиме аккаунтов прячем чужую память (см. _can_access_horae). Глобальный
     # лор (без привязки к сессии/персонажу) виден всем; user is None / админ — всё.
-    return [r for r in rows if await _can_access_horae(db, r, user)]
+    # can_write — можно ли её менять (интерфейс прячет ✎/🗑 у чужого).
+    out = []
+    for r in rows:
+        if await _can_access_horae(db, r, user):
+            item = HoraeEntryRead.model_validate(r).model_dump()
+            item["can_write"] = await _can_access_horae(db, r, user, write=True)
+            out.append(item)
+    return out
 
 
 @app.post("/api/horae", response_model=HoraeEntryRead)
@@ -3058,6 +3085,21 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
     return job_id
 
 
+async def _foreign_turn(session_id: int, user) -> None:
+    """
+    Реплику написал не владелец чата (друг, админ в чужом чате): у сообщений нет
+    автора, и память о пользователе владельца приписала бы её владельцу —
+    указатель уходит за неё.
+    """
+    if user is None:
+        return
+    async with AsyncSessionLocal() as db:
+        sess = await db.get(models.ChatSession, session_id)
+        if sess is not None and sess.owner_id != user.id:
+            await user_memory.skip_to_end(db, session_id)
+            await db.commit()
+
+
 async def _own_reply_id(db, session_id: int, reply_to_message_id) -> int | None:
     """
     id сообщения, на которое отвечают, — только если оно из ЭТОГО чата.
@@ -3362,6 +3404,8 @@ async def ws_chat(websocket: WebSocket, session_id: int):
                 return
         debug_log.set_owner(None)  # режим без аккаунтов: владелец один
 
+    if not sec.get("accounts_enabled"):
+        ws_user = None
     await websocket.accept()
     current_job_id: str | None = None
     forward_task: asyncio.Task | None = None
@@ -3398,6 +3442,14 @@ async def ws_chat(websocket: WebSocket, session_id: int):
                     generation_manager.cancel(current_job_id)
                 continue
 
+            # Доступ проверяем на каждом ходе, а не только при подключении:
+            # владелец мог закрыть доступ, пока у друга открыта вкладка.
+            if ws_user is not None:
+                async with AsyncSessionLocal() as db:
+                    if not await _can_access_session(db, await db.get(models.ChatSession, session_id), ws_user):
+                        await websocket.close(code=4403)
+                        return
+
             # Останавливаем предыдущую пересылку (если вдруг ещё идёт).
             if forward_task and not forward_task.done():
                 forward_task.cancel()
@@ -3419,6 +3471,7 @@ async def ws_chat(websocket: WebSocket, session_id: int):
                         session_id, msg.content, msg.attachments, msg.params, db,
                         reply_to_message_id=msg.reply_to_message_id,
                     )
+                    await _foreign_turn(session_id, ws_user)
 
             await websocket.send_json({"type": "job", "job_id": current_job_id})
             job = generation_manager.get(current_job_id)
@@ -3467,6 +3520,7 @@ async def http_send(
         session_id, msg.content, msg.attachments, msg.params, db,
         reply_to_message_id=msg.reply_to_message_id,
     )
+    await _foreign_turn(session_id, user)
     return {"job_id": job_id}
 
 
@@ -3520,6 +3574,7 @@ async def http_send_form(
         session_id, (data.get("content") or ""), attachments, params, db,
         reply_to_message_id=data.get("reply_to_message_id"),
     )
+    await _foreign_turn(session_id, user)
     return {"job_id": job_id}
 
 

@@ -139,6 +139,10 @@ class HoraeEntryRead(HoraeEntryBase):
     id: int
 
 
+class HoraeEntryListed(HoraeEntryRead):
+    can_write: bool = True
+
+
 class CharacterUpdate(BaseModel):
     """Частичное обновление персонажа (все поля опциональны)."""
     # Закрепить наверху списка. Внутри это дата (pinned_at), снаружи — флаг.

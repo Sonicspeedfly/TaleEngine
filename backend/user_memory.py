@@ -123,7 +123,9 @@ _TRANSIENT_RE = re.compile(
     r"\b(?:буд(?:у|ет|ем|ете|ут)|собира(?:юсь|ется|емся|етесь|ются|лся|лась|лись)|"
     r"планиру(?:ю|ет|ем|ете|ют)|пришл\w*|прислат\w*|скин\w*|кин(?:у|ет|ем|ете|ут)|вылож\w*|"
     r"отправ\w*|покаж(?:у|ет|ем|ете|ут)|поделит\w*|обеща\w*|сегодня|завтра|вчера|на днях|скоро|"
-    r"в этом чате|обсужда\w*|спросил\w*|хотел\w* бы получить|today|tomorrow|yesterday|tonight)\b",
+    r"в этом чате|обсужда\w*|спросил\w*|хотел\w* бы получить|today|tomorrow|yesterday|tonight|"
+    r"(?:will|going to|gonna)\s+(?:send|share|show|post|upload|give|write|finish|make|try|continue|bring|"
+    r"drop|attach))\b",
     re.IGNORECASE,
 )
 # Код, ссылки и файлы. Имена технологий вида Node.js — не файлы.
@@ -227,7 +229,9 @@ def _names_pattern(names) -> re.Pattern | None:
         if len(w) >= 5:
             alts.append(re.escape(w[:-1]) + r"\w{0,3}")
         elif w[-1] in "аяоеиыуюьй":
-            alts.append(re.escape(w[:-1]) + _NAME_ENDINGS)   # «Лира» → «Лиру», «Катя» → «Катей»
+            # «Лира» → «Лиру», «Катя» → «Катей». Окончание обязательно: голая
+            # основа («мир» от «Мира», «ник» от «Ника») — уже другое слово.
+            alts.append(re.escape(w[:-1]) + _NAME_ENDINGS.rstrip("?"))
         else:
             alts.append(re.escape(w) + _NAME_ENDINGS)        # «Ян» → «Яна», «Олег» → «Олегу»
     return re.compile(r"\b(?:" + "|".join(alts) + r")\b", re.IGNORECASE)
@@ -755,7 +759,15 @@ def build_router(current_user):
             .group_by(models.UserMemory.profile_key))).all())
         keys = [own]
         if _manager(user):
-            keys += sorted(k for k in counts if k != own and (k == "local" or k.startswith("tg:")))
+            # И профили без записей: с настройками (выключили и стёрли — вернуться
+            # к ним всё равно нужно) и Telegram-пользователи, у которых есть чаты.
+            found = set(counts)
+            found |= {k[len("user_memory:"):] for k in (await db.execute(
+                select(models.AppSetting.key).where(models.AppSetting.key.like("user_memory:%")))).scalars()}
+            found |= set((await db.execute(select(models.ChatSession.user_key).where(
+                models.ChatSession.user_key.like("tg:%"), models.ChatSession.owner_id.is_(None))
+                .distinct())).scalars())
+            keys += sorted(k for k in found if k != own and (k == "local" or re.fullmatch(r"tg:\d+", k)))
         return [{"key": k, "own": k == own, "count": int(counts.get(k, 0)),
                  "label": "Вы" if k == own else ("Веб без аккаунта" if k == "local" else "Telegram " + k[3:])}
                 for k in keys]

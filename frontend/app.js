@@ -2996,6 +2996,7 @@ createApp({
       this.processingNote = false;
       this.groupWaiting = 0;
       // Сервер — источник истины: перечитываем сообщения (там уже новый ответ/свайп).
+      const sid = this.sessionId;
       await this.loadMessages();
       // Ответ разобран на сервере — открытая «Хроника» перечитает состояние.
       this.horaeTick += 1;
@@ -3008,7 +3009,10 @@ createApp({
       this.currentThought = "";
       this.liveBubbles = [];
       // «Дописать»: остановленный ответ убираем, текст дописываем к реплике и
-      // запускаем ответ заново — без звука и плашки, ответа ещё нет.
+      // запускаем ответ заново — без звука и плашки, ответа ещё нет. Пока
+      // перечитывали, открыли другой чат — правка ушла бы в него: текст
+      // возвращаем в поле ввода.
+      if (append && this.sessionId !== sid) { this.input = append; return; }
       if (append) return this._applyAppend(append);
       if (this.soundOn) this.playChime();
       if (answered) this.showToast("✅ Ответ получен", () => this._scrollToLastReply());
@@ -4110,7 +4114,7 @@ createApp({
       };
     },
     // Запись «во всех чатах» в режиме аккаунтов меняет только админ (её видят все).
-    horaeLocked(h) { return !this.isAdmin && this.horaeScope(h) === "global"; },
+    horaeLocked(h) { return h.can_write === false || (!this.isAdmin && this.horaeScope(h) === "global"); },
     async saveHorae() {
       const h = this.horaeEdit;
       if (h.scope === "session" && !this.sessionId) {
@@ -4150,10 +4154,14 @@ createApp({
       return "/user-memory" + path + (this.userMemProfile ? "?profile=" + encodeURIComponent(this.userMemProfile) : "");
     },
     async loadUserMemory() {
+      const prof = this.userMemProfile;
       try {
-        this.userMem = await this.api(this._umq(""));
+        const data = await this.api(this._umq(""));
+        if (prof !== this.userMemProfile) return;   // пока ждали, выбрали другой профиль
+        this.userMem = data;
         this.userMemError = "";
       } catch (e) {
+        if (prof !== this.userMemProfile) return;
         // Прежний список не стираем: сбой перечитывания не должен его прятать.
         this.userMemError = e.message || "нет связи";
       }
@@ -4163,6 +4171,9 @@ createApp({
     },
     async switchUserMemProfile(key) {
       this.userMemProfile = key;
+      // Список прежнего профиля не показываем под новым: действия ушли бы не туда.
+      this.userMem = null;
+      this.userMemError = "";
       this.userMemEdit = { id: null, content: "" };
       await this.loadUserMemory();
     },
@@ -6724,13 +6735,17 @@ createApp({
                 к вам обращаться, на каком языке писать, чем вы занимаетесь, что умеете и любите, какие ответы вам удобны.
                 Темы разговоров, планы («скину файл»), события сюжета и то, что вы отыгрываете, сюда <b>не</b> попадают — они
                 остаются в своём чате.</p>
-              <div v-if="userMemProfiles.length > 1" class="row" style="margin-bottom:8px">
+              <div v-if="userMemProfiles.length > 1 || userMemProfile" class="row" style="margin-bottom:8px">
                 <label>Чья память
                   <select :value="userMemProfile" @change="switchUserMemProfile($event.target.value)">
                     <option v-for="p in userMemProfiles" :key="p.key" :value="p.own ? '' : p.key">{{ p.label }} ({{ p.count }})</option>
+                    <option v-if="userMemProfile && !userMemProfiles.some((p) => p.key === userMemProfile)"
+                            :value="userMemProfile">{{ userMemProfile }}</option>
                   </select>
                 </label>
               </div>
+              <p v-if="userMemProfile" class="field-hint">Открыта память другого профиля
+                ({{ userMemProfile === 'local' ? 'веб без аккаунта' : 'Telegram ' + userMemProfile.slice(3) }}) — правки уйдут туда.</p>
               <p v-if="userMemError" class="field-hint danger-text">Не удалось загрузить: {{ userMemError }}
                 <button class="btn-icon" @click="loadUserMemory" aria-label="Повторить загрузку">↻</button></p>
               <p v-if="!userMem && !userMemError" class="muted">Загружаю…</p>

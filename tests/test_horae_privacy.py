@@ -94,6 +94,36 @@ def test_horae_privacy_scoped_by_owner(client):
         assert client.patch(f"/api/sessions/{b_pub.json()['session_id']}/horae/tables/{gtable}",
                             json={"cell": {"r": 0, "c": 1, "value": "B_WAS_HERE"}},
                             headers=bh).status_code == 403
+        # Обычная ячейка глобальной таблицы у B — только в его чате: размер общего
+        # шаблона (его видят все) от неё не растёт.
+        assert client.patch(f"/api/sessions/{b_pub.json()['session_id']}/horae/tables/{gtable}",
+                            json={"cell": {"r": 9, "c": 1, "value": "моё"}}, headers=bh).status_code == 200
+        a_pub = client.post(f"/api/sessions?character_id={public['id']}", headers=ah).json()["session_id"]
+        a_tables = client.get(f"/api/sessions/{a_pub}/horae/state", headers=ah).json()["tables"]
+        assert next(t for t in a_tables if t["id"] == gtable)["rows"] == 2
+        # Карточку общего и чужого персонажа B не правит и не удаляет; закрепить — может.
+        assert client.patch(f"/api/characters/{public['id']}", json={"system_prompt": "B"},
+                            headers=bh).status_code == 403
+        assert client.patch(f"/api/characters/{public['id']}", json={"pinned": True}, headers=bh).status_code == 200
+        client.patch(f"/api/characters/{public['id']}", json={"pinned": False}, headers=bh)
+        assert client.patch(f"/api/characters/{char_a['id']}", json={"system_prompt": "B"},
+                            headers=bh).status_code == 403
+        assert client.delete(f"/api/characters/{char_a['id']}", headers=bh).status_code == 403
+        # Список лорбука говорит, что можно менять.
+        listed = {h["id"]: h for h in client.get(f"/api/horae?for_session={own}", headers=bh).json()}
+        assert listed[global_h["id"]]["can_write"] is False
+        # Доступ закрыли — открытый сокет друга больше не принимает ходы.
+        with client.websocket_connect(f"/ws/chat/{shared}?token={b['token']}") as ws:
+            uid_b = b["user"]["id"]
+            assert client.delete(f"/api/sessions/{shared}/share/{uid_b}", headers=ah).status_code == 200
+            ws.send_json({"type": "user_message", "content": "((меня зовут Борис))"})
+            try:
+                ws.receive_json()
+                closed = False
+            except Exception:  # noqa: BLE001 — сервер закрыл сокет
+                closed = True
+            assert closed
+        client.post(f"/api/sessions/{shared}/share", json={"username": "horae_b"}, headers=ah)   # вернуть доступ
         # Токен в адресе — тот же пользователь, а не «никто» с чужой памятью «local».
         mem = client.get(f"/api/user-memory?token={b['token']}").json()
         assert mem["profile"].startswith("u:") and not mem["items"]

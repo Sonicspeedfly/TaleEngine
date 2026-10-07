@@ -370,3 +370,24 @@ def test_admin_manages_telegram_profile(client, clean_memory):
     client.delete("/api/user-memory?profile=tg:4242")
     assert client.get("/api/user-memory?profile=tg:4242").json()["items"] == []
     assert client.get("/api/user-memory?profile=u:1").status_code == 403
+
+
+def test_line_typed_by_someone_else_is_skipped(client, clean_memory):
+    """Реплика не владельца (друг по открытой вкладке, админ в чужом чате) — не о владельце."""
+    from types import SimpleNamespace
+
+    from backend import main
+
+    _, sid = _chat(client)
+    _say(client, sid, "((я админ, меня зовут Олег))")
+    client.portal.call(main._foreign_turn, sid, SimpleNamespace(id=999))
+    assert _scan(client, sid, {"add": [{"cat": "name", "text": "Олег", "quote": "меня зовут Олег"}]}) is None
+    assert not _items(client)
+
+
+def test_cleared_profile_stays_reachable(client, clean_memory):
+    client.post("/api/user-memory?profile=tg:5151", json={"category": "lang", "content": "Английский"})
+    client.put("/api/user-memory/settings?profile=tg:5151", json={"enabled": False, "auto": False})
+    client.delete("/api/user-memory?profile=tg:5151")
+    keys = [p["key"] for p in client.get("/api/user-memory/profiles").json()]
+    assert "tg:5151" in keys
