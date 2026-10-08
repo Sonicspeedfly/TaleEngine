@@ -852,15 +852,23 @@ async def carryover(session_id: int, *, keep: int = 5, vectors: bool = True, use
         )
         db.add(dst)
         await db.flush()
+        from backend.attachments import copy_attachments
+
         for m in rows:
             if m.id < start_id:
                 continue
-            db.add(models.Message(
-                session_id=dst.id, role=m.role, content=m.content, attachments=list(m.attachments or []),
+            copy_msg = models.Message(
+                session_id=dst.id, role=m.role, content=m.content, attachments=[],
                 swipes=list(m.swipes or []), active_swipe=m.active_swipe, model_used=m.model_used,
                 speaker_name=m.speaker_name, reply_to_id=None, canvas_id=None,
                 horae=copy.deepcopy(m.horae) if m.horae else None, created_at=m.created_at,
-            ))
+            )
+            db.add(copy_msg)
+            if m.attachments:
+                # Свои копии файлов: общая ссылка на файл исходного чата пропала
+                # бы с его удалением (см. attachments.copy_attachments).
+                await db.flush()
+                copy_msg.attachments = await copy_attachments(db, copy_msg.id, m)
         if src.is_group:
             for gm in (await db.execute(
                 select(models.GroupMember).where(models.GroupMember.session_id == session_id)

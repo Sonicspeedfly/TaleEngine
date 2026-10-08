@@ -350,6 +350,8 @@ createApp({
       dock: null,
       dockTrack: null,
       dockPlaying: false,
+      // player.js не загрузился — кнопок «поверх» и переноса нет, файлы играют в ленте.
+      hasDock: !!(window.TalePlayer && window.TalePlayer.MediaDock),
       // Играющее в ленте аудио/видео само уходит в плеер при прокрутке и смене чата.
       mediaAutoFloat: true,
       // Как начался идущий ответ: "send" — обычная отправка, "retry" — ответ на
@@ -3478,13 +3480,16 @@ createApp({
     },
     _mediaItem(m, ai) {
       const a = (m.attachments || [])[ai] || {};
-      const ch = this.selectedCharacter;
+      // Имя — персонажа ЭТОГО чата (выбранный в сайдбаре мог уже смениться).
+      const card = this._sessionCard(this.sessionId);
+      const ch = card && this.characters.find((x) => x.id === card.character_id);
       return {
         src: a.data || a.preview || this.attUrl(m, ai),
         kind: a.type === "audio" ? "audio" : "video",
         name: a.name || "",
         msgId: m.id, idx: ai, sessionId: this.sessionId,
-        who: m.role === "user" ? "Вы" : (m.speaker_name || (ch && ch.name) || "Ответ"),
+        who: m.role === "user" ? "Вы" : (m.speaker_name || (this.sharedView && this.sharedView.character_name)
+          || (ch && ch.name) || (card && card.character_name) || "Ответ"),
       };
     },
     // Все аудио и видео открытого чата по порядку — очередь плеера (⏮ ⏭, «подряд»).
@@ -3498,10 +3503,12 @@ createApp({
     // Открыть файл сообщения в плавающем плеере; el — элемент в ленте, если файл
     // уже играл там: плеер продолжит с того же места, а лента замолчит.
     popOutMedia(m, ai, el) {
+      if (!this.hasDock) return;
       const queue = this.mediaQueue();
       let pos = queue.findIndex((q) => q.msgId === m.id && q.idx === ai);
       if (pos < 0) { queue.push(this._mediaItem(m, ai)); pos = queue.length - 1; }
-      const startAt = el && isFinite(el.currentTime) ? el.currentTime : 0;
+      // Доигранный до конца файл открываем с начала, а не с последней секунды.
+      const startAt = el && !el.ended && isFinite(el.currentTime) ? el.currentTime : 0;
       if (el && !el.paused) el.pause();
       const card = this._sessionCard(this.sessionId);
       const ch = this.selectedCharacter;
@@ -3533,8 +3540,16 @@ createApp({
       const t = this.dockTrack;
       return !!t && t.msgId === m.id && t.idx === ai && t.sessionId === this.sessionId;
     },
-    dockGoto(item) {
-      if (item && typeof item.msgId === "number") this.jumpToMessage(item.sessionId, item.msgId);
+    // «↩ к сообщению»: чат открываем как из списка — свой через openRecent (с его
+    // персонажем), открытый другом — через openSharedSession (не как свой).
+    async dockGoto(item) {
+      if (!item || typeof item.msgId !== "number") return;
+      if (item.sessionId !== this.sessionId) {
+        const row = this.unifiedChats.find((r) => r.id === item.sessionId);
+        if (!row) { this.showToast("Этот чат удалён или больше недоступен"); return; }
+        await this.openChatRow(row);
+      }
+      await this.jumpToMessage(item.sessionId, item.msgId);
     },
     // Звук один: заиграло в ленте — плеер и прочие файлы ленты на паузу;
     // заиграл плеер — замолкает лента. Играющее в ленте файл провожаем
@@ -3548,16 +3563,21 @@ createApp({
         return;
       }
       if (!t.closest(".att-item")) return;   // предпросмотр в поле ввода и т.п.
-      if (this.$refs.dock) this.$refs.dock.pause();
+      // Плеер уступает и звук, и кнопки системы (экран блокировки) файлу ленты.
+      const dock = this.$refs.dock;
+      if (dock && typeof dock.release === "function") dock.release();
       inline.forEach((x) => { if (x !== t && !x.paused) x.pause(); });
       this._watchInline(t);
     },
     _watchInline(el) {
       if (this._mediaIO) this._mediaIO.disconnect();
       this._mediaIO = null;
-      if (!this.mediaAutoFloat || typeof IntersectionObserver === "undefined") return;
+      if (!this.hasDock || !this.mediaAutoFloat || typeof IntersectionObserver === "undefined") return;
       this._mediaIO = new IntersectionObserver((entries) => {
         for (const en of entries) {
+          // Видео в системном окне (своя «картинка в картинке» браузера) листать
+          // и должно — его не трогаем.
+          if (document.pictureInPictureElement === el) continue;
           if (!en.isIntersecting && !el.paused && !el.ended) this._floatInline(el);
         }
       }, { threshold: 0 });
@@ -3570,8 +3590,9 @@ createApp({
     },
     // Перед уходом из чата: играющий в ленте файл не обрывается, а переезжает в плеер.
     _floatPlayingInline() {
-      if (!this.mediaAutoFloat) return;
-      const el = [...document.querySelectorAll(".att-item audio, .att-item video")].find((x) => !x.paused && !x.ended);
+      if (!this.hasDock || !this.mediaAutoFloat) return;
+      const el = [...document.querySelectorAll(".att-item audio, .att-item video")].find(
+        (x) => !x.paused && !x.ended && document.pictureInPictureElement !== x);
       if (el) this._floatInline(el);
     },
 
@@ -5887,7 +5908,7 @@ createApp({
                     <span class="att-fname" :title="a.name || ''">{{ attIcon(a) }} {{ a.name || 'файл' }}</span>
                     <i v-if="a.size"> · {{ fmtSize(a.size) }}</i>
                     <span v-if="inDock(m, ai)" class="att-indock">🎧 {{ dockPlaying ? 'играет' : 'в плеере' }}</span>
-                    <button v-else-if="isMediaAtt(a)" class="att-pop" @click="popOutFromButton($event, m, ai)"
+                    <button v-else-if="hasDock && isMediaAtt(a)" class="att-pop" @click="popOutFromButton($event, m, ai)"
                             :aria-label="'Открыть «' + (a.name || 'файл') + '» в плавающем плеере'"
                             title="Слушать и смотреть поверх страницы, листая чат">⧉ поверх</button>
                     <a class="att-dl" :href="a.data || a.preview || attUrl(m, ai)" :download="a.name || 'файл'" :title="'Скачать «' + (a.name || 'файл') + '»'">⬇ скачать</a>
@@ -6329,7 +6350,7 @@ createApp({
           <label class="check"><input type="checkbox" v-model="sendScroll" /> Прокручивать вниз, когда отправляю сообщение или файлы</label>
           <label class="check"><input type="checkbox" v-model="streamFollow" /> Следовать за ответом, пока он пишется (только если я внизу)</label>
           <label class="check"><input type="checkbox" v-model="soundOn" /> Звук, когда ответ готов</label>
-          <label class="check"><input type="checkbox" v-model="mediaAutoFloat" /> Аудио и видео доигрывают в плавающем плеере, когда листаю ленту или открываю другой чат</label>
+          <label v-if="hasDock" class="check"><input type="checkbox" v-model="mediaAutoFloat" /> Аудио и видео доигрывают в плавающем плеере, когда листаю ленту или открываю другой чат</label>
           <p class="muted" style="margin:2px 0 10px">Выключено — лента стоит там, где вы читаете. Когда ответ готов — плашка «Ответ получен» (клик — к началу ответа). Вниз — кнопка ⤓ или клавиша End. Пока ответ пишется, можно дописать запрос: введите текст и нажмите Enter — ответ начнётся заново с учётом дописанного.</p>
           <div class="hr"></div>
           <h3>Параметры генерации</h3>

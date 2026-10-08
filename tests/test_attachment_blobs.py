@@ -257,3 +257,80 @@ def test_audio_attachment_supports_range_requests(client):
     client.delete(f"/api/messages/{mid}")
     from backend import attachments
     assert not attachments._att_cache
+
+
+def test_range_response_has_validator_and_304(client):
+    """Ответ 206 без ETag браузер не кэширует — каждое открытие качало бы файлы заново."""
+    cid = client.post("/api/characters", json={"name": "Валидатор"}).json()["id"]
+    sid = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]
+    raw = b"etag-bytes" * 50
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        r = client.post(f"/api/sessions/{sid}/send", json={"content": "a", "attachments": [
+            {"type": "audio", "data": "data:audio/wav;base64," + base64.b64encode(raw).decode(),
+             "mime": "audio/wav", "name": "a.wav"}]})
+        _wait_done(client, r.json()["job_id"])
+    mid = [m for m in client.get(f"/api/sessions/{sid}/messages").json() if m["role"] == "user"][-1]["id"]
+    part = client.get(f"/api/messages/{mid}/att/0", headers={"Range": "bytes=0-"})
+    etag = part.headers.get("etag")
+    assert part.status_code == 206 and etag
+    assert client.get(f"/api/messages/{mid}/att/0", headers={"If-None-Match": etag}).status_code == 304
+    # If-Range с чужим валидатором — файл целиком, а не кусок другой версии.
+    stale = client.get(f"/api/messages/{mid}/att/0", headers={"Range": "bytes=0-9", "If-Range": '"old"'})
+    assert stale.status_code == 200 and stale.content == raw
+
+
+def test_fork_gets_own_copy_of_files(client):
+    """
+    Ветка ссылалась на файл исходного чата: после его удаления файл пропадал, а
+    освободившийся id получал файл ДРУГОГО чата — и ветка показывала чужое.
+    """
+    cid = client.post("/api/characters", json={"name": "Ветвистый"}).json()["id"]
+    src = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]
+    raw = b"A-SECRET-" * 30
+    _send_image(client, src, raw)
+    umsg = [m for m in client.get(f"/api/sessions/{src}/messages").json() if m["role"] == "user"][-1]
+    fork = client.post(f"/api/sessions/{src}/fork", json={"message_id": umsg["id"]}).json()["session_id"]
+    fmsg = [m for m in client.get(f"/api/sessions/{fork}/messages").json() if m["role"] == "user"][-1]
+    con = sqlite3.connect(_db_path())
+    src_blob = json.loads(con.execute("SELECT attachments FROM messages WHERE id=?", (umsg["id"],)).fetchone()[0])[0]["blob_id"]
+    fork_blob = json.loads(con.execute("SELECT attachments FROM messages WHERE id=?", (fmsg["id"],)).fetchone()[0])[0]["blob_id"]
+    con.close()
+    assert src_blob != fork_blob
+    client.delete(f"/api/sessions/{src}")
+    resp = client.get(f"/api/messages/{fmsg['id']}/att/0")
+    assert resp.status_code == 200 and resp.content == raw
+
+
+def test_shared_blob_links_split_on_startup(client):
+    """Старые ветки (до 2.10.0) получают свои копии файлов; ссылка на чужой файл — убирается."""
+    cid = client.post("/api/characters", json={"name": "Старая ветка"}).json()["id"]
+    sid = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]
+    raw = b"OWNED-BY-SOURCE" * 20
+    _send_image(client, sid, raw)
+    src = [m for m in client.get(f"/api/sessions/{sid}/messages").json() if m["role"] == "user"][-1]
+    con = sqlite3.connect(_db_path())
+    atts, created = con.execute("SELECT attachments, created_at FROM messages WHERE id=?", (src["id"],)).fetchone()
+    # «Ветка» по-старому: то же время и роль, ссылка на тот же blob.
+    copy_id = con.execute(
+        "INSERT INTO messages (session_id, role, content, attachments, swipes, active_swipe, created_at) "
+        "VALUES (?, 'user', 'копия', ?, '[]', 0, ?)", (sid, atts, created)).lastrowid
+    # Постороннее сообщение со ссылкой на тот же blob (как после переиспользования id).
+    alien_id = con.execute(
+        "INSERT INTO messages (session_id, role, content, attachments, swipes, active_swipe, created_at) "
+        "VALUES (?, 'assistant', 'чужое', ?, '[]', 0, '2001-01-01 00:00:00')", (sid, atts)).lastrowid
+    con.commit()
+    con.close()
+
+    from fastapi.testclient import TestClient
+
+    from backend.main import app
+
+    with TestClient(app) as c2:
+        con = sqlite3.connect(_db_path())
+        copy_atts = json.loads(con.execute("SELECT attachments FROM messages WHERE id=?", (copy_id,)).fetchone()[0])
+        alien_atts = json.loads(con.execute("SELECT attachments FROM messages WHERE id=?", (alien_id,)).fetchone()[0])
+        con.close()
+        assert copy_atts[0]["blob_id"] != json.loads(atts)[0]["blob_id"]
+        assert "blob_id" not in alien_atts[0]
+        assert c2.get(f"/api/messages/{copy_id}/att/0").content == raw
+        assert c2.get(f"/api/messages/{alien_id}/att/0").status_code == 404

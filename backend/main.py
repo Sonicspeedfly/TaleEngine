@@ -70,6 +70,7 @@ from backend.attachments import (
     att_cache_get,
     att_cache_put,
     attachment_data,
+    copy_attachments,
     delete_message_blobs,
     hydrate_export_attachments,
     store_attachments,
@@ -1257,7 +1258,7 @@ async def fork_session(
             session_id=fork.id,
             role=m.role,
             content=m.content,
-            attachments=list(m.attachments or []),
+            attachments=[],     # свои копии файлов — ниже, когда известен id
             swipes=list(m.swipes or []),
             active_swipe=m.active_swipe,
             model_used=m.model_used,
@@ -1269,6 +1270,8 @@ async def fork_session(
         )
         db.add(copy_msg)
         await db.flush()
+        if m.attachments:
+            copy_msg.attachments = await copy_attachments(db, copy_msg.id, m)
         id_map[m.id] = copy_msg.id
     # Состояние Horae ветки: правки и свёртки до развилки, с новыми id.
     await horae_engine.copy_to_fork(db, session_id, fork.id, id_map, pivot.id)
@@ -1455,7 +1458,7 @@ async def get_attachment(
     raw = att_cache_get(ckey)
     if raw is None:
         # data: инлайн (легаси) или из blob-таблицы (тяжёлый base64 хранится отдельно).
-        data = await attachment_data(db, atts[idx])
+        data = await attachment_data(db, atts[idx], owner=message_id)
         if not data:
             raise HTTPException(404, "Данные вложения не найдены")
         b64 = data.split(",", 1)[1] if data.startswith("data:") and "," in data else data
@@ -1474,7 +1477,17 @@ async def get_attachment(
         ascii_name = name.encode("ascii", "ignore").decode() or "attachment"
         quoted = urllib.parse.quote(name, safe="")
         headers["Content-Disposition"] = f'inline; filename="{ascii_name}"; filename*=UTF-8\'\'{quoted}'
-    return _media_response(raw, mime, headers, request.headers.get("range"))
+    # Валидатор обязателен: ответ 206 без него Chromium не кэширует, и каждое
+    # открытие страницы заново качало бы все голосовые и видео чата.
+    etag = '"' + hashlib.sha1(repr(ckey).encode()).hexdigest()[:20] + '"'
+    headers["ETag"] = etag
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=headers)
+    rng = request.headers.get("range")
+    if_range = request.headers.get("if-range")
+    if rng and if_range and if_range != etag:
+        rng = None   # файл не тот, что у браузера, — целиком
+    return _media_response(raw, mime, headers, rng)
 
 
 @app.get("/api/sessions/{session_id}/messages")
@@ -2846,7 +2859,7 @@ async def _collect_reference_images(db, session_id, character, msgs) -> list[str
     for m in msgs[-8:]:
         for att in (m.attachments or []):
             if isinstance(att, dict) and att.get("type") == "image":
-                data = await attachment_data(db, att)
+                data = await attachment_data(db, att, owner=m.id)
                 if _is_image(data):
                     refs.append(data)
     # Без дублей, не больше 4.

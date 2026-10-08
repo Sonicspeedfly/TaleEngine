@@ -75,6 +75,7 @@
         y: typeof p.y === "number" ? p.y : null,
         drag: null,
         seeking: false,
+        released: false,
       };
     },
     computed: {
@@ -103,55 +104,104 @@
     },
     watch: {
       // Новое открытие (из ленты, кнопкой «поверх»): файл pos с секунды startAt.
-      seq() { this.i = this.pos; this.showList = false; this.load(this.startAt, true); },
-      collapsed(v) { savePrefs({ collapsed: v }); this.$nextTick(this.clamp); },
+      seq() { this.i = this.pos; this.showList = false; this.released = false; this.load(this.startAt, true); },
+      collapsed(v) {
+        savePrefs({ collapsed: v });
+        // Кнопка, на которой был фокус, исчезла вместе с видом — фокус на её
+        // пару в новом виде, а не в никуда (body).
+        const had = this.$refs.box && this.$refs.box.contains(document.activeElement);
+        this.$nextTick(() => {
+          this.clamp();
+          if (!had || !this.$refs.box) return;
+          const t = this.$refs.box.querySelector(v ? ".md-pill .md-play" : ".md-head");
+          if (t) t.focus();
+        });
+      },
       size(v) { savePrefs({ size: v }); this.$nextTick(this.clamp); },
       autoNext(v) { savePrefs({ autoNext: v }); },
     },
     mounted() {
       window.addEventListener("resize", this.clamp);
+      // Высота меняется не только от размера окна: видео вместо аудио, список
+      // файлов, ошибка. Передвинутый плеер не должен уезжать кнопками за край.
+      if (typeof ResizeObserver !== "undefined") {
+        this._ro = new ResizeObserver(() => this.clamp());
+        this._ro.observe(this.$refs.box);
+      }
       this.load(this.startAt, true);
       this.$nextTick(this.clamp);
     },
     beforeUnmount() {
+      // Плеер закрыт: всё, что ещё ждёт загрузки файла, не должно включить звук
+      // у отсоединённого элемента, а его события — вернуть кнопки системы.
+      this._dead = true;
+      this._cancelLoad();
       window.removeEventListener("resize", this.clamp);
+      if (this._ro) this._ro.disconnect();
+      const el = this.media();
+      if (el) {
+        el.pause();
+        el.removeAttribute("src");
+        try { el.load(); } catch (e) { /* остановить загрузку */ }
+      }
       this.clearSession();
     },
     methods: {
       media() { return this.$refs.media || null; },
+      // Снять всё, что повесила прошлая загрузка (слушатели, таймер): иначе
+      // её запоздалый «старт» перемотал бы или включил уже другой файл.
+      _cancelLoad() {
+        if (this._loadCleanup) this._loadCleanup();
+        this._loadCleanup = null;
+      },
       // Загрузить текущий файл очереди и (если autoplay) начать с секунды at.
       load(at, autoplay) {
+        this._cancelLoad();
+        const tok = (this._loadTok = (this._loadTok || 0) + 1);
+        const live = () => !this._dead && tok === this._loadTok;
         this.error = "";
         this.time = at || 0;
         this.duration = 0;
         this.$emit("track", this.cur);
         this.$nextTick(() => {
           const el = this.media();
-          if (!el || !this.cur) return;
+          if (!live() || !el || !this.cur) return;
           if (el.getAttribute("src") !== this.cur.src) el.setAttribute("src", this.cur.src);
           el.playbackRate = this.rate;
-          // rewind — вернуть позицию после прыжка «в бесконечность» (см. ниже).
+          el.muted = this.muted;
+          let timer = null;
           const go = (rewind) => {
-            if (at || rewind) { try { el.currentTime = at || 0; } catch (e) { /* ещё не готов */ } }
-            if (autoplay) el.play().catch(() => { this.playing = false; });
+            if (!live()) return;
+            // Файл уже доигран до конца (в ленте) — начинаем сначала, а не с конца:
+            // иначе сразу сработал бы «конец» и плеер перескочил к следующему.
+            const pos = at && isFinite(el.duration) && at >= el.duration - 0.25 ? 0 : at;
+            // rewind — вернуть позицию после прыжка «в бесконечность» (см. ниже).
+            if (pos || rewind) { try { el.currentTime = pos || 0; } catch (e) { /* ещё не готов */ } }
+            if (autoplay) el.play().catch(() => { if (live()) this.playing = false; });
+          };
+          const fix = () => {
+            if (!live() || !isFinite(el.duration)) return;
+            cleanup();
+            this.onMeta();
+            go(true);
           };
           const start = () => {
+            if (!live()) return;
             if (isFinite(el.duration)) { go(); return; }
             // Запись из браузера (webm MediaRecorder) не знает своей длины,
             // пока её не дочитать: прыжок «в бесконечность» заставляет браузер
             // её посчитать — иначе полоса перемотки стояла бы мёртвой.
-            let done = false;
-            const fix = () => {
-              if (done || !isFinite(el.duration)) return;
-              done = true;
-              el.removeEventListener("durationchange", fix);
-              this.onMeta();
-              go(true);
-            };
             el.addEventListener("durationchange", fix);
-            setTimeout(() => { if (!done) { done = true; el.removeEventListener("durationchange", fix); go(true); } }, 2500);
+            timer = setTimeout(() => { cleanup(); go(true); }, 2500);
             try { el.currentTime = 1e101; } catch (e) { fix(); }
           };
+          const cleanup = () => {
+            el.removeEventListener("loadedmetadata", start);
+            el.removeEventListener("durationchange", fix);
+            if (timer) clearTimeout(timer);
+            timer = null;
+          };
+          this._loadCleanup = cleanup;
           if (el.readyState >= 1) start();
           else el.addEventListener("loadedmetadata", start, { once: true });
           this.updateSession();
@@ -165,6 +215,13 @@
       },
       // Пауза снаружи (в ленте запустили другой файл — звук должен быть один).
       pause() { const el = this.media(); if (el && !el.paused) el.pause(); },
+      // Уступить кнопки системы файлу в ленте: пауза и снятие своих кнопок
+      // (иначе экран блокировки показывал бы этот файл и не управлял играющим).
+      release() {
+        this.released = true;
+        this.pause();
+        this.clearSession();
+      },
       skip(sec) {
         const el = this.media();
         if (!el) return;
@@ -220,9 +277,14 @@
       // ----- события элемента -----
       onTime() { if (!this.seeking) this.time = this.media() ? this.media().currentTime : 0; this.updatePosition(); },
       onMeta() { const el = this.media(); this.duration = el && isFinite(el.duration) ? el.duration : 0; this.updatePosition(); },
-      onPlay() { this.playing = true; this.buffering = false; this.$emit("playing", true); this.updateSession(); },
-      onPause() { this.playing = false; this.$emit("playing", false); this.updateSession(); },
+      onPlay() {
+        if (this._dead) return;
+        this.released = false;
+        this.playing = true; this.buffering = false; this.$emit("playing", true); this.updateSession();
+      },
+      onPause() { if (this._dead) return; this.playing = false; this.$emit("playing", false); this.updateSession(); },
       onEnded() {
+        if (this._dead) return;
         this.playing = false;
         this.$emit("playing", false);
         if (this.autoNext && this.hasNext) this.go(this.i + 1);
@@ -257,7 +319,13 @@
         return moved;
       },
       // Свёрнутая пилюля: нажатие разворачивает, перетаскивание — двигает.
-      pillUp(ev) { if (!this.dragEnd(ev)) this.collapsed = false; },
+      // Кнопки пилюли (⏸, ✕) работают сами: перетаскивание с них не начинается,
+      // и разворачивать на их отпускании нельзя — иначе клик ушёл бы в никуда.
+      pillUp(ev) {
+        const started = !!this.drag;
+        const moved = this.dragEnd(ev);
+        if (started && !moved) this.collapsed = false;
+      },
       // Стрелки на шапке двигают плеер с клавиатуры (перетаскивание мышью — не единственный путь).
       nudge(dx, dy) {
         const box = this.$refs.box.getBoundingClientRect();
@@ -274,7 +342,8 @@
         this.x = Math.max(EDGE, Math.min(this.x, vw - r.width - EDGE));
         this.y = Math.max(EDGE, Math.min(this.y, vh - r.height - EDGE));
       },
-      resetPlace() {
+      resetPlace(ev) {
+        if (ev && ev.target.closest("button, input")) return;   // двойной клик по кнопке шапки
         this.x = null; this.y = null;
         savePrefs({ x: null, y: null });
       },
@@ -287,17 +356,20 @@
           if (d) this.nudge(d[0], d[1]);
           return;
         }
+        // С Ctrl/Cmd/Alt — чужие сочетания (палитра Ctrl+K, «назад» Alt+←).
+        if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
         if (ev.target.closest("button") && (ev.key === " " || ev.key === "Enter")) return;
         if (ev.key === " " || ev.key === "k") { ev.preventDefault(); this.toggle(); }
         else if (ev.key === "ArrowLeft") { ev.preventDefault(); this.skip(-5); }
         else if (ev.key === "ArrowRight") { ev.preventDefault(); this.skip(5); }
-        else if (ev.key === "Escape") { this.collapsed = true; }
+        // Escape обработан здесь — шторка и прочие слои под плеером не закрываются.
+        else if (ev.key === "Escape" && !this.collapsed) { ev.preventDefault(); this.collapsed = true; }
       },
 
       // ----- кнопки системы (шторка телефона, клавиши медиа, экран блокировки) -----
       updateSession() {
         const ms = navigator.mediaSession;
-        if (!ms || !this.cur) return;
+        if (!ms || !this.cur || this._dead || this.released) return;
         try {
           ms.metadata = new window.MediaMetadata({ title: this.title, artist: this.subtitle || "TaleEngine", album: "TaleEngine" });
           ms.playbackState = this.playing ? "playing" : "paused";
@@ -313,7 +385,7 @@
       },
       updatePosition() {
         const ms = navigator.mediaSession;
-        if (!ms || !ms.setPositionState || !this.duration) return;
+        if (!ms || !ms.setPositionState || !this.duration || this._dead || this.released) return;
         try { ms.setPositionState({ duration: this.duration, position: Math.min(this.time, this.duration), playbackRate: this.rate }); } catch (e) { /* */ }
       },
       clearSession() {
@@ -344,7 +416,7 @@
 
     <template v-else>
       <div class="md-head" tabindex="0" @pointerdown="dragStart" @pointermove="dragMove" @pointerup="dragEnd"
-           @pointercancel="dragEnd" @dblclick="resetPlace"
+           @pointercancel="dragEnd" @dblclick="resetPlace($event)"
            aria-label="Плеер. Пробел — пауза, стрелки — перемотка, Shift со стрелками — передвинуть"
            title="Перетащите, чтобы передвинуть; двойной щелчок — на место">
         <span class="md-grip" aria-hidden="true">⋮⋮</span>
@@ -393,7 +465,8 @@
       <div class="md-seek">
         <span class="md-time">{{ fmt(time) }}</span>
         <input type="range" min="0" max="100" step="0.1" :value="progress"
-               @pointerdown="seeking = true" @pointerup="seeking = false" @input="seekTo" @change="seeking = false"
+               @pointerdown="seeking = true" @pointerup="seeking = false" @pointercancel="seeking = false"
+               @lostpointercapture="seeking = false" @blur="seeking = false" @input="seekTo" @change="seeking = false"
                :aria-valuetext="fmt(time) + ' из ' + fmt(duration)" aria-label="Перемотка" />
         <span class="md-time">{{ fmt(duration) }}</span>
       </div>
