@@ -57,16 +57,41 @@ def _decoded_size(data: str) -> int:
     return max(0, int(payload * 3 / 4) - (data[-2:].count("=") if data else 0))
 
 
-async def load_blob(db, blob_id) -> str:
+async def load_blob(db, blob_id, owner: int | None = None) -> str:
+    """
+    Данные файла по blob_id. owner — id сообщения, которому файл должен
+    принадлежать: id в SQLite переиспользуются, и ссылка, пережившая удаление
+    своего файла, иначе отдала бы файл ДРУГОГО чата.
+    """
     if not blob_id:
         return ""
     blob = await db.get(models.AttachmentBlob, int(blob_id))
-    return (blob.data if blob else "") or ""
+    if blob is None or (owner is not None and blob.message_id != owner):
+        return ""
+    return blob.data or ""
 
 
-async def attachment_data(db, att: dict) -> str:
-    """data вложения: инлайн (легаси) или из blob-таблицы."""
-    return (att.get("data") or "") or await load_blob(db, att.get("blob_id"))
+async def attachment_data(db, att: dict, owner: int | None = None) -> str:
+    """data вложения: инлайн (легаси) или из blob-таблицы (см. load_blob про owner)."""
+    return (att.get("data") or "") or await load_blob(db, att.get("blob_id"), owner)
+
+
+async def copy_attachments(db, message_id: int, source) -> list[dict]:
+    """
+    Вложения сообщения-копии (ветка, продолжение): свои blob'ы, а не ссылки на
+    файлы исходного сообщения. Общая ссылка жила до удаления исходного чата —
+    дальше файл пропадал, а освободившийся id получал файл другого чата.
+    """
+    out = []
+    for a in source.attachments or []:
+        if not isinstance(a, dict):
+            continue
+        data = await attachment_data(db, a, owner=source.id)
+        if data:
+            out.extend(await store_attachments(db, message_id, [{**a, "data": data}]))
+        else:
+            out.append({k: v for k, v in a.items() if k not in ("data", "blob_id")})
+    return out
 
 
 async def message_attachments_in(db, msg) -> list[AttachmentIn]:
@@ -75,7 +100,7 @@ async def message_attachments_in(db, msg) -> list[AttachmentIn]:
     for a in (msg.attachments or []):
         if not isinstance(a, dict):
             continue
-        data = await attachment_data(db, a)
+        data = await attachment_data(db, a, owner=msg.id)
         if not data:
             continue
         out.append(AttachmentIn(
@@ -85,8 +110,29 @@ async def message_attachments_in(db, msg) -> list[AttachmentIn]:
     return out
 
 
+# Последние раскодированные аудио и видео (см. main.get_attachment): перемотка —
+# это серия Range-запросов к одному файлу, и без кэша каждый раскодировал бы весь
+# base64 заново. Чистится при удалении вложений: id в SQLite переиспользуются.
+_att_cache: dict = {}
+_ATT_CACHE_BYTES = 96 * 1024 * 1024
+
+
+def att_cache_get(key):
+    return _att_cache.get(key)
+
+
+def att_cache_put(key, raw: bytes) -> None:
+    if len(raw) > _ATT_CACHE_BYTES // 2:
+        return
+    _att_cache.pop(key, None)
+    _att_cache[key] = raw
+    while sum(len(v) for v in _att_cache.values()) > _ATT_CACHE_BYTES:
+        _att_cache.pop(next(iter(_att_cache)))
+
+
 async def delete_message_blobs(db, message_ids) -> None:
     """Удаляет данные вложений для перечисленных сообщений (или подзапроса id)."""
+    _att_cache.clear()
     from sqlalchemy import delete as sql_delete
 
     await db.execute(
@@ -113,7 +159,7 @@ async def hydrate_export_attachments(db, export_dict: dict, messages) -> None:
         for a in atts:
             if not isinstance(a, dict):
                 continue
-            data = await attachment_data(db, a)
+            data = await attachment_data(db, a, owner=m.id)
             meta = {k: v for k, v in a.items() if k != "blob_id"}
             if data:
                 meta["data"] = data

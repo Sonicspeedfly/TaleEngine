@@ -344,6 +344,16 @@ createApp({
       // Прокручивать ленту вниз, когда вы отправляете сообщение или файлы. По
       // умолчанию нет: отправили — лента стоит, где вы читаете (вниз — ⤓ / End).
       sendScroll: false,
+      // Плавающий плеер (player.js). dock — что в нём открыто: очередь медиа
+      // чата, с какого файла и секунды начать; seq растёт при каждом открытии.
+      // dockTrack — какой файл играет сейчас (метка «в плеере» у вложения).
+      dock: null,
+      dockTrack: null,
+      dockPlaying: false,
+      // player.js не загрузился — кнопок «поверх» и переноса нет, файлы играют в ленте.
+      hasDock: !!(window.TalePlayer && window.TalePlayer.MediaDock),
+      // Играющее в ленте аудио/видео само уходит в плеер при прокрутке и смене чата.
+      mediaAutoFloat: true,
       // Как начался идущий ответ: "send" — обычная отправка, "retry" — ответ на
       // повисшую реплику, "" — прочее (перегенерация, «Продолжить», группа,
       // канвас). «Дописать» (appendToRequest) умеет только первые два: там
@@ -2300,6 +2310,7 @@ createApp({
     },
     async openSession(s) {
       if (s.id === this.sessionId && !this.sharedView) return; // уже открыт
+      this._floatPlayingInline();   // музыка из прежнего чата доигрывает в плеере
       this._handoffStreaming();  // текущую генерацию (если есть) доигрываем в фоне
       this.sharedView = null;   // это мой собственный чат, а не «чужой»
       // «Ответить на сообщение» — только в пределах чата. Не сброшенный выбор
@@ -2380,6 +2391,7 @@ createApp({
     },
     // Открыть чат, которым со мной поделился друг (только из раздела «Доступные мне»).
     async openSharedSession(s) {
+      this._floatPlayingInline();
       this._handoffStreaming();
       this.sharedView = s;
       this.replyToId = null;   // ответ — только в пределах чата (см. openSession)
@@ -3462,6 +3474,128 @@ createApp({
         reader.readAsDataURL(file);
       }
     },
+    // ---------- Плавающий плеер ----------
+    isMediaAtt(a) {
+      return !!a && (a.type === "audio" || a.type === "video" || (a.mime || "").startsWith("video"));
+    },
+    _mediaItem(m, ai) {
+      const a = (m.attachments || [])[ai] || {};
+      // Имя — персонажа ЭТОГО чата (выбранный в сайдбаре мог уже смениться).
+      const card = this._sessionCard(this.sessionId);
+      const ch = card && this.characters.find((x) => x.id === card.character_id);
+      return {
+        src: a.data || a.preview || this.attUrl(m, ai),
+        kind: a.type === "audio" ? "audio" : "video",
+        name: a.name || "",
+        msgId: m.id, idx: ai, sessionId: this.sessionId,
+        who: m.role === "user" ? "Вы" : (m.speaker_name || (this.sharedView && this.sharedView.character_name)
+          || (ch && ch.name) || (card && card.character_name) || "Ответ"),
+      };
+    },
+    // Все аудио и видео открытого чата по порядку — очередь плеера (⏮ ⏭, «подряд»).
+    mediaQueue() {
+      const out = [];
+      for (const m of this.messages) {
+        (m.attachments || []).forEach((a, ai) => { if (this.isMediaAtt(a)) out.push(this._mediaItem(m, ai)); });
+      }
+      return out;
+    },
+    // Открыть файл сообщения в плавающем плеере; el — элемент в ленте, если файл
+    // уже играл там: плеер продолжит с того же места, а лента замолчит.
+    popOutMedia(m, ai, el) {
+      if (!this.hasDock) return;
+      const queue = this.mediaQueue();
+      let pos = queue.findIndex((q) => q.msgId === m.id && q.idx === ai);
+      if (pos < 0) { queue.push(this._mediaItem(m, ai)); pos = queue.length - 1; }
+      // Доигранный до конца файл открываем с начала, а не с последней секунды.
+      const startAt = el && !el.ended && isFinite(el.currentTime) ? el.currentTime : 0;
+      if (el && !el.paused) el.pause();
+      const card = this._sessionCard(this.sessionId);
+      const ch = this.selectedCharacter;
+      this.dock = {
+        queue, pos, startAt,
+        seq: ((this.dock && this.dock.seq) || 0) + 1,
+        chatTitle: (card && card.title) || (ch && ch.name) || "",
+        bottom: this._dockBottom(),
+      };
+    },
+    // Место плеера по умолчанию — над полем ввода, а не на нём (на телефоне
+    // поле в две строки, и постоянный отступ его перекрывал).
+    _dockBottom() {
+      const c = document.querySelector(".composer");
+      if (!c) return 0;
+      const top = c.getBoundingClientRect().top;
+      return top > 0 ? Math.max(16, Math.round(window.innerHeight - top + 8)) : 0;
+    },
+    popOutFromButton(ev, m, ai) {
+      const item = ev.target.closest(".att-item");
+      this.popOutMedia(m, ai, item ? item.querySelector("audio, video") : null);
+    },
+    closeDock() {
+      this.dock = null;
+      this.dockTrack = null;
+      this.dockPlaying = false;
+    },
+    inDock(m, ai) {
+      const t = this.dockTrack;
+      return !!t && t.msgId === m.id && t.idx === ai && t.sessionId === this.sessionId;
+    },
+    // «↩ к сообщению»: чат открываем как из списка — свой через openRecent (с его
+    // персонажем), открытый другом — через openSharedSession (не как свой).
+    async dockGoto(item) {
+      if (!item || typeof item.msgId !== "number") return;
+      if (item.sessionId !== this.sessionId) {
+        const row = this.unifiedChats.find((r) => r.id === item.sessionId);
+        if (!row) { this.showToast("Этот чат удалён или больше недоступен"); return; }
+        await this.openChatRow(row);
+      }
+      await this.jumpToMessage(item.sessionId, item.msgId);
+    },
+    // Звук один: заиграло в ленте — плеер и прочие файлы ленты на паузу;
+    // заиграл плеер — замолкает лента. Играющее в ленте файл провожаем
+    // взглядом: ушло за край — переносим в плеер (если включено).
+    _onMediaPlay(e) {
+      const t = e.target;
+      if (!t || !(t instanceof HTMLMediaElement)) return;
+      const inline = document.querySelectorAll(".att-item audio, .att-item video");
+      if (t.closest(".media-dock")) {
+        inline.forEach((x) => { if (!x.paused) x.pause(); });
+        return;
+      }
+      if (!t.closest(".att-item")) return;   // предпросмотр в поле ввода и т.п.
+      // Плеер уступает и звук, и кнопки системы (экран блокировки) файлу ленты.
+      const dock = this.$refs.dock;
+      if (dock && typeof dock.release === "function") dock.release();
+      inline.forEach((x) => { if (x !== t && !x.paused) x.pause(); });
+      this._watchInline(t);
+    },
+    _watchInline(el) {
+      if (this._mediaIO) this._mediaIO.disconnect();
+      this._mediaIO = null;
+      if (!this.hasDock || !this.mediaAutoFloat || typeof IntersectionObserver === "undefined") return;
+      this._mediaIO = new IntersectionObserver((entries) => {
+        for (const en of entries) {
+          // Видео в системном окне (своя «картинка в картинке» браузера) листать
+          // и должно — его не трогаем.
+          if (document.pictureInPictureElement === el) continue;
+          if (!en.isIntersecting && !el.paused && !el.ended) this._floatInline(el);
+        }
+      }, { threshold: 0 });
+      this._mediaIO.observe(el);
+    },
+    _floatInline(el) {
+      if (this._mediaIO) { this._mediaIO.disconnect(); this._mediaIO = null; }
+      const m = this.messages.find((x) => String(x.id) === el.dataset.mid);
+      if (m) this.popOutMedia(m, Number(el.dataset.ai), el);
+    },
+    // Перед уходом из чата: играющий в ленте файл не обрывается, а переезжает в плеер.
+    _floatPlayingInline() {
+      if (!this.hasDock || !this.mediaAutoFloat) return;
+      const el = [...document.querySelectorAll(".att-item audio, .att-item video")].find(
+        (x) => !x.paused && !x.ended && document.pictureInPictureElement !== x);
+      if (el) this._floatInline(el);
+    },
+
     // Авторизация в query — для <img>/<audio>, которые не умеют слать заголовки.
     _authQuery() {
       if (this.userToken) return "token=" + encodeURIComponent(this.userToken);
@@ -5125,6 +5259,10 @@ createApp({
     soundOn(v) { localStorage.setItem("soundOn", v ? "1" : "0"); },
     streamFollow(v) { try { localStorage.setItem("streamFollow", v ? "1" : "0"); } catch (e) { /* приватный режим */ } },
     sendScroll(v) { try { localStorage.setItem("sendScroll", v ? "1" : "0"); } catch (e) { /* приватный режим */ } },
+    mediaAutoFloat(v) {
+      try { localStorage.setItem("mediaAutoFloat", v ? "1" : "0"); } catch (e) { /* приватный режим */ }
+      if (!v && this._mediaIO) { this._mediaIO.disconnect(); this._mediaIO = null; }
+    },
 
     // Фокус при открытии оверлея уходит внутрь, при закрытии ВОЗВРАЩАЕТСЯ на
     // вызвавший элемент. Раньше клавиатурный путь после каждого закрытия
@@ -5213,6 +5351,9 @@ createApp({
     // Клавиши перемещения по чату: Home/End и Alt+↑/↓ (см. _onNavKey — в полях
     // ввода они не перехватываются).
     document.addEventListener("keydown", this._onNavKey);
+    // Плавающий плеер: «play» не всплывает, поэтому ловим на погружении — один
+    // слушатель на все аудио и видео ленты (см. _onMediaPlay).
+    document.addEventListener("play", this._onMediaPlay, true);
     // Реактивный список чатов: мутации шлют CHATLIST_EVENT, здесь его ловим
     // (см. _onChatListEvent). Vue перерисует только изменившиеся строки
     // (key = вид + id): без моргания, без сброса прокрутки сайдбара и без потери
@@ -5258,6 +5399,7 @@ createApp({
     this.soundOn = localStorage.getItem("soundOn") !== "0";
     this.streamFollow = localStorage.getItem("streamFollow") === "1";
     this.sendScroll = localStorage.getItem("sendScroll") === "1";
+    this.mediaAutoFloat = localStorage.getItem("mediaAutoFloat") !== "0";
     try {
       this.authStatus = await fetch("/api/auth/status").then((r) => r.json());
     } catch (e) {}
@@ -5756,13 +5898,19 @@ createApp({
                        переписке — это содержимое реплики, и с пустым alt она
                        пропала бы из ответа целиком. -->
                   <img v-if="a.type==='image'" :src="a.data || a.preview || attUrl(m, ai)" loading="lazy" class="att-img" @click="lightbox = a.data || a.preview || attUrl(m, ai)" :alt="a.name ? 'Изображение ' + a.name : 'Изображение в сообщении'" title="Открыть" />
-                  <audio v-else-if="a.type==='audio'" :src="a.data || a.preview || attUrl(m, ai)" controls preload="none" class="att-audio"></audio>
-                  <video v-else-if="a.type==='video' || ((a.mime || '').startsWith('video'))" :src="a.data || a.preview || attUrl(m, ai)" controls preload="metadata" class="att-video"></video>
+                  <audio v-else-if="a.type==='audio'" :src="a.data || a.preview || attUrl(m, ai)" controls preload="none" class="att-audio"
+                         :data-mid="m.id" :data-ai="ai"></audio>
+                  <video v-else-if="a.type==='video' || ((a.mime || '').startsWith('video'))" :src="a.data || a.preview || attUrl(m, ai)" controls preload="metadata" class="att-video"
+                         :data-mid="m.id" :data-ai="ai"></video>
                   <a v-else class="att-doc" :href="a.data || a.preview || attUrl(m, ai)" :download="a.name || 'файл'" title="Скачать">{{ attIcon(a) }} {{ a.name || 'документ' }}</a>
                   <!-- Подпись с ОРИГИНАЛЬНЫМ именем файла + размер + скачать (для всех типов) -->
                   <div v-if="a.type!=='document'" class="att-caption">
                     <span class="att-fname" :title="a.name || ''">{{ attIcon(a) }} {{ a.name || 'файл' }}</span>
                     <i v-if="a.size"> · {{ fmtSize(a.size) }}</i>
+                    <span v-if="inDock(m, ai)" class="att-indock">🎧 {{ dockPlaying ? 'играет' : 'в плеере' }}</span>
+                    <button v-else-if="hasDock && isMediaAtt(a)" class="att-pop" @click="popOutFromButton($event, m, ai)"
+                            :aria-label="'Открыть «' + (a.name || 'файл') + '» в плавающем плеере'"
+                            title="Слушать и смотреть поверх страницы, листая чат">⧉ поверх</button>
                     <a class="att-dl" :href="a.data || a.preview || attUrl(m, ai)" :download="a.name || 'файл'" :title="'Скачать «' + (a.name || 'файл') + '»'">⬇ скачать</a>
                   </div>
                 </div>
@@ -6202,6 +6350,7 @@ createApp({
           <label class="check"><input type="checkbox" v-model="sendScroll" /> Прокручивать вниз, когда отправляю сообщение или файлы</label>
           <label class="check"><input type="checkbox" v-model="streamFollow" /> Следовать за ответом, пока он пишется (только если я внизу)</label>
           <label class="check"><input type="checkbox" v-model="soundOn" /> Звук, когда ответ готов</label>
+          <label v-if="hasDock" class="check"><input type="checkbox" v-model="mediaAutoFloat" /> Аудио и видео доигрывают в плавающем плеере, когда листаю ленту или открываю другой чат</label>
           <p class="muted" style="margin:2px 0 10px">Выключено — лента стоит там, где вы читаете. Когда ответ готов — плашка «Ответ получен» (клик — к началу ответа). Вниз — кнопка ⤓ или клавиша End. Пока ответ пишется, можно дописать запрос: введите текст и нажмите Enter — ответ начнётся заново с учётом дописанного.</p>
           <div class="hr"></div>
           <h3>Параметры генерации</h3>
@@ -7251,6 +7400,11 @@ createApp({
     </div>
   </div>
 
+  <!-- ===== Плавающий плеер аудио и видео (player.js) ===== -->
+  <media-dock v-if="dock" ref="dock" :queue="dock.queue" :pos="dock.pos" :start-at="dock.startAt"
+              :seq="dock.seq" :chat-title="dock.chatTitle" :bottom-gap="dock.bottom" @close="closeDock" @goto="dockGoto"
+              @playing="dockPlaying = $event" @track="dockTrack = $event"></media-dock>
+
   <!-- ===== Всплывающие уведомления (тосты) ===== -->
   <div class="toast-wrap">
     <!-- Тост кликабелен: он переводит в чат, где пришёл ответ. Но это был div
@@ -7465,4 +7619,6 @@ createApp({
     || { template: '<div><p class="muted">Хроника не загрузилась — обновите страницу.</p>'
       + '<slot name="compress"></slot><slot name="lore"></slot></div>' })
   .component("horae-msg", (window.HoraeUI && window.HoraeUI.components.HoraeMsg) || { render: () => null })
+  // Плавающий плеер из player.js; не загрузился — файлы играют в ленте, как раньше.
+  .component("media-dock", (window.TalePlayer && window.TalePlayer.MediaDock) || { render: () => null })
   .mount("#app");

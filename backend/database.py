@@ -75,6 +75,9 @@ async def init_db() -> None:
         await conn.run_sync(_migrate_attachment_blobs)
         # Разовая чистка «сирот» от старого некаскадного удаления чатов (см. ниже).
         await conn.run_sync(_cleanup_orphans)
+        # Ветки и продолжения до 2.10.0 ссылались на файлы исходного чата —
+        # даём им свои копии (см. _split_shared_blobs).
+        await conn.run_sync(_split_shared_blobs)
         # Ссылки на копии файлов в хранилище модели уходят вместе с файлом.
         await conn.run_sync(_media_ref_trigger)
 
@@ -153,6 +156,71 @@ def _migrate_attachment_blobs(sync_conn) -> None:
     if moved:
         print(f"[migrate] Вложения вынесены из сообщений в attachment_blobs: {moved} шт. "
               "(файл БД можно ужать командой VACUUM при желании)")
+
+
+def _split_shared_blobs(sync_conn) -> None:
+    """
+    Идемпотентно: у каждого сообщения — только свои файлы.
+
+    До 2.10.0 ветка и «новый чат с памятью» копировали в сообщение ссылку на
+    файл исходного сообщения (blob_id). Пока исходный чат жив, это работало;
+    после его удаления файл пропадал, а освободившийся id SQLite отдавал файлу
+    ДРУГОГО чата — и ветка показывала (и отправляла модели) чужой файл.
+
+    Ссылку на файл копии (тот же автор и то же время создания — их копирование
+    сохраняет) заменяем своей копией данных. Ссылку на файл постороннего
+    сообщения — убираем: это уже чужой файл, остаётся пометка о вложении.
+    """
+    import json as _json
+
+    from sqlalchemy import inspect, text
+
+    tables = set(inspect(sync_conn).get_table_names())
+    if "messages" not in tables or "attachment_blobs" not in tables:
+        return
+    owners = {bid: (mid, created, role) for bid, mid, created, role in sync_conn.execute(text(
+        "SELECT b.id, b.message_id, m.created_at, m.role FROM attachment_blobs b "
+        "LEFT JOIN messages m ON m.id = b.message_id WHERE b.message_id IS NOT NULL"
+    )).fetchall()}
+    rows = sync_conn.execute(text(
+        "SELECT id, created_at, role, attachments FROM messages "
+        "WHERE attachments IS NOT NULL AND attachments LIKE '%\"blob_id\"%'"
+    )).fetchall()
+    copied = dropped = 0
+    for mid, created, role, raw in rows:
+        try:
+            atts = _json.loads(raw)
+        except Exception:  # noqa: BLE001 — битый JSON не должен ломать старт
+            continue
+        if not isinstance(atts, list):
+            continue
+        changed = False
+        for a in atts:
+            if not isinstance(a, dict) or not a.get("blob_id"):
+                continue
+            try:
+                bid = int(a["blob_id"])
+            except (TypeError, ValueError):
+                continue
+            owner = owners.get(bid)
+            if owner is None or owner[0] == mid:
+                continue   # своё (или файла уже нет — отдаётся 404)
+            if owner[1] == created and owner[2] == role:
+                res = sync_conn.execute(text(
+                    "INSERT INTO attachment_blobs (message_id, data) "
+                    "SELECT :m, data FROM attachment_blobs WHERE id = :b"), {"m": mid, "b": bid})
+                a["blob_id"] = res.lastrowid
+                copied += 1
+            else:
+                a.pop("blob_id", None)
+                dropped += 1
+            changed = True
+        if changed:
+            sync_conn.execute(text("UPDATE messages SET attachments = :a WHERE id = :i"),
+                              {"a": _json.dumps(atts, ensure_ascii=False), "i": mid})
+    if copied or dropped:
+        print(f"[migrate] Файлы веток отделены от исходных чатов: копий {copied}, "
+              f"чужих ссылок убрано {dropped}")
 
 
 def _cleanup_orphans(sync_conn) -> None:
