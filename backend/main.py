@@ -67,6 +67,8 @@ from backend import (
     user_memory,
 )
 from backend.attachments import (
+    att_cache_get,
+    att_cache_put,
     attachment_data,
     delete_message_blobs,
     hydrate_export_attachments,
@@ -1395,9 +1397,34 @@ def _iso_utc(dt) -> str | None:
     return dt.isoformat() + ("" if dt.tzinfo else "Z")
 
 
+_RANGE_RE = re.compile(r"^\s*bytes\s*=\s*(\d*)\s*-\s*(\d*)\s*$")
+
+
+def _media_response(raw: bytes, mime: str, headers: dict, range_header: str | None) -> Response:
+    """
+    Ответ с поддержкой Range (206 Partial Content). Без неё браузер не умеет
+    перематывать аудио и видео: любой прыжок по полосе начинал файл с нуля, а
+    длинное голосовое приходилось слушать подряд от начала.
+    """
+    size = len(raw)
+    headers = {**headers, "Accept-Ranges": "bytes"}
+    m = _RANGE_RE.match(range_header or "")
+    if not m or (not m.group(1) and not m.group(2)):
+        return Response(content=raw, media_type=mime, headers=headers)
+    if m.group(1):
+        start = int(m.group(1))
+        end = min(int(m.group(2)), size - 1) if m.group(2) else size - 1
+    else:   # bytes=-N — последние N байт
+        start, end = max(0, size - int(m.group(2))), size - 1
+    if start >= size or start > end:
+        return Response(status_code=416, headers={**headers, "Content-Range": f"bytes */{size}"})
+    headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+    return Response(content=raw[start:end + 1], status_code=206, media_type=mime, headers=headers)
+
+
 @app.get("/api/messages/{message_id}/att/{idx}")
 async def get_attachment(
-    message_id: int, idx: int,
+    message_id: int, idx: int, request: Request,
     token: str = "", x_user_token: str | None = Header(default=None),
     db: AsyncSession = Depends(get_session),
 ):
@@ -1419,16 +1446,25 @@ async def get_attachment(
     atts = msg.attachments or []
     if not (0 <= idx < len(atts)) or not isinstance(atts[idx], dict):
         raise HTTPException(404, "Вложение не найдено")
-    # data: инлайн (легаси) или из blob-таблицы (тяжёлый base64 хранится отдельно).
-    data = await attachment_data(db, atts[idx])
-    if not data:
-        raise HTTPException(404, "Данные вложения не найдены")
     mime = atts[idx].get("mime") or "application/octet-stream"
-    b64 = data.split(",", 1)[1] if data.startswith("data:") and "," in data else data
-    try:
-        raw = base64.b64decode(b64)
-    except Exception:  # noqa: BLE001
-        raise HTTPException(422, "Не удалось декодировать вложение")
+    # Ключ кэша: id в SQLite переиспользуются, поэтому — со временем создания
+    # сообщения и метой файла (и кэш чистится при удалении вложений).
+    a = atts[idx]
+    ckey = (message_id, idx, str(msg.created_at), a.get("blob_id"), a.get("size"), a.get("name"),
+            len(str(a.get("data") or "")))
+    raw = att_cache_get(ckey)
+    if raw is None:
+        # data: инлайн (легаси) или из blob-таблицы (тяжёлый base64 хранится отдельно).
+        data = await attachment_data(db, atts[idx])
+        if not data:
+            raise HTTPException(404, "Данные вложения не найдены")
+        b64 = data.split(",", 1)[1] if data.startswith("data:") and "," in data else data
+        try:
+            raw = base64.b64decode(b64)
+        except Exception:  # noqa: BLE001
+            raise HTTPException(422, "Не удалось декодировать вложение")
+        if mime.startswith(("audio/", "video/")):
+            att_cache_put(ckey, raw)
     # Content-Disposition с ОРИГИНАЛЬНЫМ именем: при «Сохранить как» браузер даёт
     # файлу то же имя, что было при загрузке (в т.ч. кириллица — filename* / RFC 5987).
     # inline — чтобы фото/видео/аудио всё равно открывались прямо в странице.
@@ -1438,7 +1474,7 @@ async def get_attachment(
         ascii_name = name.encode("ascii", "ignore").decode() or "attachment"
         quoted = urllib.parse.quote(name, safe="")
         headers["Content-Disposition"] = f'inline; filename="{ascii_name}"; filename*=UTF-8\'\'{quoted}'
-    return Response(content=raw, media_type=mime, headers=headers)
+    return _media_response(raw, mime, headers, request.headers.get("range"))
 
 
 @app.get("/api/sessions/{session_id}/messages")
@@ -4113,7 +4149,7 @@ if _frontend_dir.exists():
         снимает выбор: адрес меняется РОВНО тогда, когда изменился файл.
         """
         html = (_frontend_dir / "index.html").read_text(encoding="utf-8")
-        for asset in ("app.js", "styles.css", "horae.js"):
+        for asset in ("app.js", "styles.css", "horae.js", "player.js"):
             html = html.replace(f'"/{asset}"', f'"/{asset}?v={_asset_version(asset)}"')
         html = _localize_cdn(html, _vendor_files())
         return Response(html, media_type="text/html; charset=utf-8")

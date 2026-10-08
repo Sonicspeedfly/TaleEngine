@@ -220,3 +220,40 @@ def test_legacy_inline_data_migrates_on_startup(client):
         # И эндпоинт отдаёт исходные байты после миграции.
         resp = c2.get(f"/api/messages/{mid}/att/0")
         assert resp.status_code == 200 and resp.content == raw
+
+
+def test_audio_attachment_supports_range_requests(client):
+    """
+    Перемотка аудио и видео: браузер просит куски файла (Range). Без 206 любой
+    прыжок по полосе начинал голосовое с нуля.
+    """
+    cid = client.post("/api/characters", json={"name": "Диапазон"}).json()["id"]
+    sid = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]
+    raw = bytes(range(256)) * 40
+    data_uri = "data:audio/wav;base64," + base64.b64encode(raw).decode()
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        r = client.post(f"/api/sessions/{sid}/send", json={
+            "content": "голосовое", "attachments": [
+                {"type": "audio", "data": data_uri, "mime": "audio/wav", "name": "voice.wav"}
+            ],
+        })
+        _wait_done(client, r.json()["job_id"])
+    mid = [m for m in client.get(f"/api/sessions/{sid}/messages").json() if m["role"] == "user"][-1]["id"]
+    url = f"/api/messages/{mid}/att/0"
+
+    full = client.get(url)
+    assert full.status_code == 200 and full.content == raw and full.headers["accept-ranges"] == "bytes"
+    part = client.get(url, headers={"Range": "bytes=100-199"})
+    assert part.status_code == 206 and part.content == raw[100:200]
+    assert part.headers["content-range"] == f"bytes 100-199/{len(raw)}"
+    tail = client.get(url, headers={"Range": "bytes=-16"})
+    assert tail.status_code == 206 and tail.content == raw[-16:]
+    open_end = client.get(url, headers={"Range": f"bytes={len(raw) - 10}-"})
+    assert open_end.status_code == 206 and open_end.content == raw[-10:]
+    assert client.get(url, headers={"Range": f"bytes={len(raw)}-"}).status_code == 416
+
+    # Сообщение удалили — кэш раскодированных файлов не отдаёт его байты новому
+    # сообщению с тем же id (SQLite их переиспользует).
+    client.delete(f"/api/messages/{mid}")
+    from backend import attachments
+    assert not attachments._att_cache

@@ -85,8 +85,29 @@ async def message_attachments_in(db, msg) -> list[AttachmentIn]:
     return out
 
 
+# Последние раскодированные аудио и видео (см. main.get_attachment): перемотка —
+# это серия Range-запросов к одному файлу, и без кэша каждый раскодировал бы весь
+# base64 заново. Чистится при удалении вложений: id в SQLite переиспользуются.
+_att_cache: dict = {}
+_ATT_CACHE_BYTES = 96 * 1024 * 1024
+
+
+def att_cache_get(key):
+    return _att_cache.get(key)
+
+
+def att_cache_put(key, raw: bytes) -> None:
+    if len(raw) > _ATT_CACHE_BYTES // 2:
+        return
+    _att_cache.pop(key, None)
+    _att_cache[key] = raw
+    while sum(len(v) for v in _att_cache.values()) > _ATT_CACHE_BYTES:
+        _att_cache.pop(next(iter(_att_cache)))
+
+
 async def delete_message_blobs(db, message_ids) -> None:
     """Удаляет данные вложений для перечисленных сообщений (или подзапроса id)."""
+    _att_cache.clear()
     from sqlalchemy import delete as sql_delete
 
     await db.execute(

@@ -1704,6 +1704,76 @@ input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
 .att-caption i { font-style: normal; opacity: 0.7; flex: none; }
 .att-dl { margin-left: auto; flex: none; color: var(--accent); text-decoration: none; }
 .att-dl:hover { text-decoration: underline; }
+/* «⧉ поверх» — открыть файл в плавающем плеере; «🎧 в плеере» — он уже там. */
+.att-pop { flex: none; padding: 1px 6px; font-size: var(--fs-100); background: transparent; color: var(--accent);
+  border-color: transparent; border-radius: var(--r-sm); }
+.att-pop:hover { background: var(--accent-subtle); border-color: transparent; }
+.att-indock { flex: none; color: var(--ok); }
+
+/* ===== Плавающий плеер (player.js) =====
+   Окно поверх страницы, но не модалка: лента под ним живая. Без явного места
+   стоит справа над полем ввода; перетащили — left/top из style. Выше шторки
+   настроек (её открывают, не останавливая музыку), ниже модалок и тостов. */
+.media-dock {
+  position: fixed; right: 16px; bottom: 112px; z-index: calc(var(--z-drawer) + 1);
+  max-width: calc(100vw - 16px);
+  background: var(--surface-2); color: var(--text-primary);
+  border: 1px solid var(--border-strong); border-radius: var(--r-lg); box-shadow: var(--shadow-1);
+  display: flex; flex-direction: column; overflow: hidden;
+  animation: md-in var(--dur-2) var(--ease-out);
+}
+.media-dock.placed { right: auto; bottom: auto; }
+.media-dock.dragging { opacity: 0.92; box-shadow: var(--shadow-2); }
+@keyframes md-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+.md-btn { padding: 3px 7px; min-width: 30px; min-height: 30px; background: transparent; border-color: transparent;
+  color: var(--text-secondary); border-radius: var(--r-sm); line-height: 1; font-size: var(--fs-200); }
+.md-btn:hover:not(:disabled) { color: var(--text-primary); background: var(--surface-hover); border-color: transparent; }
+.md-btn.on { color: var(--accent); background: var(--accent-subtle); }
+.md-btn.md-play { color: var(--text-on-accent); background: var(--accent-fill); min-width: 38px; border-radius: var(--r-pill); }
+.md-btn.md-play:hover { background: var(--accent-fill-hover); color: var(--text-on-accent); }
+.md-head { display: flex; align-items: center; gap: 2px; padding: 4px 4px 4px 8px; cursor: grab;
+  touch-action: none; user-select: none; border-bottom: 1px solid var(--border-subtle); }
+.media-dock.dragging .md-head, .media-dock.dragging .md-pill { cursor: grabbing; }
+.md-grip { color: var(--text-tertiary); letter-spacing: -2px; margin-right: 4px; }
+.md-titles { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.md-title { font-size: var(--fs-200); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.md-sub { font-size: var(--fs-100); color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.md-stage { position: relative; background: #000; }
+.md-video { display: block; width: 100%; max-height: 60vh; background: #000; cursor: pointer; }
+/* Полный экран и системное окно — поверх картинки, в углу: в строке кнопок им места нет. */
+.md-stage-tools { position: absolute; top: 4px; right: 4px; display: flex; gap: 2px; opacity: 0.85; }
+.md-stage-tools .md-btn { background: rgba(0, 0, 0, 0.55); color: #fff; }
+.md-stage-tools .md-btn:hover { background: rgba(0, 0, 0, 0.75); color: #fff; }
+.md-body { padding: 6px 8px 8px; display: flex; flex-direction: column; gap: 4px; }
+.md-seek { display: flex; align-items: center; gap: 6px; }
+.md-seek input[type=range] { flex: 1; padding: 0; border: 0; background: transparent; accent-color: var(--accent); min-width: 0; }
+.md-time { font-size: var(--fs-100); color: var(--text-secondary); font-variant-numeric: tabular-nums; flex: none; }
+.md-controls { display: flex; align-items: center; gap: 1px; flex-wrap: wrap; }
+.md-controls .md-btn { padding: 3px 5px; min-width: 28px; }
+.md-spacer { flex: 1; }
+.md-controls .md-rate { font-variant-numeric: tabular-nums; min-width: 38px; }
+.md-error { margin: 0; font-size: var(--fs-100); color: var(--danger); }
+.md-list { list-style: none; margin: 0; padding: 4px; max-height: 220px; overflow-y: auto; border-bottom: 1px solid var(--border-subtle); }
+.md-list button { width: 100%; display: flex; align-items: center; gap: 6px; text-align: left; padding: 5px 6px;
+  background: transparent; border-color: transparent; font-size: var(--fs-100); }
+.md-list button:hover { background: var(--surface-hover); border-color: transparent; }
+.md-list button.cur { background: var(--accent-subtle); color: var(--accent); }
+.md-li-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.md-li-who { color: var(--text-tertiary); flex: none; }
+/* Свёрнутый вид: пилюля — кнопка, название и тонкая полоска прогресса. */
+.media-dock.collapsed { border-radius: var(--r-pill); }
+.md-pill { display: flex; align-items: center; gap: 4px; padding: 3px 4px; cursor: grab; touch-action: none;
+  user-select: none; position: relative; max-width: 280px; }
+.md-pill-title { font-size: var(--fs-100); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 1; max-width: 160px; }
+.md-pill-bar { position: absolute; left: 12px; right: 12px; bottom: 1px; height: 2px; background: var(--border-subtle); border-radius: 2px; overflow: hidden; }
+.md-pill-bar i { display: block; height: 100%; background: var(--accent); }
+@media (max-width: 767.98px) {
+  /* На телефоне: над полем ввода и навигацией, почти во всю ширину. */
+  .media-dock { right: 8px; bottom: calc(env(safe-area-inset-bottom, 0px) + 140px); }
+  .media-dock:not(.video):not(.collapsed) { width: calc(100vw - 16px) !important; }
+  .md-btn { min-width: 36px; min-height: 36px; }
+}
+@media (prefers-reduced-motion: reduce) { .media-dock { animation: none; } }
 
 /* Live-размышления модели (thinking): свёрнутый блок над печатающимся ответом. */
 .thought-box { font-size: var(--fs-100); color: var(--text-secondary); background: var(--surface-1);
