@@ -1234,11 +1234,9 @@ def assemble_context(
     # сообщения остаётся.
     # Окно файлов (настройка «Файлы из последних сообщений»): даже ссылкой файл
     # стоит токенов на каждом ходу, и человек сам решает, сколько их держать.
-    before = _count_marks(history)
+    marks_before = [_count_marks([m]) for m in history]
     history = window_history_media(history, files_window)
-    if report is not None:
-        report["files_window"] = files_window
-        report["files_windowed"] = before - _count_marks(history)
+    marks_after = [_count_marks([m]) for m in history]
     history = cap_history_media(history, token_budget // 2)
     #
     # ЭКОНОМИЯ: граница обрезки квантуется по ступеням (см. stable_trim_start) —
@@ -1250,6 +1248,11 @@ def assemble_context(
     # бюджет — последние реплики диалога модель видит всё равно, иначе она
     # отвечала бы без контекста вовсе.
     start = min(start, max(0, len(history) - _MIN_HISTORY_TAIL))
+    if report is not None:
+        # Файлы за окном — только у сообщений, которые модель видит: у
+        # обрезанных бюджетом файлов и так нет, окно их не «сэкономило».
+        report["files_window"] = files_window
+        report["files_windowed"] = sum(a - b for a, b in zip(marks_before[start:], marks_after[start:]))
     trimmed_history: list[dict] = [
         {"role": m["role"], "content": m["content"]} for m in history[start:]
     ]

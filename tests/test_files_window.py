@@ -127,3 +127,27 @@ async def test_group_chat_files_outside_window_become_notes(client):
     assert texts.count(files_window_note(2)) == 3
     blocks = client.portal.call(build, -1)
     assert sum(1 for b in blocks if isinstance(b, dict) and mr.MARK in b) == 5
+
+
+def test_report_counts_only_files_the_model_would_see():
+    """Файлы у сообщений, обрезанных бюджетом, — не заслуга окна: в отчёт не идут."""
+    from backend import horae_memory as hm
+
+    hist = []
+    for i in range(100):
+        meta = {"type": "image", "mime": "image/png", "name": f"f{i}.png", "size": 1000, "blob_id": i + 1}
+        hist.append({"role": "user", "content": mr.history_content(("слово " * 400) + str(i), [meta])})
+        hist.append({"role": "assistant", "content": "ок " * 400})
+    char = {"name": "X", "description": "", "personality": "", "scenario": "", "system_prompt": "", "mes_example": ""}
+
+    def windowed(w):
+        rep = {}
+        hm.assemble_context(character=char, horae_records=[], history=list(hist), user_message="привет",
+                            token_budget=20_000, report=rep, files_window=w)
+        return rep["files_windowed"], rep["history"]["trimmed"]
+
+    n10, trimmed = windowed(10)
+    assert trimmed > 150 and n10 == 0        # окно шире видимой части — ничего не сняло
+    n0, start0 = windowed(0)
+    visible = sum(_marks(m) for m in hist[start0:])
+    assert 0 < n0 == visible < 100            # только файлы видимых сообщений
