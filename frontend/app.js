@@ -182,6 +182,9 @@ createApp({
         // тарифицирует ВЕСЬ вход вдвое дороже. Раньше здесь стоял 1 млн.
         context_tokens: 200000,
         knowledge_chars: 60000,    // потолок текста базы знаний в контексте (0 = без лимита)
+        // Окно файлов: из скольких последних сообщений модель получает файлы
+        // (0 — только файлы текущего сообщения, -1 — весь чат).
+        files_window: 10,
         // Стандартная фильтрация по умолчанию. Существующие профили не
         // затрагиваются: loadUiPrefs кладёт сохранённые параметры поверх.
         disable_safety: false,
@@ -267,17 +270,18 @@ createApp({
       // --- Расход токенов (кнопка 📊) ---
       usageOpen: false,
       usage: null,
-      // Готовые наборы «сколько платим за ход». Меняют две настройки разом:
-      // окно контекста и объём базы знаний. (Файлы истории модель видит все —
-      // ссылками на хранилище, их вес входит в окно контекста.)
+      // Готовые наборы «сколько платим за ход». Меняют три настройки разом:
+      // окно контекста, объём базы знаний и окно файлов.
       economyModes: [
-        { id: "eco", label: "🪙 Экономия", hint: "Минимум токенов на ход: короткая память и короткий справочник",
-          v: { context_tokens: 64000, knowledge_chars: 20000 } },
-        { id: "balance", label: "⚖️ Баланс", hint: "Рекомендуется: почти полная память без удвоенного тарифа Gemini",
-          v: { context_tokens: 200000, knowledge_chars: 60000 } },
-        { id: "max", label: "🔥 Максимум", hint: "Помнит всё (1 млн токенов) и весь справочник. Дорого!",
-          v: { context_tokens: 1000000, knowledge_chars: 0 } },
+        { id: "eco", label: "🪙 Экономия", hint: "Минимум токенов на ход: короткая память, короткий справочник, файлы 3 последних сообщений",
+          v: { context_tokens: 64000, knowledge_chars: 20000, files_window: 3 } },
+        { id: "balance", label: "⚖️ Баланс", hint: "Рекомендуется: почти полная память без удвоенного тарифа Gemini, файлы 10 последних сообщений",
+          v: { context_tokens: 200000, knowledge_chars: 60000, files_window: 10 } },
+        { id: "max", label: "🔥 Максимум", hint: "Помнит всё (1 млн токенов), весь справочник и все файлы чата. Дорого!",
+          v: { context_tokens: 1000000, knowledge_chars: 0, files_window: -1 } },
       ],
+      // Окно файлов: готовые значения (своё число — в поле рядом).
+      filesWindowPresets: [[0, "Только текущее"], [3, "3"], [5, "5"], [10, "10"], [20, "20"], [50, "50"], [-1, "Весь чат"]],
       // «Файлы для модели»: хранилище файлов у прокси для текущей модели
       // (GET /api/media/status). null — ещё не загружено.
       mediaStatus: null,
@@ -527,6 +531,14 @@ createApp({
   },
 
   computed: {
+    // Окно файлов словами: «10 сообщений», «только текущее», «весь чат».
+    filesWindowLabel() {
+      const n = this.params.files_window;
+      if (n == null || n === "") return "по умолчанию сервера";
+      if (Number(n) < 0) return "весь чат";
+      if (Number(n) === 0) return "только текущее сообщение";
+      return n + " " + this.plural(Number(n), "сообщение", "сообщения", "сообщений");
+    },
     // «Обо мне»: действующие сведения и кандидаты, ждущие подтверждения.
     userMemActive() {
       return ((this.userMem && this.userMem.items) || []).filter((i) => i.status === "active");
@@ -1753,16 +1765,24 @@ createApp({
       }
       // Файлы хода (2.8.0): ссылкой на хранилище, целиком или ждут загрузки.
       const f = stats.files;
-      if (f && f.total) {
+      const old = stats.files_windowed || 0;
+      if ((f && f.total) || old) {
         const bits = [];
         if (f.refs) bits.push(n(f.refs) + " ссылкой");
         if (f.inline) bits.push(n(f.inline) + " целиком (" + f.inline_mb + " МБ)");
         if (f.pending) bits.push(n(f.pending) + " ждут загрузки");
-        if (f.notes) bits.push(n(f.notes) + " пометкой");
-        const why = f.storage === "off" ? " · хранилище у прокси не работает (⚙ → Генерация)"
-          : f.storage === "unchecked" ? " · хранилище ещё не проверено"
-          : f.storage === "disabled" ? " · ссылки выключены на сервере" : "";
-        rows.push({ text: "Файлы: " + bits.join(" · ") + why, warn: !!f.notes && f.storage !== "ok" });
+        if (f && f.notes) bits.push(n(f.notes) + " пометкой");
+        // Старше окна файлов (⚙ → Генерация → «Файлы из последних сообщений»).
+        if (old) {
+          const w = stats.files_window;
+          bits.push(n(old) + " старше окна (" + (w > 0 ? w + " " + this.plural(w, "сообщение", "сообщения", "сообщений")
+            : "только текущее") + ")");
+        }
+        const st = f ? f.storage : "";
+        const why = st === "off" ? " · хранилище у прокси не работает (⚙ → Генерация)"
+          : st === "unchecked" ? " · хранилище ещё не проверено"
+          : st === "disabled" ? " · ссылки выключены на сервере" : "";
+        rows.push({ text: "Файлы: " + bits.join(" · ") + why, warn: !!(f && f.notes) && st !== "ok" });
       }
       const found = (stats.recalled || []).length;
       const factsOff = mem.facts_enabled === false || mem.facts_mode === "off";
@@ -3997,6 +4017,8 @@ createApp({
         }
         // Новые настройки экономии могли не сохраниться в старых профилях.
         if (this.params.knowledge_chars == null) this.params.knowledge_chars = 60000;
+        // Окно файлов (2.11.0): в профилях до него ключа нет — 10 последних сообщений.
+        if (this.params.files_window == null) this.params.files_window = 10;
         // Настройки обхода цензуры (появились в 1.13.0). Порог доставляем только
         // тем, у кого Zero-Censorship РЕАЛЬНО включён: иначе эта строка молча
         // возвращала бы «off» и новым профилям, у которых фильтры стандартные.
@@ -5256,6 +5278,17 @@ createApp({
     // сохранения (PUT уходит из наблюдателя выше) отчёт перечитываем, иначе
     // «из бюджета хода» до следующего хода показывал бы прежнее число.
     "params.context_tokens"() { this._ctxAfterSave = true; },
+    // Окно файлов: пустое поле — «по умолчанию сервера» (null), а не "" — его
+    // сервер не принял бы, и ход упал бы на проверке параметров.
+    "params.files_window"(v) {
+      this._ctxAfterSave = true;
+      if (v === "" || v == null || Number.isNaN(Number(v))) {
+        if (v !== null) this.params.files_window = null;
+        return;
+      }
+      const k = Math.max(-1, Math.min(10000, Math.round(Number(v))));
+      if (k !== v) this.params.files_window = k;
+    },
     soundOn(v) { localStorage.setItem("soundOn", v ? "1" : "0"); },
     streamFollow(v) { try { localStorage.setItem("streamFollow", v ? "1" : "0"); } catch (e) { /* приватный режим */ } },
     sendScroll(v) { try { localStorage.setItem("sendScroll", v ? "1" : "0"); } catch (e) { /* приватный режим */ } },
@@ -6384,6 +6417,17 @@ createApp({
                     @click="params.context_tokens = p[0]">{{ p[1] }}</button>
           </div>
           <p class="muted" style="margin:2px 0 10px">Сколько ИСТОРИИ чата видит модель на каждый ход. <b>Важно про цену:</b> у Gemini вход свыше ~200 тыс. токенов тарифицируется <b>вдвое дороже — целиком</b>, поэтому 200к выгоднее 1 млн почти без потери памяти. Что не влезло — сохранит авто-сводка (вкладка «Память»).</p>
+
+          <label>📎 Файлы из последних сообщений <span class="range-val">{{ filesWindowLabel }}</span>
+            <input type="number" min="-1" max="10000" step="1" v-model.number="params.files_window"
+                   aria-describedby="files-window-hint" /></label>
+          <div class="row" style="gap:6px; margin:-4px 0 6px; flex-wrap:wrap" role="group" aria-label="Готовые значения окна файлов">
+            <button v-for="p in filesWindowPresets" :key="p[0]"
+                    :class="params.files_window === p[0] ? 'btn-primary' : ''"
+                    :aria-pressed="params.files_window === p[0] ? 'true' : 'false'"
+                    @click="params.files_window = p[0]">{{ p[1] }}</button>
+          </div>
+          <p id="files-window-hint" class="muted" style="margin:2px 0 10px">Из скольких последних сообщений модель получает фото, голосовые, видео и документы. Файлы старше — пометкой с именем: модель знает, что файл был, но не тратит на него токены. <b>Даже ссылкой файл стоит токенов на каждом ходу</b> (минута голосового ≈ 2 тыс., видео — десятки тысяч). Файлы сообщения, на которое модель отвечает, уходят всегда. 0 — только они, −1 — все файлы чата.</p>
 
           <!-- Файлы для модели (2.8.0): вместо лимитов «Файлы в памяти диалога».
                Файл один раз загружается в хранилище Google через прокси, и
