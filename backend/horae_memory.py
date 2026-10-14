@@ -219,6 +219,64 @@ NOTE_MEDIA_WINDOW = ("[содержимое файла в этот запрос 
 _MIN_HISTORY_TAIL = 4
 
 
+def files_window_note(window: int) -> str:
+    """Пометка вместо файла старше окна файлов (подпись с именем файла остаётся)."""
+    return ("[содержимое этого файла в запрос не вошло: модели отправляются файлы только из "
+            f"{window} последних сообщений; не описывай его по догадке]" if window > 0 else
+            "[содержимое этого файла в запрос не вошло: модели отправляются только файлы "
+            "текущего сообщения; не описывай его по догадке]")
+
+
+def window_history_media(history: list[dict], window: int | None) -> list[dict]:
+    """
+    Окно файлов: файлы-заготовки (media_refs.MARK) остаются только у window
+    последних сообщений истории, у старших — пометка (текст сообщения и
+    подпись с именем файла остаются). Файлы сообщения, на которое идёт ответ
+    (priority 2: перегенерация, «Продолжить»), уходят всегда. window None или
+    < 0 — без ограничения. Возвращает копию, если что-то снято.
+    """
+    from backend.media_refs import MARK
+
+    if window is None or window < 0:
+        return history
+    cut = len(history) - window   # сообщения с индексом < cut — без файлов
+    if cut <= 0:
+        return history
+    note = {"type": "text", "text": files_window_note(window)}
+    out, changed = [], False
+    for i, m in enumerate(history):
+        c = m.get("content")
+        if i < cut and isinstance(c, list) and any(
+                isinstance(b, dict) and MARK in b and int(b[MARK].get("priority") or 0) < 2 for b in c):
+            m = {**m, "content": [
+                note if isinstance(b, dict) and MARK in b and int(b[MARK].get("priority") or 0) < 2 else b
+                for b in c
+            ]}
+            changed = True
+        out.append(m)
+    return out if changed else history
+
+
+def _count_marks(history: list[dict]) -> int:
+    from backend.media_refs import MARK
+
+    return sum(1 for m in history if isinstance(m.get("content"), list)
+               for b in m["content"] if isinstance(b, dict) and MARK in b)
+
+
+def resolve_files_window(params) -> int:
+    """Окно файлов хода: из параметров интерфейса, иначе FILES_WINDOW из .env."""
+    from backend.config import settings
+
+    value = getattr(params, "files_window", None) if params is not None else None
+    if value is None:
+        value = settings.FILES_WINDOW
+    try:
+        return max(-1, int(value))
+    except (TypeError, ValueError):
+        return -1
+
+
 def cap_history_media(history: list[dict], media_budget: int, step: int = _TRIM_STEP) -> list[dict]:
     """
     Файлы-заготовки истории (media_refs.MARK) в пределах media_budget токенов,
@@ -991,6 +1049,7 @@ def assemble_context(
     report: dict | None = None,
     horae=None,
     user_memory: str = "",
+    files_window: int | None = None,
 ) -> list[dict]:
     """
     ЧИСТАЯ функция сборки контекста. Возвращает messages для LiteLLM:
@@ -1022,6 +1081,9 @@ def assemble_context(
         правила тегов (в системный промпт или хвост), блок состояния сюжета
         (хвост, после мастер-снимка), кандидаты воспоминаний (отсев — после
         обрезки истории, как у фактов) и напоминание формата (перед фокусом).
+
+    :param files_window: окно файлов — из скольких последних сообщений истории
+        модель получает файлы (см. window_history_media); None — без ограничения.
 
     :param user_memory: блок «Память о пользователе» (user_memory.prompt_block):
         общие сведения о самом собеседнике для всех его чатов. Идёт в системный
@@ -1170,6 +1232,11 @@ def assemble_context(
     # окна текст десятков сообщений. Поэтому файлам — не больше половины
     # бюджета: от свежих к старым, дальше вместо файла пометка, а текст
     # сообщения остаётся.
+    # Окно файлов (настройка «Файлы из последних сообщений»): даже ссылкой файл
+    # стоит токенов на каждом ходу, и человек сам решает, сколько их держать.
+    marks_before = [_count_marks([m]) for m in history]
+    history = window_history_media(history, files_window)
+    marks_after = [_count_marks([m]) for m in history]
     history = cap_history_media(history, token_budget // 2)
     #
     # ЭКОНОМИЯ: граница обрезки квантуется по ступеням (см. stable_trim_start) —
@@ -1181,6 +1248,11 @@ def assemble_context(
     # бюджет — последние реплики диалога модель видит всё равно, иначе она
     # отвечала бы без контекста вовсе.
     start = min(start, max(0, len(history) - _MIN_HISTORY_TAIL))
+    if report is not None:
+        # Файлы за окном — только у сообщений, которые модель видит: у
+        # обрезанных бюджетом файлов и так нет, окно их не «сэкономило».
+        report["files_window"] = files_window
+        report["files_windowed"] = sum(a - b for a, b in zip(marks_before[start:], marks_after[start:]))
     trimmed_history: list[dict] = [
         {"role": m["role"], "content": m["content"]} for m in history[start:]
     ]
@@ -1588,6 +1660,7 @@ async def build_context_from_db(
         report=report,
         horae=horae_parts,
         user_memory=about_user,
+        files_window=resolve_files_window(params),
     )
 
 

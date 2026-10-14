@@ -290,7 +290,7 @@ def _merge_params(params: Optional[GenerationParams]) -> dict:
             # контекста, а не сэмплинг-параметры litellm.
             if key in ("model", "disable_safety", "web_access", "send_avatars",
                        "reasoning_effort", "file_reasoning", "context_tokens",
-                       "knowledge_chars", "safety_preset", "safety_overrides"):
+                       "knowledge_chars", "files_window", "safety_preset", "safety_overrides"):
                 continue
             merged[key] = value
     return merged

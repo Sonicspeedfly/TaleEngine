@@ -360,9 +360,20 @@ async def build_group_messages(
     file_costs = [0] * len(msgs)
     media_left = token_budget // 2 if token_budget and token_budget > 0 else None
     skip_files: set[int] = set()
+    old_files: set[int] = set()
+    # Окно файлов (настройка «Файлы из последних сообщений»): файлы только у
+    # window сообщений перед последней репликой пользователя, у старших — пометка.
+    from backend.horae_memory import resolve_files_window
+
+    window = resolve_files_window(params)
+    newest_idx = next((i for i in range(len(msgs) - 1, -1, -1) if msgs[i].id == newest_user), len(msgs))
     for idx in range(len(msgs) - 1, -1, -1):
         m = msgs[idx]
         if m.role != "user" or m.id == newest_user:
+            continue
+        if window >= 0 and idx < newest_idx - window:
+            if m.attachments:
+                old_files.add(m.id)
             continue
         cost = sum(block_tokens(ph) or 0 for ph in (placeholder(a) for a in (m.attachments or []))
                    if ph is not None)
@@ -421,7 +432,10 @@ async def build_group_messages(
     # не мог «услышать» голосовое / «увидеть» фото (отвечал по кругу, игнорируя их).
     # Теперь свежие вложения прикладываем к финальной реплике как мультимодал.
     user_content: list = [{"type": "text", "text": transcript + f"\n\n{target_character.name}:"}]
-    att_blocks = _collect_user_attachments(msgs[start:], skip=skip_files)
+    from backend.horae_memory import files_window_note
+
+    att_blocks = _collect_user_attachments(msgs[start:], skip=skip_files, old=old_files,
+                                           old_note=files_window_note(window))
     # Хранилище файлов для модели не работает — файлы сверх лимита «целиком»
     # заранее становятся пометкой (их вес не нужен транскрипту).
     try:
@@ -540,7 +554,8 @@ def _fit_transcript(lines: list[str], system: str, token_budget: int, start: int
     )
 
 
-def _collect_user_attachments(msgs, skip: set | None = None) -> list[dict]:
+def _collect_user_attachments(msgs, skip: set | None = None, old: set | None = None,
+                              old_note: str = "") -> list[dict]:
     """
     Файлы из реплик ПОЛЬЗОВАТЕЛЯ группового чата, вошедших в транскрипт
     (хронологически), — подписи с именем и заготовки (media_refs.placeholder).
@@ -556,6 +571,7 @@ def _collect_user_attachments(msgs, skip: set | None = None) -> list[dict]:
     if not user_msgs:
         return []
     skip = skip or set()
+    old = old or set()
     kinds = {"image": "изображение", "video": "видео", "audio": "аудио", "pdf": "документ"}
     from backend.horae_memory import NOTE_MEDIA_WINDOW
 
@@ -574,6 +590,12 @@ def _collect_user_attachments(msgs, skip: set | None = None) -> list[dict]:
                 label += f": «{te['name']}»"
             label += f" — {kinds.get(te['kind'], 'файл')}]"
             blocks.append({"type": "text", "text": label})
-            # Не вошёл в долю окна под файлы — подпись остаётся, данные нет.
-            blocks.append({"type": "text", "text": NOTE_MEDIA_WINDOW} if m.id in skip else ph)
+            # Старше окна файлов или не вошёл в долю окна под файлы — подпись
+            # остаётся, данных нет.
+            if m.id in old:
+                blocks.append({"type": "text", "text": old_note})
+            elif m.id in skip:
+                blocks.append({"type": "text", "text": NOTE_MEDIA_WINDOW})
+            else:
+                blocks.append(ph)
     return blocks
