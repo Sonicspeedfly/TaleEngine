@@ -5078,7 +5078,9 @@ createApp({
     _gcpAlertOnce() {
       const alerts = (this.gcp && this.gcp.alerts) || [];
       if (!alerts.length) return;
-      const key = new Date().toISOString().slice(0, 10) + "|" + alerts.join("|");
+      // Ключ — без чисел: остаток меняется каждый час, а напоминать про то же
+      // самое чаще раза в день незачем.
+      const key = new Date().toISOString().slice(0, 10) + "|" + alerts.map((a) => a.replace(/[\d.,\s$≈]+/g, "")).join("|");
       try {
         if (localStorage.getItem("gcpAlerted") === key) return;
         localStorage.setItem("gcpAlerted", key);
