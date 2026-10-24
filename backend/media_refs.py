@@ -911,7 +911,10 @@ _MIME_RE = re.compile(r"unsupported mime|mime type .{0,40}not supported|file typ
                       r"unsupported (file|media) type", re.IGNORECASE)
 _MISSING_RE = re.compile(r"not found|no such object|may not exist|does not exist|expired|deleted|404",
                          re.IGNORECASE)
-_PERMISSION_RE = re.compile(r"permission|access denied|forbidden|403", re.IGNORECASE)
+# Нет доступа к копии. Google отвечает так и без имени файла: например, когда
+# у проекта, где лежит бакет, закрыта оплата («The billing account for the
+# owning project is disabled», 403 PERMISSION_DENIED) — после смены аккаунта.
+_PERMISSION_RE = re.compile(r"permission|access denied|forbidden|403|billing", re.IGNORECASE)
 # Сколько раз ссылка была «под подозрением» (ошибка без явного виновника) у
 # модели. Успешный ответ с ней обнуляет счёт; _SUSPECT_LIMIT подряд — модель её
 # не читает, ссылкой этот файл для неё больше не идёт.
@@ -943,7 +946,10 @@ async def handle_ref_error(used: list[dict], error, params=None, connection=None
       * названная в ошибке ссылка не найдена — она сбойная, файл загрузится
         заново (старая копия будет удалена);
       * нет прав — перезагрузка не поможет: модель перепроверяется (probe), и
-        только провал проверки выключает ссылки для неё;
+        только провал проверки выключает ссылки для неё. Ошибка доступа без
+        имени файла (403, закрытая оплата проекта бакета) тоже считается
+        ошибкой ссылок: ход повторяется с файлами целиком, а проверка
+        переключит хранилище на новый бакет;
       * по тексту не понять, какая ссылка виновата, — ничего не портим: этот
         ход идёт с файлами целиком, модель перепроверяется, а ссылки запроса
         получают «подозрение» (успешный ответ с ними его снимает).
@@ -953,7 +959,7 @@ async def handle_ref_error(used: list[dict], error, params=None, connection=None
     """
     text = str(error or "")
     uris = [u["uri"] for u in used if u.get("uri")]
-    if not uris or not _REF_ERROR_RE.search(text) and not _MIME_RE.search(text):
+    if not uris or not (_REF_ERROR_RE.search(text) or _MIME_RE.search(text) or _PERMISSION_RE.search(text)):
         return None
     named = {u for u in uris if any(f in text for f in _ref_forms(u))}
     route = route_for(params, connection)
@@ -1024,6 +1030,10 @@ async def _update_refs(scope: str, uris: set[str], **values) -> None:
 def explain(error: str) -> str:
     """Понятная причина, почему хранилище у прокси не работает."""
     low = (error or "").lower()
+    # Раньше «bucket»: текст сбоя загрузки в бакет с закрытой оплатой называет и бакет.
+    if "billing" in low:
+        return ("У проекта Google Cloud закрыта или не подключена оплата. Бакет (GCS_BUCKET_NAME) "
+                "и vertex_project у прокси должны быть в проекте с рабочим платёжным аккаунтом.")
     if "bucket" in low:
         return ("У прокси не задан бакет Google Cloud Storage для загрузки файлов "
                 "(переменная окружения GCS_BUCKET_NAME у процесса прокси).")
@@ -1244,7 +1254,7 @@ _REJECT_RE = re.compile(r"\b(413|415)\b|too large|unsupported|not supported|"
                         r"invalid (file|mime)|max_file_size", re.IGNORECASE)
 # Отказ по самому файлу не вечен: через неделю (или после смены прокси) — ещё раз.
 _REJECT_TTL = timedelta(days=7)
-_CAPABILITY_RE = re.compile(r"bucket|files_settings|model_list|model not found|managed files|"
+_CAPABILITY_RE = re.compile(r"bucket|files_settings|model_list|model not found|managed files|billing account|"
                             r"\b401\b|unauthorized|invalid api key|authentication", re.IGNORECASE)
 
 
