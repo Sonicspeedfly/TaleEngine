@@ -402,6 +402,22 @@ async def test_access_error_without_file_name_retries_inline_and_rechecks(db_rea
     assert row.status == "ready"
     assert "оплата" in mr.explain(_BILLING_CLOSED + " bucket")
 
+    class _Http(Exception):
+        def __init__(self, text, status_code):
+            super().__init__(text)
+            self.status_code = status_code
+
+    with patch.object(mr.uploader, "enqueue_probe"):
+        # Отказ с кодом 403 и без подробностей — тоже повод повторить с файлами.
+        assert await mr.handle_ref_error([{"uri": GS}], _Http("Forbidden", 403), None, PROXY) == {GS}
+        # Квота и лимит токенов — не про доступ к ссылкам: повтора нет.
+        assert await mr.handle_ref_error([{"uri": GS}], _Http(
+            "429 RESOURCE_EXHAUSTED: You exceeded your current quota, please check your plan and "
+            "billing details.", 429), None, PROXY) is None
+        assert await mr.handle_ref_error([{"uri": GS}], RuntimeError(
+            "400 The input token count (1403921) exceeds the maximum number of tokens allowed (1048576)"),
+            None, PROXY) is None
+
 
 async def test_inactive_file_is_deferred_not_failed(db_ready):
     from sqlalchemy import select

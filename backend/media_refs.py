@@ -911,15 +911,24 @@ _MIME_RE = re.compile(r"unsupported mime|mime type .{0,40}not supported|file typ
                       r"unsupported (file|media) type", re.IGNORECASE)
 _MISSING_RE = re.compile(r"not found|no such object|may not exist|does not exist|expired|deleted|404",
                          re.IGNORECASE)
-# Нет доступа к копии. Google отвечает так и без имени файла: например, когда
-# у проекта, где лежит бакет, закрыта оплата («The billing account for the
-# owning project is disabled», 403 PERMISSION_DENIED) — после смены аккаунта.
-_PERMISSION_RE = re.compile(r"permission|access denied|forbidden|403|billing", re.IGNORECASE)
+_PERMISSION_RE = re.compile(r"permission|access denied|forbidden|403|billing account", re.IGNORECASE)
+# Нет доступа, а имени файла в ошибке нет: так Vertex отвечает, когда у проекта,
+# где лежит бакет, закрыта оплата («The billing account for the owning project
+# is disabled», 403 PERMISSION_DENIED) — после смены аккаунта Google. Лимиты и
+# квоты (429, «…check your plan and billing details») сюда не относятся.
+_ACCESS_RE = re.compile(r"permission_denied|\b403\b", re.IGNORECASE)
 # Сколько раз ссылка была «под подозрением» (ошибка без явного виновника) у
 # модели. Успешный ответ с ней обнуляет счёт; _SUSPECT_LIMIT подряд — модель её
 # не читает, ссылкой этот файл для неё больше не идёт.
 _suspects: dict[tuple[str, str], int] = {}
 _SUSPECT_LIMIT = 3
+
+
+def _access_denied(error, text: str) -> bool:
+    """Отказ в доступе (403), а не лимит или перегрузка."""
+    if getattr(error, "status_code", None) == 403 or "billing account" in text.lower():
+        return True
+    return bool(_ACCESS_RE.search(text)) and not is_transient(error)
 
 
 def _ref_forms(uri: str) -> list[str]:
@@ -959,7 +968,7 @@ async def handle_ref_error(used: list[dict], error, params=None, connection=None
     """
     text = str(error or "")
     uris = [u["uri"] for u in used if u.get("uri")]
-    if not uris or not (_REF_ERROR_RE.search(text) or _MIME_RE.search(text) or _PERMISSION_RE.search(text)):
+    if not uris or not (_REF_ERROR_RE.search(text) or _MIME_RE.search(text) or _access_denied(error, text)):
         return None
     named = {u for u in uris if any(f in text for f in _ref_forms(u))}
     route = route_for(params, connection)
