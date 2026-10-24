@@ -270,6 +270,15 @@ createApp({
       // --- Расход токенов (кнопка 📊) ---
       usageOpen: false,
       usage: null,
+      // --- Счёт Google Cloud (2.12.0): оплата, расход, остаток кредита ---
+      gcp: null,
+      gcpLoading: false,
+      gcpError: "",
+      gcpLoadedAt: 0,
+      gcpSettingsOpen: false,
+      gcpDetailsOpen: false,
+      gcpForm: { credit_amount: "", credit_since: "", credit_expires: "", warn_below: "",
+                 project_id: "", bigquery: true, bq_table: "", prices: {} },
       // Готовые наборы «сколько платим за ход». Меняют три настройки разом:
       // окно контекста, объём базы знаний и окно файлов.
       economyModes: [
@@ -647,6 +656,26 @@ createApp({
     },
     replyToMsg() {
       return this.messages.find((m) => m.id === this.replyToId) || null;
+    },
+    // Карточка «Google Cloud»: доля оставшегося кредита и откуда цифры.
+    gcpCreditPct() {
+      const c = this.gcp && this.gcp.credit;
+      if (!c || !c.amount) return 0;
+      return Math.max(0, Math.min(100, Math.round((c.remaining / c.amount) * 100)));
+    },
+    gcpSourceLine() {
+      const g = this.gcp;
+      if (!g) return "";
+      const bq = g.bigquery || {};
+      const est = "оценка по токенам TaleEngine (хранение файлов и другие сервисы Google в неё не входят)";
+      if (bq.state === "ok") {
+        return bq.exported_at
+          ? `Точно по Google — до ${this.fmtDay(g.month.exact_until)} (экспорт от ${this.fmtDay(bq.exported_at)} ${String(bq.exported_at).slice(11, 16)} UTC), позже — ${est}.`
+          : `Экспорт BigQuery подключён, данных за период пока нет. Сейчас — ${est}.`;
+      }
+      if (bq.state === "no_table") return `Экспорт BigQuery: таблица ещё не появилась (Google создаёт её в течение нескольких часов после включения). Пока — ${est}.`;
+      if (bq.state === "error") return `Экспорт BigQuery: ${bq.error} Пока — ${est}.`;
+      return est.charAt(0).toUpperCase() + est.slice(1) + ".";
     },
     canvasSelText() {
       if (!this.canvas || this.canvasSel.end <= this.canvasSel.start) return "";
@@ -4990,6 +5019,90 @@ createApp({
     async loadUsage() {
       try { this.usage = await this.api("/usage?days=7"); } catch (e) { this.usage = null; }
     },
+    // ---------- Счёт Google Cloud ----------
+    async loadGcp(force = false) {
+      if (!this.isAdmin || this.gcpLoading) return;
+      this.gcpLoading = true;
+      this.gcpError = "";
+      try {
+        this.gcp = await this.api("/billing/gcp" + (force ? "?force=true" : ""));
+        this.gcpLoadedAt = Date.now();
+        this._gcpFillForm();
+        this._gcpAlertOnce();
+      } catch (e) {
+        this.gcpError = e.message || String(e);
+      } finally {
+        this.gcpLoading = false;
+      }
+    },
+    _gcpFillForm() {
+      const s = (this.gcp && this.gcp.settings) || {};
+      const prices = {};
+      // Поля цен — для каждой модели из оценки, чтобы можно было задать вручную.
+      for (const m of (this.gcp && this.gcp.models) || []) prices[m.model] = { in: "", out: "", cache: "" };
+      for (const [m, p] of Object.entries(s.prices || {})) prices[m] = { in: p.in ?? "", out: p.out ?? "", cache: p.cache ?? "" };
+      this.gcpForm = {
+        credit_amount: s.credit_amount ?? "", credit_since: s.credit_since || "",
+        credit_expires: s.credit_expires || "", warn_below: s.warn_below ?? "",
+        project_id: s.project_id || "", bigquery: s.bigquery !== false, bq_table: s.bq_table || "", prices,
+      };
+    },
+    async saveGcp() {
+      const f = this.gcpForm;
+      const num = (v) => (v === "" || v == null || isNaN(Number(v)) ? null : Number(v));
+      const prices = {};
+      for (const [m, p] of Object.entries(f.prices || {})) {
+        const row = {};
+        for (const k of ["in", "out", "cache"]) if (num(p[k]) != null) row[k] = num(p[k]);
+        if (Object.keys(row).length) prices[m] = row;
+      }
+      try {
+        this.gcp = await this.api("/billing/gcp/settings", {
+          method: "PUT",
+          body: JSON.stringify({
+            credit_amount: num(f.credit_amount), credit_since: f.credit_since || "",
+            credit_expires: f.credit_expires || "", warn_below: num(f.warn_below),
+            project_id: (f.project_id || "").trim(), bigquery: !!f.bigquery,
+            bq_table: (f.bq_table || "").trim(), prices,
+          }),
+        });
+        this.gcpLoadedAt = Date.now();
+        this._gcpFillForm();
+        this.showToast("Сохранено");
+      } catch (e) {
+        this.showToast("Не удалось сохранить: " + (typeof e.message === "string" ? e.message : "проверьте поля"));
+      }
+    },
+    // Срочное (оплата выключена, кредит на исходе) — уведомлением раз в день,
+    // а не при каждом открытии; сама карточка показывает это постоянно.
+    _gcpAlertOnce() {
+      const alerts = (this.gcp && this.gcp.alerts) || [];
+      if (!alerts.length) return;
+      const key = new Date().toISOString().slice(0, 10) + "|" + alerts.join("|");
+      try {
+        if (localStorage.getItem("gcpAlerted") === key) return;
+        localStorage.setItem("gcpAlerted", key);
+      } catch (e) { /* без хранилища — просто покажем */ }
+      for (const a of alerts) {
+        this.showToast("☁️ " + a, () => { this.drawerTab = "generation"; });
+      }
+    },
+    fmtMoney(v) {
+      if (v == null || isNaN(Number(v))) return "—";
+      const cur = (this.gcp && this.gcp.currency) || "USD";
+      const n = Number(v);
+      const abs = Math.abs(n);
+      const sign = n < 0 ? "−" : "";
+      const tiny = abs > 0 && abs < 0.01;
+      const body = (tiny ? 0.01 : abs).toLocaleString("ru-RU", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      return (tiny ? "<" : "") + sign + (cur === "USD" ? "$" + body : body + " " + cur);
+    },
+    gcpPriceSource(src) {
+      return { proxy: "прокси", local: "LiteLLM сервера", manual: "вручную" }[src] || src || "—";
+    },
+    fmtDay(iso) {
+      return iso ? String(iso).slice(0, 10).split("-").reverse().join(".") : "";
+    },
     // Красивое число: 1234567 -> «1.23 млн», 45678 -> «45.7 тыс.»
     fmtTokens(n) {
       n = Number(n || 0);
@@ -5199,6 +5312,14 @@ createApp({
       // onclose: сокет «жив», но события не приходят — «печатает…» висит вечно, хотя
       // ответ давно сохранён на сервере. Если 45с тишины — дослушиваем задачу через
       // SSE (он отдаёт весь накопленный буфер), а без job_id просто перечитываем БД.
+      // Счёт Google Cloud: администратору — уведомление, если оплата выключена
+      // или кредит на исходе. Не тормозим запуск; сервер сам кэширует ответы
+      // Google, так что ежечасная перечитка ничего не стоит.
+      clearInterval(this._gcpTimer);
+      if (this.isAdmin) {
+        setTimeout(() => this.loadGcp(), 4000);
+        this._gcpTimer = setInterval(() => this.loadGcp(), 3600 * 1000);
+      }
       clearInterval(this._streamWatchdog);
       this._streamWatchdog = setInterval(() => {
         if (!this.streaming) return;
@@ -5370,7 +5491,10 @@ createApp({
         this.loadHoraeGlobal();
         this.loadUserMemory();
       }
-      if (tab === "generation") this.loadMediaStatus();
+      if (tab === "generation") {
+        this.loadMediaStatus();
+        if (this.isAdmin && Date.now() - this.gcpLoadedAt > 10 * 60 * 1000) this.loadGcp();
+      }
     },
     // Ввод в палитре: поиск по репликам идёт на сервер с дебаунсом, чтобы не
     // слать запрос на каждую букву.
@@ -6414,6 +6538,99 @@ createApp({
                     :title="m.hint" @click="applyEconomyMode(m)" :aria-label="m.hint">{{ m.label }}</button>
             <button @click="usageOpen = true; loadUsage()" title="Сколько токенов реально потрачено" aria-label="Сколько токенов реально потрачено">📊 Расход</button>
           </div>
+
+          <!-- Счёт Google Cloud (2.12.0): оплата, расход, остаток кредита —
+               чтобы заходить в биллинг, только когда кредит на исходе. -->
+          <section v-if="isAdmin" class="gcp-card" :class="{ alert: gcp && gcp.alerts && gcp.alerts.length }" aria-label="Счёт Google Cloud">
+            <div class="row-between">
+              <b>☁️ Google Cloud</b>
+              <span class="row" style="gap:4px">
+                <button class="btn-icon" @click="loadGcp(true)" :disabled="gcpLoading" :aria-label="gcpLoading ? 'Обновляю данные Google Cloud' : 'Обновить данные Google Cloud'" title="Спросить Google сейчас">{{ gcpLoading ? '…' : '🔄' }}</button>
+                <button class="btn-icon" @click="gcpSettingsOpen = !gcpSettingsOpen" :aria-expanded="gcpSettingsOpen ? 'true' : 'false'" aria-label="Настройки карточки Google Cloud" title="Кредит, порог, проект">⚙</button>
+              </span>
+            </div>
+            <p v-if="!gcp && gcpError" class="gcp-warn">Не удалось получить данные: {{ gcpError }}</p>
+            <p v-else-if="!gcp" class="muted">{{ gcpLoading ? 'Спрашиваю Google…' : 'Данные ещё не загружены.' }} <button v-if="!gcpLoading" @click="loadGcp()">Загрузить</button></p>
+            <template v-else>
+              <p v-if="!gcp.auth.ok" class="gcp-warn">⚠ {{ gcp.auth.error }}</p>
+              <div v-if="gcp.status" class="gcp-line">
+                <template v-if="gcp.status.ok">
+                  <span v-if="gcp.status.account_open === false" class="gcp-bad">❌ Платёжный аккаунт закрыт</span>
+                  <span v-else-if="!gcp.status.billing_enabled" class="gcp-bad">❌ У проекта выключена оплата</span>
+                  <span v-else>✅ Оплата активна</span>
+                  <span class="muted"> · {{ gcp.project }}<span v-if="gcp.status.account_name"> · {{ gcp.status.account_name }}</span></span>
+                </template>
+                <span v-else class="gcp-warn">⚠ Состояние оплаты: {{ gcp.status.error }}</span>
+              </div>
+              <div v-if="gcp.credit" class="gcp-credit">
+                <div class="row-between"><span>Кредит</span><b>≈ {{ fmtMoney(gcp.credit.remaining) }} <span class="muted">из {{ fmtMoney(gcp.credit.amount) }}</span></b></div>
+                <div class="gcp-meter" role="progressbar" aria-label="Остаток кредита" aria-valuemin="0" aria-valuemax="100" :aria-valuenow="gcpCreditPct">
+                  <i :style="{ width: gcpCreditPct + '%' }" :class="{ low: gcp.credit.low }"></i>
+                </div>
+                <div class="muted gcp-small">потрачено {{ fmtMoney(gcp.credit.used) }} с {{ fmtDay(gcp.credit.since) }}<span v-if="gcp.credit.expires"> · действует до {{ fmtDay(gcp.credit.expires) }}<span v-if="gcp.credit.days_left != null"> ({{ gcp.credit.days_left >= 0 ? gcp.credit.days_left + ' дн.' : 'истёк' }})</span></span></div>
+              </div>
+              <p v-else class="muted gcp-small">Чтобы видеть остаток кредита, впишите его в ⚙ — сумму и дату с экрана Billing → Credits.</p>
+              <div class="gcp-line">Сегодня ≈ <b>{{ fmtMoney(gcp.today.spent) }}</b> · за месяц ≈ <b>{{ fmtMoney(gcp.month.spent) }}</b><span v-if="gcp.month.net != null"> · к оплате {{ fmtMoney(gcp.month.net) }}</span></div>
+              <div class="muted gcp-small">{{ gcpSourceLine }}</div>
+              <p v-for="(a, i) in gcp.alerts" :key="'a' + i" class="gcp-bad gcp-small">⚠ {{ a }}</p>
+              <p v-for="(n, i) in gcp.notes" :key="'n' + i" class="muted gcp-small">ℹ {{ n }}</p>
+              <button class="gcp-more" @click="gcpDetailsOpen = !gcpDetailsOpen" :aria-expanded="gcpDetailsOpen ? 'true' : 'false'">{{ gcpDetailsOpen ? 'Скрыть подробности' : 'Подробнее' }}</button>
+              <div v-if="gcpDetailsOpen" class="gcp-details">
+                <template v-if="gcp.by_service.length">
+                  <h4>По сервисам за месяц (Google)</h4>
+                  <div v-for="sv in gcp.by_service" :key="sv.service" class="row-between gcp-small">
+                    <span>{{ sv.service }}</span><span>{{ fmtMoney(sv.cost) }}<span v-if="sv.credits" class="muted"> (кредиты {{ fmtMoney(sv.credits) }})</span></span>
+                  </div>
+                </template>
+                <h4>По дням</h4>
+                <p v-if="!gcp.by_day.length" class="muted gcp-small">Расхода пока нет.</p>
+                <div v-for="d in gcp.by_day.slice(0, 14)" :key="d.day" class="row-between gcp-small">
+                  <span>{{ fmtDay(d.day) }}</span>
+                  <span>{{ fmtMoney(d.spent) }} <span class="muted">{{ d.exact != null ? '· Google ' + fmtMoney(d.exact) : '' }}{{ d.estimate ? ' · оценка ' + fmtMoney(d.estimate) : '' }}</span></span>
+                </div>
+                <h4>Модели и цены <span class="muted">($ за 1 млн токенов)</span></h4>
+                <p class="muted gcp-small">Цены — от вашего LiteLLM-прокси или LiteLLM этого сервера. Если цена неверная или её нет, впишите свою и нажмите «Сохранить».</p>
+                <div v-for="m in gcp.models" :key="m.model" class="gcp-model">
+                  <div class="row-between gcp-small"><b>{{ m.model }}</b><span>≈ {{ fmtMoney(m.cost) }}</span></div>
+                  <div class="muted gcp-small">
+                    <template v-if="m.price">вход {{ m.price.in }} · из кэша {{ m.price.cache != null ? m.price.cache : '—' }} · ответ {{ m.price.out }} <span>({{ gcpPriceSource(m.source) }})</span></template>
+                    <template v-else>цены нет — расход не считается</template>
+                    <span v-if="m.under"> · {{ m.under }}</span>
+                  </div>
+                  <div v-if="gcpForm.prices[m.model]" class="row gcp-price-row">
+                    <input type="number" min="0" step="0.001" v-model="gcpForm.prices[m.model].in" :placeholder="'вход' + (m.price ? ' ' + m.price.in : '')" :aria-label="'Цена входа ' + m.model">
+                    <input type="number" min="0" step="0.001" v-model="gcpForm.prices[m.model].cache" :placeholder="'кэш' + (m.price && m.price.cache != null ? ' ' + m.price.cache : '')" :aria-label="'Цена входа из кэша ' + m.model">
+                    <input type="number" min="0" step="0.001" v-model="gcpForm.prices[m.model].out" :placeholder="'ответ' + (m.price ? ' ' + m.price.out : '')" :aria-label="'Цена ответа ' + m.model">
+                  </div>
+                </div>
+                <button v-if="gcp.models.length" @click="saveGcp">Сохранить цены</button>
+              </div>
+            </template>
+            <div v-if="gcpSettingsOpen" class="gcp-settings">
+              <label>Кредит, {{ (gcp && gcp.currency) || 'USD' }} — сумма с экрана Billing → Credits
+                <input type="number" min="0" step="0.01" v-model="gcpForm.credit_amount" placeholder="например, 300"></label>
+              <label>На какую дату эта сумма (с этого дня считается расход)
+                <input type="date" v-model="gcpForm.credit_since"></label>
+              <label>Кредит действует до
+                <input type="date" v-model="gcpForm.credit_expires"></label>
+              <label>Предупредить, когда останется меньше
+                <input type="number" min="0" step="0.01" v-model="gcpForm.warn_below" placeholder="10% от кредита"></label>
+              <label>ID проекта Google Cloud
+                <input v-model="gcpForm.project_id" :placeholder="(gcp && gcp.project) || 'из входа Google'" autocomplete="off" spellcheck="false"></label>
+              <label class="row" style="gap:6px"><input type="checkbox" v-model="gcpForm.bigquery"> Точный расход из экспорта BigQuery</label>
+              <label v-if="gcpForm.bigquery">Таблица экспорта (если не нашлась сама)
+                <input v-model="gcpForm.bq_table" placeholder="проект.набор.gcp_billing_export_v1_…" autocomplete="off" spellcheck="false"></label>
+              <button class="btn-primary" @click="saveGcp">Сохранить</button>
+              <details class="gcp-small" style="margin-top:8px">
+                <summary>Что нужно на сервере</summary>
+                <div class="muted" style="margin-top:6px">
+                  <p>Вход Google — тот же, что у LiteLLM-прокси (<code>gcloud auth application-default login</code>), под тем же пользователем, от которого работает TaleEngine. Включите в проекте Cloud Billing API (состояние оплаты) и BigQuery API (экспорт):</p>
+                  <p><code>gcloud services enable cloudbilling.googleapis.com bigquery.googleapis.com</code></p>
+                  <p>Экспорт: Billing → Billing export → BigQuery export → Standard usage cost → набор данных в регионе US (multi-region). Данные приходят с задержкой в несколько часов.</p>
+                </div>
+              </details>
+            </div>
+          </section>
 
           <label>🧠 Окно контекста — память диалога (токенов) <span class="range-val">{{ params.context_tokens >= 1000000 ? '1 млн (максимум)' : params.context_tokens }}</span>
             <input type="number" min="4000" max="1000000" step="4000" v-model.number="params.context_tokens" /></label>

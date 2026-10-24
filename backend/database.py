@@ -332,6 +332,13 @@ def _sqlite_add_missing_columns(sync_conn) -> None:
         "canvases": {
             "history": "JSON",
         },
+        "usage_days": {
+            "audio_tokens": "INTEGER DEFAULT 0",
+            "long_requests": "INTEGER DEFAULT 0",
+            "long_prompt_tokens": "INTEGER DEFAULT 0",
+            "long_cached_tokens": "INTEGER DEFAULT 0",
+            "long_completion_tokens": "INTEGER DEFAULT 0",
+        },
     }
     inspector = inspect(sync_conn)
     existing_tables = set(inspector.get_table_names())
