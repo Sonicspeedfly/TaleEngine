@@ -244,6 +244,69 @@ async def test_snapshot_merges_bigquery_and_alerts(db_ready, monkeypatch):
         assert len(calls) > n
 
 
+async def test_partial_export_day_does_not_hide_spend(db_ready, monkeypatch):
+    """Ревью: вчерашний Vertex AI выгружен частично, а сегодняшний Storage уже есть."""
+    from backend.database import AsyncSessionLocal
+
+    today = date.today()
+    y = (today - timedelta(days=1)).isoformat()
+    await _usage(y, "gem", prompt_tokens=5_000_000, cached_tokens=0, completion_tokens=0)   # оценка $5
+    rows = [[y, "Vertex AI", "USD", "0.5", "-0.5", "-0.5", "1", "2026-10-24T05:00:00Z"],
+            [today.isoformat(), "Cloud Storage", "USD", "0.01", "-0.01", "-0.01", "1", "2026-10-24T06:00:00Z"]]
+    monkeypatch.setattr(gb, "_request", _google(bq_rows=rows))
+    monkeypatch.setattr(gb, "proxy_prices", _no_proxy_prices(PRICE))
+    async with AsyncSessionLocal() as db:
+        await gb.save_settings(db, {"credit_amount": 10, "credit_since": y})
+        snap = await gb.snapshot(db, None)
+    day = {r["day"]: r for r in snap["by_day"]}[y]
+    assert day["exact"] == pytest.approx(0.5) and day["spent"] == pytest.approx(5.0)
+    assert snap["credit"]["remaining"] == pytest.approx(10 - 5.0 - 0.01)
+
+
+async def test_expired_credit_alerts(db_ready, monkeypatch):
+    from backend.database import AsyncSessionLocal
+
+    today = date.today()
+    monkeypatch.setattr(gb, "_request", _google())
+    monkeypatch.setattr(gb, "proxy_prices", _no_proxy_prices())
+    async with AsyncSessionLocal() as db:
+        await gb.save_settings(db, {"credit_amount": 300, "credit_since": (today - timedelta(days=95)).isoformat(),
+                                    "credit_expires": (today - timedelta(days=1)).isoformat(), "bigquery": False})
+        snap = await gb.snapshot(db, None)
+    assert snap["credit"]["expired"] and snap["credit"]["low"]
+    assert any("истёк" in a for a in snap["alerts"])
+
+
+async def test_cache_is_per_project_and_missing_table_rechecked_soon(db_ready, monkeypatch):
+    from backend.database import AsyncSessionLocal
+
+    monkeypatch.setattr(gb, "_request", _google(tables=False))
+    monkeypatch.setattr(gb, "proxy_prices", _no_proxy_prices())
+    async with AsyncSessionLocal() as db:
+        await gb.snapshot(db, None)
+    bq_key = next(k for k in gb._cache if k.startswith("bq|"))
+    assert bq_key.startswith(f"bq|{PROJECT}|")
+    # «Таблицы ещё нет» живёт в кэше 10 минут, а не 3 часа.
+    assert gb._now() - gb._cache[bq_key][0] >= gb.BQ_TTL - gb.ERROR_TTL - 5
+    assert f"status|{PROJECT}" in gb._cache
+
+
+def test_billing_settings_drop_infinity(client, monkeypatch):
+    """Ревью: Infinity сохранялся и дальше каждый ответ падал с 500."""
+    async def fake_snapshot(db, connection, force=False):
+        return {"settings": await gb.load_settings(db)}
+    monkeypatch.setattr(gb, "snapshot", fake_snapshot)
+    try:
+        r = client.put("/api/admin/billing/gcp/settings", headers={"Content-Type": "application/json"},
+                       content='{"credit_amount": Infinity, "warn_below": NaN, "prices": {"m": {"in": Infinity, "out": 2}}}')
+        assert r.status_code == 200, r.text
+        cfg = r.json()["settings"]
+        assert cfg["credit_amount"] is None and cfg["warn_below"] is None and cfg["prices"] == {"m": {"out": 2.0}}
+    finally:
+        client.put("/api/admin/billing/gcp/settings", json={})
+    assert gb.clean_settings({"prices": {"m": {"in": float("inf"), "out": 1}}})["prices"] == {"m": {"out": 1.0}}
+
+
 async def test_snapshot_reports_missing_export_table(db_ready, monkeypatch):
     from backend.database import AsyncSessionLocal
 
@@ -278,14 +341,14 @@ def test_billing_api_saves_settings(client, monkeypatch):
         return {"settings": await gb.load_settings(db), "force": force}
     monkeypatch.setattr(gb, "snapshot", fake_snapshot)
     try:
-        r = client.put("/api/billing/gcp/settings", json={"credit_amount": 250, "credit_since": "2026-10-01",
+        r = client.put("/api/admin/billing/gcp/settings", json={"credit_amount": 250, "credit_since": "2026-10-01",
                                                           "prices": {"gem": {"in": 1.25, "out": None}}})
         assert r.status_code == 200, r.text
         assert r.json()["settings"]["credit_amount"] == 250 and r.json()["settings"]["prices"] == {"gem": {"in": 1.25}}
-        assert client.get("/api/billing/gcp?force=true").json()["force"] is True
-        assert client.put("/api/billing/gcp/settings", json={"credit_since": "1 окт"}).status_code == 422
+        assert client.get("/api/admin/billing/gcp?force=true").json()["force"] is True
+        assert client.put("/api/admin/billing/gcp/settings", json={"credit_since": "1 окт"}).status_code == 422
     finally:
-        client.put("/api/billing/gcp/settings", json={})
+        client.put("/api/admin/billing/gcp/settings", json={})
 
 
 async def test_billing_api_is_admin_only():

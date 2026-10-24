@@ -657,6 +657,12 @@ createApp({
     replyToMsg() {
       return this.messages.find((m) => m.id === this.replyToId) || null;
     },
+    // Карточка «Google Cloud» — администратору. В режиме кода доступа путь
+    // /api/admin/ требует ещё пароль администратора, если он задан.
+    gcpVisible() {
+      if (!this.isAdmin) return false;
+      return this.authStatus.accounts_enabled || !this.authStatus.admin_set || !!this.adminPassword;
+    },
     // Карточка «Google Cloud»: доля оставшегося кредита и откуда цифры.
     gcpCreditPct() {
       const c = this.gcp && this.gcp.credit;
@@ -667,7 +673,7 @@ createApp({
       const g = this.gcp;
       if (!g) return "";
       const bq = g.bigquery || {};
-      const est = "оценка по токенам TaleEngine (хранение файлов и другие сервисы Google в неё не входят)";
+      const est = "оценка по токенам TaleEngine (генерация картинок, хранение файлов и другие сервисы Google в неё не входят)";
       if (bq.state === "ok") {
         return bq.exported_at
           ? `Точно по Google — до ${this.fmtDay(g.month.exact_until)} (экспорт от ${this.fmtDay(bq.exported_at)} ${String(bq.exported_at).slice(11, 16)} UTC), позже — ${est}.`
@@ -1065,7 +1071,12 @@ createApp({
       if (!res.ok) {
         // Достаём реальный текст ошибки сервера (а не просто код).
         let detail = "HTTP " + res.status;
-        try { const j = await res.json(); if (j && j.detail) detail = j.detail; } catch (e) {}
+        try {
+          const j = await res.json();
+          // 422 FastAPI — список ошибок полей: «поле: что не так», а не [object Object].
+          if (j && Array.isArray(j.detail)) detail = j.detail.map((d) => ((d.loc || []).slice(-1)[0] || "") + ": " + (d.msg || "")).join("; ");
+          else if (j && j.detail) detail = j.detail;
+        } catch (e) {}
         // Код ответа — рядом с текстом: вызывающему иногда важно отличить
         // «чата больше нет» (403/404) от сбоя сети, а по тексту это ненадёжно.
         const err = new Error(detail);
@@ -5021,13 +5032,14 @@ createApp({
     },
     // ---------- Счёт Google Cloud ----------
     async loadGcp(force = false) {
-      if (!this.isAdmin || this.gcpLoading) return;
+      if (!this.gcpVisible || this.gcpLoading) return;
       this.gcpLoading = true;
       this.gcpError = "";
       try {
-        this.gcp = await this.api("/billing/gcp" + (force ? "?force=true" : ""));
+        this.gcp = await this.api("/admin/billing/gcp" + (force ? "?force=true" : ""));
         this.gcpLoadedAt = Date.now();
-        this._gcpFillForm();
+        // Фоновая перечитка не стирает то, что админ сейчас вписывает.
+        if (!this.gcpSettingsOpen && !this.gcpDetailsOpen) this._gcpFillForm();
         this._gcpAlertOnce();
       } catch (e) {
         this.gcpError = e.message || String(e);
@@ -5049,7 +5061,12 @@ createApp({
     },
     async saveGcp() {
       const f = this.gcpForm;
-      const num = (v) => (v === "" || v == null || isNaN(Number(v)) ? null : Number(v));
+      const num = (v) => (v === "" || v == null || !isFinite(Number(v)) ? null : Math.max(0, Number(v)));
+      const pid = String(f.project_id || "").trim();
+      if (!/^[a-z0-9:.\-]*$/.test(pid)) {
+        this.showToast("ID проекта — маленькие латинские буквы, цифры и дефисы (например, my-project-123), а не название проекта.");
+        return;
+      }
       const prices = {};
       for (const [m, p] of Object.entries(f.prices || {})) {
         const row = {};
@@ -5057,12 +5074,12 @@ createApp({
         if (Object.keys(row).length) prices[m] = row;
       }
       try {
-        this.gcp = await this.api("/billing/gcp/settings", {
+        this.gcp = await this.api("/admin/billing/gcp/settings", {
           method: "PUT",
           body: JSON.stringify({
             credit_amount: num(f.credit_amount), credit_since: f.credit_since || "",
             credit_expires: f.credit_expires || "", warn_below: num(f.warn_below),
-            project_id: (f.project_id || "").trim(), bigquery: !!f.bigquery,
+            project_id: pid, bigquery: !!f.bigquery,
             bq_table: (f.bq_table || "").trim(), prices,
           }),
         });
@@ -5070,7 +5087,7 @@ createApp({
         this._gcpFillForm();
         this.showToast("Сохранено");
       } catch (e) {
-        this.showToast("Не удалось сохранить: " + (typeof e.message === "string" ? e.message : "проверьте поля"));
+        this.showToast("Не удалось сохранить: " + e.message);
       }
     },
     // Срочное (оплата выключена, кредит на исходе) — уведомлением раз в день,
@@ -5097,7 +5114,7 @@ createApp({
       const sign = n < 0 ? "−" : "";
       const tiny = abs > 0 && abs < 0.01;
       const body = (tiny ? 0.01 : abs).toLocaleString("ru-RU", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-      return (tiny ? "<" : "") + sign + (cur === "USD" ? "$" + body : body + " " + cur);
+      return sign + (tiny ? "<" : "") + (cur === "USD" ? "$" + body : body + " " + cur);
     },
     gcpPriceSource(src) {
       return { proxy: "прокси", local: "LiteLLM сервера", manual: "вручную" }[src] || src || "—";
@@ -5310,18 +5327,18 @@ createApp({
       if (this.authStatus.accounts_enabled && this.userToken) {
         this._friendsTimer = setInterval(() => this.loadFriends(), 20000);
       }
-      // Сторож зависшего стриминга. Полуоткрытый TCP (удалённый сервер, NAT) не даёт
-      // onclose: сокет «жив», но события не приходят — «печатает…» висит вечно, хотя
-      // ответ давно сохранён на сервере. Если 45с тишины — дослушиваем задачу через
-      // SSE (он отдаёт весь накопленный буфер), а без job_id просто перечитываем БД.
       // Счёт Google Cloud: администратору — уведомление, если оплата выключена
       // или кредит на исходе. Не тормозим запуск; сервер сам кэширует ответы
       // Google, так что ежечасная перечитка ничего не стоит.
       clearInterval(this._gcpTimer);
-      if (this.isAdmin) {
+      if (this.gcpVisible) {
         setTimeout(() => this.loadGcp(), 4000);
         this._gcpTimer = setInterval(() => this.loadGcp(), 3600 * 1000);
       }
+      // Сторож зависшего стриминга. Полуоткрытый TCP (удалённый сервер, NAT) не даёт
+      // onclose: сокет «жив», но события не приходят — «печатает…» висит вечно, хотя
+      // ответ давно сохранён на сервере. Если 45с тишины — дослушиваем задачу через
+      // SSE (он отдаёт весь накопленный буфер), а без job_id просто перечитываем БД.
       clearInterval(this._streamWatchdog);
       this._streamWatchdog = setInterval(() => {
         if (!this.streaming) return;
@@ -5495,7 +5512,7 @@ createApp({
       }
       if (tab === "generation") {
         this.loadMediaStatus();
-        if (this.isAdmin && Date.now() - this.gcpLoadedAt > 10 * 60 * 1000) this.loadGcp();
+        if (this.gcpVisible && Date.now() - this.gcpLoadedAt > 10 * 60 * 1000) this.loadGcp();
       }
     },
     // Ввод в палитре: поиск по репликам идёт на сервер с дебаунсом, чтобы не
@@ -6543,7 +6560,7 @@ createApp({
 
           <!-- Счёт Google Cloud (2.12.0): оплата, расход, остаток кредита —
                чтобы заходить в биллинг, только когда кредит на исходе. -->
-          <section v-if="isAdmin" class="gcp-card" :class="{ alert: gcp && gcp.alerts && gcp.alerts.length }" aria-label="Счёт Google Cloud">
+          <section v-if="gcpVisible" class="gcp-card" :class="{ alert: gcp && gcp.alerts && gcp.alerts.length }" aria-label="Счёт Google Cloud">
             <div class="row-between">
               <b>☁️ Google Cloud</b>
               <span class="row" style="gap:4px">
@@ -6554,7 +6571,8 @@ createApp({
             <p v-if="!gcp && gcpError" class="gcp-warn">Не удалось получить данные: {{ gcpError }}</p>
             <p v-else-if="!gcp" class="muted">{{ gcpLoading ? 'Спрашиваю Google…' : 'Данные ещё не загружены.' }} <button v-if="!gcpLoading" @click="loadGcp()">Загрузить</button></p>
             <template v-else>
-              <p v-if="!gcp.auth.ok" class="gcp-warn">⚠ {{ gcp.auth.error }}</p>
+              <p v-if="gcpError" class="gcp-warn">Не удалось обновить: {{ gcpError }}</p>
+              <p v-if="gcp.auth.error" class="gcp-warn">⚠ {{ gcp.auth.error }}</p>
               <div v-if="gcp.status" class="gcp-line">
                 <template v-if="gcp.status.ok">
                   <span v-if="gcp.status.account_open === false" class="gcp-bad">❌ Платёжный аккаунт закрыт</span>
@@ -6573,7 +6591,7 @@ createApp({
               </div>
               <p v-else class="muted gcp-small">Чтобы видеть остаток кредита, впишите его в ⚙ — сумму и дату с экрана Billing → Credits.</p>
               <div class="gcp-line">Сегодня ≈ <b>{{ fmtMoney(gcp.today.spent) }}</b> · за месяц ≈ <b>{{ fmtMoney(gcp.month.spent) }}</b><span v-if="gcp.month.net != null"> · к оплате {{ fmtMoney(gcp.month.net) }}</span></div>
-              <div class="muted gcp-small">{{ gcpSourceLine }}</div>
+              <div class="muted gcp-small">{{ gcpSourceLine }}<span v-if="gcp.checked_at"> Оплата проверена {{ fmtDay(gcp.checked_at) }} {{ String(gcp.checked_at).slice(11, 16) }}.</span></div>
               <p v-for="(a, i) in gcp.alerts" :key="'a' + i" class="gcp-bad gcp-small">⚠ {{ a }}</p>
               <p v-for="(n, i) in gcp.notes" :key="'n' + i" class="muted gcp-small">ℹ {{ n }}</p>
               <button class="gcp-more" @click="gcpDetailsOpen = !gcpDetailsOpen" :aria-expanded="gcpDetailsOpen ? 'true' : 'false'">{{ gcpDetailsOpen ? 'Скрыть подробности' : 'Подробнее' }}</button>
@@ -6619,7 +6637,7 @@ createApp({
                 <input type="number" min="0" step="0.01" v-model="gcpForm.warn_below" placeholder="10% от кредита"></label>
               <label>ID проекта Google Cloud
                 <input v-model="gcpForm.project_id" :placeholder="(gcp && gcp.project) || 'из входа Google'" autocomplete="off" spellcheck="false"></label>
-              <label class="row" style="gap:6px"><input type="checkbox" v-model="gcpForm.bigquery"> Точный расход из экспорта BigQuery</label>
+              <label class="check"><input type="checkbox" v-model="gcpForm.bigquery"> Точный расход из экспорта BigQuery</label>
               <label v-if="gcpForm.bigquery">Таблица экспорта (если не нашлась сама)
                 <input v-model="gcpForm.bq_table" placeholder="проект.набор.gcp_billing_export_v1_…" autocomplete="off" spellcheck="false"></label>
               <button class="btn-primary" @click="saveGcp">Сохранить</button>

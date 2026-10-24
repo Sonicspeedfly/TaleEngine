@@ -4081,21 +4081,22 @@ async def usage_get(days: int = 7, db: AsyncSession = Depends(get_session)):
 
 
 # ============================ СЧЁТ GOOGLE CLOUD ============================
-@app.get("/api/billing/gcp")
+@app.get("/api/admin/billing/gcp")
 async def gcp_billing_get(force: bool = False, user=Depends(current_user),
                           db: AsyncSession = Depends(get_session)):
     """
     Карточка «Google Cloud»: включена ли оплата, расход (точно — из экспорта
     BigQuery, иначе оценка по токенам) и остаток кредита. Ответы Google
     кэшируются (оплата — час, экспорт — 3 часа); force — обновить сейчас.
-    Счёт проекта — дело администратора.
+    Счёт проекта — дело администратора: путь под /api/admin/, поэтому в
+    режиме кода доступа нужен ещё и пароль администратора (если задан).
     """
     if user is not None and user.role != "admin":
         raise HTTPException(403, "Только администратор")
     return await gcp_billing.snapshot(db, await get_connection(db), force=force)
 
 
-@app.put("/api/billing/gcp/settings")
+@app.put("/api/admin/billing/gcp/settings")
 async def gcp_billing_settings(payload: GcpBillingSettings, user=Depends(current_user),
                                db: AsyncSession = Depends(get_session)):
     if user is not None and user.role != "admin":

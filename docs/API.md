@@ -225,8 +225,8 @@ HTTP Basic Auth поверх всего нужен ещё заголовок `Au
 | POST | `/api/media/probe` `{model}` | Проверить хранилище сейчас: тестовая картинка загружается и читается моделью по ссылке. Ответ — как у статуса; 400 — прямой режим без прокси, 403 — не админ (режим аккаунтов), 429 — проверка шла меньше 10 с назад |
 | GET/PUT | `/api/settings/ui` | Серверные UI-предпочтения (параметры по умолчанию) |
 | GET | `/api/usage?days=` | Расход токенов по дням, моделям и видам запроса |
-| GET | `/api/billing/gcp?force=` | Карточка «Google Cloud» (только админ): `status` (Cloud Billing: `billing_enabled`, `account_open`, `currency`), `bigquery` (`state` `ok\|no_table\|error\|off`, `table`, `exported_at`), `today`/`month` (`spent`, `net`, `exact_until`), `by_day` (`spent`, `exact`, `estimate`), `by_service`, `models` (цена $ за 1 млн токенов и её источник `proxy\|local\|manual`), `credit` (`remaining`, `used`, `days_left`, `low`), `alerts`, `notes`. Ответы Google кэшируются (оплата — час, экспорт — 3 часа); `force=true` — спросить сейчас |
-| PUT | `/api/billing/gcp/settings` | Кредит и дата, срок, порог предупреждения, ID проекта, экспорт BigQuery и его таблица, цены моделей вручную. Ответ — как у GET |
+| GET | `/api/admin/billing/gcp?force=` | Карточка «Google Cloud» (только админ; в режиме кода доступа — с паролем администратора, если он задан): `status` (Cloud Billing: `billing_enabled`, `account_open`, `currency`), `bigquery` (`state` `ok\|no_table\|error\|off`, `table`, `exported_at`), `today`/`month` (`spent`, `net`, `exact_until`), `by_day` (`spent`, `exact`, `estimate`), `by_service`, `models` (цена $ за 1 млн токенов и её источник `proxy\|local\|manual`), `credit` (`remaining`, `used`, `days_left`, `low`), `alerts`, `notes`. Ответы Google кэшируются (оплата — час, экспорт — 3 часа); `force=true` — спросить сейчас |
+| PUT | `/api/admin/billing/gcp/settings` | Кредит и дата, срок, порог предупреждения, ID проекта, экспорт BigQuery и его таблица, цены моделей вручную. Ответ — как у GET |
 
 ## Друзья и шаринг (режим аккаунтов)
 

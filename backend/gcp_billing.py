@@ -10,11 +10,11 @@
   2. Оценка по токенам TaleEngine (таблица usage_days) × цены моделей. Цены
      берутся у прокси (/model/info: его LiteLLM знает цены своих моделей), если
      там нет — из LiteLLM этого сервера, можно задать и вручную. Видит только
-     запросы TaleEngine: хранение файлов и другие сервисы проекта в неё не
-     попадают.
+     чат и служебные запросы TaleEngine: генерация картинок, хранение файлов и
+     другие сервисы проекта в неё не попадают.
   3. Экспорт биллинга в BigQuery — фактический расход по сервисам и списанные
-     кредиты. Приходит с задержкой в несколько часов, поэтому за последний день
-     берётся большее из факта и оценки.
+     кредиты. Приходит частями и с задержкой в несколько часов, поэтому за
+     последние двое суток берётся большее из факта и оценки.
 
 Остаток кредита: сумма с экрана Billing → Credits на дату, которую указал
 пользователь, минус расход после неё. Сам остаток пробного кредита Google по
@@ -30,6 +30,7 @@ print-access-token`.
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -86,10 +87,7 @@ def clean_settings(raw: dict | None) -> dict:
         if k in DEFAULTS:
             cfg[k] = v
     for k in ("credit_amount", "warn_below"):
-        try:
-            cfg[k] = None if cfg[k] in (None, "") else max(0.0, float(cfg[k]))
-        except (TypeError, ValueError):
-            cfg[k] = None
+        cfg[k] = _finite(cfg[k])
     for k in ("credit_since", "credit_expires"):
         cfg[k] = cfg[k] if _parse_day(cfg[k]) else ""
     cfg["project_id"] = str(cfg["project_id"] or "").strip()
@@ -99,13 +97,7 @@ def clean_settings(raw: dict | None) -> dict:
     for model, p in (cfg["prices"] or {}).items() if isinstance(cfg["prices"], dict) else []:
         if not isinstance(p, dict):
             continue
-        row = {}
-        for f in ("in", "out", "cache"):
-            try:
-                if p.get(f) not in (None, ""):
-                    row[f] = max(0.0, float(p[f]))
-            except (TypeError, ValueError):
-                pass
+        row = {f: v for f in ("in", "out", "cache") if (v := _finite(p.get(f))) is not None}
         if row:
             prices[str(model)] = row
     cfg["prices"] = prices
@@ -129,10 +121,20 @@ async def save_settings(db, values: dict) -> dict:
     else:
         row.value = cfg
     await db.commit()
-    # Проект или таблица могли смениться — прежние ответы Google не годятся.
-    for key in ("status", "bq"):
+    # Ключи кэша включают проект и таблицу, так что чужой ответ не всплывёт;
+    # а прежние для того же проекта — пусть спросит заново.
+    for key in [k for k in _cache if k.startswith(("status|", "bq|"))]:
         _cache.pop(key, None)
     return cfg
+
+
+def _finite(v) -> float | None:
+    """Неотрицательное конечное число или None (Infinity не пройдёт в JSON-ответ)."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, f) if math.isfinite(f) else None
 
 
 def _parse_day(s) -> date | None:
@@ -146,9 +148,8 @@ def _parse_day(s) -> date | None:
 
 def adc_path() -> str:
     """Где лежит вход Google: GOOGLE_APPLICATION_CREDENTIALS или файл gcloud."""
-    p = (settings.GOOGLE_APPLICATION_CREDENTIALS or "").strip()
-    if p:
-        return os.path.expanduser(p)
+    if _configured_path():
+        return _configured_path()
     if os.name == "nt":
         base = os.path.join(os.environ.get("APPDATA", ""), "gcloud")
     else:
@@ -199,13 +200,22 @@ def _gcloud_bin() -> str:
     return home if os.path.exists(home) else ""
 
 
+def _configured_path() -> str:
+    """Файл ключа из настроек (.env не попадает в окружение процесса сам)."""
+    p = (settings.GOOGLE_APPLICATION_CREDENTIALS or "").strip()
+    return os.path.expanduser(p) if p else ""
+
+
 async def _token_from_gcloud() -> str:
     gcloud = _gcloud_bin()
     if not gcloud:
         return ""
+    env = dict(os.environ)
+    if _configured_path():
+        env["GOOGLE_APPLICATION_CREDENTIALS"] = _configured_path()
     proc = await asyncio.create_subprocess_exec(
         gcloud, "auth", "application-default", "print-access-token",
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env)
     try:
         out, _err = await asyncio.wait_for(proc.communicate(), 40)
     except asyncio.TimeoutError:
@@ -221,8 +231,14 @@ async def _token_from_google_auth() -> str:
     except ImportError:
         return ""
 
+    scopes = ["https://www.googleapis.com/auth/cloud-platform"]
+    path = _configured_path()
+
     def _get():
-        creds, _project = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+        if path:
+            creds, _project = google.auth.load_credentials_from_file(path, scopes=scopes)
+        else:
+            creds, _project = google.auth.default(scopes=scopes)
         creds.refresh(google.auth.transport.requests.Request())
         return creds.token or ""
 
@@ -579,7 +595,7 @@ async def estimate(db, since: date, prices: dict, overrides: dict) -> dict:
 
 # ================================ сводка ================================
 
-async def _cached(name: str, ttl: float, force: bool, fn, empty_is_error: bool = False):
+async def _cached(name: str, ttl: float, force: bool, fn, retry_soon=None):
     hit = _cache.get(name)
     if hit and not force and _now() - hit[0] < ttl:
         return hit[1]
@@ -590,8 +606,9 @@ async def _cached(name: str, ttl: float, force: bool, fn, empty_is_error: bool =
     except Exception as exc:  # noqa: BLE001 — сеть, таймаут: показываем, а не падаем
         log.warning("Биллинг Google: %s", exc)
         value = {"error": f"Не удалось связаться с Google: {type(exc).__name__}: {exc}"[:300]}
-    failed = isinstance(value, dict) and (value.get("error") or (empty_is_error and not value))
-    # Неудачу кэшируем коротко: исправили настройку — через 10 минут увидим.
+    failed = isinstance(value, dict) and (value.get("error") or (retry_soon is not None and retry_soon(value)))
+    # Неудачу (и «ещё нет», вроде таблицы экспорта) кэшируем коротко:
+    # исправили настройку или Google создал таблицу — через 10 минут увидим.
     _cache[name] = (_now() - (ttl - ERROR_TTL if failed and ttl > ERROR_TTL else 0), value)
     _fetched[name] = _now()
     return value
@@ -632,7 +649,7 @@ async def _snapshot(db, connection, force):
 
     status = None
     if token and project:
-        status = await _cached("status", STATUS_TTL, force,
+        status = await _cached(f"status|{project}", STATUS_TTL, force,
                                lambda: fetch_status(token, quota, project))
         if status.get("ok"):
             if status.get("account_open") is False:
@@ -654,11 +671,13 @@ async def _snapshot(db, connection, force):
                 return {"state": "no_table", "datasets": datasets}
             data = await query_export(token, quota, table, since)
             return {"state": "ok", "table": table, **data}
-        bq = await _cached("bq", BQ_TTL, force, _bq)
+        bq = await _cached(f"bq|{project}|{cfg['bq_table']}|{since.isoformat()}", BQ_TTL, force, _bq,
+                           retry_soon=lambda v: v.get("state") == "no_table")
         if bq.get("error"):
             bq = {"state": "error", "error": bq["error"]}
 
-    prices = await _cached("prices", PRICES_TTL, force, lambda: proxy_prices(connection), empty_is_error=True)
+    prices = await _cached("prices", PRICES_TTL, force, lambda: proxy_prices(connection),
+                           retry_soon=lambda v: not v)
     if not isinstance(prices, dict) or prices.get("error"):
         prices = {}
     est = await estimate(db, since, prices, cfg["prices"])
@@ -674,6 +693,10 @@ async def _snapshot(db, connection, force):
 
     exact_days: dict = (bq.get("days") or {}) if bq.get("state") == "ok" else {}
     last_exact = max(exact_days) if exact_days else ""
+    # Экспорт приходит частями и с разной скоростью по сервисам: день считаем
+    # полным, только когда он позади на двое суток и после него уже есть
+    # данные. До того — большее из факта и оценки.
+    complete_until = min(last_exact, (today - timedelta(days=2)).isoformat()) if last_exact else ""
     by_day = []
     for d in sorted(set(est["by_day"]) | set(exact_days)):
         if d < since.isoformat():
@@ -683,7 +706,7 @@ async def _snapshot(db, connection, force):
         # Потрачено против кредита: расход за вычетом скидок, кроме самого
         # пробного кредита (он и есть то, что уменьшается).
         spend_exact = None if x is None else max(0.0, x["cost"] + x["credits"] - x["promo"])
-        if spend_exact is not None and d < last_exact:
+        if spend_exact is not None and d < last_exact and d <= complete_until:
             spent = spend_exact
         else:
             spent = max(spend_exact or 0.0, e)
@@ -708,7 +731,7 @@ async def _snapshot(db, connection, force):
         "month": {"spent": _money(total(month_rows, month)),
                   "net": _money(sum(r["net"] for r in month_rows if r["net"] is not None))
                   if any(r["net"] is not None for r in month_rows) else None,
-                  "exact_until": last_exact or None},
+                  "exact_until": complete_until or None},
         "by_day": list(reversed(by_day)),
         "by_service": _services(bq, month),
         "models": [
@@ -722,7 +745,7 @@ async def _snapshot(db, connection, force):
         "settings": cfg,
         "alerts": alerts,
         "notes": notes,
-        "checked_at": datetime.fromtimestamp(_fetched.get("status") or _now()).isoformat(timespec="minutes"),
+        "checked_at": datetime.fromtimestamp(_fetched.get(f"status|{project}") or _now()).isoformat(timespec="minutes"),
     }
     unpriced = [m["model"] for m in out["models"] if m["price"] is None and m["tokens"]]
     if unpriced:
@@ -733,19 +756,22 @@ async def _snapshot(db, connection, force):
         remaining = cfg["credit_amount"] - used
         expires = _parse_day(cfg["credit_expires"])
         threshold = cfg["warn_below"] if cfg["warn_below"] is not None else cfg["credit_amount"] * 0.1
-        low = remaining <= threshold
+        expired = bool(expires and expires < today)
+        low = remaining <= threshold or expired
         out["credit"] = {
             "amount": cfg["credit_amount"], "since": credit_since.isoformat(),
             "used": _money(used), "remaining": _money(remaining), "threshold": _money(threshold),
             "expires": expires.isoformat() if expires else None,
             "days_left": (expires - today).days if expires else None,
-            "low": low, "exact_until": last_exact or None,
+            "low": low, "expired": expired, "exact_until": complete_until or None,
         }
-        if remaining <= 0:
+        if expired:
+            alerts.append(f"Кредит Google Cloud истёк {expires.strftime('%d.%m.%Y')} — дальше оплата идёт с карты.")
+        elif remaining <= 0:
             alerts.append("Кредит Google Cloud, судя по расходу, закончился — дальше оплата идёт с карты.")
         elif low:
             alerts.append(f"Кредита Google Cloud осталось мало: ≈ {_fmt(remaining, currency)}.")
-        if expires and 0 <= (expires - today).days <= 7:
+        if expires and not expired and (expires - today).days <= 7:
             alerts.append(f"Кредит Google Cloud истекает {expires.strftime('%d.%m.%Y')}.")
     return out
 

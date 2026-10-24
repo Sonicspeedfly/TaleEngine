@@ -2319,5 +2319,5 @@ input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
 .gcp-price-row input { flex: 1 1 0; min-width: 0; }
 .gcp-settings { margin-top: 8px; border-top: 1px solid var(--border-subtle); padding-top: 8px; }
 .gcp-settings label { display: block; margin-bottom: 6px; }
-.gcp-settings label.row { display: flex; }
+.gcp-settings label.check { display: flex; }
 .gcp-settings input:not([type="checkbox"]) { width: 100%; box-sizing: border-box; }
