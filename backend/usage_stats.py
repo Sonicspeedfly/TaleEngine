@@ -20,6 +20,11 @@ import time
 
 logger = logging.getLogger("aichat.usage")
 
+# Порог тарифа Gemini «вход свыше 200 тыс. токенов»: такой запрос целиком (и
+# вход, и ответ) идёт по повышенной цене — копим его отдельно (long_*), чтобы
+# оценка в долларах (backend/gcp_billing.py) это учла.
+LONG_PROMPT = 200_000
+
 # Последние N запросов с разбивкой по токенам — для панели 🐞 (в памяти процесса).
 _recent: list[dict] = []
 _RECENT_MAX = 100
@@ -61,15 +66,20 @@ def extract_usage(response_or_chunk) -> dict:
     if cdet is None and isinstance(u, dict):
         cdet = u.get("completion_tokens_details")
     reasoning = _get(cdet, "reasoning_tokens") if cdet else 0
+    # Аудио во входе (Gemini берёт за него дороже текста) — для оценки в долларах.
+    audio = _get(details, "audio_tokens") if details else 0
 
     if not (prompt or completion):
         return {}
-    return {
+    out = {
         "prompt": prompt,
         "cached": min(cached, prompt),  # кэш — часть входа, не сверх него
         "completion": completion,
         "reasoning": reasoning,
     }
+    if audio:
+        out["audio"] = min(audio, prompt)
+    return out
 
 
 def recent() -> list[dict]:
@@ -125,6 +135,13 @@ async def _persist(kind: str, model: str, usage: dict) -> None:
             row.cached_tokens = (row.cached_tokens or 0) + usage.get("cached", 0)
             row.completion_tokens = (row.completion_tokens or 0) + usage.get("completion", 0)
             row.reasoning_tokens = (row.reasoning_tokens or 0) + usage.get("reasoning", 0)
+            row.audio_tokens = (row.audio_tokens or 0) + usage.get("audio", 0)
+            if usage.get("prompt", 0) > LONG_PROMPT:
+                # Длинный запрос у Gemini целиком по повышенной цене — копим отдельно.
+                row.long_requests = (row.long_requests or 0) + 1
+                row.long_prompt_tokens = (row.long_prompt_tokens or 0) + usage.get("prompt", 0)
+                row.long_cached_tokens = (row.long_cached_tokens or 0) + usage.get("cached", 0)
+                row.long_completion_tokens = (row.long_completion_tokens or 0) + usage.get("completion", 0)
             await db.commit()
     except Exception:  # noqa: BLE001 — статистика не имеет права ломать чат
         logger.debug("Не удалось записать расход токенов", exc_info=True)

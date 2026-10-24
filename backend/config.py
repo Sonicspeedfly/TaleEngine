@@ -98,6 +98,11 @@ class Settings(BaseSettings):
     # который делит базу с основным, ставьте False (как и TELEGRAM_AUTOSTART):
     # иначе оба грузили бы одни и те же файлы.
     MEDIA_REFS: bool = True
+    # Вход Google для карточки «Google Cloud» (⚙ → Генерация → «💰 Расход
+    # квоты»): состояние оплаты, экспорт биллинга BigQuery. Пусто — тот же
+    # вход, что у прокси: ~/.config/gcloud/application_default_credentials.json
+    # (`gcloud auth application-default login`). Можно указать файл ключа.
+    GOOGLE_APPLICATION_CREDENTIALS: str = ""
     # Файлы крупнее ссылкой не отправляются: загрузка держит base64 файла в
     # памяти сервера (~1,4 размера файла), а прокси на том же хосте — ещё копию.
     MEDIA_UPLOAD_MAX_MB: int = 200

@@ -539,3 +539,11 @@ class UsageDay(Base):
     completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
     # Токены «размышлений» — тарифицируются как ВЫВОД, самый дорогой вид.
     reasoning_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    # Для оценки в долларах (2.12.0): аудио во входе дороже текста, а запрос
+    # со входом свыше 200 тыс. токенов у Gemini целиком идёт по повышенной
+    # цене — такие запросы копятся отдельно (long_*, входят и в общие суммы).
+    audio_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    long_requests: Mapped[int] = mapped_column(Integer, default=0)
+    long_prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    long_cached_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    long_completion_tokens: Mapped[int] = mapped_column(Integer, default=0)

@@ -2289,3 +2289,35 @@ input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
 }
 .media-status.ok { border-color: var(--ok); background: var(--ok-subtle); }
 .media-status.warn { border-color: var(--warn); background: var(--warn-subtle); }
+
+/* Карточка «☁️ Google Cloud» (⚙ → Генерация → «💰 Расход квоты»): оплата,
+   расход и остаток кредита. */
+.gcp-card {
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin: 6px 0 10px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.gcp-card.alert { border-color: var(--danger); background: var(--danger-subtle); }
+.gcp-card .row-between { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.gcp-card .row-between > :last-child { text-align: right; }
+.gcp-card h4 { margin: 10px 0 4px; font-size: var(--fs-200, 13px); }
+.gcp-line { margin: 4px 0; }
+.gcp-small { font-size: 12px; margin: 2px 0; }
+.gcp-warn { color: var(--warn); margin: 4px 0; }
+.gcp-bad { color: var(--danger); }
+.gcp-credit { margin: 6px 0; }
+.gcp-meter { height: 6px; border-radius: 3px; background: var(--surface-3, var(--border-subtle)); overflow: hidden; margin: 4px 0 2px; }
+.gcp-meter i { display: block; height: 100%; background: var(--ok); border-radius: 3px; }
+.gcp-meter i.low { background: var(--danger-fill); }
+.gcp-more { margin-top: 4px; }
+.gcp-details { margin-top: 6px; }
+.gcp-model { padding: 4px 0; border-top: 1px solid var(--border-subtle); }
+.gcp-price-row { gap: 4px; margin-top: 4px; }
+.gcp-price-row input { flex: 1 1 0; min-width: 0; }
+.gcp-settings { margin-top: 8px; border-top: 1px solid var(--border-subtle); padding-top: 8px; }
+.gcp-settings label { display: block; margin-bottom: 6px; }
+.gcp-settings label.check { display: flex; }
+.gcp-settings input:not([type="checkbox"]) { width: 100%; box-sizing: border-box; }

@@ -52,6 +52,7 @@ from backend import (
     accounts,
     admin_service,
     debug_log,
+    gcp_billing,
     group_chat,
     horae_api,
     horae_engine,
@@ -101,6 +102,7 @@ from backend.schemas import (
     CharacterRead,
     CharacterUpdate,
     ConnectionSettings,
+    GcpBillingSettings,
     GenerationParams,
     HoraeEntryCreate,
     HoraeEntryListed,
@@ -4076,6 +4078,31 @@ async def usage_get(days: int = 7, db: AsyncSession = Depends(get_session)):
     reasoning — «размышления» (тарифицируются как вывод, самый дорогой вид).
     """
     return await usage_stats.summary(db, max(1, min(90, days)))
+
+
+# ============================ СЧЁТ GOOGLE CLOUD ============================
+@app.get("/api/admin/billing/gcp")
+async def gcp_billing_get(force: bool = False, user=Depends(current_user),
+                          db: AsyncSession = Depends(get_session)):
+    """
+    Карточка «Google Cloud»: включена ли оплата, расход (точно — из экспорта
+    BigQuery, иначе оценка по токенам) и остаток кредита. Ответы Google
+    кэшируются (оплата — час, экспорт — 3 часа); force — обновить сейчас.
+    Счёт проекта — дело администратора: путь под /api/admin/, поэтому в
+    режиме кода доступа нужен ещё и пароль администратора (если задан).
+    """
+    if user is not None and user.role != "admin":
+        raise HTTPException(403, "Только администратор")
+    return await gcp_billing.snapshot(db, await get_connection(db), force=force)
+
+
+@app.put("/api/admin/billing/gcp/settings")
+async def gcp_billing_settings(payload: GcpBillingSettings, user=Depends(current_user),
+                               db: AsyncSession = Depends(get_session)):
+    if user is not None and user.role != "admin":
+        raise HTTPException(403, "Только администратор")
+    await gcp_billing.save_settings(db, payload.model_dump())
+    return await gcp_billing.snapshot(db, await get_connection(db))
 
 
 @app.get("/api/health")

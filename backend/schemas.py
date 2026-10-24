@@ -178,6 +178,23 @@ class HoraeEntryUpdate(BaseModel):
 
 
 # ----- Настройки подключения к LiteLLM (редактируются в UI) -----
+class GcpBillingSettings(BaseModel):
+    """
+    Карточка «Google Cloud» (backend/gcp_billing.py). Числа без ограничений
+    здесь: Infinity/NaN в ответе 422 сами роняют сериализацию (500) — их
+    отбрасывает gcp_billing.clean_settings (только конечные, не меньше нуля).
+    """
+    credit_amount: Optional[float] = None
+    credit_since: str = Field(default="", pattern=r"^(\d{4}-\d{2}-\d{2})?$")
+    credit_expires: str = Field(default="", pattern=r"^(\d{4}-\d{2}-\d{2})?$")
+    warn_below: Optional[float] = None
+    project_id: str = Field(default="", max_length=100, pattern=r"^[a-z0-9:.\-]*$")
+    bigquery: bool = True
+    bq_table: str = Field(default="", max_length=300)
+    # {модель: {"in": $, "out": $, "cache": $}} — цена за 1 млн токенов
+    prices: dict[str, dict[str, Optional[float]]] = Field(default_factory=dict)
+
+
 class ConnectionSettings(BaseModel):
     use_proxy: bool = True
     base_url: str = "http://localhost:4000"
