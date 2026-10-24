@@ -420,6 +420,54 @@ async def test_recall_uses_vectors_when_embeddings_configured():
     assert [c["mid"] for c in again] == [c["mid"] for c in found]   # второй раз — из кэша векторов
 
 
+async def test_embedding_does_not_hold_the_database_write_lock():
+    """
+    Векторы считаются запросом к прокси по сети. Раньше документы писались, и
+    без коммита шли эти запросы (до 8 по ~12 с): у SQLite один писатель, и
+    отправка сообщения или загрузчик файлов через 30 с падали с «database is
+    locked». Пока идёт запрос, база должна быть свободна для записи.
+    """
+    import sqlite3
+
+    from backend import models
+    from backend.config import settings
+    from backend.database import AsyncSessionLocal
+
+    rows = []
+    for i in range(3):
+        rows.append(("user", f"u{i}", None))
+        rows.append(("assistant", f"a{i}", _ev_meta(f"2026/6/{i + 1}", f"Событие номер {i}")))
+    sid, ids = await _make_chat(rows)
+    conn = {"embedding_model": "fake-embed"}
+    path = settings.DATABASE_URL.split("///", 1)[1]
+    free = []
+
+    async def slow_embed(texts, connection=None):
+        # Посторонний писатель с коротким ожиданием — как ход пользователя.
+        other = sqlite3.connect(path, timeout=0.2)
+        try:
+            other.execute("BEGIN IMMEDIATE")
+            other.execute("ROLLBACK")
+            free.append(True)
+        except sqlite3.OperationalError:
+            free.append(False)
+        finally:
+            other.close()
+        return _bow(texts)
+
+    with patch("backend.llm_gateway.embed", new=slow_embed):
+        async with AsyncSessionLocal() as db:
+            await horae_vector.sync_documents(db, sid, conn)
+            await db.commit()
+    assert free and all(free)
+    async with AsyncSessionLocal() as db:
+        from sqlalchemy import select
+
+        docs = (await db.execute(select(models.HoraeMemoryDoc.embed_model).where(
+            models.HoraeMemoryDoc.session_id == sid))).scalars().all()
+    assert docs and all(m == "fake-embed" for m in docs)
+
+
 def comp_settings():
     from backend import horae_settings
 
