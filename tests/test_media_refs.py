@@ -362,6 +362,63 @@ async def test_ambiguous_ref_error_invalidates_nothing(db_ready):
     assert await mr.handle_ref_error([{"uri": GS}], RuntimeError("quota exceeded"), None, PROXY) is None
 
 
+# Так Vertex отвечает, когда бакет со старыми копиями — в проекте с закрытой
+# оплатой (сменили аккаунт Google): имени файла в тексте нет.
+_BILLING_CLOSED = ('litellm.APIError: APIError: Litellm_proxyException - b\'{\\n  "error": {\\n    "code": 403,'
+                   '\\n    "message": "The billing account for the owning project is disabled in state closed",'
+                   '\\n    "status": "PERMISSION_DENIED"\\n  }\\n}\\n\'. Received Model Group=gemini')
+
+
+async def test_access_error_without_file_name_retries_inline_and_rechecks(db_ready):
+    from sqlalchemy import select
+
+    from backend.database import AsyncSessionLocal
+    from backend.llm_gateway import stream_completion
+    from backend.models import MediaRef
+
+    route = _gcs_ok()
+    bid = await _blob(_b64(1000))
+    await _ref(bid, GS)
+    calls, probes = [], []
+
+    async def fake(**kw):
+        calls.append(kw["messages"])
+        if len(calls) == 1:
+            raise RuntimeError(_BILLING_CLOSED)
+        return _ok_stream("ок")
+
+    msgs = [{"role": "system", "content": "s"},
+            *_hist([{"type": "audio", "mime": "audio/ogg", "size": 1000, "blob_id": bid}]),
+            {"role": "user", "content": "ну?"}]
+    with patch("backend.llm_gateway.litellm.acompletion", new=fake), \
+            patch.object(mr.uploader, "enqueue_probe", side_effect=lambda r, force=False: probes.append(r)):
+        out = [t async for t in stream_completion(msgs, None, PROXY)]
+    assert "".join(out) == "ок" and len(calls) == 2
+    assert any(b.get("type") == "input_audio" for b in calls[1][1]["content"])  # повтор — целиком
+    assert probes == [route]                                  # хранилище перепроверится
+    assert not mr._suspects                                   # нет прав — не «подозрение» к файлу
+    async with AsyncSessionLocal() as db:
+        row = (await db.execute(select(MediaRef).where(MediaRef.blob_id == bid))).scalar_one()
+    assert row.status == "ready"
+    assert "оплата" in mr.explain(_BILLING_CLOSED + " bucket")
+
+    class _Http(Exception):
+        def __init__(self, text, status_code):
+            super().__init__(text)
+            self.status_code = status_code
+
+    with patch.object(mr.uploader, "enqueue_probe"):
+        # Отказ с кодом 403 и без подробностей — тоже повод повторить с файлами.
+        assert await mr.handle_ref_error([{"uri": GS}], _Http("Forbidden", 403), None, PROXY) == {GS}
+        # Квота и лимит токенов — не про доступ к ссылкам: повтора нет.
+        assert await mr.handle_ref_error([{"uri": GS}], _Http(
+            "429 RESOURCE_EXHAUSTED: You exceeded your current quota, please check your plan and "
+            "billing details.", 429), None, PROXY) is None
+        assert await mr.handle_ref_error([{"uri": GS}], RuntimeError(
+            "400 The input token count (1403921) exceeds the maximum number of tokens allowed (1048576)"),
+            None, PROXY) is None
+
+
 async def test_inactive_file_is_deferred_not_failed(db_ready):
     from sqlalchemy import select
 
