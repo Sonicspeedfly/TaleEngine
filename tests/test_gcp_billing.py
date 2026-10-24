@@ -138,6 +138,19 @@ def test_resolve_price_prefers_manual_then_proxy_then_local():
     price, src = gb.resolve_price("gemini-2.5-flash", {}, {})
     assert src == "local" and price["in"] > 0
     assert gb.resolve_price("совсем-неизвестная", {}, {}) == (None, "")
+    # Префикс провайдера, которого нет в таблице, — по имени без него.
+    assert gb.resolve_price("x", {"x": {"price": None, "model": "vertex_ai/gemini-2.5-pro"}}, {})[1] == "local"
+
+
+def test_local_price_never_calls_get_model_info(monkeypatch):
+    """get_model_info для ollama/… ходит в сеть и висит минутами — в потоке сервера нельзя."""
+    import litellm
+
+    def boom(*a, **kw):
+        raise AssertionError("get_model_info вызывать нельзя")
+    monkeypatch.setattr(litellm, "get_model_info", boom)
+    assert gb._local_price("ollama/my-model:7b") is None
+    assert gb._local_price("gemini-2.5-flash")["in"] > 0
 
 
 def test_clean_settings_drops_garbage():

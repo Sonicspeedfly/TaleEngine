@@ -453,21 +453,22 @@ def _price_from_info(info: dict | None) -> dict | None:
 
 
 def _local_price(model: str) -> dict | None:
-    """Цены из LiteLLM этого сервера (если прокси их не отдал)."""
+    """
+    Цены из таблицы LiteLLM этого сервера (если прокси их не отдал). Только
+    поиск по словарю litellm.model_cost: litellm.get_model_info для части
+    провайдеров (ollama/…) ходит в сеть и может висеть минутами — а здесь мы
+    в потоке сервера.
+    """
     if not model:
         return None
     try:
         import litellm
     except ImportError:
         return None
-    names = [model]
-    if "/" in model:
-        names.append(model.split("/", 1)[1])
-    for name in names:
-        try:
-            got = _price_from_info(litellm.get_model_info(name))
-        except Exception:  # noqa: BLE001 — неизвестная модель
-            got = None
+    table = getattr(litellm, "model_cost", None) or {}
+    bare = model.split("/", 1)[1] if "/" in model else model
+    for name in (model, bare, f"vertex_ai/{bare}", f"gemini/{bare}"):
+        got = _price_from_info(table.get(name))
         if got:
             return got
     return None
