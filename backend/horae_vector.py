@@ -132,23 +132,38 @@ async def sync_documents(db, session_id: int, connection: dict | None = None, *,
         changed += len(doomed)
     await db.flush()
     if embed and _embedding_model(connection):
-        await embed_missing(db, session_id, connection)
+        # Векторы — запросы к прокси по сети (до MAX_EMBED_PER_PASS/EMBED_BATCH
+        # штук, каждый до ~12 с). Держать ради них открытую запись нельзя: у
+        # SQLite один писатель на файл, и всё остальное (ход, загрузчик файлов)
+        # через 30 с падало с «database is locked». Документы фиксируем сразу,
+        # векторы пишутся своими короткими транзакциями.
+        await db.commit()
+        await embed_missing(session_id, connection)
     return changed
 
 
-async def embed_missing(db, session_id: int, connection) -> int:
-    """Досчитать векторы документов без векторов текущей модели (не больше MAX_EMBED_PER_PASS)."""
+async def embed_missing(session_id: int, connection) -> int:
+    """
+    Досчитать векторы документов без векторов текущей модели (не больше
+    MAX_EMBED_PER_PASS). Своими сессиями: запрос к прокси идёт без открытой
+    записи, а запись векторов пакета — короткая. Документ, который поменялся,
+    пока считался его вектор, не трогается (сверка doc_hash): досчитается в
+    следующий раз.
+    """
     from sqlalchemy import or_, update
+
+    from backend.database import AsyncSessionLocal
 
     model = _embedding_model(connection)
     if not model:
         return 0
-    todo = (await db.execute(
-        select(models.HoraeMemoryDoc.id, models.HoraeMemoryDoc.document).where(
-            models.HoraeMemoryDoc.session_id == session_id,
-            or_(models.HoraeMemoryDoc.embedding.is_(None), models.HoraeMemoryDoc.embed_model != model),
-        ).limit(MAX_EMBED_PER_PASS)
-    )).all()
+    async with AsyncSessionLocal() as db:
+        todo = (await db.execute(
+            select(models.HoraeMemoryDoc.id, models.HoraeMemoryDoc.document, models.HoraeMemoryDoc.doc_hash).where(
+                models.HoraeMemoryDoc.session_id == session_id,
+                or_(models.HoraeMemoryDoc.embedding.is_(None), models.HoraeMemoryDoc.embed_model != model),
+            ).limit(MAX_EMBED_PER_PASS)
+        )).all()
     todo = [d for d in todo if d.document]
     done = 0
     for i in range(0, len(todo), EMBED_BATCH):
@@ -156,11 +171,13 @@ async def embed_missing(db, session_id: int, connection) -> int:
         vectors = await _embed([d.document for d in batch], connection)
         if not vectors or len(vectors) != len(batch):
             break  # провайдер недоступен — поиск по словам, досчитаем позже
-        for d, v in zip(batch, vectors):
-            await db.execute(update(models.HoraeMemoryDoc).where(models.HoraeMemoryDoc.id == d.id)
-                             .values(embedding=v, embed_model=model))
-            done += 1
-        await db.flush()
+        async with AsyncSessionLocal() as db:
+            for d, v in zip(batch, vectors):
+                res = await db.execute(update(models.HoraeMemoryDoc).where(
+                    models.HoraeMemoryDoc.id == d.id, models.HoraeMemoryDoc.doc_hash == d.doc_hash,
+                ).values(embedding=v, embed_model=model))
+                done += res.rowcount or 0
+            await db.commit()
     return done
 
 
