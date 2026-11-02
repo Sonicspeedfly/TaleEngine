@@ -2731,7 +2731,15 @@ createApp({
         if (this.streaming && this.turnSid && !next[this.turnSid]) {
           next[this.turnSid] = { job_id: this.currentJobId, kind: this.turnKind, stage: this.turnStage };
         }
+        // Чаты, где ответ шёл до обрыва шины, а в снимке его уже нет, — ответ
+        // закончился, пока связи не было (телефон заморозил фоновую вкладку).
+        // Их «готово» не пришло — объявляем сами (один раз на job_id).
+        const gone = Object.entries(this.processingChats || {})
+          .filter(([sid, j]) => !next[sid] && j && j.job_id && !this._isDone(j.job_id));
         this.processingChats = next;
+        for (const [sid, j] of gone) {
+          this._onTurnDone({ session_id: Number(sid), job_id: j.job_id, kind: j.kind, ok: true });
+        }
         const mine = (ev.jobs || []).find((j) => j && j.session_id === this.sessionId);
         if (mine) this._followForeignJob(this.sessionId, mine);
         return;
@@ -3300,6 +3308,25 @@ createApp({
     },
 
     // ---------- WebSocket стриминг ----------
+    // Отправить по WS. Сокет только что пересоздан (открыли чат) и ещё
+    // подключается — сообщение ждёт открытия, а не падает в InvalidStateError:
+    // раньше ход после этого «готовил запрос» две минуты и терял реплику.
+    _wsSend(payload) {
+      const ws = this.ws;
+      if (ws && ws.readyState === 1) {
+        try { ws.send(JSON.stringify(payload)); return; } catch (e) { /* ниже — в очередь */ }
+      }
+      (this._wsQueue = this._wsQueue || []).push({ sid: this.sessionId, payload });
+    },
+    _flushWsQueue(sid) {
+      const q = this._wsQueue || [];
+      this._wsQueue = [];
+      for (const item of q) {
+        // Чат успели сменить — реплика ушла бы не туда (её вернёт сторож хода).
+        if (item.sid !== sid) continue;
+        try { this.ws.send(JSON.stringify(item.payload)); } catch (e) { this._wsQueue.push(item); }
+      }
+    },
     connectWs() {
       // Поколение сокета. Обработчики старого сокета могут сработать уже ПОСЛЕ
       // того, как открыт новый (закрытие приходит асинхронно), и без этой метки
@@ -3324,6 +3351,7 @@ createApp({
         this.connected = true;
         this._wsRetry = 0;
         this._startHeartbeat();
+        this._flushWsQueue(sid);
         // Сверка с сервером после (пере)подключения: ход мог закончиться, пока
         // связи не было, или идти, хотя страница о нём не знает.
         this._onWsOpen(sid);
@@ -4085,12 +4113,12 @@ createApp({
           .then((r) => this._onHttpTurnStarted(sid, clientId, r))
           .catch((e) => this._onHttpTurnFailed(sid, clientId, e, "Не удалось отправить вложение: ", { content, pend, bigFiles: {} }));
       } else {
-        this.ws.send(JSON.stringify({
+        this._wsSend({
           type: "user_message", content,
           attachments, params: this.params,
           reply_to_message_id: replyTo,
           client_id: clientId,
-        }));
+        });
         this._armAccept(clientId);
       }
     },
@@ -4168,7 +4196,7 @@ createApp({
     regenerate() {
       if (!this.connected || this.streaming) return;
       const clientId = this._beginTurn("");
-      this.ws.send(JSON.stringify({ type: "regenerate", params: this.params, client_id: clientId }));
+      this._wsSend({ type: "regenerate", params: this.params, client_id: clientId });
       this._armAccept(clientId);
     },
     // Повторить последний ход: если ответ так и не родился (ошибка/обрыв/остановка) —
@@ -4188,7 +4216,7 @@ createApp({
       const params = (useFallback === true && this.fallbackModel)
         ? { ...this.params, model: this.fallbackModel }
         : this.params;
-      this.ws.send(JSON.stringify({ type: "retry", params, client_id: clientId }));
+      this._wsSend({ type: "retry", params, client_id: clientId });
       this._armAccept(clientId);
       if (this.sendScroll) this.scrollDown();
     },
@@ -4202,8 +4230,13 @@ createApp({
       this._stoppedClientId = this.turnClientId;
       const jid = this.currentJobId;
       if (jid) {
-        // Отмена по id работает и для WS-, и для HTTP-хода (SSE).
-        this.api("/jobs/" + jid + "/cancel", { method: "POST" }).catch(() => {});
+        // Отмена по id работает и для WS-, и для HTTP-хода (SSE). Не дошла
+        // (сеть моргнула) — «Стоп» снова доступен, иначе он молчал бы до конца хода.
+        this.api("/jobs/" + jid + "/cancel", { method: "POST" }).catch(() => {
+          if (this.currentJobId !== jid) return;
+          this._userStopped = false;
+          this.showToast("Не удалось остановить ответ — нажмите «Стоп» ещё раз");
+        });
       } else if (this._turnHttp) {
         // HTTP-ход без id: файл ещё грузится — прерываем загрузку (реплика не
         // дойдёт до сервера); уже загружен — отменим по id, как только сервер
@@ -4234,9 +4267,10 @@ createApp({
       if (!same() || sid !== this.sessionId) return;
       // Хода нет — или сервер старый и спросить нельзя (там прежнее поведение).
       if (!r || !r.job) { this.finishStream(); return; }
-      if (!this.currentJobId) {
-        // WS-стоп пришёл раньше, чем ход стартовал, — отменяем его теперь по id.
-        // На новом сервере отмена идемпотентна, повтор ничего не порвёт.
+      if (!this.currentJobId || r.job.stage !== "saving") {
+        // WS-стоп пришёл раньше, чем ход стартовал, или отмена потерялась по
+        // дороге — отменяем по id ещё раз. На новом сервере отмена
+        // идемпотентна, повтор ничего не порвёт.
         this.currentJobId = r.job.job_id;
         this.api("/jobs/" + r.job.job_id + "/cancel", { method: "POST" }).catch(() => {});
       }
@@ -4814,7 +4848,7 @@ createApp({
     continueReply() {
       if (!this.connected || this.streaming) return;
       const clientId = this._beginTurn("");
-      this.ws.send(JSON.stringify({ type: "continue", params: this.params, client_id: clientId }));
+      this._wsSend({ type: "continue", params: this.params, client_id: clientId });
       this._armAccept(clientId);
     },
 

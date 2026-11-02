@@ -201,6 +201,14 @@ async def lifespan(app: FastAPI):
         except Exception:  # noqa: BLE001 — не мешаем старту веб-сервера
             pass
     yield
+    # Идущие ответы: останавливаем стрим (уже написанное сохранится) и даём
+    # сохранению закончиться — иначе asyncio.run отменил бы и саму запись.
+    running = generation_manager.active_jobs()
+    for job in running:
+        generation_manager.cancel(job.job_id)
+    if running:
+        await asyncio.gather(*(generation_manager.wait_done(j, 8) for j in running),
+                             return_exceptions=True)
     await media_refs.uploader.stop()
     await telegram_runtime.stop()
     # Даём фоновым задачам дозавершиться (обычно это быстрые чтения БД);
@@ -1367,11 +1375,15 @@ async def delete_session(
     # Идущий ответ этого чата снимается без сохранения и дожидается ДО удаления
     # строк: иначе он сохранился бы в удалённый чат, а его id SQLite отдаст
     # следующему новому — и чужой ответ всплыл бы там.
-    job = generation_manager.active_for(session_id)
-    if job is not None:
-        generation_manager.cancel(job.job_id, discard=True)
-        await generation_manager.wait_done(job, TURN_HANDOFF_WAIT)
+    # Под замком старта: ход, который ещё собирает контекст (job нет), сначала
+    # зарегистрируется — и тогда его можно снять, а не пропустить.
+    async with horae_engine.loop_lock(_turn_start_locks, session_id):
+        job = generation_manager.active_for(session_id)
+        if job is not None:
+            generation_manager.cancel(job.job_id, discard=True)
+            await generation_manager.wait_done(job, TURN_HANDOFF_WAIT)
     _turn_start_locks.pop(session_id, None)
+    _sse_access_epoch[0] += 1   # id чата достанется новому — решения о доступе устарели
     # Задание памяти (пересборка/догонялка) снимается и забывается ДО удаления
     # строк: id этого чата достанется следующему новому, и тот не должен ни
     # видеть чужое задание, ни получать в память его работу (см. forget_job).
@@ -1836,7 +1848,9 @@ _ANSWERING_KINDS = ("send", "retry", "group")
 
 async def _drop_turn_for_deleted(db, msg) -> None:
     """Удаляют реплику, на которую сейчас идёт ответ, — ход отменяется без сохранения."""
-    job = generation_manager.active_for(msg.session_id)
+    # Ход, который ещё собирает контекст, сначала регистрируется (замок старта).
+    async with horae_engine.loop_lock(_turn_start_locks, msg.session_id):
+        job = generation_manager.active_for(msg.session_id)
     if job is None or msg.role != "user" or job.kind not in _ANSWERING_KINDS:
         return
     last_user = (await db.execute(
@@ -3146,6 +3160,9 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
                 await rdb.commit()
                 saved_ids.append(msg.id)
                 job.message_id = msg.id
+            # Реплика записана, а очередь идёт дальше (пауза, следующий персонаж):
+            # это снова ожидание модели — с пульсом, и новый ход видит «занято» сразу.
+            generation_manager.set_stage(job, "waiting")
 
         # Пауза между ответами персонажей: несколько запросов подряд быстро
         # выбирают квоту токенов-в-минуту у Vertex (429). Разносим их во времени.
@@ -3556,6 +3573,16 @@ async def _query_auth(params, headers=None) -> tuple[int | None, object]:
     return None, None
 
 
+# Растёт при удалении чата: кэши «доступен ли чат» в /sse/events сбрасываются.
+_sse_access_epoch = [0]
+
+
+async def _same_user(request: Request, user) -> bool:
+    """Токен потока всё ещё даёт того же пользователя с той же ролью."""
+    status, now = await _query_auth(request.query_params, request.headers)
+    return not status and now is not None and now.id == user.id and now.role == user.role
+
+
 async def _session_access(session_id: int, user) -> bool:
     """Доступ к чату для путей без Depends(get_session) (WS, SSE): своя короткая сессия БД."""
     async with AsyncSessionLocal() as db:
@@ -3721,12 +3748,17 @@ async def ws_chat(websocket: WebSocket, session_id: int):
                 continue
 
             if mtype == "stop":
+                # Отозванный доступ — и останавливать чужие ходы нельзя.
+                if ws_user is not None and not await _session_access(session_id, ws_user):
+                    await websocket.close(code=4403)
+                    return
                 # Останавливаем ход ЧАТА, а не только начатый этим сокетом:
                 # после F5 ход начат другим соединением.
                 job = generation_manager.active_for(session_id)
-                if job is not None:
-                    generation_manager.cancel(job.job_id)
-                elif any(not t.done() for t in turn_tasks):
+                stopped = job is not None and generation_manager.cancel(job.job_id)
+                # Прежний ход уже остановлен или сохраняется, а этот сокет готовит
+                # новый («Стоп» → «Дописать» → «Стоп»): остановка — для нового.
+                if not stopped and any(not t.done() for t in turn_tasks):
                     stop_pending = True
                 continue
 
@@ -3813,10 +3845,15 @@ async def sse_events(request: Request):
     if status:
         return JSONResponse({"detail": "Требуется вход или код доступа"}, status_code=401)
     access: dict[int, tuple[float, bool]] = {}
+    epoch = [_sse_access_epoch[0]]
 
     async def allowed(session_id) -> bool:
         if user is None:
             return True
+        # Чат удалили — его id SQLite отдаст новому (возможно, чужому) чату.
+        if epoch[0] != _sse_access_epoch[0]:
+            access.clear()
+            epoch[0] = _sse_access_epoch[0]
         now = time.monotonic()
         hit = access.get(session_id)
         if hit and now - hit[0] < SSE_ACCESS_TTL:
@@ -3836,6 +3873,10 @@ async def sse_events(request: Request):
                 try:
                     event = await asyncio.wait_for(queue.get(), SSE_EVENTS_KEEPALIVE)
                 except asyncio.TimeoutError:
+                    # Заодно перепроверяем вход: удалённый пользователь, отозванный
+                    # токен или снятая роль админа не должны и дальше читать чужие ходы.
+                    if user is not None and not await _same_user(request, user):
+                        break
                     yield ": ping\n\n"
                     continue
                 if await allowed(event.get("session_id")):

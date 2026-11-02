@@ -277,8 +277,12 @@ class GenerationManager:
     def _interrupt(self, job: GenerationJob) -> None:
         """Прервать ожидание модели, не трогая сохранение."""
         st = job.stream_task
-        if st is not None and not st.done():
-            st.cancel()
+        if st is not None:
+            # Стрим идёт — режем его. Уже кончился, а сценарий ещё не продолжил
+            # (тот же оборот цикла) — сценарий не трогаем: он увидит stopping и
+            # сохранит дописанную реплику сам.
+            if not st.done():
+                st.cancel()
             return
         # Групповой сценарий вне стрима (режиссёр выбирает, пауза между ответами):
         # сценарий целиком. На сохранении реплики (stage saving) — не трогаем.
