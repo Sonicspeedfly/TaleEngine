@@ -1632,6 +1632,37 @@ input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
   flex: none; width: 8px; height: 8px; border-radius: 50%;
   background: var(--accent);
 }
+/* «В чате идёт ответ»: кольцо того же размера, что и точка «пришёл ответ».
+   Форма отличает два состояния без опоры на цвет; пульс — признак процесса,
+   а не украшение, и при reduced-motion он замирает (кольцо остаётся). */
+.proc-dot {
+  flex: none; width: 8px; height: 8px; border-radius: 50%;
+  border: 2px solid var(--accent); box-sizing: border-box;
+  animation: proc-pulse 1.4s ease-in-out infinite;
+}
+@keyframes proc-pulse { 0%,100% { opacity: 0.35; } 50% { opacity: 1; } }
+
+/* ----- Индикатор хода над полем ввода: «Жду ответ модели · 1:20» ----- */
+/* Перенос строк разрешён: на 360px пояснение про файл встаёт второй строкой,
+   а не выталкивает плашку за край экрана. Цифры времени моноширинные, чтобы
+   строка не дрожала каждую секунду. */
+.art-indicator.turn-stage {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px;
+  background: var(--surface-2); border-color: var(--border-subtle); color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+.turn-stage .stage-text { color: var(--text-primary); min-width: 0; }
+.turn-stage .stage-note { flex-basis: 100%; font-size: var(--fs-100); min-width: 0; overflow-wrap: anywhere; }
+.turn-stage .stage-dot {
+  flex: none; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--accent); animation: proc-pulse 1.4s ease-in-out infinite;
+}
+/* Сохранение — короткая служебная стадия: точка горит ровно. */
+.turn-stage.stage-saving .stage-dot { animation: none; }
+.notify-hint { margin: 2px 0 8px; }
+@media (prefers-reduced-motion: reduce) {
+  .proc-dot, .turn-stage .stage-dot { animation: none; opacity: 1; }
+}
 
 /* ----- Тег области видимости записи памяти Horae ----- */
 .scope-tag {
