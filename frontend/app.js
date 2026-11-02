@@ -129,6 +129,16 @@ createApp({
       currentReply: "",
       currentThought: "",   // live-«размышления» модели (reasoning_content), в ответ не входят
       currentJobId: null,
+      // Идущий ход открытого чата — ОДИН объект, разложенный по полям рядом со
+      // streaming/currentJobId/streamKind. Раньше хода как сущности не было:
+      // любое «done» из любого источника (WS, SSE сторожа, фоновый SSE) гасило
+      // то, что сейчас на экране, даже если это был уже другой, следующий ответ.
+      turnSid: null,          // чат, в котором идёт ход
+      turnKind: "",           // вид хода с сервера: send | regenerate | continue | retry | group
+      turnStage: "",          // preparing | waiting | thinking | streaming | saving
+      turnStartedAt: 0,       // Date.now() начала хода (с поправкой на elapsed сервера)
+      turnClientId: "",       // client_id отправки: им сервер подтверждает приём (accepted)
+      turnNow: 0,             // тикает раз в секунду, пока идёт ход: из него время в индикаторе
       connected: false,
       ws: null,
       chatError: "", // последняя ошибка генерации (показываем, не прячем)
@@ -514,7 +524,19 @@ createApp({
       sharedSessions: [],   // чаты, которыми со мной поделились
       sharedView: null,     // открытый сейчас «чужой» чат (из раздела «Доступные мне»)
       notifOpen: false,     // выпадашка уведомлений
-      pendingChats: [],     // id чатов, куда пришёл ответ, пока вы были в другом чате
+      pendingChats: [],     // id чатов, куда пришёл ответ, пока вы были в другом чате (переживает F5)
+      // Чаты, где сейчас идёт ответ: { [session_id]: { job_id, kind, stage } }.
+      // Источник — шина /sse/events (snapshot/turn_started/turn_done), а без неё
+      // (старый сервер) — свои ходы, уведённые в фон при смене чата.
+      processingChats: {},
+      busyMsg: {},          // { [message_id]: "del" | "edit" } — запрос по сообщению ещё идёт
+      // Системные уведомления браузера (Notification API), когда вкладка в фоне.
+      // Разрешение спрашиваем только из клика по галочке: браузеры молча
+      // отклоняют запрос, сделанный без жеста пользователя.
+      notifySystem: false,
+      notifyHint: "",       // почему галочка не включилась (запрещено/не поддерживается)
+      titleUnread: 0,       // ответы, пришедшие, пока вкладка была скрыта: «(N)» в заголовке
+      activeJobChecking: false, // открыли чат и ещё не знаем, идёт ли в нём ответ
       toasts: [],           // всплывающие уведомления (тосты) в правом нижнем углу
       katexReady: false,    // KaTeX догрузился лениво -> перерисовать формулы
       chatFilter: "",       // строка поиска по чатам (появляется, когда их много)
@@ -702,8 +724,27 @@ createApp({
     },
     canRetry() {
       if (this.streaming || !this.messages.length) return false;
+      // Пока у чата есть живой ход на сервере (ответ досчитывается после F5,
+      // идёт из другой вкладки или Telegram), «не получен» — ложь, а кнопка
+      // «Повторить» запустила бы второй, параллельный ответ на ту же реплику.
+      // Пока не спросили сервер (только открыли чат) — тоже молчим.
+      if (this.processingChats[this.sessionId] || this.activeJobChecking) return false;
       const last = this.messages[this.messages.length - 1];
       return last.role === "user" && last.id !== "tmp";
+    },
+    // Строка индикатора хода. На стадии streaming её нет: там индикатор —
+    // обычный курсор в пузыре ответа. Пустая строка — индикатор не показываем.
+    turnStageLabel() {
+      if (!this.streaming) return "";
+      const sec = Math.max(0, Math.floor(((this.turnNow || Date.now()) - (this.turnStartedAt || Date.now())) / 1000));
+      const t = Math.floor(sec / 60) + ":" + String(sec % 60).padStart(2, "0");
+      switch (this.turnStage) {
+        case "preparing": return "Готовлю запрос… · " + t;
+        case "waiting": return "Жду ответ модели · " + t;
+        case "thinking": return "Модель думает · " + t;
+        case "saving": return "Сохраняю ответ…";
+        default: return "";
+      }
     },
     // Веб-приложение (HTML/CSS/JS/React) — для него доступен live-предпросмотр в iframe.
     canvasIsWeb() {
@@ -1071,16 +1112,21 @@ createApp({
       if (!res.ok) {
         // Достаём реальный текст ошибки сервера (а не просто код).
         let detail = "HTTP " + res.status;
+        let jobId = null;
         try {
           const j = await res.json();
           // 422 FastAPI — список ошибок полей: «поле: что не так», а не [object Object].
           if (j && Array.isArray(j.detail)) detail = j.detail.map((d) => ((d.loc || []).slice(-1)[0] || "") + ": " + (d.msg || "")).join("; ");
+          else if (j && j.detail && typeof j.detail === "object") detail = j.detail.detail || j.detail.message || detail;
           else if (j && j.detail) detail = j.detail;
+          jobId = (j && (j.job_id || (j.detail && j.detail.job_id))) || null;
         } catch (e) {}
         // Код ответа — рядом с текстом: вызывающему иногда важно отличить
         // «чата больше нет» (403/404) от сбоя сети, а по тексту это ненадёжно.
+        // 409 «в чате уже идёт ответ» несёт job_id того хода — к нему подписываемся.
         const err = new Error(detail);
         err.status = res.status;
+        err.jobId = jobId;
         throw err;
       }
       return res.status === 204 ? null : res.json();
@@ -1322,6 +1368,11 @@ createApp({
       return new Promise((resolve, reject) => {
         const isForm = (typeof FormData !== "undefined") && body instanceof FormData;
         const xhr = new XMLHttpRequest();
+        // Хэндл — для «Стоп» во время загрузки (stop прерывает её). Поле с «_»:
+        // Vue не оборачивает его в Proxy.
+        this._uploadXhr = xhr;
+        const done = () => { if (this._uploadXhr === xhr) this._uploadXhr = null; };
+        xhr.addEventListener("loadend", done);
         xhr.open("POST", "/api" + path);
         // Для FormData Content-Type ставит браузер (multipart с boundary).
         if (!isForm) xhr.setRequestHeader("Content-Type", "application/json");
@@ -1343,8 +1394,18 @@ createApp({
           } else {
             if (xhr.status === 401) this.needAccess = true;
             let detail = "HTTP " + xhr.status;
-            try { const j = JSON.parse(xhr.responseText); if (j && j.detail) detail = j.detail; } catch (e) {}
-            reject(new Error(detail));
+            let jobId = null;
+            try {
+              const j = JSON.parse(xhr.responseText);
+              if (j && j.detail && typeof j.detail === "object") detail = j.detail.detail || j.detail.message || detail;
+              else if (j && j.detail) detail = j.detail;
+              jobId = (j && (j.job_id || (j.detail && j.detail.job_id))) || null;
+            } catch (e) {}
+            // Статус и job_id — как у api(): на 409 send() подпишется на идущий ход.
+            const err = new Error(detail);
+            err.status = xhr.status;
+            err.jobId = jobId;
+            reject(err);
           }
         };
         xhr.onerror = () => { this.uploadProgress = null; reject(new Error("сеть: не удалось загрузить файл на сервер")); };
@@ -2396,13 +2457,34 @@ createApp({
       this.closeSidebarOnMobile(); // на мобильном прячем сайдбар после выбора
       // Запоминаем последний открытый чат — восстановим при перезагрузке страницы.
       this._rememberLastChat();
+      this.titleUnread = 0;     // человек пришёл читать — «(N)» в заголовке больше не нужен
       try {
-        await this.loadMessages(true);   // свежее открытие — грузим последнюю порцию
+        await this._loadWithActiveJob(s.id);
       } finally {
         // Быстро открыли ещё один чат — сокет и флаг за ним, не за этим.
         if (seq === this._openSeq) {
           this.connectWs();
           this.switchingChat = false;
+        }
+      }
+    },
+    // Свежая лента чата и его идущий ход (F5 посреди генерации, возврат из
+    // другого чата, ход из соседней вкладки). Спрашиваем параллельно, а ход
+    // применяем ПОСЛЕ ленты: подпись «последний ответ до хода» (_replySig) и
+    // граница «Дописать» считаются по уже загруженным сообщениям. Пока ответа
+    // нет, плашка «Ответ не получен» не показывается (activeJobChecking).
+    async _loadWithActiveJob(sid) {
+      this.activeJobChecking = true;
+      this._ajOpenAt = { sid, at: Date.now() };
+      const aj = this._fetchActiveJob(sid);
+      try {
+        await this.loadMessages(true);   // свежее открытие — грузим последнюю порцию
+      } finally {
+        const r = await aj;
+        if (sid === this.sessionId) {
+          this.activeJobChecking = false;
+          if (r && r.job) this._adoptJob(sid, r.job);
+          else if (r && !this.streaming) delete this.processingChats[sid];
         }
       }
     },
@@ -2465,8 +2547,9 @@ createApp({
       this.sessionTimezone = s.timezone || ""; // чужой чат: пояс владельца, не перезаписываем
       this.closeSidebarOnMobile();
       this.notifOpen = false;
+      this.titleUnread = 0;
       try {
-        await this.loadMessages(true);   // свежее открытие — грузим последнюю порцию
+        await this._loadWithActiveJob(s.id);   // см. openSession
       } finally {
         if (seq === this._openSeq) {
           this.connectWs();
@@ -2475,15 +2558,35 @@ createApp({
       }
     },
     // Перевести идущую генерацию текущего чата в фон: она досчитается на сервере,
-    // мы поймаем «готово» через SSE и подсветим тот чат (а не свежеоткрытый).
+    // мы поймаем «готово» и подсветим тот чат (а не свежеоткрытый). С шиной
+    // /sse/events «готово» придёт по ней (turn_done) — отдельный EventSource на
+    // ход не нужен и дал бы второе уведомление; без шины (старый сервер) —
+    // прежний фоновый SSE по job_id.
     _handoffStreaming() {
-      if (this.streaming && this.currentJobId && this.sessionId) {
-        this._trackBackgroundJob(this.sessionId, this.currentJobId);
+      const sid = this.turnSid || this.sessionId;
+      if (this.streaming && sid) {
+        // Метку «идёт ответ» ставим, только если её есть кому снять: шина
+        // (turn_done) или фоновый SSE по известному id. Иначе (старый сервер,
+        // id ещё нет) она висела бы у чата вечно.
+        const tracked = this._busAlive || !!this.currentJobId;
+        if (tracked && !this.processingChats[sid]) {
+          this.processingChats[sid] = { job_id: this.currentJobId, kind: this.turnKind, stage: this.turnStage };
+        }
+        if (this.currentJobId && !this._busAlive) this._trackBackgroundJob(sid, this.currentJobId);
       }
+      // SSE открытого хода тоже закрываем: иначе его «done» пришёл бы в уже
+      // другой, свежеоткрытый чат и погасил бы там чужой ход.
+      if (this._sse) { try { this._sse.close(); } catch (e) {} this._sse = null; }
+      this._clearTurnTimers();
       this.streaming = false;
       this.streamKind = "";
       this._appendText = null;
+      this._userStopped = false;
       this.currentJobId = null;
+      this.turnSid = null;
+      this.turnStage = "";
+      this.turnClientId = "";
+      this.processingNote = false;
       this.currentReply = "";
       this.currentThought = "";
       this.liveBubbles = [];
@@ -2492,22 +2595,44 @@ createApp({
       // Хэндлы EventSource держим вне реактивных данных, чтобы Vue не оборачивал их в Proxy.
       this._bgJobs = this._bgJobs || {};
       if (this._bgJobs[sid]) { try { this._bgJobs[sid].close(); } catch (e) {} }
-      const es = new EventSource("/sse/job/" + jobId);
+      const q = this._sseQuery();
+      const es = new EventSource("/sse/job/" + jobId + (q ? "?" + q : ""));
       this._bgJobs[sid] = es;
+      const finish = (ev) => {
+        try { es.close(); } catch (_) {}
+        if (this._bgJobs[sid] === es) delete this._bgJobs[sid];
+        delete this.processingChats[sid];
+        this.notifyChatListChanged(sid);
+        if (this.sessionId === sid && !document.hidden) {
+          if (this._feedIdle()) this.loadMessages().catch(() => {});   // уже вернулись сюда
+          return;
+        }
+        // Поток оборвался без итога — чем кончился ход, мы не знаем, и «Ответ
+        // готов» был бы враньём. Список перечитан, превью скажет само.
+        if (!ev) return;
+        this._notifyReply(sid, {
+          job_id: jobId, ok: !ev || ev.type !== "error",
+          error: ev && ev.type === "error" ? ev.content : null,
+        });
+      };
       es.onmessage = (e) => {
         let ev; try { ev = JSON.parse(e.data); } catch (_) { return; }
-        if (ev.type !== "done" && ev.type !== "error") return; // токены в фоне не нужны
-        try { es.close(); } catch (_) {}
-        delete this._bgJobs[sid];
-        this.notifyChatListChanged(sid);
-        if (this.sessionId === sid) { this.loadMessages(); return; } // уже вернулись сюда
-        if (!this.pendingChats.includes(sid)) this.pendingChats.push(sid);
-        if (this.soundOn) this.playChime();
-        this.showToast(
-          ev.type === "error" ? "⚠ Ошибка генерации в другом чате" : "💬 Ответ готов в другом чате",
-          () => this._openById(sid),
-        );
+        // Ошибку запоминаем, а ход закрываем по «done»: новый сервер после error
+        // ещё сохраняет частичный ответ. Старый «done» после error не шлёт —
+        // для него ошибка без job_id и есть конец хода.
+        if (ev.type === "error") { es._err = ev; if (!ev.job_id) finish(ev); return; }
+        if (ev.type === "done") finish(es._err || ev);
       };
+      // Задача уже очищена (404) или сервер перезапустился: ответ, если родился,
+      // лежит в базе. Раньше обработчика не было вовсе — EventSource закрывался,
+      // запись в _bgJobs текла, а уведомление не приходило никогда.
+      es.onerror = () => {
+        if (es.readyState === 2 || !this._bgJobs[sid]) finish(null);
+      };
+    },
+    // Идёт ли в чате ответ: по шине или свой ход открытого чата.
+    chatBusy(id) {
+      return !!this.processingChats[id] || (this.streaming && this.turnSid === id);
     },
     _clearPending(sid) {
       const i = this.pendingChats.indexOf(sid);
@@ -2522,6 +2647,279 @@ createApp({
       const sh = this.sharedSessions.find((x) => x.id === sid);
       if (sh) return this.openSharedSession(sh);
       return this.openSession({ id: sid }); // запасной вариант: хотя бы покажем сообщения
+    },
+    // ---------- Шина событий ходов (/sse/events) ----------
+    // Авторизация для EventSource: заголовков он не шлёт. У API код доступа
+    // в access_code, у сокета — в code; кладём оба, лишний сервер не читает.
+    _sseQuery() {
+      const qs = [];
+      if (this.userToken) qs.push("token=" + encodeURIComponent(this.userToken));
+      if (this.accessCode) {
+        qs.push("access_code=" + encodeURIComponent(this.accessCode));
+        qs.push("code=" + encodeURIComponent(this.accessCode));
+      }
+      return qs.join("&");
+    },
+    // Одна подписка на всё приложение: начало и конец ходов во ВСЕХ доступных
+    // чатах. Раньше о готовом ответе в другом чате знала только вкладка,
+    // запустившая ход, и только до F5.
+    _connectEvents() {
+      if (this._busUnsupported || typeof EventSource === "undefined") return;
+      if (this._evES) { try { this._evES.close(); } catch (e) {} this._evES = null; }
+      clearTimeout(this._evTimer);
+      const q = this._sseQuery();
+      let opened = false;
+      const es = (this._evES = new EventSource("/sse/events" + (q ? "?" + q : "")));
+      es.onopen = () => {
+        if (this._evES !== es) return;
+        opened = true;
+        this._evRetry = 0;
+        this._busAlive = true;
+      };
+      es.onmessage = (e) => {
+        if (this._evES !== es) return;
+        let ev; try { ev = JSON.parse(e.data); } catch (_) { return; }
+        this._onBusEvent(ev);
+      };
+      es.onerror = () => {
+        try { es.close(); } catch (_) {}
+        if (this._evES !== es) return;
+        this._evES = null;
+        this._busAlive = false;
+        // Ни разу не открылся — возможно, сервер старый и маршрута нет:
+        // проверяем обычным запросом, чтобы не долбить 404 вечно.
+        if (!opened) this._probeEvents();
+        else this._scheduleEvents();
+      };
+    },
+    async _probeEvents() {
+      let status = 0;
+      try {
+        const ac = typeof AbortController !== "undefined" ? new AbortController() : null;
+        const q = this._sseQuery();
+        const res = await fetch("/sse/events" + (q ? "?" + q : ""), ac ? { signal: ac.signal } : {});
+        status = res.status;
+        if (ac) ac.abort();   // поток не нужен — хватило статуса
+      } catch (e) {}
+      if (status === 404) { this._busUnsupported = true; return; }
+      this._scheduleEvents();
+    },
+    _scheduleEvents() {
+      clearTimeout(this._evTimer);
+      const delay = Math.min(60000, 2000 * Math.pow(2, this._evRetry || 0));
+      this._evRetry = (this._evRetry || 0) + 1;
+      this._evTimer = setTimeout(() => this._connectEvents(), delay);
+    },
+    _stopEvents() {
+      clearTimeout(this._evTimer);
+      if (this._evES) { try { this._evES.close(); } catch (e) {} this._evES = null; }
+      this._busAlive = false;
+    },
+    // Только список чатов здесь, без сигнала соседним вкладкам: у каждой
+    // вкладки своя подписка на шину, им пересылать нечего.
+    _bumpChatList(sid) {
+      window.dispatchEvent(new CustomEvent(CHATLIST_EVENT, { detail: { sid: sid || null } }));
+    },
+    _onBusEvent(ev) {
+      if (!ev || !ev.type) return;
+      if (ev.type === "snapshot") {
+        // Снимок при (пере)подключении — истина о том, где идёт ответ сейчас.
+        const next = {};
+        for (const j of ev.jobs || []) {
+          if (j && j.session_id != null) next[j.session_id] = { job_id: j.job_id, kind: j.kind || "", stage: j.stage || "" };
+        }
+        if (this.streaming && this.turnSid && !next[this.turnSid]) {
+          next[this.turnSid] = { job_id: this.currentJobId, kind: this.turnKind, stage: this.turnStage };
+        }
+        // Чаты, где ответ шёл до обрыва шины, а в снимке его уже нет, — ответ
+        // закончился, пока связи не было (телефон заморозил фоновую вкладку).
+        // Их «готово» не пришло — объявляем сами (один раз на job_id).
+        const gone = Object.entries(this.processingChats || {})
+          .filter(([sid, j]) => !next[sid] && j && j.job_id && !this._isDone(j.job_id));
+        this.processingChats = next;
+        for (const [sid, j] of gone) {
+          this._onTurnDone({ session_id: Number(sid), job_id: j.job_id, kind: j.kind, ok: true });
+        }
+        const mine = (ev.jobs || []).find((j) => j && j.session_id === this.sessionId);
+        if (mine) this._followForeignJob(this.sessionId, mine);
+        return;
+      }
+      if (ev.type === "turn_started") {
+        if (ev.session_id == null) return;
+        this.processingChats[ev.session_id] = { job_id: ev.job_id, kind: ev.kind || "", stage: "waiting" };
+        if (ev.session_id === this.sessionId) this._followForeignJob(ev.session_id, ev);
+        // Реплика уже сохранена — чат поднимается в списке.
+        this._bumpChatList(ev.session_id);
+        return;
+      }
+      if (ev.type === "turn_done") this._onTurnDone(ev);
+    },
+    // Ход открытого чата, о котором страница не знает (соседняя вкладка,
+    // Telegram, снимок после реконнекта шины): показываем его и слушаем по SSE.
+    // Свой ход (streaming) не трогаем — у него свой канал.
+    _followForeignJob(sid, j) {
+      if (this.streaming || this.switchingChat || sid !== this.sessionId || !j.job_id) return;
+      if (this._isDone(j.job_id)) return;
+      this._adoptJob(sid, { job_id: j.job_id, kind: j.kind, stage: j.stage || "waiting", elapsed: j.elapsed || 0 });
+      if (this.streaming && this.currentJobId === j.job_id) this.resumeSSE(j.job_id);
+    },
+    _onTurnDone(ev) {
+      const sid = ev.session_id;
+      if (sid == null) return;
+      delete this.processingChats[sid];
+      this._bumpChatList(sid);
+      const notify = !ev.stopped;
+      if (sid === this.sessionId) {
+        if (this.streaming) {
+          // На экране другой ход — этот конец не про него.
+          if (this.currentJobId && ev.job_id && this.currentJobId !== ev.job_id) return;
+          // Обычно «done» приносит свой канал. Не принёс за 2 с — канал потерял
+          // ход (сокет моргнул, «job» не дошёл): завершаем сами, по job_id
+          // без дублей со своим «done».
+          clearTimeout(this._finishGrace);
+          const jid = ev.job_id;
+          this._finishGrace = setTimeout(() => {
+            this._finishGrace = null;
+            if (this.streaming && this.sessionId === sid && (!this.currentJobId || this.currentJobId === jid)) this.finishStream(jid);
+          }, 2000);
+        } else if (!this._isDone(ev.job_id) && this._feedIdle()) {
+          this.loadMessages().catch(() => {});   // ход не наш (Telegram, другая вкладка)
+        }
+        // Открытый и видимый чат покажет ответ сам; уведомление — только в фоне.
+        if (notify && document.hidden) this._notifyReply(sid, ev);
+        return;
+      }
+      if (notify) this._notifyReply(sid, ev);
+    },
+    _chatName(sid) {
+      const r = this.unifiedChats.find((x) => x.id === sid);
+      return r && r.title ? "«" + r.title + "»" : "#" + sid;
+    },
+    // Уведомить о готовом ответе. Один раз на job_id: одно и то же «готово»
+    // приходит и по шине, и по своему потоку, и по фоновому SSE старого пути.
+    _notifyReply(sid, ev) {
+      ev = ev || {};
+      if (ev.job_id && !this._jobMark("_notifiedJobs", ev.job_id)) return;
+      const ok = ev.ok !== false && !ev.error;
+      const name = this._chatName(sid);
+      const open = sid === this.sessionId;
+      // Метка «новый ответ» у чата в списке (сохраняется, переживает F5).
+      if ((!open || document.hidden) && !this.pendingChats.includes(sid)) this.pendingChats.push(sid);
+      if (document.hidden) this.titleUnread += 1;
+      if (this.soundOn) this.playChime();
+      this.showToast(ok ? "💬 Ответ готов: " + name : "⚠ Ошибка в чате " + name,
+        () => (open ? this._scrollToLastReply() : this._openById(sid)));
+      if (!document.hidden || !this.notifySystem) return;
+      if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
+      try {
+        const detail = ok ? (ev.preview || "") : (ev.error || "ошибка генерации");
+        // tag — один системный баннер на чат: следующий ответ заменяет прежний.
+        const n = new Notification(ok ? "Ответ готов" : "Ошибка генерации", {
+          body: name + (detail ? ": " + detail : ""), tag: "chat-" + sid,
+        });
+        n.onclick = () => {
+          try { window.focus(); } catch (e) {}
+          try { n.close(); } catch (e) {}
+          if (sid !== this.sessionId) this._openById(sid);
+          else this._scrollToLastReply();
+        };
+      } catch (e) { /* Android Chrome: конструктор без service worker бросает */ }
+    },
+    // Галочка «Системные уведомления». Разрешение спрашиваем ПРЯМО из клика:
+    // без жеста пользователя браузеры отклоняют запрос молча.
+    async toggleNotifySystem(ev) {
+      const box = ev && ev.target;
+      const want = !!(box && box.checked);
+      this.notifyHint = "";
+      if (!want) { this.notifySystem = false; return; }
+      const refuse = (hint) => {
+        this.notifySystem = false;
+        if (box) box.checked = false;   // v-model тут нет: false→false Vue не перерисует
+        this.notifyHint = hint;
+      };
+      if (typeof Notification === "undefined") {
+        refuse("Этот браузер не умеет системные уведомления. На iPhone они есть только у сайта, добавленного на экран «Домой».");
+        return;
+      }
+      let perm = Notification.permission;
+      if (perm === "default") {
+        try {
+          // Старый Safari: requestPermission с колбэком и без промиса.
+          perm = await new Promise((resolve) => {
+            const p = Notification.requestPermission(resolve);
+            if (p && p.then) p.then(resolve, () => resolve("denied"));
+          });
+        } catch (e) { perm = "denied"; }
+      }
+      if (perm === "granted") { this.notifySystem = true; return; }
+      refuse(perm === "denied"
+        ? "Браузер запретил уведомления для этого сайта. Разрешите их в настройках сайта (значок замка или «ⓘ» слева от адреса → Уведомления → Разрешить) и включите галочку снова."
+        : "Разрешение не выдано — уведомлений не будет. Включите галочку снова, чтобы браузер спросил ещё раз.");
+    },
+    // Метки «пришёл ответ» живут в localStorage — отдельно для каждого
+    // пользователя: в режиме аккаунтов один браузер делят несколько человек.
+    _pendingKey() {
+      const u = this.currentUserObj;
+      return "pendingChats" + (u ? ":" + (u.id || u.username || "") : "");
+    },
+    _loadPendingChats() {
+      let ids = [];
+      try { ids = JSON.parse(localStorage.getItem(this._pendingKey()) || "[]"); } catch (e) {}
+      this._pendingLoaded = true;
+      this.pendingChats = Array.isArray(ids) ? ids.filter((x) => Number.isFinite(x)).slice(-200) : [];
+    },
+    // Вернулись к вкладке: «(N)» в заголовке прочитан, метка у открытого чата
+    // тоже; шину, умершую в фоне (телефон усыпил вкладку), поднимаем сразу.
+    _onTabVisible() {
+      if (document.visibilityState !== "visible") return;
+      this.titleUnread = 0;
+      if (this.sessionId) this._clearPending(this.sessionId);
+      if (this._appReady && !this._evES && !this._busUnsupported) {
+        this._evRetry = 0;
+        this._connectEvents();
+      }
+    },
+    // Сторож зависшего хода. Новый сервер шлёт status раз в 10 с, поэтому 35 с
+    // тишины — уже не «модель долго думает», а потерянный канал. Сначала
+    // спрашиваем сервер, жив ли ход, и только потом решаем: завершить или
+    // пересобрать канал. SSE параллельно живому сокету не открываем — раньше
+    // так каждый токен приходил дважды.
+    async _watchdogTick() {
+      if (!this.streaming || this._watchdogBusy) return;
+      const legacy = this._activeJobApi === false;
+      if (Date.now() - (this._lastEvtAt || 0) < (legacy ? 45000 : 35000)) return;
+      this._lastEvtAt = Date.now();
+      if (legacy) {
+        // Старый сервер: пульса нет, active_job нет — прежний путь, но без
+        // задвоения: старый сокет закрываем, ход дослушиваем одним SSE.
+        if (this.currentJobId) { this.connectWs(); this.resumeSSE(this.currentJobId); }
+        else this.finishStream();
+        return;
+      }
+      this._watchdogBusy = true;
+      try {
+        const sid = this.sessionId;
+        const gen = this._genSeq || 0;
+        const r = await this._fetchActiveJob(sid);
+        if (!this.streaming || (this._genSeq || 0) !== gen || sid !== this.sessionId) return;
+        if (!r) return;   // спросить не вышло (сеть) — следующий круг через 10 с
+        if (!r.job) {
+          // Хода нет. Без id он мог ещё не стартовать: сервер готовит запрос
+          // (память, поиск по истории) — даём на это до 2 минут.
+          if (!this.currentJobId && this.turnStage === "preparing" && Date.now() - this.turnStartedAt < 120000) return;
+          this.finishStream();
+          return;
+        }
+        if (this.currentJobId && r.job.job_id !== this.currentJobId) { this.finishStream(); return; }
+        if (!this.currentJobId) this.currentJobId = r.job.job_id;
+        this._applyStatus(r.job);
+        // Ход жив, а события до нас не доходят — пересобираем канал. Сокет при
+        // подключении сам подпишется на ход чата.
+        if (this._sse) this.resumeSSE(this.currentJobId);
+        else this.connectWs();
+      } finally {
+        this._watchdogBusy = false;
+      }
     },
     showToast(text, onClick) {
       const id = (this._toastSeq = (this._toastSeq || 0) + 1);
@@ -2580,8 +2978,19 @@ createApp({
     },
     async deleteSession(s) {
       if (!(await this.askConfirm("Удалить этот чат?", { okText: "Удалить" }))) return;
-      await this.api("/sessions/" + s.id, { method: "DELETE" });
-      if (this.sessionId === s.id) { this.sessionId = null; this.messages = []; }
+      try {
+        await this.api("/sessions/" + s.id, { method: "DELETE" });
+      } catch (e) {
+        this.showToast("⚠ Не удалось удалить чат: " + e.message);
+        return;
+      }
+      // Сервер отменил ход удалённого чата — его «идёт ответ» на экране тоже снимаем.
+      if (this.sessionId === s.id) {
+        if (this.streaming) this._handoffStreaming();
+        this.sessionId = null; this.messages = [];
+      }
+      delete this.processingChats[s.id];
+      this._clearPending(s.id);
       await this.syncChatList(s.id);
     },
     async renameSession(s) {
@@ -2899,6 +3308,25 @@ createApp({
     },
 
     // ---------- WebSocket стриминг ----------
+    // Отправить по WS. Сокет только что пересоздан (открыли чат) и ещё
+    // подключается — сообщение ждёт открытия, а не падает в InvalidStateError:
+    // раньше ход после этого «готовил запрос» две минуты и терял реплику.
+    _wsSend(payload) {
+      const ws = this.ws;
+      if (ws && ws.readyState === 1) {
+        try { ws.send(JSON.stringify(payload)); return; } catch (e) { /* ниже — в очередь */ }
+      }
+      (this._wsQueue = this._wsQueue || []).push({ sid: this.sessionId, payload });
+    },
+    _flushWsQueue(sid) {
+      const q = this._wsQueue || [];
+      this._wsQueue = [];
+      for (const item of q) {
+        // Чат успели сменить — реплика ушла бы не туда (её вернёт сторож хода).
+        if (item.sid !== sid) continue;
+        try { this.ws.send(JSON.stringify(item.payload)); } catch (e) { this._wsQueue.push(item); }
+      }
+    },
     connectWs() {
       // Поколение сокета. Обработчики старого сокета могут сработать уже ПОСЛЕ
       // того, как открыт новый (закрытие приходит асинхронно), и без этой метки
@@ -2923,6 +3351,10 @@ createApp({
         this.connected = true;
         this._wsRetry = 0;
         this._startHeartbeat();
+        this._flushWsQueue(sid);
+        // Сверка с сервером после (пере)подключения: ход мог закончиться, пока
+        // связи не было, или идти, хотя страница о нём не знает.
+        this._onWsOpen(sid);
       };
       this.ws.onclose = () => {
         // Закрылся СТАРЫЙ сокет, пока новый уже работает — не наше дело.
@@ -2935,8 +3367,10 @@ createApp({
         if (gen !== this._wsGen) return;
         this.connected = false;
         this._stopHeartbeat();
-        // Непреднамеренный обрыв: дослушиваем активную генерацию через SSE.
-        if (this.streaming && this.currentJobId) this.resumeSSE(this.currentJobId);
+        // Непреднамеренный обрыв. Новый сервер при переподключении сам подпишет
+        // сокет на ход чата (job resumed) — SSE рядом дал бы каждый токен дважды.
+        // Старый (нет active_job) так не умеет: дослушиваем ход через SSE.
+        if (this._activeJobApi === false && this.streaming && this.currentJobId) this.resumeSSE(this.currentJobId);
         // Автопереподключение с бэкоффом: сеть моргнула или сервер перезапустился.
         // Потолок 8 с, а не 15: дольше человек воспринимает как «зависло».
         const delay = Math.min(8000, 1000 * Math.pow(2, this._wsRetry || 0));
@@ -2950,10 +3384,13 @@ createApp({
       // реконнект не планируется: закрываем сами, дальше отработает onclose.
       this.ws.onerror = () => { try { this.ws && this.ws.close(); } catch (e) {} };
       this.ws.onmessage = (e) => {
+        // Сообщение, успевшее прийти в уже замещённый сокет (смена чата), —
+        // про прежний чат: в открытый ход его пускать нельзя.
+        if (gen !== this._wsGen) return;
         this._hbPending = false;   // любое сообщение — признак живого соединения
         const data = JSON.parse(e.data);
         if (data && data.type === "pong") return;  // служебный ответ, в ленту не идёт
-        this.onWsEvent(data);
+        this.onWsEvent(data, "ws");
       };
     },
 
@@ -3006,70 +3443,374 @@ createApp({
       window.addEventListener("online", wake);
       window.addEventListener("focus", wake);
     },
-    onWsEvent(ev) {
+    // ---------- Ход: начало, сверка с сервером, конец ----------
+    _newClientId() {
+      return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    },
+    // Таймеры хода: ожидание accepted, проверка после «Стоп», пауза перед
+    // завершением по шине. Все живут, только пока жив ход, — снимаем разом.
+    _clearTurnTimers() {
+      for (const k of ["_acceptTimer", "_stopTimer", "_finishGrace"]) {
+        if (this[k]) { clearTimeout(this[k]); this[k] = null; }
+      }
+    },
+    // Множества обработанных job_id. Обычные поля с «_» — не реактивные; держим
+    // последние 300 id, старейшие выбрасываем (Set хранит порядок вставки).
+    _jobSet(name) {
+      if (!this[name]) this[name] = new Set();
+      return this[name];
+    },
+    _jobMark(name, jid) {
+      const s = this._jobSet(name);
+      if (s.has(jid)) return false;
+      s.add(jid);
+      if (s.size > 300) s.delete(s.values().next().value);
+      return true;
+    },
+    _isDone(jid) { return !!jid && this._jobSet("_doneJobs").has(jid); },
+    // Начать ход в открытом чате. Возвращает client_id: им сервер подтвердит приём.
+    _beginTurn(streamKind) {
+      this._clearTurnTimers();
+      this.chatError = "";
+      this.currentReply = "";
+      this.currentThought = "";
+      this.liveBubbles = [];
+      this.currentJobId = null;
+      this.turnSid = this.sessionId;
+      this.turnKind = "";
+      this.turnStage = "preparing";
+      this.turnStartedAt = Date.now();
+      this.turnNow = Date.now();
+      this.turnClientId = this._newClientId();
+      this._turnAccepted = false;
+      this._turnFailed = false;
+      this._userStopped = false;
+      this._lastTokSeq = 0;
+      this._turnSendText = "";
+      this._turnHttp = false;
+      this._turnSig = this._replySig();
+      this.streamKind = streamKind || "";
+      this.streaming = true;
+      this._lastEvtAt = Date.now();
+      return this.turnClientId;
+    },
+    // Подпись последнего ответа ассистента: id, число свайпов, длина текста.
+    // По ней finishStream понимает, что ответ правда появился (новое сообщение,
+    // новый свайп перегенерации, дописанный «Продолжить»), а не просто пришёл
+    // «done»: раньше «✅ Ответ получен» звучал и тогда, когда ответа не было.
+    _replySig() {
+      for (let i = this.messages.length - 1; i >= 0; i--) {
+        const m = this.messages[i];
+        if (m.role === "assistant" && typeof m.id === "number") {
+          return m.id + ":" + (m.swipes || []).length + ":" + (m.content || "").length;
+        }
+      }
+      return "";
+    },
+    // Активный ход чата на сервере. Возвращает { job } (job = null — хода нет)
+    // либо undefined: сервер старый (маршрута нет — 404 «Not Found») или
+    // спросить не вышло. На undefined вызывающий ведёт себя по-старому.
+    async _fetchActiveJob(sid) {
+      if (!sid || this._activeJobApi === false) return undefined;
+      try {
+        const r = await this.api("/sessions/" + sid + "/active_job");
+        this._activeJobApi = true;
+        return { job: (r && r.job) || null };
+      } catch (e) {
+        // «Чата нет» на новом сервере — тоже 404, но с другим текстом: старым
+        // сервер считаем, только если маршрут не ответил ни разу.
+        if (e.status === 404 && e.message === "Not Found" && this._activeJobApi !== true) this._activeJobApi = false;
+        return undefined;
+      }
+    },
+    // Стадия и время хода из status / active_job. Время берём раннее из двух:
+    // своё (с момента нажатия) включает подготовку запроса, серверное — нужно
+    // после F5, когда своего начала у страницы нет.
+    _applyStatus(ev) {
+      if (ev.stage && ev.stage !== "done") this.turnStage = ev.stage;
+      const el = Number(ev.elapsed);
+      if (ev.elapsed != null && Number.isFinite(el)) {
+        const at = Date.now() - Math.max(0, el) * 1000;
+        this.turnStartedAt = this.turnStartedAt ? Math.min(this.turnStartedAt, at) : at;
+      }
+    },
+    // Показать в открытом чате ход, который уже идёт на сервере (F5 посреди
+    // ответа, возврат в чат, ход из соседней вкладки или Telegram).
+    _adoptJob(sid, job) {
+      if (!job || !job.job_id || sid !== this.sessionId || this._isDone(job.job_id)) return;
+      if (this.streaming) {
+        // Свой ход уже на экране — дополняем то, чего не знали.
+        if (!this.currentJobId) this.currentJobId = job.job_id;
+        if (this.currentJobId === job.job_id) this._applyStatus(job);
+        return;
+      }
+      this._clearTurnTimers();
+      this.currentReply = "";
+      this.currentThought = "";
+      this.liveBubbles = [];
+      this.chatError = "";
+      this.currentJobId = job.job_id;
+      this.turnSid = sid;
+      this.turnKind = job.kind || "";
+      this.turnStage = job.stage && job.stage !== "done" ? job.stage : "waiting";
+      this.turnStartedAt = Date.now() - Math.max(0, Number(job.elapsed) || 0) * 1000;
+      this.turnNow = Date.now();
+      this.turnClientId = "";
+      this._turnAccepted = true;
+      this._turnFailed = false;
+      this._userStopped = false;
+      this._lastTokSeq = 0;
+      this._turnSendText = "";
+      this._turnHttp = false;
+      this._turnSig = this._replySig();
+      // «Дописать» умеет только ответ на реплику пользователя (send/retry):
+      // граница хода — эта реплика, как в retryGeneration.
+      const last = this.messages[this.messages.length - 1];
+      const hanging = (job.kind === "send" || job.kind === "retry") && !this.currentIsGroup
+        && last && last.role === "user" && typeof last.id === "number";
+      this.streamKind = hanging ? job.kind : "";
+      if (hanging) { this._turnFloor = last.id - 1; this._turnText = last.content || ""; }
+      this.processingChats[sid] = { job_id: job.job_id, kind: job.kind || "", stage: this.turnStage };
+      this.streaming = true;
+      this._lastEvtAt = Date.now();
+    },
+    // Спросить сервер про ход чата и привести экран к ответу.
+    async _syncActiveJob(sid) {
+      const r = await this._fetchActiveJob(sid);
+      if (!r || sid !== this.sessionId) return r;
+      if (r.job) this._adoptJob(sid, r.job);
+      else if (!this.streaming) delete this.processingChats[sid];
+      return r;
+    },
+    // Сокет (пере)подключился. Новый сервер сам пришлёт job resumed, если ход
+    // идёт, — здесь ловим обратный случай: ход закончился, пока связи не было,
+    // и его «done» ушёл в мёртвый сокет.
+    async _onWsOpen(sid) {
+      if (sid !== this.sessionId) return;
+      // openSession только что спросил сам — второй запрос подряд не нужен.
+      if (this._ajOpenAt && this._ajOpenAt.sid === sid && Date.now() - this._ajOpenAt.at < 3000) return;
+      const jid = this.currentJobId;
+      const r = await this._syncActiveJob(sid);
+      if (!r || r.job || sid !== this.sessionId || !this.streaming) return;
+      // Хода нет. Если id был известен — он завершился без нас: перечитываем
+      // ленту. Без id ход мог ещё не стартовать (сервер готовит запрос) — это
+      // решит сторож.
+      if (jid && this.currentJobId === jid) this.finishStream(jid);
+    },
+    // Ждём подтверждения приёма (accepted). Молчание 10 с при живом сокете —
+    // реплика, скорее всего, не дошла: раньше «печатает…» висело до сторожа,
+    // а потом звучал ложный «Ответ получен», и текст пропадал.
+    _armAccept(clientId) {
+      if (this._acceptTimer) clearTimeout(this._acceptTimer);
+      this._acceptTimer = setTimeout(() => this._acceptTimeout(clientId), 10000);
+    },
+    async _acceptTimeout(clientId) {
+      this._acceptTimer = null;
+      const pending = () => this.streaming && this.turnClientId === clientId
+        && !this._turnAccepted && !this.currentJobId;
+      if (!pending()) return;
+      // Старый сервер accepted не шлёт — для него молчание ничего не значит.
+      if (this._activeJobApi !== true) return;
+      // Сокет умер — это забота реконнекта: onopen сверится с сервером.
+      if (!this.ws || this.ws.readyState !== 1) return;
+      const sid = this.sessionId;
+      const r = await this._fetchActiveJob(sid);
+      if (!pending() || sid !== this.sessionId) return;
+      if (r && r.job) {
+        // Подтверждение потерялось, а ход идёт — переподключаемся: сокет при
+        // подключении сам подпишется на ход чата.
+        this.currentJobId = r.job.job_id;
+        this._turnAccepted = true;
+        this._applyStatus(r.job);
+        this.connectWs();
+        return;
+      }
+      this.showToast("⚠ Сервер не подтвердил отправку. Если реплика не сохранилась, её текст вернётся в поле ввода");
+      this._turnFailed = true;
+      this.finishStream();
+    },
+    onWsEvent(ev, src) {
+      if (!ev || !ev.type) return;
       this._lastEvtAt = Date.now(); // метка для сторожа зависшего стриминга
+      const t = ev.type;
+      if (t === "accepted") {
+        if (ev.client_id && ev.client_id === this.turnClientId) {
+          this._turnAccepted = true;
+          if (this._acceptTimer) { clearTimeout(this._acceptTimer); this._acceptTimer = null; }
+        }
+        return;
+      }
+      if (t === "busy") return this._onBusy(ev);
+      if (t === "job") return this._onJob(ev, src);
+      // Чужие события не трогают ход на экране. Раньше любое «done» (из WS, из
+      // SSE сторожа, запоздалое от прошлого хода) гасило то, что идёт сейчас, —
+      // например, новый ответ после «Дописать».
+      if (ev.job_id) {
+        if (this._isDone(ev.job_id)) return;          // этот ход уже закрыт
+        if (!this.streaming) return;                   // хода на экране нет
+        if (this.currentJobId && ev.job_id !== this.currentJobId) return;
+        if (!this.currentJobId) this.currentJobId = ev.job_id;
+      } else if (ev.client_id && ev.client_id !== this.turnClientId) {
+        return;                                        // ответ на чужую отправку
+      }
       // Нейросеть подала признаки жизни — плашка «обрабатывает файл» больше не нужна.
-      if (ev.type === "token" || ev.type === "thought" || ev.type === "done" || ev.type === "error") {
+      if (t === "token" || t === "thought" || t === "done" || t === "error") {
         this.processingNote = false;
       }
-      if (ev.type === "job") {
-        this.currentJobId = ev.job_id;
-        // «job» сервер шлёт ПОСЛЕ того, как сохранил реплику пользователя (или
-        // начал перегенерацию). Это первый момент, когда чат честно поднимается
-        // в списке: ждать «done» значило бы держать его на старом месте всю
-        // генерацию, а длинный ответ идёт минуту.
-        this.notifyChatListChanged(this.sessionId);
-      }
-      else if (ev.type === "waiting") {
+      if (t === "status") {
+        this._applyStatus(ev);
+      } else if (t === "waiting") {
         // Пауза между ответами персонажей в группе (защита от 429).
         this.groupWaiting = Math.round(ev.seconds || 0);
-      } else if (ev.type === "speaker") {
+      } else if (t === "speaker") {
         // Групповой чат: начинается реплика нового персонажа.
         this.groupWaiting = 0;
+        this.turnStage = "streaming";
         this.liveBubbles.push({ name: ev.name, content: "" });
         this._followStream();
-      } else if (ev.type === "token") {
+      } else if (t === "token") {
+        if (ev.seq) this._lastTokSeq = ev.seq;
+        if (this.turnStage !== "saving") this.turnStage = "streaming";
         if (this.liveBubbles.length) this.liveBubbles[this.liveBubbles.length - 1].content += ev.content;
         else this.currentReply += ev.content;
         this._followStream();
-      } else if (ev.type === "thought") {
+      } else if (t === "thought") {
         // Размышления модели: копятся отдельно от ответа, показываются свёрнуто.
+        if (this.turnStage === "preparing" || this.turnStage === "waiting") this.turnStage = "thinking";
         this.currentThought += ev.content;
-      } else if (ev.type === "speaker_done") {
+      } else if (t === "speaker_done") {
         // ничего: пузырь остаётся на экране до перечитки истории
-      } else if (ev.type === "fallback") {
+      } else if (t === "fallback") {
+        if (!this._firstSeen(ev)) return;
         // Основная модель не ответила — сервер повторяет ход запасной.
         // Частичный текст основной сбрасываем: ответ придёт с чистого листа.
+        // Но повтор подписчику (F5, реконнект) шлёт накопленный текст запасной
+        // РАНЬШЕ этого события: если fallback старше уже пришедшего текста, он
+        // про прошлое — текст не трогаем.
+        const stale = ev.seq && this._lastTokSeq && ev.seq < this._lastTokSeq;
+        if (!stale) {
+          this.currentReply = "";
+          this.currentThought = "";
+          this.liveBubbles = [];
+        }
+        this.showToast("⚠ Основная модель не ответила — пробую запасную: " + (ev.model || ""));
+      } else if (t === "notice") {
+        if (!this._firstSeen(ev)) return;
+        // Сервер облегчил запрос (например, повторил без файлов истории) — говорим, что и почему.
+        this.showToast("⚠ " + (ev.content || ""));
+      } else if (t === "done") {
+        this.finishStream(ev.job_id || this.currentJobId);
+      } else if (t === "error") {
+        // Ошибку НЕ прячем — показываем баннером, чтобы было видно причину.
+        this.chatError = ev.content || "неизвестная ошибка";
+        // Новый сервер после error ещё сохраняет частичный ответ и досылает
+        // done — ход закроет он. Старый (событие без job_id и client_id) done
+        // после ошибки не шлёт: для него ошибка и есть конец хода.
+        if (!ev.job_id && !ev.client_id) this.finishStream();
+      }
+    },
+    // Служебные события, которые сервер повторяет позднему подписчику (notice,
+    // fallback): показываем один раз на job_id+seq, иначе каждый реконнект
+    // заново выбрасывал бы тот же тост.
+    _firstSeen(ev) {
+      if (!ev.job_id || !ev.seq) return true;
+      return this._jobMark("_seenEvents", ev.job_id + ":" + ev.seq);
+    },
+    _onJob(ev, src) {
+      // Сокет подхватил ход, за которым шёл SSE (реконнект во время HTTP-хода):
+      // дальше события идут по сокету, SSE закрываем — иначе токены задвоятся.
+      if (src !== "sse" && this._sse) { try { this._sse.close(); } catch (e) {} this._sse = null; }
+      if (!ev.job_id || this._isDone(ev.job_id)) return;
+      if (ev.resumed) {
+        // Сервер подписал сокет на уже идущий ход и сейчас повторит накопленное
+        // одним куском — то, что уже на экране, сбрасываем (иначе задвоится).
+        if (!this.streaming) this._adoptJob(this.sessionId, { job_id: ev.job_id, kind: ev.kind, stage: "waiting", elapsed: 0 });
+        else this.currentJobId = ev.job_id;
+        if (ev.kind) this.turnKind = ev.kind;
         this.currentReply = "";
         this.currentThought = "";
         this.liveBubbles = [];
-        this.showToast("⚠ Основная модель не ответила — пробую запасную: " + (ev.model || ""));
-      } else if (ev.type === "notice") {
-        // Сервер облегчил запрос (например, повторил без файлов истории) — говорим, что и почему.
-        this.showToast("⚠ " + (ev.content || ""));
-      } else if (ev.type === "done") this.finishStream();
-      else if (ev.type === "error") {
-        // Ошибку НЕ прячем — показываем баннером, чтобы было видно причину.
-        this.chatError = ev.content || "неизвестная ошибка";
-        this.finishStream();
+        return;
       }
+      // Ход, который человек уже остановил, пока сервер готовил запрос (WS-стоп
+      // пришёл раньше, чем ход появился): отменяем его по id, как только он есть.
+      if (ev.client_id && ev.client_id === this._stoppedClientId && ev.client_id !== this.turnClientId) {
+        this.api("/jobs/" + ev.job_id + "/cancel", { method: "POST" }).catch(() => {});
+        return;
+      }
+      if (ev.client_id && this.turnClientId && ev.client_id !== this.turnClientId) return;
+      if (!this.streaming) return;
+      this.currentJobId = ev.job_id;
+      if (ev.kind) this.turnKind = ev.kind;
+      this._turnAccepted = true;
+      if (this._acceptTimer) { clearTimeout(this._acceptTimer); this._acceptTimer = null; }
+      // Ход запущен — запрос собран, дальше ждём модель (старый сервер status не шлёт).
+      if (this.turnStage === "preparing") this.turnStage = "waiting";
+      // «job» сервер шлёт ПОСЛЕ того, как сохранил реплику пользователя (или
+      // начал перегенерацию). Это первый момент, когда чат честно поднимается
+      // в списке: ждать «done» значило бы держать его на старом месте всю
+      // генерацию, а длинный ответ идёт минуту.
+      this.notifyChatListChanged(this.sessionId);
     },
-    async finishStream() {
-      // Ошибку показывает баннер, остановку человек нажал сам — «получен»
-      // только про ответ, который дописан.
-      const answered = !this.chatError && !this._userStopped;
+    // Сервер не стал запускать второй ход: в чате уже идёт ответ (соседняя
+    // вкладка, Telegram, ответ после F5). На тот ход он уже подписал сокет —
+    // показываем его. Своя реплика не сохранена: возвращаем текст в поле ввода.
+    _onBusy(ev) {
+      if (ev.client_id && this.turnClientId && ev.client_id !== this.turnClientId) return;
+      this._clearTurnTimers();
+      const text = this._turnSendText;
+      this._turnSendText = "";
+      this.messages = this.messages.filter((m) => m.id !== "tmp");
+      if (text && !this.input.trim()) this.input = text;
+      this.currentReply = "";
+      this.currentThought = "";
+      this.liveBubbles = [];
+      this.currentJobId = ev.job_id || null;
+      this.turnKind = ev.kind || "";
+      this.turnStage = "waiting";
+      this.turnSid = this.sessionId;
+      this.streamKind = "";
+      this._turnAccepted = true;
+      this._turnSig = this._replySig();
+      if (!this.streaming) this.streaming = true;
+      this.showToast(text
+        ? "В этом чате уже идёт ответ — показываю его. Ваш текст вернулся в поле ввода"
+        : "В этом чате уже идёт ответ — показываю его");
+    },
+    // Конец хода. Идемпотентен: второй «done» того же хода (сокет и SSE, шина,
+    // сторож, проверка после «Стоп») ничего не делает — раньше каждый вызов
+    // заново перечитывал ленту и выбрасывал второй тост.
+    async finishStream(jobId) {
+      if (!this.streaming) return;
+      const jid = (typeof jobId === "string" && jobId) || this.currentJobId;
+      if (jid) this._jobMark("_doneJobs", jid);
+      this._clearTurnTimers();
+      if (this._sse) { try { this._sse.close(); } catch (e) {} this._sse = null; }
+      const stopped = this._userStopped;
+      const failed = this._turnFailed;
       this._userStopped = false;
+      this._turnFailed = false;
       const append = this._appendText;
       this._appendText = null;
+      const sig = this._turnSig;
+      const restore = this._turnSendText;
+      this._turnSendText = "";
+      const floor = this._turnFloor || 0;
       this._genSeq = (this._genSeq || 0) + 1;   // ответ закончился (см. stop)
       this.streamKind = "";
       this.streaming = false;
       this.currentJobId = null;
+      this.turnSid = null;
+      this.turnStage = "";
+      this.turnClientId = "";
       this.processingNote = false;
       this.groupWaiting = 0;
       // Сервер — источник истины: перечитываем сообщения (там уже новый ответ/свайп).
       const sid = this.sessionId;
-      await this.loadMessages();
+      if (sid) delete this.processingChats[sid];
+      // Сбой перечитки не должен обрывать конец хода: раньше исключение здесь
+      // пропускало обновление списка, звук и тост.
+      try { await this.loadMessages(); } catch (e) {}
       // Ответ разобран на сервере — открытая «Хроника» перечитает состояние.
       this.horaeTick += 1;
       this._horaeRecheck();
@@ -3086,8 +3827,27 @@ createApp({
       // возвращаем в поле ввода.
       if (append && this.sessionId !== sid) { this.input = append; return; }
       if (append) return this._applyAppend(append);
+      if (this.sessionId !== sid) return;
+      // Реплика так и не сохранилась (ход не стартовал, сервер не подтвердил,
+      // остановили до сохранения) — текст возвращаем в поле ввода, а не теряем.
+      if (restore && !this.input.trim()
+          && !this.messages.some((m) => m.role === "user" && typeof m.id === "number" && m.id > floor)) {
+        this.input = restore;
+      }
+      // «Ответ получен» — только если ответ правда появился: новый последний
+      // ответ ассистента, ход не остановлен и без ошибки.
+      const last = this.messages[this.messages.length - 1];
+      const fresh = !!last && last.role === "assistant" && this._replySig() !== sig;
+      const answered = fresh && !this.chatError && !stopped && !failed;
+      this.liveStatus = answered ? "Ответ получен"
+        : this.chatError ? "Ошибка генерации: " + this.chatError
+        : stopped ? "Ответ остановлен" : "Ответ не получен";
+      if (!answered) return;
+      // Вкладка в фоне: тост никто не увидит — нужен заголовок и системное
+      // уведомление (то же, что для других чатов; по job_id без дублей с шиной).
+      if (document.hidden) { this._notifyReply(sid, { job_id: jid, ok: true }); return; }
       if (this.soundOn) this.playChime();
-      if (answered) this.showToast("✅ Ответ получен", () => this._scrollToLastReply());
+      this.showToast("✅ Ответ получен", () => this._scrollToLastReply());
     },
     // Дописать к запросу, пока модель отвечает: Enter во время генерации.
     // Идущий ответ останавливается (дальше токены не тратятся), а когда
@@ -3163,6 +3923,8 @@ createApp({
         o.onended = () => ctx.close();
       } catch (e) {}
     },
+    // Следить за ходом по SSE: HTTP-отправка с файлами (сокет на неё не
+    // подписан), чужой ход открытого чата, старый сервер после обрыва сокета.
     resumeSSE(jobId) {
       if (this._sse) { try { this._sse.close(); } catch (e) {} this._sse = null; }
       // SSE отдаёт НАКОПЛЕННЫЙ буфер целиком — сбрасываем live-текст,
@@ -3170,19 +3932,38 @@ createApp({
       this.currentReply = "";
       this.currentThought = "";
       this.liveBubbles = [];
-      const es = (this._sse = new EventSource("/sse/job/" + jobId));
+      const q = this._sseQuery();
+      const es = (this._sse = new EventSource("/sse/job/" + jobId + (q ? "?" + q : "")));
       es.onmessage = (e) => {
-        const ev = JSON.parse(e.data);
-        this.onWsEvent(ev);
-        if (ev.type === "done" || ev.type === "error") { es.close(); this._sse = null; }
+        if (this._sse !== es) { try { es.close(); } catch (_) {} return; }
+        let ev; try { ev = JSON.parse(e.data); } catch (_) { return; }
+        this.onWsEvent(ev, "sse");
+        // Новый сервер после error досылает done — закрываемся по done (или по
+        // error старого сервера: у него done после ошибки нет).
+        if (ev.type === "done" || (ev.type === "error" && !ev.job_id)) {
+          try { es.close(); } catch (_) {}
+          if (this._sse === es) this._sse = null;
+        }
       };
-      es.onerror = () => {
-        // Задача уже завершена и очищена (404) или SSE недоступен: ответ, если он
-        // родился, давно сохранён в БД — перечитываем её и разблокируем интерфейс,
-        // вместо того чтобы вечно крутить «печатает…».
+      es.onerror = async () => {
         try { es.close(); } catch (e) {}
+        if (this._sse !== es) return;
         this._sse = null;
-        if (this.streaming) this.finishStream();
+        if (!this.streaming || this.currentJobId !== jobId) return;
+        // Раньше любой сбой потока гасил ход, хотя сервер мог ещё отвечать.
+        // Теперь спрашиваем: ход жив — переподписываемся, нет — ответ уже в базе.
+        const sid = this.sessionId;
+        const r = await this._fetchActiveJob(sid);
+        if (!this.streaming || this.currentJobId !== jobId || sid !== this.sessionId) return;
+        if (r && r.job && r.job.job_id === jobId) {
+          // Живой сокет при переподключении сам подпишется на ход чата.
+          if (this.ws && this.ws.readyState === 1) { this.connectWs(); return; }
+          setTimeout(() => {
+            if (this.streaming && this.currentJobId === jobId && !this._sse) this.resumeSSE(jobId);
+          }, 3000);
+          return;
+        }
+        this.finishStream(jobId);
       };
     },
     // Авторесайз поля ввода под содержимое (до max-height из CSS, дальше — скролл).
@@ -3290,12 +4071,13 @@ createApp({
         type: a.type, mime: a.mime, name: a.name, size: a.size, data: a.data, preview: a.preview,
       }));
       this.messages.push({ id: "tmp", role: "user", content, attachments: displayAtts, swipes: [content], active_swipe: 0, created_at: new Date().toISOString() });
-      this.currentReply = "";
-      this.currentThought = "";
-      this.liveBubbles = [];
-      this.streaming = true;
-      this.streamKind = this.currentIsGroup ? "" : "send";
-      this._lastEvtAt = Date.now();
+      const clientId = this._beginTurn(this.currentIsGroup ? "" : "send");
+      // HTTP-ход (файлы): до ответа сервера job_id нет, а WS-стоп отменил бы
+      // ход ЧАТА — возможно, чужой (соседняя вкладка). См. stop().
+      this._turnHttp = bigList.length > 0 || attachments.length > 0;
+      // Текст реплики — на случай, если она не сохранится (сервер не подтвердил,
+      // ход не стартовал, «в чате уже идёт ответ»): finishStream вернёт его в поле.
+      this._turnSendText = content;
       this.input = "";
       this.pendingAttachments = [];
       this.replyToId = null;
@@ -3314,51 +4096,108 @@ createApp({
         fd.append("payload", JSON.stringify({
           content, attachments: metas, params: this.params, reply_to_message_id: replyTo,
         }));
-        for (const a of bigList) fd.append("files", attFiles[a.id], a.name || "file");
+        // Файлы из очереди убираем, но держим под рукой: на 409 («в чате уже
+        // идёт ответ») реплика не сохранена, и вложения возвращаются в поле.
+        const bigFiles = {};
+        for (const a of bigList) { fd.append("files", attFiles[a.id], a.name || "file"); bigFiles[a.id] = attFiles[a.id]; }
         for (const a of bigList) delete attFiles[a.id];
-        this._postWithProgress("/sessions/" + sid + "/send_form", fd).then((r) => {
-          this.currentJobId = r.job_id;
-          this.processingNote = true; // файл на сервере — дальше работает нейросеть
-          // HTTP-ход не получает события «job» по сокету: реплика сохранена,
-          // когда сервер вернул job_id, — здесь чат и поднимается в списке.
-          this.notifyChatListChanged(this.sessionId);
-          this.resumeSSE(r.job_id);
-        }).catch((e) => {
-          this.chatError = "Не удалось отправить файл: " + e.message;
-          this.finishStream();
-        });
+        this._postWithProgress("/sessions/" + sid + "/send_form", fd)
+          .then((r) => this._onHttpTurnStarted(sid, clientId, r))
+          .catch((e) => this._onHttpTurnFailed(sid, clientId, e, "Не удалось отправить файл: ", { content, pend, bigFiles }));
       } else if (attachments.length) {
         // Вложения (особенно аудио/видео) не влезают в WebSocket-кадр (~16 МБ) —
         // отправляем ход по HTTP с ПРОГРЕССОМ загрузки, ответ слушаем по SSE.
         this._postWithProgress("/sessions/" + sid + "/send", {
           content, attachments, params: this.params, reply_to_message_id: replyTo,
-        }).then((r) => {
-          this.currentJobId = r.job_id;
-          this.processingNote = true;
-          this.notifyChatListChanged(this.sessionId);
-          this.resumeSSE(r.job_id);
-        }).catch((e) => {
-          this.chatError = "Не удалось отправить вложение: " + e.message;
-          this.finishStream();
-        });
+        })
+          .then((r) => this._onHttpTurnStarted(sid, clientId, r))
+          .catch((e) => this._onHttpTurnFailed(sid, clientId, e, "Не удалось отправить вложение: ", { content, pend, bigFiles: {} }));
       } else {
-        this.ws.send(JSON.stringify({
+        this._wsSend({
           type: "user_message", content,
           attachments, params: this.params,
           reply_to_message_id: replyTo,
-        }));
+          client_id: clientId,
+        });
+        this._armAccept(clientId);
       }
+    },
+    // HTTP-ход (файлы) принят: сервер вернул job_id. Загрузка могла идти
+    // минутами — за это время человек мог уйти в другой чат или остановить
+    // ход. Раньше ответ сервера вешался на тот чат, что открыт СЕЙЧАС.
+    _onHttpTurnStarted(sid, clientId, r) {
+      const jobId = r && r.job_id;
+      const current = this.streaming && sid === this.sessionId && clientId === this.turnClientId;
+      if (!current) {
+        if (jobId) {
+          // Остановили, пока файл грузился: id появился только сейчас — отменяем.
+          if (clientId === this._stoppedClientId) {
+            this.api("/jobs/" + jobId + "/cancel", { method: "POST" }).catch(() => {});
+          } else {
+            this._noteBackgroundJob(sid, jobId);   // ушли в другой чат — ответ отследим в фоне
+          }
+        }
+        this.notifyChatListChanged(sid);
+        return;
+      }
+      if (!jobId) { this.finishStream(); return; }
+      this.currentJobId = jobId;
+      this._turnAccepted = true;
+      if (this.turnStage === "preparing") this.turnStage = "waiting";
+      this.processingNote = true; // файл на сервере — дальше работает нейросеть
+      // HTTP-ход не получает события «job» по сокету: реплика сохранена,
+      // когда сервер вернул job_id, — здесь чат и поднимается в списке.
+      this.notifyChatListChanged(this.sessionId);
+      this.resumeSSE(jobId);
+      // «Стоп» нажали во время загрузки, когда id ещё не было: отменяем сейчас.
+      if (this._userStopped) this.api("/jobs/" + jobId + "/cancel", { method: "POST" }).catch(() => {});
+    },
+    _onHttpTurnFailed(sid, clientId, e, prefix, back) {
+      const current = this.streaming && sid === this.sessionId && clientId === this.turnClientId;
+      if (e && e.status === 409) {
+        // В чате уже идёт ответ: реплика не сохранена. Возвращаем текст и файлы
+        // в поле ввода, а сами показываем идущий ход.
+        if (!current) { this.showToast("⚠ В чате " + this._chatName(sid) + " уже шёл ответ — сообщение не отправлено"); return; }
+        this.messages = this.messages.filter((m) => m.id !== "tmp");
+        if (!this.input.trim()) this.input = back.content || "";
+        if (!this.pendingAttachments.length && back.pend && back.pend.length) {
+          this._attFiles = Object.assign(this._attFiles || {}, back.bigFiles || {});
+          this.pendingAttachments = back.pend;
+        }
+        this._turnSendText = "";
+        this.showToast("В этом чате уже идёт ответ — показываю его. Ваше сообщение вернулось в поле ввода");
+        if (e.jobId) {
+          this.currentJobId = e.jobId;
+          this.streamKind = "";
+          this.turnStage = "waiting";
+          this._turnAccepted = true;
+          this._turnSig = this._replySig();
+          this.resumeSSE(e.jobId);
+        } else {
+          this._turnFailed = true;
+          this.finishStream();
+        }
+        return;
+      }
+      // Загрузку прервал сам человек кнопкой «Стоп» — это не ошибка.
+      if (current && this._userStopped) { this.finishStream(); return; }
+      const msg = prefix + ((e && e.message) || "ошибка");
+      if (!current) { this.showToast("⚠ " + msg + " (чат " + this._chatName(sid) + ")", () => this._openById(sid)); return; }
+      this.chatError = msg;
+      this._turnFailed = true;
+      this.finishStream();
+    },
+    // Свой ход ушёл в фон (сменили чат до ответа сервера). С шиной о конце
+    // скажет turn_done; без неё — отдельный SSE по job_id, как раньше.
+    _noteBackgroundJob(sid, jobId) {
+      if (!this.processingChats[sid]) this.processingChats[sid] = { job_id: jobId, kind: "send", stage: "waiting" };
+      if (!this._busAlive) this._trackBackgroundJob(sid, jobId);
     },
     regenerate() {
       if (!this.connected || this.streaming) return;
-      this.streamKind = "";
-      this.chatError = "";
-      this.currentReply = "";
-      this.currentThought = "";
-      this.liveBubbles = [];
-      this.streaming = true;
-      this._lastEvtAt = Date.now();
-      this.ws.send(JSON.stringify({ type: "regenerate", params: this.params }));
+      const clientId = this._beginTurn("");
+      this._wsSend({ type: "regenerate", params: this.params, client_id: clientId });
+      this._armAccept(clientId);
     },
     // Повторить последний ход: если ответ так и не родился (ошибка/обрыв/остановка) —
     // сервер сгенерирует его заново БЕЗ дублирования реплики пользователя;
@@ -3370,42 +4209,73 @@ createApp({
       // новый свайп к уже данному ответу — нет (удалился бы весь ответ со свайпами).
       const last = this.messages[this.messages.length - 1];
       const hanging = !this.currentIsGroup && last && last.role === "user" && typeof last.id === "number";
-      this.streamKind = hanging ? "retry" : "";
       if (hanging) { this._turnFloor = last.id - 1; this._turnText = last.content || ""; }
-      this.chatError = "";
-      this.currentReply = "";
-      this.currentThought = "";
-      this.liveBubbles = [];
-      this.streaming = true;
-      this._lastEvtAt = Date.now();
+      const clientId = this._beginTurn(hanging ? "retry" : "");
       // Строгое сравнение: из шаблона метод зовут как обработчик клика,
       // и первым аргументом прилетает MouseEvent (он truthy).
       const params = (useFallback === true && this.fallbackModel)
         ? { ...this.params, model: this.fallbackModel }
         : this.params;
-      this.ws.send(JSON.stringify({ type: "retry", params }));
+      this._wsSend({ type: "retry", params, client_id: clientId });
+      this._armAccept(clientId);
       if (this.sendScroll) this.scrollDown();
     },
     stop() {
       if (!this.streaming) return;
+      // Одна отмена на одно нажатие. Раньше уходили две (HTTP и WS): вторая
+      // прилетала, когда сервер уже сохранял ответ, рвала сохранение — ход
+      // висел до перезапуска сервера, а с ним и запертая на запись база.
+      if (this._userStopped) return;
       this._userStopped = true;
-      // Отмена по id задачи (HTTP) работает и для WS-, и для HTTP-хода (SSE);
-      // сервер отменит генерацию и пришлёт done. WS-стоп — как запасной путь.
-      if (this.currentJobId) {
-        this.api("/jobs/" + this.currentJobId + "/cancel", { method: "POST" }).catch(() => {});
-      }
-      if (this.ws && this.connected) {
-        this.ws.send(JSON.stringify({ type: "stop" }));
-        // Если done потерялся (сокет умер молча) — разблокируемся сами. Только
-        // если идёт всё тот же ответ: «дописать» к этому моменту уже мог
-        // запустить новый, и таймер оборвал бы его на экране.
-        const gen = this._genSeq || 0;
-        setTimeout(() => { if (this.streaming && (this._genSeq || 0) === gen) this.finishStream(); }, 4000);
-      } else {
-        // Соединения нет: просто снимаем блокировку и перечитываем БД
+      this._stoppedClientId = this.turnClientId;
+      const jid = this.currentJobId;
+      if (jid) {
+        // Отмена по id работает и для WS-, и для HTTP-хода (SSE). Не дошла
+        // (сеть моргнула) — «Стоп» снова доступен, иначе он молчал бы до конца хода.
+        this.api("/jobs/" + jid + "/cancel", { method: "POST" }).catch(() => {
+          if (this.currentJobId !== jid) return;
+          this._userStopped = false;
+          this.showToast("Не удалось остановить ответ — нажмите «Стоп» ещё раз");
+        });
+      } else if (this._turnHttp) {
+        // HTTP-ход без id: файл ещё грузится — прерываем загрузку (реплика не
+        // дойдёт до сервера); уже загружен — отменим по id, как только сервер
+        // его вернёт (_onHttpTurnStarted).
+        if (this.uploadProgress && this._uploadXhr) { try { this._uploadXhr.abort(); } catch (e) {} return; }
+      } else if (this.ws && this.connected) {
+        // id ещё нет (сервер готовит запрос) — WS-стоп отменит ход ЧАТА.
+        try { this.ws.send(JSON.stringify({ type: "stop" })); } catch (e) {}
+      } else if (!this.uploadProgress) {
+        // Ни id, ни соединения: снимаем блокировку и перечитываем БД
         // (частичный ответ, если был, сервер уже сохранил).
         this.finishStream();
+        return;
       }
+      // Раньше через 4 с ход гасился вслепую — даже если сервер в это время
+      // сохранял ответ. Теперь через 6 с спрашиваем сервер: хода нет — конец,
+      // есть (стадия saving) — ждём его done.
+      const gen = this._genSeq || 0;
+      if (this._stopTimer) clearTimeout(this._stopTimer);
+      this._stopTimer = setTimeout(() => this._afterStop(gen), 6000);
+    },
+    async _afterStop(gen) {
+      this._stopTimer = null;
+      const same = () => this.streaming && (this._genSeq || 0) === gen;
+      if (!same()) return;
+      const sid = this.sessionId;
+      const r = await this._fetchActiveJob(sid);
+      if (!same() || sid !== this.sessionId) return;
+      // Хода нет — или сервер старый и спросить нельзя (там прежнее поведение).
+      if (!r || !r.job) { this.finishStream(); return; }
+      if (!this.currentJobId || r.job.stage !== "saving") {
+        // WS-стоп пришёл раньше, чем ход стартовал, или отмена потерялась по
+        // дороге — отменяем по id ещё раз. На новом сервере отмена
+        // идемпотентна, повтор ничего не порвёт.
+        this.currentJobId = r.job.job_id;
+        this.api("/jobs/" + r.job.job_id + "/cancel", { method: "POST" }).catch(() => {});
+      }
+      this._applyStatus(r.job);
+      this._stopTimer = setTimeout(() => this._afterStop(gen), 6000);
     },
 
     // ---------- Действия над сообщениями ----------
@@ -3446,18 +4316,39 @@ createApp({
       if (e.key === "Escape") { e.preventDefault(); this.editingId = null; return; }
       if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); this.saveEdit(); }
     },
+    // Правка и удаление: пока запрос идёт, кнопка показывает «…» и не жмётся
+    // повторно; сбой — тостом. Раньше ошибок не ловили вовсе, и на занятом
+    // сервере нажатие выглядело как «ничего не происходит, всё зависло».
     async saveEdit() {
-      await this.api("/messages/" + this.editingId, { method: "PATCH", body: JSON.stringify({ content: this.editingText }) });
-      this.editingId = null;
-      this.loadMessages();
-      this.notifyChatListChanged(this.sessionId);   // правка последней реплики меняет превью
+      const id = this.editingId;
+      if (id == null || this.busyMsg[id]) return;
+      this.busyMsg[id] = "edit";
+      try {
+        await this.api("/messages/" + id, { method: "PATCH", body: JSON.stringify({ content: this.editingText }) });
+        if (this.editingId === id) this.editingId = null;
+        this.loadMessages().catch(() => {});
+        this.notifyChatListChanged(this.sessionId);   // правка последней реплики меняет превью
+      } catch (e) {
+        // Правка остаётся открытой: текст не теряется, можно нажать ещё раз.
+        this.showToast("⚠ Не удалось сохранить правку: " + e.message);
+      } finally {
+        delete this.busyMsg[id];
+      }
     },
     async deleteMessage(msg) {
+      if (this.busyMsg[msg.id]) return;
       if (!(await this.askConfirm("Удалить сообщение?", { okText: "Удалить" }))) return;
-      await this.api("/messages/" + msg.id, { method: "DELETE" });
-      this.loadMessages();
-      // Удалили последнюю реплику — у чата сменились превью, время и место в списке.
-      this.notifyChatListChanged(this.sessionId);
+      this.busyMsg[msg.id] = "del";
+      try {
+        await this.api("/messages/" + msg.id, { method: "DELETE" });
+        this.loadMessages().catch(() => {});
+        // Удалили последнюю реплику — у чата сменились превью, время и место в списке.
+        this.notifyChatListChanged(this.sessionId);
+      } catch (e) {
+        this.showToast("⚠ Не удалось удалить сообщение: " + e.message);
+      } finally {
+        delete this.busyMsg[msg.id];
+      }
     },
     // Скопировать текст сообщения в буфер обмена одной кнопкой.
     async copyMessage(m) {
@@ -3956,14 +4847,9 @@ createApp({
     // ---------- Функция «Продолжить» ----------
     continueReply() {
       if (!this.connected || this.streaming) return;
-      this.streamKind = "";
-      this.chatError = "";
-      this.currentReply = "";
-      this.currentThought = "";
-      this.liveBubbles = [];
-      this.streaming = true;
-      this._lastEvtAt = Date.now();
-      this.ws.send(JSON.stringify({ type: "continue", params: this.params }));
+      const clientId = this._beginTurn("");
+      this._wsSend({ type: "continue", params: this.params, client_id: clientId });
+      this._armAccept(clientId);
     },
 
     // ---------- Фон чата ----------
@@ -5317,6 +6203,8 @@ createApp({
       await Promise.all([this.loadCharacters(), this.loadPersonas(), this.loadHorae(),
         this.loadGroups(), this.loadFriends(), this.loadAllSessions()]);
       this._safetyHint();
+      // Метки «пришёл ответ» из прошлого визита (пользователь уже известен).
+      this._loadPendingChats();
       // Восстанавливаем последний открытый чат (после F5 сразу можно писать);
       // если не вышло — показываем блок быстрого старта, а не открываем первого
       // персонажа молча: раньше это создавало чат как побочный эффект запуска.
@@ -5337,16 +6225,11 @@ createApp({
       }
       // Сторож зависшего стриминга. Полуоткрытый TCP (удалённый сервер, NAT) не даёт
       // onclose: сокет «жив», но события не приходят — «печатает…» висит вечно, хотя
-      // ответ давно сохранён на сервере. Если 45с тишины — дослушиваем задачу через
-      // SSE (он отдаёт весь накопленный буфер), а без job_id просто перечитываем БД.
+      // ответ давно сохранён на сервере. Что делать при тишине — см. _watchdogTick.
       clearInterval(this._streamWatchdog);
-      this._streamWatchdog = setInterval(() => {
-        if (!this.streaming) return;
-        if (Date.now() - (this._lastEvtAt || 0) < 45000) return;
-        this._lastEvtAt = Date.now();
-        if (this.currentJobId) this.resumeSSE(this.currentJobId);
-        else this.finishStream();
-      }, 15000);
+      this._streamWatchdog = setInterval(() => this._watchdogTick(), 10000);
+      // Шина ходов всех чатов: «идёт ответ» в списке и уведомления о готовых.
+      this._connectEvents();
       // Esc закрывает верхний оверлей — как ожидают от десктопного приложения.
       this._bindWake();
       if (!this._escBound) {
@@ -5436,6 +6319,20 @@ createApp({
       if (k !== v) this.params.files_window = k;
     },
     soundOn(v) { localStorage.setItem("soundOn", v ? "1" : "0"); },
+    notifySystem(v) { try { localStorage.setItem("notifySystem", v ? "1" : "0"); } catch (e) { /* приватный режим */ } },
+    pendingChats: {
+      handler(v) {
+        // До загрузки сохранённых меток не пишем: пустой массив data() затёр бы их.
+        if (!this._pendingLoaded) return;
+        try { localStorage.setItem(this._pendingKey(), JSON.stringify(v.slice(-200))); } catch (e) {}
+      },
+      deep: true,
+    },
+    // «(N) TaleEngine»: сколько ответов пришло, пока вкладка была в фоне.
+    titleUnread(n) {
+      const base = this._baseTitle || "TaleEngine";
+      document.title = n > 0 ? "(" + n + ") " + base : base;
+    },
     streamFollow(v) { try { localStorage.setItem("streamFollow", v ? "1" : "0"); } catch (e) { /* приватный режим */ } },
     sendScroll(v) { try { localStorage.setItem("sendScroll", v ? "1" : "0"); } catch (e) { /* приватный режим */ } },
     mediaAutoFloat(v) {
@@ -5466,10 +6363,19 @@ createApp({
     },
 
     // Объявляем этапы хода, а не токены.
+    // Итог хода («получен», «остановлен», ошибка) объявляет finishStream: он
+    // один знает, появился ли ответ на самом деле.
     streaming(on) {
-      this.liveStatus = on ? "Генерация ответа началась" : "Ответ получен";
+      if (on) this.liveStatus = "Генерация ответа началась";
       if (on) this._startTelemetry();
       else this._stopTelemetry();
+      // Время в индикаторе хода тикает раз в секунду — только пока ход идёт.
+      clearInterval(this._turnTicker);
+      this._turnTicker = null;
+      if (on) {
+        this.turnNow = Date.now();
+        this._turnTicker = setInterval(() => { this.turnNow = Date.now(); }, 1000);
+      }
     },
     // Полоса заполнения окна должна относиться к ОТКРЫТОМУ чату, иначе она
     // показывала бы вес предыдущего.
@@ -5579,6 +6485,14 @@ createApp({
     this.adminPassword = localStorage.getItem("adminPassword") || "";
     this.userToken = localStorage.getItem("userToken") || "";
     this.soundOn = localStorage.getItem("soundOn") !== "0";
+    // Системные уведомления включены, только если разрешение всё ещё есть:
+    // его могли отозвать в настройках браузера между визитами.
+    try {
+      this.notifySystem = localStorage.getItem("notifySystem") === "1"
+        && typeof Notification !== "undefined" && Notification.permission === "granted";
+    } catch (e) { this.notifySystem = false; }
+    this._baseTitle = document.title || "TaleEngine";
+    document.addEventListener("visibilitychange", this._onTabVisible);
     this.streamFollow = localStorage.getItem("streamFollow") === "1";
     this.sendScroll = localStorage.getItem("sendScroll") === "1";
     this.mediaAutoFloat = localStorage.getItem("mediaAutoFloat") !== "0";
@@ -5819,8 +6733,11 @@ createApp({
             <button type="button" class="row-main" @click="openChatRow(s)"
                     :title="s.title + ' — чат #' + s.id"
                     :aria-current="s.id === sessionId ? 'true' : null"
-                    :aria-label="(s.kind === 'group' ? 'Группа ' : s.kind === 'shared' ? 'Общий чат ' : 'Чат ') + s.title + (s.character_name ? ', ' + s.character_name : '') + (s.pinned ? ', закреплён' : '') + (pendingChats.includes(s.id) ? ', пришёл новый ответ' : '') + (s.last_at ? ', ' + shortWhen(s.last_at) : '')">
-              <span v-if="pendingChats.includes(s.id)" class="reply-dot" aria-hidden="true"></span>
+                    :aria-label="(s.kind === 'group' ? 'Группа ' : s.kind === 'shared' ? 'Общий чат ' : 'Чат ') + s.title + (s.character_name ? ', ' + s.character_name : '') + (s.pinned ? ', закреплён' : '') + (chatBusy(s.id) ? ', идёт ответ' : '') + (pendingChats.includes(s.id) ? ', пришёл новый ответ' : '') + (s.last_at ? ', ' + shortWhen(s.last_at) : '')">
+              <!-- «Идёт ответ» — пульсирующее кольцо, «пришёл ответ» — сплошная
+                   точка: два состояния различаются формой, а не только цветом. -->
+              <span v-if="chatBusy(s.id)" class="proc-dot" aria-hidden="true" title="Идёт ответ"></span>
+              <span v-else-if="pendingChats.includes(s.id)" class="reply-dot" aria-hidden="true"></span>
               <span class="grow row-text">
                 <span class="row-title">
                   <span v-if="s.pinned" class="pin-mark" aria-hidden="true">📌</span>
@@ -6045,7 +6962,8 @@ createApp({
                 <span class="muted edit-hint">Ctrl+Enter — сохранить · Esc — отмена</span>
                 <div style="flex:1"></div>
                 <button @click="editingId = null">Отмена</button>
-                <button class="btn-primary" @click="saveEdit">Сохранить</button>
+                <button class="btn-primary" @click="saveEdit" :disabled="!!busyMsg[m.id]"
+                        :aria-busy="busyMsg[m.id] === 'edit' ? 'true' : null">{{ busyMsg[m.id] === 'edit' ? 'Сохраняю…' : 'Сохранить' }}</button>
               </div>
             </div>
             <!-- ответ ИИ + плашка документа (ответ-Канвас) -->
@@ -6146,7 +7064,9 @@ createApp({
               <button v-if="!m.canvas_id" class="btn-icon" @click="startEdit(m)" title="Редактировать" aria-label="Редактировать">✎</button>
               <button v-if="!m.canvas_id && m.role === 'assistant' && m.id === lastAssistantId" class="btn-icon"
                       @click="regenerate" title="Перегенерировать" aria-label="Перегенерировать">↻</button>
-              <button class="btn-icon" @click="deleteMessage(m)" title="Удалить" aria-label="Удалить">🗑</button>
+              <button class="btn-icon" @click="deleteMessage(m)" :disabled="!!busyMsg[m.id]"
+                      :aria-busy="busyMsg[m.id] === 'del' ? 'true' : null"
+                      :title="busyMsg[m.id] === 'del' ? 'Удаляю…' : 'Удалить'" aria-label="Удалить">{{ busyMsg[m.id] === 'del' ? '…' : '🗑' }}</button>
               <!-- Одна кнопка-переключатель, а не пара «⋯»/«✕» с разными
                    элементами: у пары aria-expanded навсегда застывал в «false», и
                    о раскрытом состоянии скринридер не узнавал ничем. Кнопки нет,
@@ -6324,10 +7244,14 @@ createApp({
           <i v-if="uploadProgress.total"> ({{ fmtSize(uploadProgress.loaded) }} из {{ fmtSize(uploadProgress.total) }})</i>
           <span class="upload-track"><span class="upload-fill" :style="{ width: (uploadProgress.percent || 0) + '%' }"></span></span>
         </div>
-        <!-- Файл уже на сервере — идёт передача нейросети и обработка (до первого токена) -->
-        <div v-else-if="processingNote && streaming && !currentReply && !currentThought && !liveBubbles.length"
-             class="art-indicator files-bar">
-          📡 Файл загружен на сервер — нейросеть получает и обрабатывает его… Большие файлы обрабатываются до нескольких минут.
+        <!-- Индикатор хода: виден на всех стадиях, кроме самой печати ответа
+             (там индикатор — курсор в пузыре). Раньше до первого токена был
+             только пустой пузырь, и минута ожидания модели выглядела как
+             зависание. Время тикает от начала хода, «Стоп» доступен всегда. -->
+        <div v-else-if="turnStageLabel" class="art-indicator turn-stage" :class="'stage-' + turnStage">
+          <span class="stage-dot" aria-hidden="true"></span>
+          <span class="stage-text">{{ turnStageLabel }}</span>
+          <span v-if="processingNote && turnStage !== 'saving'" class="stage-note">Файл на сервере — большие файлы модель обрабатывает до нескольких минут.</span>
         </div>
         </div><!-- /.composer-bars -->
         <div class="row">
@@ -6532,8 +7456,12 @@ createApp({
           <label class="check"><input type="checkbox" v-model="sendScroll" /> Прокручивать вниз, когда отправляю сообщение или файлы</label>
           <label class="check"><input type="checkbox" v-model="streamFollow" /> Следовать за ответом, пока он пишется (только если я внизу)</label>
           <label class="check"><input type="checkbox" v-model="soundOn" /> Звук, когда ответ готов</label>
+          <!-- Не v-model: включение сначала спрашивает разрешение браузера, и
+               галочка встаёт, только если его дали (см. toggleNotifySystem). -->
+          <label class="check"><input type="checkbox" :checked="notifySystem" @change="toggleNotifySystem($event)" /> Системные уведомления, когда вкладка в фоне</label>
+          <p v-if="notifyHint" class="muted notify-hint" role="status">{{ notifyHint }}</p>
           <label v-if="hasDock" class="check"><input type="checkbox" v-model="mediaAutoFloat" /> Аудио и видео доигрывают в плавающем плеере, когда листаю ленту или открываю другой чат</label>
-          <p class="muted" style="margin:2px 0 10px">Выключено — лента стоит там, где вы читаете. Когда ответ готов — плашка «Ответ получен» (клик — к началу ответа). Вниз — кнопка ⤓ или клавиша End. Пока ответ пишется, можно дописать запрос: введите текст и нажмите Enter — ответ начнётся заново с учётом дописанного.</p>
+          <p class="muted" style="margin:2px 0 10px">Выключено — лента стоит там, где вы читаете. Когда ответ готов — плашка «Ответ получен» (клик — к началу ответа). Вниз — кнопка ⤓ или клавиша End. Пока ответ пишется, можно дописать запрос: введите текст и нажмите Enter — ответ начнётся заново с учётом дописанного. Ответ в другом чате или в свёрнутой вкладке отмечается точкой в списке чатов, плашкой и числом в заголовке вкладки; системное уведомление — только когда вкладка в фоне.</p>
           <div class="hr"></div>
           <h3>Параметры генерации</h3>
           <label>Модель <input v-model="params.model" list="models-list" placeholder="как в прокси" />

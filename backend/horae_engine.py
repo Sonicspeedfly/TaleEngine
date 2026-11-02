@@ -808,16 +808,29 @@ def covered_pointer(entries, summaries, snapshot_pointer: int) -> int:
 # ---------------------------------------------------------------------------
 # Удаление сообщений / чата, ветка
 # ---------------------------------------------------------------------------
-async def on_messages_deleted(db, session_id: int, deleted_ids: list[int]) -> None:
+async def on_messages_deleted(db, session_id: int, deleted_ids: list[int], locked: bool = False) -> None:
     """
     После удаления сообщений: свёртки, чей диапазон доходит до удалённого,
     снимаются (их текст пересказывает удалённое; дети, целиком старше,
     возвращаются), якоря правок и таблиц прижимаются к последнему id —
     SQLite выдаст удалённые id новым сообщениям, и те иначе сошли бы за
     «уже учтённые». Документы поиска удалённых сообщений — удаляются.
+
+    locked=True — вызывающий УЖЕ держит chat_lock(session_id) (замок не
+    реентерабелен). Брать замок надо ДО первой записи в базу: иначе эта
+    транзакция держит запись SQLite и ждёт замок, а его держатель ждёт запись
+    (busy timeout 30 с) — «database is locked» у всего приложения.
     """
     if not deleted_ids:
         return
+    if locked:
+        await _on_messages_deleted(db, session_id, deleted_ids)
+        return
+    async with chat_lock(session_id):
+        await _on_messages_deleted(db, session_id, deleted_ids)
+
+
+async def _on_messages_deleted(db, session_id: int, deleted_ids: list[int]) -> None:
     first = min(deleted_ids)
     await db.execute(sql_delete(models.HoraeMemoryDoc).where(
         models.HoraeMemoryDoc.session_id == session_id,
@@ -825,30 +838,29 @@ async def on_messages_deleted(db, session_id: int, deleted_ids: list[int]) -> No
     row = await db.get(models.HoraeChatState, session_id)
     if row is None:
         return
-    async with chat_lock(session_id):
-        data = await load_chat_data(db, session_id)
-        last = await last_message_id(db, session_id)
+    data = await load_chat_data(db, session_id)
+    last = await last_message_id(db, session_id)
 
-        def cascade(items: list) -> list:
-            out = []
-            for s in items:
-                if s.get("kind") != "carry" and _range(s)[1] >= first:
-                    out.extend(cascade(s.get("children") or []))
-                else:
-                    out.append(s)
-            return out
+    def cascade(items: list) -> list:
+        out = []
+        for s in items:
+            if s.get("kind") != "carry" and _range(s)[1] >= first:
+                out.extend(cascade(s.get("children") or []))
+            else:
+                out.append(s)
+        return out
 
-        data["summaries"] = cascade(data["summaries"])
-        for op in data["ops"]:
-            if int(op.get("at") or 0) > last:
-                op["at"] = last
-        for table in data.get("tables") or []:
-            if int(table.get("base_anchor") or 0) > last:
-                table["base_anchor"] = last
-        for overlay in (data.get("table_overlays") or {}).values():
-            if int(overlay.get("base_anchor") or 0) > last:
-                overlay["base_anchor"] = last
-        await save_chat_data(db, session_id, data)
+    data["summaries"] = cascade(data["summaries"])
+    for op in data["ops"]:
+        if int(op.get("at") or 0) > last:
+            op["at"] = last
+    for table in data.get("tables") or []:
+        if int(table.get("base_anchor") or 0) > last:
+            table["base_anchor"] = last
+    for overlay in (data.get("table_overlays") or {}).values():
+        if int(overlay.get("base_anchor") or 0) > last:
+            overlay["base_anchor"] = last
+    await save_chat_data(db, session_id, data)
 
 
 async def on_session_deleted(db, session_id: int) -> None:

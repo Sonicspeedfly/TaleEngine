@@ -68,12 +68,18 @@ async def test_safety_off_uses_threshold_off():
 @pytest.mark.asyncio
 async def test_safety_off_by_default_and_for_service_calls():
     """
-    Полная свобода по умолчанию: disable_safety=True в схеме → фильтры сняты даже
-    без явного флага. Служебные вызовы (params=None, напр. режиссёр) — тоже без фильтров.
+    По умолчанию — стандартный режим (disable_safety=False): пороги не передаём,
+    решает провайдер. Zero-Censorship включается в настройках и снимает фильтры.
+    Служебные вызовы (params=None, напр. режиссёр) — всегда без фильтров.
     """
     with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
         _ = [t async for t in stream_completion([{"role": "user", "content": "hi"}], GenerationParams())]
-    assert "safety_settings" in _fake_acompletion.captured  # дефолт = свобода
+    assert "safety_settings" not in _fake_acompletion.captured  # дефолт = стандартный режим
+
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
+        _ = [t async for t in stream_completion([{"role": "user", "content": "hi"}],
+                                                GenerationParams(disable_safety=True))]
+    assert "safety_settings" in _fake_acompletion.captured  # Zero-Censorship = свобода
 
     with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
         _ = [t async for t in stream_completion([{"role": "user", "content": "hi"}], None)]
@@ -239,7 +245,7 @@ async def test_reasoning_auto_boosts_for_files_when_safety_on():
 @pytest.mark.asyncio
 async def test_reasoning_not_auto_forced_when_zero_censorship():
     """
-    Zero-Censorship (disable_safety=True, ДЕФОЛТ): авто-thinking НЕ включаем даже
+    Zero-Censorship (disable_safety=True): авто-thinking НЕ включаем даже
     при файлах — иначе reasoning-модерация Gemini душит контент при snятых
     фильтрах. Регресс «обход цензуры сломался как будто».
     """
@@ -247,7 +253,7 @@ async def test_reasoning_not_auto_forced_when_zero_censorship():
     content = build_user_content("что на видео?", [att])
     with patch("backend.llm_gateway.litellm.acompletion", new=_fake_acompletion):
         _ = [t async for t in stream_completion(
-            [{"role": "user", "content": content}], GenerationParams()  # disable_safety=True по умолчанию
+            [{"role": "user", "content": content}], GenerationParams(disable_safety=True)
         )]
     assert "reasoning_effort" not in _fake_acompletion.captured
     # Но фильтры при этом сняты (safety_settings=OFF) — свобода на месте.

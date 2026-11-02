@@ -214,7 +214,8 @@ def test_debug_log_records_chat(client):
             for _ in range(50):
                 if ws.receive_json()["type"] in ("done", "error"):
                     break
-    log = client.get("/api/debug/log").json()
+    # Ответ — {"entries": [...], "scope", "can_see_all"} (изоляция лога по владельцу).
+    log = client.get("/api/debug/log").json()["entries"]
     assert any(e["kind"] == "chat" and e["status"] == "ok" for e in log)
     assert any("messages" in e for e in log)  # есть сводка по сообщениям
 
@@ -671,7 +672,7 @@ def test_empty_llm_response_is_explicit_error(client):
     # Ответа нет, но причина зафиксирована явно (не молчим).
     msgs = client.get(f"/api/sessions/{sid}/messages").json()
     assert [m["role"] for m in msgs] == ["user"]
-    log = client.get("/api/debug/log").json()
+    log = client.get("/api/debug/log").json()["entries"]
     entry = log[0]
     assert entry["status"] == "error"
     assert "ПУСТОЙ ответ" in entry["error"]

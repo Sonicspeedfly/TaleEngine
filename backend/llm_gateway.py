@@ -692,6 +692,49 @@ async def stream_completion(
             _last_stream_end = time.monotonic()
 
 
+class StreamStalled(RuntimeError):
+    """Модель замолчала посреди ответа дольше STREAM_IDLE_TIMEOUT."""
+
+
+async def _idle_guarded(response):
+    """
+    Чанки стрима с ограничением тишины МЕЖДУ ними (settings.STREAM_IDLE_TIMEOUT).
+
+    Таймаут LiteLLM — это таймаут одного чтения сокета; прокси, который держит
+    соединение и шлёт пустые keep-alive байты, под него не попадает, и ход висел
+    без конца без единого события. Первый чанк ждём без этого ограничения: до
+    него модель может долго читать файлы, а его уже ограничивают таймаут
+    запроса и повторы LiteLLM. Любой следующий чанк (текст, размышления, usage)
+    сбрасывает отсчёт.
+    """
+    it = response.__aiter__()
+    first = True
+    while True:
+        limit = settings.STREAM_IDLE_TIMEOUT
+        try:
+            if first or not limit or limit <= 0:
+                chunk = await it.__anext__()
+            else:
+                chunk = await asyncio.wait_for(it.__anext__(), limit)
+        except StopAsyncIteration:
+            return
+        except asyncio.TimeoutError:
+            raise StreamStalled(f"Модель замолчала на {limit} с — ответ оборван") from None
+        first = False
+        yield chunk
+
+
+async def _close_stream(response) -> None:
+    """Закрыть стрим модели явно (освобождает соединение с прокси), не дольше 2 с."""
+    close = getattr(response, "aclose", None)
+    if close is None:
+        return
+    try:
+        await asyncio.wait_for(close(), 2)
+    except Exception:  # noqa: BLE001 — закрытие best-effort, ошибка уже есть выше
+        pass
+
+
 async def _stream_once(
     messages: list[dict],
     params: Optional[GenerationParams] = None,
@@ -774,6 +817,7 @@ async def _stream_once(
         # расход токенов не виден вообще: считать «на глазок» по длине текста
         # бессмысленно (файлы, кэш и размышления так не посчитать).
         call_kwargs["stream_options"] = {"include_usage": True}
+    response = None
     try:
         try:
             response = await litellm.acompletion(**call_kwargs)
@@ -793,7 +837,7 @@ async def _stream_once(
         finish_reason = None
         thought_len = 0
         usage: dict = {}
-        async for chunk in response:
+        async for chunk in _idle_guarded(response):
             # usage приходит отдельным служебным чанком в самом конце стрима
             # (иногда — прицепом к последнему содержательному). Забираем и то, и то.
             usage = usage_stats.extract_usage(chunk) or usage
@@ -844,7 +888,16 @@ async def _stream_once(
             debug_log.finish(entry, "error", error=msg)
             raise RuntimeError(msg)
         debug_log.finish(entry, "ok", preview=text[:400])
+    except asyncio.CancelledError:
+        # Stop или потолок хода (backend/generation.py). Запись в отладке иначе
+        # висела бы «...» навсегда, а незакрытый стрим держал бы соединение с
+        # прокси (и генерацию у провайдера) до сборки мусора.
+        if entry.get("status") == "...":
+            debug_log.finish(entry, "error", error="Остановлено")
+        await _close_stream(response)
+        raise
     except Exception as exc:  # noqa: BLE001
+        await _close_stream(response)
         msg = str(exc)
         # Обрыв соединения на БОЛЬШОМ запросе — объясняем по-человечески: голое
         # «Connection error» не говорит, что прокси/провайдер оборвали связь

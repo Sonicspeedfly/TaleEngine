@@ -64,6 +64,7 @@ from backend import (
     models,
     native_io,
     telegram_runtime,
+    turn_events,
     usage_stats,
     user_memory,
 )
@@ -200,6 +201,14 @@ async def lifespan(app: FastAPI):
         except Exception:  # noqa: BLE001 — не мешаем старту веб-сервера
             pass
     yield
+    # Идущие ответы: останавливаем стрим (уже написанное сохранится) и даём
+    # сохранению закончиться — иначе asyncio.run отменил бы и саму запись.
+    running = generation_manager.active_jobs()
+    for job in running:
+        generation_manager.cancel(job.job_id)
+    if running:
+        await asyncio.gather(*(generation_manager.wait_done(j, 8) for j in running),
+                             return_exceptions=True)
     await media_refs.uploader.stop()
     await telegram_runtime.stop()
     # Даём фоновым задачам дозавершиться (обычно это быстрые чтения БД);
@@ -525,11 +534,17 @@ async def _backfill_fact_vectors(session_id: int) -> None:
 
 # ---- Колбэки сохранения ответа ассистента (после завершения генерации) ----
 # model_override приходит от менеджера генерации, если ответ дала ЗАПАСНАЯ модель.
+# Возвращают id сохранённого сообщения (None — сохранять было некуда): менеджер
+# кладёт его в 'done' и в уведомление «Ответ готов».
 def _make_persist_new(model_used: str):
     """Создаёт НОВОЕ сообщение ассистента (первый свайп = сам ответ)."""
 
-    async def cb(session_id: int, content: str, model_override: str | None = None) -> None:
+    async def cb(session_id: int, content: str, model_override: str | None = None) -> int | None:
         async with AsyncSessionLocal() as db:
+            # Чат удалили, пока шёл ответ: SQLite отдаст его id новому чату, и
+            # ответ «сироты» всплыл бы там.
+            if await db.get(models.ChatSession, session_id) is None:
+                return None
             # Служебные теги Horae — из текста в мету (в чате и истории их нет).
             clean, meta = await horae_engine.split_reply(db, session_id, content)
             msg = models.Message(
@@ -549,6 +564,7 @@ def _make_persist_new(model_used: str):
         _spawn_bg(horae_tasks.after_turn(session_id, [message_id]))
         if user_memory.schedule(session_id):
             _spawn_bg(user_memory.maybe_update(session_id))
+        return message_id
 
     return cb
 
@@ -556,11 +572,13 @@ def _make_persist_new(model_used: str):
 def _make_persist_swipe(message_id: int, model_used: str):
     """Добавляет новый вариант (свайп) к существующему ответу ассистента."""
 
-    async def cb(session_id: int, content: str, model_override: str | None = None) -> None:
+    async def cb(session_id: int, content: str, model_override: str | None = None) -> int | None:
         async with AsyncSessionLocal() as db:
             msg = await db.get(models.Message, message_id)
-            if not msg:
-                return
+            # Ответ удалили, пока шёл новый вариант; id мог уже достаться
+            # другому сообщению (SQLite переиспользует id) — чужое не трогаем.
+            if not msg or msg.session_id != session_id or msg.role != "assistant":
+                return None
             clean, meta = await horae_engine.split_reply(db, session_id, content)
             swipes = list(msg.swipes or [])
             swipes.append(clean)
@@ -573,6 +591,7 @@ def _make_persist_swipe(message_id: int, model_used: str):
             msg.horae = horae_engine.with_appended_meta(msg.horae, len(swipes), meta)
             await db.commit()
         _spawn_bg(horae_tasks.after_turn(session_id, [message_id]))
+        return message_id
 
     return cb
 
@@ -580,11 +599,11 @@ def _make_persist_swipe(message_id: int, model_used: str):
 def _make_persist_continue(message_id: int, model_used: str):
     """Дописывает сгенерированный текст В КОНЕЦ существующего ответа (функция «Продолжить»)."""
 
-    async def cb(session_id: int, content: str, model_override: str | None = None) -> None:
+    async def cb(session_id: int, content: str, model_override: str | None = None) -> int | None:
         async with AsyncSessionLocal() as db:
             msg = await db.get(models.Message, message_id)
-            if not msg:
-                return
+            if not msg or msg.session_id != session_id or msg.role != "assistant":
+                return None  # см. _make_persist_swipe
             # Теги пишутся в конце ответа — значит, в продолжении. Мета
             # продолжения сливается с прежней мета этого свайпа.
             clean, meta = await horae_engine.split_reply(db, session_id, content)
@@ -603,6 +622,7 @@ def _make_persist_continue(message_id: int, model_used: str):
                                                    horae_state.merge_meta(old, meta))
             await db.commit()
         _spawn_bg(horae_tasks.after_turn(session_id, [message_id]))
+        return message_id
 
     return cb
 
@@ -1352,6 +1372,18 @@ async def delete_session(
     sess = await db.get(models.ChatSession, session_id)
     if not await _can_access_session(db, sess, user):
         raise HTTPException(403, "Нет доступа к этому чату")
+    # Идущий ответ этого чата снимается без сохранения и дожидается ДО удаления
+    # строк: иначе он сохранился бы в удалённый чат, а его id SQLite отдаст
+    # следующему новому — и чужой ответ всплыл бы там.
+    # Под замком старта: ход, который ещё собирает контекст (job нет), сначала
+    # зарегистрируется — и тогда его можно снять, а не пропустить.
+    async with horae_engine.loop_lock(_turn_start_locks, session_id):
+        job = generation_manager.active_for(session_id)
+        if job is not None:
+            generation_manager.cancel(job.job_id, discard=True)
+            await generation_manager.wait_done(job, TURN_HANDOFF_WAIT)
+    _turn_start_locks.pop(session_id, None)
+    _sse_access_epoch[0] += 1   # id чата достанется новому — решения о доступе устарели
     # Задание памяти (пересборка/догонялка) снимается и забывается ДО удаления
     # строк: id этого чата достанется следующему новому, и тот не должен ни
     # видеть чужое задание, ни получать в память его работу (см. forget_job).
@@ -1769,12 +1801,18 @@ async def delete_knowledge(kid: int, user=Depends(current_user), db: AsyncSessio
 # ============================ СООБЩЕНИЯ ============================
 @app.patch("/api/messages/{message_id}")
 async def edit_message(
-    message_id: int, payload: MessageEdit, db: AsyncSession = Depends(get_session)
+    message_id: int, payload: MessageEdit,
+    user=Depends(current_user), db: AsyncSession = Depends(get_session),
 ):
-    """Редактирование текста или переключение активного свайпа (варианта ответа)."""
+    """
+    Редактирование текста или переключение активного свайпа (варианта ответа).
+    Идущий в чате ход правку не блокирует: он пишет НОВЫЙ ответ или свайп.
+    """
     msg = await db.get(models.Message, message_id)
     if not msg:
         raise HTTPException(404, "Сообщение не найдено")
+    if not await _can_access_session(db, await db.get(models.ChatSession, msg.session_id), user):
+        raise HTTPException(403, "Нет доступа к этому чату")
     if payload.active_swipe is not None:
         swipes = msg.swipes or [msg.content]
         idx = max(0, min(payload.active_swipe, len(swipes) - 1))
@@ -1803,23 +1841,57 @@ async def edit_message(
     return {"ok": True, "content": msg.content, "active_swipe": msg.active_swipe}
 
 
+# Ходы, которые отвечают на ПОСЛЕДНЮЮ реплику пользователя (а не дописывают
+# готовый ответ): удалив эту реплику, их ответ оставили бы висеть ни на чём.
+_ANSWERING_KINDS = ("send", "retry", "group")
+
+
+async def _drop_turn_for_deleted(db, msg) -> None:
+    """Удаляют реплику, на которую сейчас идёт ответ, — ход отменяется без сохранения."""
+    # Ход, который ещё собирает контекст, сначала регистрируется (замок старта).
+    async with horae_engine.loop_lock(_turn_start_locks, msg.session_id):
+        job = generation_manager.active_for(msg.session_id)
+    if job is None or msg.role != "user" or job.kind not in _ANSWERING_KINDS:
+        return
+    last_user = (await db.execute(
+        select(func.max(models.Message.id)).where(
+            models.Message.session_id == msg.session_id, models.Message.role == "user")
+    )).scalar()
+    if last_user != msg.id:
+        return
+    generation_manager.cancel(job.job_id, discard=True)
+    # Ждём конца хода ДО своей записи: ход, который уже сохранял ответ, допишет
+    # его, и удаление пойдёт после, а не наперегонки за запись SQLite.
+    await generation_manager.wait_done(job, TURN_HANDOFF_WAIT)
+
+
 @app.delete("/api/messages/{message_id}")
-async def delete_message(message_id: int, db: AsyncSession = Depends(get_session)):
+async def delete_message(
+    message_id: int, user=Depends(current_user), db: AsyncSession = Depends(get_session)
+):
     msg = await db.get(models.Message, message_id)
     if msg:
         session_id = msg.session_id
-        await delete_message_blobs(db, [message_id])  # данные вложений — тоже
-        await db.delete(msg)
-        await db.flush()
-        # Удалили самые свежие сообщения — их id SQLite выдаст новым. Указатель
-        # сводки прижимается к оставшимся СЕЙЧАС, до того как новые сообщения
-        # займут эти id и сойдут за уже учтённые (см. memory_service.clamp_summary_pointer).
-        await memory_service.clamp_summary_pointer(db, session_id)
-        await user_memory.clamp_pointer(db, session_id)
-        # Horae: свёртки, доходящие до удалённого, снимаются; якоря правок и
-        # таблиц прижимаются; документ поиска удаляется.
-        await horae_engine.on_messages_deleted(db, session_id, [message_id])
-        await db.commit()
+        if not await _can_access_session(db, await db.get(models.ChatSession, session_id), user):
+            raise HTTPException(403, "Нет доступа к этому чату")
+        await _drop_turn_for_deleted(db, msg)
+        # Замок Horae чата берём ДО первой записи в базу. Раньше удаление сначала
+        # писало (blob'ы, сообщение — запись SQLite захвачена), а потом ждало этот
+        # замок; его держатель (after_turn сразу после ответа) ждал запись SQLite —
+        # 30 с «database is locked» у всего приложения.
+        async with horae_engine.chat_lock(session_id):
+            await delete_message_blobs(db, [message_id])  # данные вложений — тоже
+            await db.delete(msg)
+            await db.flush()
+            # Удалили самые свежие сообщения — их id SQLite выдаст новым. Указатель
+            # сводки прижимается к оставшимся СЕЙЧАС, до того как новые сообщения
+            # займут эти id и сойдут за уже учтённые (см. memory_service.clamp_summary_pointer).
+            await memory_service.clamp_summary_pointer(db, session_id)
+            await user_memory.clamp_pointer(db, session_id)
+            # Horae: свёртки, доходящие до удалённого, снимаются; якоря правок и
+            # таблиц прижимаются; документ поиска удаляется.
+            await horae_engine.on_messages_deleted(db, session_id, [message_id], locked=True)
+            await db.commit()
     return {"ok": True}
 
 
@@ -2995,7 +3067,8 @@ async def make_image(
 
 
 # ==================== КОНВЕЙЕР ГЕНЕРАЦИИ ====================
-async def _start_group_turn(session_id, content, attachments, params, db, reply_to_message_id=None, save_user=True) -> str:
+async def _start_group_turn(session_id, content, attachments, params, db, reply_to_message_id=None,
+                            save_user=True, kind="group") -> str:
     """
     Ход в групповом чате: сохраняем реплику пользователя и запускаем сценарий, где
     последовательно отвечают выбранные персонажи (по упоминанию / режиссёр / по кругу).
@@ -3072,6 +3145,9 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
         saved_ids: list[int] = []
 
         async def _save_reply(character, text: str) -> None:
+            # Стадия saving: Stop в это время не рвёт запись (см. generation.cancel),
+            # а лишь не даёт ответить следующим персонажам.
+            generation_manager.set_stage(job, "saving")
             async with AsyncSessionLocal() as rdb:
                 clean, meta = await horae_engine.split_reply(rdb, session_id, text)
                 msg = models.Message(
@@ -3083,6 +3159,10 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
                 rdb.add(msg)
                 await rdb.commit()
                 saved_ids.append(msg.id)
+                job.message_id = msg.id
+            # Реплика записана, а очередь идёт дальше (пауза, следующий персонаж):
+            # это снова ожидание модели — с пульсом, и новый ход видит «занято» сразу.
+            generation_manager.set_stage(job, "waiting")
 
         # Пауза между ответами персонажей: несколько запросов подряд быстро
         # выбирают квоту токенов-в-минуту у Vertex (429). Разносим их во времени.
@@ -3096,10 +3176,14 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
                 pass
 
         for i, character in enumerate(chosen):
+            if job.stopping:
+                break  # Stop или потолок хода: следующие персонажи не отвечают
             # Перед каждым ответом, КРОМЕ первого, — пауза (даёт квоте восстановиться).
             if i > 0 and reply_delay > 0:
                 job.broadcast({"type": "waiting", "seconds": reply_delay})
                 await asyncio.sleep(reply_delay)
+                if job.stopping:
+                    break
             job.broadcast({"type": "speaker", "name": character.name, "character_id": character.id})
             async with AsyncSessionLocal() as rdb:
                 rsess = await rdb.get(models.ChatSession, session_id)
@@ -3108,23 +3192,19 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
                     send_avatars=bool(params and params.send_avatars),
                     knowledge_chars=_kb_chars(params), params=params,
                 )
-            text = ""
-            _thought = lambda t: job.broadcast({"type": "thought", "content": t})  # noqa: E731
-            try:
-                async for tok in stream_completion(
-                        messages, params, connection, on_thought=_thought,
-                        on_notice=lambda t: job.broadcast({"type": "notice", "content": t})):
-                    text += tok
-                    job.broadcast({"type": "token", "content": tok})
-            except Exception:  # noqa: BLE001 — сбой одного персонажа (в т.ч. [Errno 5])
-                # НЕ теряем уже написанное: сохраняем частичный текст, затем пробрасываем
-                # ошибку выше (клиент увидит баннер, но реплика не «исчезнет»).
-                if text.strip():
-                    await _save_reply(character, text)
-                    job.broadcast({"type": "speaker_done", "name": character.name})
-                raise
-            await _save_reply(character, text)
-            job.broadcast({"type": "speaker_done", "name": character.name})
+            # Стрим персонажа — во внутренней задаче job: Stop прерывает только
+            # ожидание модели, а написанное сохраняется (раньше терялось).
+            text, exc = await generation_manager.stream_part(
+                job, lambda on_thought, on_notice: stream_completion(
+                    messages, params, connection, on_thought=on_thought, on_notice=on_notice))
+            # НЕ теряем уже написанное: сохраняем частичный текст (сбой одного
+            # персонажа, в т.ч. [Errno 5], или Stop), затем пробрасываем ошибку
+            # выше (клиент увидит баннер, но реплика не «исчезнет»).
+            if text.strip() and not job.discard:
+                await _save_reply(character, text)
+                job.broadcast({"type": "speaker_done", "name": character.name})
+            if exc is not None:
+                raise exc
         # Ход группы завершён — освежаем авто-сводку сюжета (фоном).
         _spawn_bg(_maybe_update_summary(session_id))
         _spawn_bg(horae_tasks.after_turn(session_id, list(saved_ids)))
@@ -3132,7 +3212,7 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
             _spawn_bg(user_memory.maybe_update(session_id))
 
     job_id = uuid.uuid4().hex
-    await generation_manager.start_runner(job_id, session_id, runner)
+    await generation_manager.start_runner(job_id, session_id, runner, kind=kind)
     return job_id
 
 
@@ -3231,11 +3311,12 @@ async def _start_user_turn(session_id, content, attachments, params, db, reply_t
         params,
         on_complete=_make_persist_new(_effective_model(params, connection)),
         connection=connection,
+        kind="send",
     )
     return job_id
 
 
-async def _start_regenerate(session_id, params, db) -> str:
+async def _start_regenerate(session_id, params, db, kind="regenerate") -> str:
     """
     Перегенерация: создаёт НОВЫЙ свайп для последнего ответа ассистента.
     Контекст собирается БЕЗ этого ответа (модель заново отвечает на ту же реплику).
@@ -3296,6 +3377,7 @@ async def _start_regenerate(session_id, params, db) -> str:
         params,
         on_complete=_make_persist_swipe(target.id, _effective_model(params, connection)),
         connection=connection,
+        kind=kind,
     )
     return job_id
 
@@ -3355,6 +3437,7 @@ async def _start_continue(session_id, params, db) -> str:
         params,
         on_complete=_make_persist_continue(target.id, _effective_model(params, connection)),
         connection=connection,
+        kind="continue",
     )
     return job_id
 
@@ -3377,11 +3460,12 @@ async def _start_retry(session_id, params, db) -> str:
     ).scalars().all()
     last = msgs[-1] if msgs else None
     if not last or last.role != "user":
-        return await _start_regenerate(session_id, params, db)
+        return await _start_regenerate(session_id, params, db, kind="retry")
 
     if sess.is_group:
         # Реплика уже в БД (runner группы читает историю из неё) — не дублируем.
-        return await _start_group_turn(session_id, last.content, [], params, db, save_user=False)
+        return await _start_group_turn(session_id, last.content, [], params, db, save_user=False,
+                                       kind="retry")
 
     character = await db.get(models.Character, sess.character_id)
     connection = await get_connection(db)
@@ -3410,8 +3494,106 @@ async def _start_retry(session_id, params, db) -> str:
         params,
         on_complete=_make_persist_new(_effective_model(params, connection)),
         connection=connection,
+        kind="retry",
     )
     return job_id
+
+
+# ==================== ОДИН ХОД НА ЧАТ ====================
+# Замки старта хода по чатам. Проверка «в чате уже идёт ответ» и регистрация
+# нового job должны идти под одним замком: контекст собирается долго (секунды),
+# и две отправки подряд (двойной клик, вторая вкладка, retry после F5) иначе
+# обе видели «свободно» и запускали два параллельных ответа на одну реплику.
+_turn_start_locks: dict = {}
+# Сколько ждать, пока остановленный (или уже сохраняющий ответ) ход закончится,
+# прежде чем начать новый: «Стоп» и сразу «Дописать».
+TURN_HANDOFF_WAIT = 15
+_turn_log = logging.getLogger("aichat.turns")
+
+
+class TurnBusy(Exception):
+    """В чате уже идёт ответ — второй ход не запускаем (клиент подписывается на этот)."""
+
+    def __init__(self, job):
+        super().__init__("В этом чате уже идёт ответ")
+        self.job = job
+
+
+async def _guarded_turn(session_id: int, start) -> str:
+    """
+    Запустить ход start() (корутина-фабрика → job_id), если в чате нет другого.
+    Остановленный или сохраняющий ход дожидаемся (до TURN_HANDOFF_WAIT с),
+    идущий — TurnBusy.
+    """
+    async with horae_engine.loop_lock(_turn_start_locks, session_id):
+        job = generation_manager.active_for(session_id)
+        if job is not None and (job.cancel_requested or job.stage == "saving"):
+            await generation_manager.wait_done(job, TURN_HANDOFF_WAIT)
+            job = generation_manager.active_for(session_id)
+        if job is not None:
+            raise TurnBusy(job)
+        return await start()
+
+
+def _busy_response(job) -> JSONResponse:
+    return JSONResponse(
+        {"detail": "В этом чате уже идёт ответ", "job_id": job.job_id, "kind": job.kind},
+        status_code=409,
+    )
+
+
+def _error_text(exc: BaseException) -> str:
+    if isinstance(exc, HTTPException):
+        return str(exc.detail)
+    return str(exc) or exc.__class__.__name__
+
+
+async def _query_auth(params, headers=None) -> tuple[int | None, object]:
+    """
+    Опознание для WebSocket и SSE: их пути не под /api/, AccessMiddleware их не
+    видит, а EventSource не умеет слать заголовки. Код/токен — из query
+    (token, code или access_code), заголовки — запасной путь.
+    Возвращает (None, user) при успехе (user=None в режиме без аккаунтов) или
+    (401, None).
+    """
+    headers = headers or {}
+    sec = admin_service.security_cache()
+    if sec.get("accounts_enabled"):
+        token = params.get("token", "") or headers.get("x-user-token", "")
+        async with AsyncSessionLocal() as db:
+            user = await accounts.user_from_token(db, token)
+        return (401, None) if user is None else (None, user)
+    code = sec.get("access_code") or ""
+    if code:
+        given = params.get("code", "") or params.get("access_code", "") or headers.get("x-access-code", "")
+        ap = sec.get("admin_password") or ""
+        adm = headers.get("x-admin-password", "")
+        if given != code and not (ap and (given == ap or adm == ap)):
+            return 401, None
+    return None, None
+
+
+# Растёт при удалении чата: кэши «доступен ли чат» в /sse/events сбрасываются.
+_sse_access_epoch = [0]
+
+
+async def _same_user(request: Request, user) -> bool:
+    """Токен потока всё ещё даёт того же пользователя с той же ролью."""
+    status, now = await _query_auth(request.query_params, request.headers)
+    return not status and now is not None and now.id == user.id and now.role == user.role
+
+
+async def _session_access(session_id: int, user) -> bool:
+    """Доступ к чату для путей без Depends(get_session) (WS, SSE): своя короткая сессия БД."""
+    async with AsyncSessionLocal() as db:
+        return await _can_access_session(db, await db.get(models.ChatSession, session_id), user)
+
+
+async def _job_access(db, job, user) -> bool:
+    """Доступ к ходу = доступ к его чату. Без аккаунтов — всем, кто прошёл код доступа."""
+    if user is None:
+        return True
+    return await _can_access_session(db, await db.get(models.ChatSession, job.session_id), user)
 
 
 # ==================== WEBSOCKET (основной стриминг) ====================
@@ -3419,61 +3601,138 @@ async def _start_retry(session_id, params, db) -> str:
 async def ws_chat(websocket: WebSocket, session_id: int):
     """
     Входящие сообщения от клиента:
-      {"type":"user_message","content":"...","attachments":[...],"params":{...}}
-      {"type":"regenerate","params":{...}}      — новый вариант последнего ответа
-      {"type":"retry","params":{...}}            — повторить ход после сбоя/остановки
-      {"type":"stop"}                            — остановить текущую генерацию
+      {"type":"user_message","content":"...","attachments":[...],"params":{...},"client_id":"..."}
+      {"type":"regenerate","params":{...},"client_id":"..."} — новый вариант последнего ответа
+      {"type":"continue","params":{...},"client_id":"..."}   — дописать последний ответ
+      {"type":"retry","params":{...},"client_id":"..."}      — повторить ход после сбоя/остановки
+      {"type":"stop"}                            — остановить идущий ход ЧАТА
+      {"type":"ping"}                            — пульс → {"type":"pong"}
 
-    Исходящие: {"type":"job","job_id":...}, {"type":"token",...}, {"type":"done"|"error"}.
+    Исходящие на ход: {"type":"accepted","client_id"} и {"type":"status","stage":"preparing"}
+    сразу; затем {"type":"job","job_id","kind","client_id"} и события job до 'done'
+    (token, thought, status, notice, fallback, speaker…, error, done — с job_id и seq).
+    Если в чате уже идёт ответ: {"type":"busy","job_id","kind","client_id"} и
+    пересылка событий того хода. Старт упал: {"type":"error","content","client_id"}
+    и {"type":"done","client_id"}. При подключении к чату с идущим ходом —
+    {"type":"job","job_id","kind","resumed":true} и его события.
 
-    Чтение входящих и пересылка токенов идут ПАРАЛЛЕЛЬНО, поэтому кнопка Stop
-    срабатывает прямо во время генерации.
+    Ход стартует в отдельной задаче: сборка контекста занимает секунды (память,
+    поиск по истории), и всё это время цикл приёма отвечает на ping и stop —
+    раньше клиент не получал pong, рвал сокет и терял ход.
     """
-    # Контроль доступа для WebSocket (код/токен передаются в query).
-    sec = admin_service.security_cache()
-    if sec.get("accounts_enabled"):
-        async with AsyncSessionLocal() as db:
-            ws_user = await accounts.user_from_token(db, websocket.query_params.get("token", ""))
-            if ws_user is None:
-                await websocket.close(code=4401)
-                return
-            # Доступ к чату: владелец, тот, с кем поделились, или админ.
-            wsess = await db.get(models.ChatSession, session_id)
-            if not await _can_access_session(db, wsess, ws_user):
-                await websocket.close(code=4403)
-                return
-            # Владелец хода для панели отладки. Фоновая задача генерации
-            # создаётся из этого контекста и наследует пометку.
-            debug_log.set_owner(getattr(ws_user, "id", None))
-    else:
-        code = sec.get("access_code") or ""
-        if code:
-            q = websocket.query_params.get("code", "")
-            ap = sec.get("admin_password") or ""
-            if q != code and not (ap and q == ap):
-                await websocket.close(code=4401)
-                return
-        debug_log.set_owner(None)  # режим без аккаунтов: владелец один
+    status, ws_user = await _query_auth(websocket.query_params, websocket.headers)
+    if status:
+        await websocket.close(code=4401)
+        return
+    # Доступ к чату: владелец, тот, с кем поделились, или админ.
+    if ws_user is not None and not await _session_access(session_id, ws_user):
+        await websocket.close(code=4403)
+        return
+    # Владелец хода для панели отладки. Фоновые задачи генерации создаются из
+    # этого контекста и наследуют пометку (режим без аккаунтов: владелец один).
+    debug_log.set_owner(getattr(ws_user, "id", None))
 
-    if not sec.get("accounts_enabled"):
-        ws_user = None
     await websocket.accept()
-    current_job_id: str | None = None
+    send_lock = asyncio.Lock()
     forward_task: asyncio.Task | None = None
+    forward_job_id: str | None = None
+    turn_tasks: set = set()
+    stop_pending = False
+
+    async def send(event: dict) -> bool:
+        # Отправки идут из цикла приёма, задачи хода и пересылки — по очереди.
+        try:
+            async with send_lock:
+                await websocket.send_json(event)
+            return True
+        except Exception:  # noqa: BLE001 — клиент отключился; ход живёт в фоне
+            return False
 
     async def forward(job):
-        """Пересылает события генерации клиенту, не блокируя приём входящих."""
+        """Пересылает события генерации клиенту до 'done' (ошибка — не конец: за ней идёт 'done')."""
         queue = job.subscribe()
         try:
             while True:
                 event = await queue.get()
-                await websocket.send_json(event)
-                if event["type"] in ("done", "error"):
+                if not await send(event):
                     break
-        except Exception:  # noqa: BLE001 — клиент мог отключиться; генерация живёт в фоне
-            pass
+                if event["type"] == "done":
+                    break
         finally:
             job.unsubscribe(queue)
+
+    def follow(job) -> None:
+        """Подписать сокет на ход (одна пересылка за раз, без дублей одного job)."""
+        nonlocal forward_task, forward_job_id
+        if forward_task and not forward_task.done():
+            if forward_job_id == job.job_id:
+                return
+            forward_task.cancel()
+        forward_job_id = job.job_id
+        forward_task = asyncio.create_task(forward(job))
+
+    async def run_turn(mtype: str, raw: dict, client_id) -> None:
+        nonlocal stop_pending
+        await send({"type": "accepted", "client_id": client_id})
+        await send({"type": "status", "stage": "preparing", "client_id": client_id})
+        try:
+            async with AsyncSessionLocal() as db:
+                if mtype == "regenerate":
+                    msg = WSRegenerate(**raw)
+                    start = lambda: _start_regenerate(session_id, msg.params, db)  # noqa: E731
+                elif mtype == "continue":
+                    msg = WSContinue(**raw)
+                    start = lambda: _start_continue(session_id, msg.params, db)  # noqa: E731
+                elif mtype == "retry":
+                    # Повтор хода: ответ на «повисшую» реплику юзера или новый свайп.
+                    rparams = GenerationParams(**(raw.get("params") or {}))
+                    start = lambda: _start_retry(session_id, rparams, db)  # noqa: E731
+                else:
+                    msg = WSUserMessage(**raw)
+                    start = lambda: _start_user_turn(  # noqa: E731
+                        session_id, msg.content, msg.attachments, msg.params, db,
+                        reply_to_message_id=msg.reply_to_message_id,
+                    )
+                job_id = await _guarded_turn(session_id, start)
+        except TurnBusy as busy:
+            # «Стоп», нажатый во время подготовки, относился к НЕначатому ходу —
+            # чужой идущий ход им не останавливаем (и следующий тоже).
+            stop_pending = False
+            # Второй ход не запускаем, а показываем идущий (retry тоже сюда).
+            await send({"type": "busy", "job_id": busy.job.job_id, "kind": busy.job.kind,
+                        "client_id": client_id})
+            follow(busy.job)
+            return
+        except Exception as exc:  # noqa: BLE001 — сбой старта не рвёт сокет, а виден клиенту
+            stop_pending = False
+            if isinstance(exc, HTTPException):
+                _turn_log.warning("Ход не начат (чат %s): %s", session_id, exc.detail)
+            else:
+                _turn_log.exception("Ход не начат (чат %s)", session_id)
+            await send({"type": "error", "content": _error_text(exc), "client_id": client_id})
+            await send({"type": "done", "content": "", "client_id": client_id})
+            return
+        if stop_pending:
+            # «Стоп» нажали, пока контекст ещё собирался: ход начат и сразу
+            # остановлен (реплика пользователя уже сохранена — как у Stop).
+            stop_pending = False
+            generation_manager.cancel(job_id)
+        if mtype not in ("regenerate", "continue", "retry"):
+            try:
+                await _foreign_turn(session_id, ws_user)
+            except Exception:  # noqa: BLE001 — ход уже идёт; указатель памяти догонит
+                _turn_log.exception("Не удалось сдвинуть память о пользователе (чат %s)", session_id)
+        job = generation_manager.get(job_id)
+        if job is None:
+            return
+        await send({"type": "job", "job_id": job_id, "kind": job.kind, "client_id": client_id})
+        follow(job)
+
+    # Вкладка открылась (F5, смена чата, реконнект), а ход чата уже идёт.
+    active = generation_manager.active_for(session_id)
+    if active is not None:
+        await send({"type": "job", "job_id": active.job_id, "kind": active.kind, "resumed": True})
+        follow(active)
 
     try:
         while True:
@@ -3485,72 +3744,147 @@ async def ws_chat(websocket: WebSocket, session_id: int):
             # иначе ping провалился бы в ветку обычного сообщения и упал на
             # валидации WSUserMessage.
             if mtype == "ping":
-                await websocket.send_json({"type": "pong"})
+                await send({"type": "pong"})
                 continue
 
             if mtype == "stop":
-                if current_job_id:
-                    generation_manager.cancel(current_job_id)
+                # Отозванный доступ — и останавливать чужие ходы нельзя.
+                if ws_user is not None and not await _session_access(session_id, ws_user):
+                    await websocket.close(code=4403)
+                    return
+                # Останавливаем ход ЧАТА, а не только начатый этим сокетом:
+                # после F5 ход начат другим соединением.
+                job = generation_manager.active_for(session_id)
+                stopped = job is not None and generation_manager.cancel(job.job_id)
+                # Прежний ход уже остановлен или сохраняется, а этот сокет готовит
+                # новый («Стоп» → «Дописать» → «Стоп»): остановка — для нового.
+                if not stopped and any(not t.done() for t in turn_tasks):
+                    stop_pending = True
                 continue
 
             # Доступ проверяем на каждом ходе, а не только при подключении:
             # владелец мог закрыть доступ, пока у друга открыта вкладка.
-            if ws_user is not None:
-                async with AsyncSessionLocal() as db:
-                    if not await _can_access_session(db, await db.get(models.ChatSession, session_id), ws_user):
-                        await websocket.close(code=4403)
-                        return
+            if ws_user is not None and not await _session_access(session_id, ws_user):
+                await websocket.close(code=4403)
+                return
 
-            # Останавливаем предыдущую пересылку (если вдруг ещё идёт).
-            if forward_task and not forward_task.done():
-                forward_task.cancel()
-
-            async with AsyncSessionLocal() as db:
-                if mtype == "regenerate":
-                    msg = WSRegenerate(**raw)
-                    current_job_id = await _start_regenerate(session_id, msg.params, db)
-                elif mtype == "continue":
-                    msg = WSContinue(**raw)
-                    current_job_id = await _start_continue(session_id, msg.params, db)
-                elif mtype == "retry":
-                    # Повтор хода: ответ на «повисшую» реплику юзера или новый свайп.
-                    rparams = GenerationParams(**(raw.get("params") or {}))
-                    current_job_id = await _start_retry(session_id, rparams, db)
-                else:
-                    msg = WSUserMessage(**raw)
-                    current_job_id = await _start_user_turn(
-                        session_id, msg.content, msg.attachments, msg.params, db,
-                        reply_to_message_id=msg.reply_to_message_id,
-                    )
-                    await _foreign_turn(session_id, ws_user)
-
-            await websocket.send_json({"type": "job", "job_id": current_job_id})
-            job = generation_manager.get(current_job_id)
-            forward_task = asyncio.create_task(forward(job))
+            cid = raw.get("client_id")
+            client_id = str(cid)[:100] if isinstance(cid, (str, int)) and cid != "" else None
+            task = asyncio.create_task(run_turn(mtype, raw, client_id))
+            turn_tasks.add(task)
+            task.add_done_callback(turn_tasks.discard)
+            # Задача хода переживает сокет (клиент мог отключиться, пока собирался
+            # контекст) — держим её в общем реестре, чтобы остановка сервера её дождалась.
+            _bg_tasks.add(task)
+            task.add_done_callback(_bg_tasks.discard)
     except WebSocketDisconnect:
         # Клиент отвалился — норма: генерация доживёт в фоне и сохранится в БД.
         return
+    finally:
+        if forward_task and not forward_task.done():
+            forward_task.cancel()
 
 
-# ==================== SSE (резерв / реконнект) ====================
+# ==================== SSE (резерв / реконнект / уведомления) ====================
+# Комментарий-пульс в SSE: прокси и браузер закрывают «молчащее» соединение,
+# а модель может думать минутами.
+SSE_JOB_KEEPALIVE = 15
+SSE_EVENTS_KEEPALIVE = 20
+# Сколько секунд помнить решение «есть ли доступ к чату» в /sse/events.
+SSE_ACCESS_TTL = 60
+_SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+
+
+def _sse(event: dict) -> str:
+    return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+
 @app.get("/sse/job/{job_id}")
-async def sse_job(job_id: str):
+async def sse_job(job_id: str, request: Request):
+    """
+    События одного хода (резерв к WebSocket и HTTP-отправке). Доступ — как у API:
+    код или токен в query (EventSource не шлёт заголовки), плюс доступ к чату хода.
+    Пересылка до 'done' (после 'error' приходит 'done'), пульс `: ping` каждые 15 с.
+    """
+    status, user = await _query_auth(request.query_params, request.headers)
+    if status:
+        return JSONResponse({"detail": "Требуется вход или код доступа"}, status_code=401)
     job = generation_manager.get(job_id)
     if not job:
         raise HTTPException(404, "Задача генерации не найдена или уже очищена")
+    if user is not None and not await _session_access(job.session_id, user):
+        raise HTTPException(403, "Нет доступа к этому чату")
 
     async def event_stream():
         queue = job.subscribe()
         try:
             while True:
-                event = await queue.get()
-                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-                if event["type"] in ("done", "error"):
+                try:
+                    event = await asyncio.wait_for(queue.get(), SSE_JOB_KEEPALIVE)
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"
+                    continue
+                yield _sse(event)
+                if event["type"] == "done":
                     break
         finally:
             job.unsubscribe(queue)
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
+
+
+@app.get("/sse/events")
+async def sse_events(request: Request):
+    """
+    Поток уведомлений о ходах всех доступных чатов (backend/turn_events.py):
+    сначала {"type":"snapshot","jobs":[…идущие…]}, затем turn_started / turn_done.
+    Так «Ответ готов» доходит до вкладки, которая сейчас в другом чате, и после F5.
+    В режиме аккаунтов — только чаты, доступные пользователю.
+    """
+    status, user = await _query_auth(request.query_params, request.headers)
+    if status:
+        return JSONResponse({"detail": "Требуется вход или код доступа"}, status_code=401)
+    access: dict[int, tuple[float, bool]] = {}
+    epoch = [_sse_access_epoch[0]]
+
+    async def allowed(session_id) -> bool:
+        if user is None:
+            return True
+        # Чат удалили — его id SQLite отдаст новому (возможно, чужому) чату.
+        if epoch[0] != _sse_access_epoch[0]:
+            access.clear()
+            epoch[0] = _sse_access_epoch[0]
+        now = time.monotonic()
+        hit = access.get(session_id)
+        if hit and now - hit[0] < SSE_ACCESS_TTL:
+            return hit[1]
+        ok = await _session_access(session_id, user)
+        access[session_id] = (now, ok)
+        return ok
+
+    async def event_stream():
+        # Подписка ДО снимка: ход, начатый между ними, не потеряется (в худшем
+        # случае придёт и в снимке, и событием — клиент различает по job_id).
+        queue = turn_events.subscribe()
+        try:
+            jobs = [j.info() for j in generation_manager.active_jobs() if await allowed(j.session_id)]
+            yield _sse({"type": "snapshot", "jobs": jobs})
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), SSE_EVENTS_KEEPALIVE)
+                except asyncio.TimeoutError:
+                    # Заодно перепроверяем вход: удалённый пользователь, отозванный
+                    # токен или снятая роль админа не должны и дальше читать чужие ходы.
+                    if user is not None and not await _same_user(request, user):
+                        break
+                    yield ": ping\n\n"
+                    continue
+                if await allowed(event.get("session_id")):
+                    yield _sse(event)
+        finally:
+            turn_events.unsubscribe(queue)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
 
 @app.post("/api/sessions/{session_id}/send")
@@ -3563,14 +3897,18 @@ async def http_send(
     (`/sse/job/{job_id}`). Нужен для сообщений с БОЛЬШИМИ вложениями: в WebSocket
     один кадр ограничен (uvicorn ws_max_size ≈ 16 МБ), а 14-МБ аудио в base64 —
     это ~19 МБ, и такое сообщение молча обрывалось. У HTTP-тела такого лимита нет.
+    В чате уже идёт ответ — 409 с его job_id (клиент подписывается на него).
     """
     sess = await db.get(models.ChatSession, session_id)
     if not await _can_access_session(db, sess, user):
         raise HTTPException(403, "Нет доступа к этому чату")
-    job_id = await _start_user_turn(
-        session_id, msg.content, msg.attachments, msg.params, db,
-        reply_to_message_id=msg.reply_to_message_id,
-    )
+    try:
+        job_id = await _guarded_turn(session_id, lambda: _start_user_turn(
+            session_id, msg.content, msg.attachments, msg.params, db,
+            reply_to_message_id=msg.reply_to_message_id,
+        ))
+    except TurnBusy as busy:
+        return _busy_response(busy.job)
     await _foreign_turn(session_id, user)
     return {"job_id": job_id}
 
@@ -3621,19 +3959,56 @@ async def http_send_form(
         ))
 
     params = GenerationParams(**(data.get("params") or {})) if data.get("params") else None
-    job_id = await _start_user_turn(
-        session_id, (data.get("content") or ""), attachments, params, db,
-        reply_to_message_id=data.get("reply_to_message_id"),
-    )
+    try:
+        job_id = await _guarded_turn(session_id, lambda: _start_user_turn(
+            session_id, (data.get("content") or ""), attachments, params, db,
+            reply_to_message_id=data.get("reply_to_message_id"),
+        ))
+    except TurnBusy as busy:
+        return _busy_response(busy.job)
     await _foreign_turn(session_id, user)
     return {"job_id": job_id}
 
 
 @app.post("/api/jobs/{job_id}/cancel")
-async def cancel_job(job_id: str):
-    """Остановить генерацию по id задачи (работает и для WS-, и для HTTP-хода)."""
-    generation_manager.cancel(job_id)
-    return {"ok": True}
+async def cancel_job(job_id: str, user=Depends(current_user), db: AsyncSession = Depends(get_session)):
+    """
+    Остановить генерацию по id задачи (работает и для WS-, и для HTTP-хода).
+    Идемпотентно: повторная отмена и отмена закончившегося хода — {"ok": true,
+    "cancelled": false}. Сохранение уже написанного отменой не прерывается.
+    """
+    job = generation_manager.get(job_id)
+    if job is None:
+        return {"ok": True, "cancelled": False}
+    if not await _job_access(db, job, user):
+        raise HTTPException(403, "Нет доступа к этому чату")
+    return {"ok": True, "cancelled": generation_manager.cancel(job_id)}
+
+
+@app.get("/api/jobs/active")
+async def list_active_jobs(user=Depends(current_user), db: AsyncSession = Depends(get_session)):
+    """Идущие ходы во всех доступных чатах (индикатор «идёт ответ» в списке чатов)."""
+    jobs = []
+    for job in generation_manager.active_jobs():
+        if await _job_access(db, job, user):
+            jobs.append(job.info())
+    return {"jobs": jobs}
+
+
+@app.get("/api/sessions/{session_id}/active_job")
+async def session_active_job(
+    session_id: int, user=Depends(current_user), db: AsyncSession = Depends(get_session)
+):
+    """
+    Идущий ход чата или null. По нему клиент после F5 / смены чата / реконнекта
+    узнаёт, что ответ ещё пишется, и подписывается на него вместо «Ответ не
+    получен ↻ Повторить» (повтор запускал второй ход параллельно первому).
+    """
+    sess = await db.get(models.ChatSession, session_id)
+    if not await _can_access_session(db, sess, user):
+        raise HTTPException(403, "Нет доступа к этому чату")
+    job = generation_manager.active_for(session_id)
+    return {"job": job.info() if job is not None else None}
 
 
 # ============================ АУТЕНТИФИКАЦИЯ / ДОСТУП ============================
