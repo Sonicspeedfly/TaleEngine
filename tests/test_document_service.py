@@ -33,7 +33,9 @@ def _docx_bytes() -> bytes:
     return buf.getvalue()
 
 
-def test_docx_extracted_as_text_when_no_libreoffice():
+def test_docx_extracted_as_text_when_no_libreoffice(monkeypatch):
+    # LibreOffice может стоять на машине с тестами — тогда docx ушёл бы в PDF.
+    monkeypatch.setattr("backend.document_service.find_libreoffice", lambda: None)
     raw = _docx_bytes()
     data = "data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64," + base64.b64encode(raw).decode()
     block = prepare_document(
