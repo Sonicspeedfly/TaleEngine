@@ -172,6 +172,50 @@ class AttachmentBlob(Base):
     data: Mapped[str] = mapped_column(Text, default="")
 
 
+class ChatDraft(Base):
+    """
+    Черновик сообщения в чате — у каждого пользователя свой (2.14.0).
+
+    Раньше поле ввода было одно на всё приложение и жило только во вкладке:
+    перешёл в другой чат — недописанный текст «переезжал» туда, начал на
+    телефоне — на компьютере пусто. Теперь черновик привязан к чату и лежит на
+    сервере: текст, ответ на сообщение и прикреплённые файлы (сами файлы — в
+    draft_files). owner_id — id пользователя (0 в режиме без аккаунтов).
+    """
+    __tablename__ = "chat_drafts"
+    __table_args__ = (UniqueConstraint("session_id", "owner_id", name="uq_draft_session_owner"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    session_id: Mapped[int] = mapped_column(Integer, index=True)
+    owner_id: Mapped[int] = mapped_column(Integer, default=0)
+    text: Mapped[str] = mapped_column(Text, default="")
+    reply_to_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Порядок файлов черновика: [id из draft_files, …].
+    files: Mapped[list] = mapped_column(JSON, default=list)
+    # Растёт на каждом сохранении: вкладка не затирает более свежую правку с
+    # другого устройства своей старой (см. backend/drafts.py).
+    version: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class DraftFile(Base):
+    """Файл, прикреплённый к черновику (данные — data:URI, как у вложений)."""
+    __tablename__ = "draft_files"
+    # id не переиспользуются: вкладка, помнящая удалённый файл №N, не должна
+    # принять за него новый файл с тем же номером.
+    __table_args__ = {"sqlite_autoincrement": True}
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    session_id: Mapped[int] = mapped_column(Integer, index=True)
+    owner_id: Mapped[int] = mapped_column(Integer, default=0)
+    type: Mapped[str] = mapped_column(String(20), default="document")
+    mime: Mapped[str] = mapped_column(String(200), default="application/octet-stream")
+    name: Mapped[str] = mapped_column(String(300), default="файл")
+    size: Mapped[int] = mapped_column(Integer, default=0)
+    data: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 class MediaRef(Base):
     """
     Ссылка на копию вложения в хранилище провайдера (см. backend/media_refs.py).

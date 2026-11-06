@@ -52,6 +52,7 @@ from backend import (
     accounts,
     admin_service,
     debug_log,
+    drafts,
     gcp_billing,
     group_chat,
     horae_api,
@@ -103,6 +104,7 @@ from backend.schemas import (
     CharacterRead,
     CharacterUpdate,
     ConnectionSettings,
+    DraftIn,
     GcpBillingSettings,
     GenerationParams,
     HoraeEntryCreate,
@@ -1407,6 +1409,7 @@ async def delete_session(
         models.Canvas, models.HoraeEntry, models.HoraeFact, models.KnowledgeFile,
     ):
         await db.execute(sql_delete(model).where(model.session_id == session_id))
+    await drafts.drop_session(db, session_id)
     if sess:
         await db.delete(sess)
     await db.commit()
@@ -3722,6 +3725,7 @@ async def ws_chat(websocket: WebSocket, session_id: int):
                 await _foreign_turn(session_id, ws_user)
             except Exception:  # noqa: BLE001 — ход уже идёт; указатель памяти догонит
                 _turn_log.exception("Не удалось сдвинуть память о пользователе (чат %s)", session_id)
+            await _clear_draft(session_id, ws_user)
         job = generation_manager.get(job_id)
         if job is None:
             return
@@ -3879,12 +3883,93 @@ async def sse_events(request: Request):
                         break
                     yield ": ping\n\n"
                     continue
+                # Черновик — личное дело его владельца, даже в общем чате.
+                if event.get("type") == "draft" and user is not None \
+                        and event.get("owner_id") != drafts.owner_of(user):
+                    continue
                 if await allowed(event.get("session_id")):
                     yield _sse(event)
         finally:
             turn_events.unsubscribe(queue)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
+
+
+# ============================ ЧЕРНОВИКИ СООБЩЕНИЙ ============================
+async def _clear_draft(session_id: int, user) -> None:
+    """Реплика сохранена — черновик этого чата пуст на всех устройствах."""
+    try:
+        async with AsyncSessionLocal() as db:
+            await drafts.clear(db, session_id, drafts.owner_of(user))
+    except Exception:  # noqa: BLE001 — ход уже идёт; черновик клиент очистит и сам
+        _turn_log.exception("Не удалось очистить черновик (чат %s)", session_id)
+
+
+async def _draft_chat(db, session_id: int, user) -> None:
+    sess = await db.get(models.ChatSession, session_id)
+    if not await _can_access_session(db, sess, user):
+        raise HTTPException(403, "Нет доступа к этому чату")
+
+
+@app.get("/api/sessions/{session_id}/draft")
+async def draft_get(session_id: int, user=Depends(current_user), db: AsyncSession = Depends(get_session)):
+    """Черновик сообщения этого чата (свой у каждого пользователя): текст, ответ, файлы (мета)."""
+    await _draft_chat(db, session_id, user)
+    draft = await drafts.get(db, session_id, drafts.owner_of(user))
+    return {**draft, "file_max_mb": settings.DRAFT_FILE_MAX_MB}
+
+
+@app.put("/api/sessions/{session_id}/draft")
+async def draft_put(session_id: int, payload: DraftIn, user=Depends(current_user),
+                    db: AsyncSession = Depends(get_session)):
+    """
+    Сохранить черновик. base_version — версия, на которой основана правка; на
+    сервере новее (правили с другого устройства) — 409 и текущий черновик.
+    """
+    await _draft_chat(db, session_id, user)
+    ok, draft = await drafts.save(
+        db, session_id, drafts.owner_of(user), text=payload.text, reply_to_id=payload.reply_to_id,
+        files=payload.files, base_version=payload.base_version, origin=payload.origin,
+    )
+    if not ok:
+        return JSONResponse({"detail": "Черновик изменён на другом устройстве", "draft": draft},
+                            status_code=409)
+    return draft
+
+
+@app.post("/api/sessions/{session_id}/draft/files")
+async def draft_file_add(
+    session_id: int,
+    file: UploadFile = File(...),
+    kind: str = Form("document"),
+    origin: str = Form(""),
+    user=Depends(current_user), db: AsyncSession = Depends(get_session),
+):
+    """Прикрепить файл к черновику. Слишком большой — 413 (останется только на этом устройстве)."""
+    await _draft_chat(db, session_id, user)
+    raw = await file.read()
+    try:
+        return await drafts.add_file(
+            db, session_id, drafts.owner_of(user), name=file.filename or "файл",
+            mime=file.content_type or "application/octet-stream", kind=kind, raw=raw, origin=origin,
+        )
+    except ValueError as exc:
+        raise HTTPException(413, str(exc)) from exc
+
+
+@app.get("/api/sessions/{session_id}/draft/files/{fid}")
+async def draft_file_get(session_id: int, fid: int, user=Depends(current_user),
+                         db: AsyncSession = Depends(get_session)):
+    await _draft_chat(db, session_id, user)
+    got = await drafts.file_data(db, session_id, drafts.owner_of(user), fid)
+    if got is None:
+        raise HTTPException(404, "Файла в черновике нет")
+    raw, mime, name = got
+    from urllib.parse import quote
+
+    return Response(content=raw, media_type=mime,
+                    headers={"Cache-Control": "private, no-store",
+                             "Content-Disposition": "inline; filename*=UTF-8''" + quote(name)})
 
 
 @app.post("/api/sessions/{session_id}/send")
@@ -3910,6 +3995,7 @@ async def http_send(
     except TurnBusy as busy:
         return _busy_response(busy.job)
     await _foreign_turn(session_id, user)
+    await _clear_draft(session_id, user)
     return {"job_id": job_id}
 
 
@@ -3967,6 +4053,7 @@ async def http_send_form(
     except TurnBusy as busy:
         return _busy_response(busy.job)
     await _foreign_turn(session_id, user)
+    await _clear_draft(session_id, user)
     return {"job_id": job_id}
 
 
