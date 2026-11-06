@@ -38,6 +38,7 @@
 этого чата, вес имён. Это режим большинства пользователей, поэтому он настроен
 на точность, а не на полноту.
 """
+import asyncio
 import json
 import logging
 import math
@@ -876,9 +877,12 @@ async def recall(
                     if got is not None:
                         pool.append({**f, "embedding": got[1], "norm": got[2]})
                 if pool:
-                    return rank_facts(pool, newest, query_vec=qvec, top_k=top_k)
+                    return await asyncio.to_thread(rank_facts, pool, newest, query_vec=qvec, top_k=top_k)
             info["mode"] = "lexical"  # векторов нет или сервис не ответил
-        return rank_facts(facts, newest, query_text=query, context_text=context, top_k=top_k)
+        # Отбор — чистый Python над всеми фактами чата (тысячи на долгой игре):
+        # в потоке, чтобы цикл событий не стоял и ответы других чатов шли ровно.
+        return await asyncio.to_thread(rank_facts, facts, newest, query_text=query,
+                                       context_text=context, top_k=top_k)
     except Exception:  # noqa: BLE001 — память не должна ронять ход
         logger.exception("Отбор фактов чата %s не удался", session_id)
         return []

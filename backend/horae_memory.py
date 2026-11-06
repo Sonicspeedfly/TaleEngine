@@ -19,6 +19,9 @@
     * build_context_from_db() — тонкая обёртка: тянет данные из БД и зовёт чистую
                                 функцию выше.
 """
+import asyncio
+import functools
+import threading
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -59,16 +62,23 @@ _ENCODER = None
 _ENCODER_TRIED = False
 
 
+_ENCODER_LOCK = threading.Lock()
+
+
 def _encoder():
     """Токенизатор tiktoken (приезжает зависимостью litellm). None, если недоступен."""
     global _ENCODER, _ENCODER_TRIED
     if not _ENCODER_TRIED:
-        _ENCODER_TRIED = True
-        try:
-            import tiktoken
-            _ENCODER = tiktoken.get_encoding("cl100k_base")
-        except Exception:  # noqa: BLE001 — без токенизатора просто считаем грубее
-            _ENCODER = None
+        # Сборка контекста идёт в потоках (2.16.0): два хода разом не должны
+        # загружать токенизатор дважды или увидеть «уже пробовали, но пусто».
+        with _ENCODER_LOCK:
+            if not _ENCODER_TRIED:
+                try:
+                    import tiktoken
+                    _ENCODER = tiktoken.get_encoding("cl100k_base")
+                except Exception:  # noqa: BLE001 — без токенизатора просто считаем грубее
+                    _ENCODER = None
+                _ENCODER_TRIED = True
     return _ENCODER
 
 
@@ -441,7 +451,23 @@ _CASE_ENDINGS = frozenset({
 })
 
 
-def keyword_hits(keyword: str, text_low: str, tokens: list[str]) -> bool:
+class _TokenIndex:
+    """
+    Слова текста и их основы множествами — один раз на скан лорбука.
+
+    Без индекса каждый ключ каждой записи проходил все слова текста и для
+    каждого заново считал основу: 300 записей × 3000 слов — сотня миллисекунд
+    на ход, а пока она шла, у соседнего пользователя стоял ответ.
+    """
+    __slots__ = ("tokens", "tok_set", "stem_set")
+
+    def __init__(self, tokens: list[str]):
+        self.tokens = tokens
+        self.tok_set = set(tokens)
+        self.stem_set = {_stem(t) for t in self.tok_set}
+
+
+def keyword_hits(keyword: str, text_low: str, tokens: list[str], index: "_TokenIndex | None" = None) -> bool:
     """
     Сработало ли ключевое слово World Info по тексту.
 
@@ -467,6 +493,10 @@ def keyword_hits(keyword: str, text_low: str, tokens: list[str]) -> bool:
         prefix = kw[:-1]
         return bool(prefix) and any(t.startswith(prefix) for t in tokens)
     kw_stem = _stem(kw)
+    if index is not None:
+        # То же, что цикл ниже, но поиском в множествах (см. _TokenIndex).
+        return (kw in index.tok_set or kw_stem in index.stem_set
+                or any(kw_stem + e in index.tok_set for e in _CASE_ENDINGS))
     for t in tokens:
         if t == kw:
             return True
@@ -527,6 +557,7 @@ def _scan_text_for_triggers(
     """
     haystack_low = (haystack or "").lower()
     tokens = _text_tokens(haystack)
+    index = _TokenIndex(tokens)
     always: list[HoraeRecord] = []
     by_keyword: list[HoraeRecord] = []
 
@@ -536,7 +567,7 @@ def _scan_text_for_triggers(
         if rec.always_on:
             always.append(rec)
             continue
-        if any(keyword_hits(kw, haystack_low, tokens) for kw in rec.keywords):
+        if any(keyword_hits(kw, haystack_low, tokens, index) for kw in rec.keywords):
             by_keyword.append(rec)
 
     by_keyword.sort(key=lambda r: r.priority, reverse=True)
@@ -1544,6 +1575,7 @@ async def build_context_from_db(
     иначе оно задвоится в истории.
     """
     from sqlalchemy import select
+    from sqlalchemy.orm import defer
 
     from backend.models import Message
 
@@ -1580,8 +1612,13 @@ async def build_context_from_db(
     # ответа, который сейчас пишется заново (skipLast плагина).
     horae_until = None
     if history is None:
+        # Свайпы и мета Horae истории здесь не нужны (messages_to_history берёт
+        # роль, текст и вложения), а их JSON — самое тяжёлое в строке: на длинном
+        # чате его разбор держал цикл событий сотни миллисекунд, и ответ соседа
+        # замирал.
         hq = (
             select(Message)
+            .options(defer(Message.swipes), defer(Message.horae))
             .where(Message.session_id == session.id)
             .order_by(Message.id)
         )
@@ -1636,7 +1673,12 @@ async def build_context_from_db(
         "mes_example": getattr(character, "mes_example", "") or "",
     }
 
-    return assemble_context(
+    # Сборка — чистая функция над готовыми данными, но на большом чате это
+    # сотни миллисекунд Python (лорбук, оценка токенов, окно). В отдельном
+    # потоке цикл событий получает управление каждые несколько миллисекунд —
+    # ответы, которые сейчас идут в других чатах, не замирают.
+    return await asyncio.to_thread(functools.partial(
+        assemble_context,
         character=char_dict,
         horae_records=records,
         history=history,
@@ -1661,7 +1703,7 @@ async def build_context_from_db(
         horae=horae_parts,
         user_memory=about_user,
         files_window=resolve_files_window(params),
-    )
+    ))
 
 
 async def _horae_parts(session_db, session, character, *, until, ooc, tags, user_message,
