@@ -16,7 +16,7 @@ version: сохранение со старой версией не затира
 import base64
 import logging
 
-from sqlalchemy import delete as sql_delete, select
+from sqlalchemy import delete as sql_delete, select, update
 
 from backend import models, turn_events
 from backend.config import settings
@@ -44,6 +44,61 @@ async def _files(db, session_id: int, owner: int, ids: list[int] | None = None) 
     if ids is not None:
         q = q.where(models.DraftFile.id.in_(ids or [-1]))
     return (await db.execute(q)).all()
+
+
+class ChatGone(LookupError):
+    """Чат удалили, пока писали его черновик."""
+
+
+async def _ensure_chat(db, session_id: int) -> None:
+    """
+    Проверка ПОСЛЕ записи: соединение уже держит замок на запись, так что
+    удаление чата либо закоммичено (видим — откатываемся), либо ещё впереди
+    (тогда оно само снесёт этот черновик). Иначе черновик, записанный в миг
+    удаления, достался бы новому чату с тем же id.
+    """
+    await db.flush()
+    gone = (await db.execute(select(models.ChatSession.id).where(
+        models.ChatSession.id == session_id))).scalar_one_or_none() is None
+    if gone:
+        await db.rollback()
+        raise ChatGone(session_id)
+
+
+async def _bump(db, session_id: int, owner: int, max_base: int | None = None):
+    """
+    Атомарно занять черновик под запись: версия +1 одним UPDATE (с условием
+    «на сервере не новее max_base»). Проверка «прочитать версию → записать»
+    пропускала два одновременных сохранения с одной базой — оба получали 200,
+    и правка одного устройства молча терялась. Теперь второе получает 409.
+    Возвращает свежую строку (уже с новой версией) или None — версия ушла вперёд.
+    После успеха соединение держит замок на запись до commit.
+    """
+    dialect = db.get_bind().dialect.name
+    if dialect in ("sqlite", "postgresql"):
+        if dialect == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert as d_insert
+        else:
+            from sqlalchemy.dialects.postgresql import insert as d_insert
+        # «Создать, если нет» одним оператором: два первых сохранения разом не
+        # падают на уникальном ключе (session_id, owner_id).
+        await db.execute(d_insert(models.ChatDraft).values(
+            session_id=session_id, owner_id=owner, text="", files=[], version=0,
+        ).on_conflict_do_nothing(index_elements=["session_id", "owner_id"]))
+    elif await _row(db, session_id, owner) is None:
+        db.add(models.ChatDraft(session_id=session_id, owner_id=owner, text="", files=[], version=0))
+        await db.flush()
+    cond = [models.ChatDraft.session_id == session_id, models.ChatDraft.owner_id == owner]
+    if max_base is not None:
+        cond.append(models.ChatDraft.version <= max_base)
+    res = await db.execute(update(models.ChatDraft).where(*cond)
+                           .values(version=models.ChatDraft.version + 1)
+                           .execution_options(synchronize_session=False))
+    if not res.rowcount:
+        return None
+    return (await db.execute(select(models.ChatDraft).where(
+        models.ChatDraft.session_id == session_id, models.ChatDraft.owner_id == owner,
+    ).execution_options(populate_existing=True))).scalar_one()
 
 
 def _file_meta(f) -> dict:
@@ -77,9 +132,9 @@ async def save(db, session_id: int, owner: int, *, text: str, reply_to_id, files
     правка: если на сервере уже новее (правили с другого устройства), ничего не
     пишем и возвращаем (False, текущий черновик).
     """
-    row = await _row(db, session_id, owner)
-    current = row.version if row is not None else 0
-    if base_version is not None and base_version < current:
+    row = await _bump(db, session_id, owner, base_version)
+    if row is None:
+        await db.rollback()
         return False, await get(db, session_id, owner)
     known = {f.id for f in await _files(db, session_id, owner)}
     keep = []
@@ -93,15 +148,13 @@ async def save(db, session_id: int, owner: int, *, text: str, reply_to_id, files
     doomed = known - set(keep)
     if doomed:
         await db.execute(sql_delete(models.DraftFile).where(models.DraftFile.id.in_(doomed)))
-    if row is None:
-        row = models.ChatDraft(session_id=session_id, owner_id=owner)
-        db.add(row)
     row.text = (text or "")[:TEXT_MAX]
     row.reply_to_id = reply_to_id if isinstance(reply_to_id, int) else None
     row.files = keep
-    row.version = current + 1
+    version = row.version
+    await _ensure_chat(db, session_id)
     await db.commit()
-    _announce(session_id, owner, row.version, origin)
+    _announce(session_id, owner, version, origin)
     return True, await get(db, session_id, owner)
 
 
@@ -111,8 +164,10 @@ async def add_file(db, session_id: int, owner: int, *, name: str, mime: str, kin
     limit = settings.DRAFT_FILE_MAX_MB * 1024 * 1024
     if len(raw) > limit:
         raise ValueError(f"Файл больше {settings.DRAFT_FILE_MAX_MB} МБ — в черновике не синхронизируется")
+    row = await _bump(db, session_id, owner)   # замок: параллельные загрузки не обойдут общий лимит
     used = sum(f.size or 0 for f in await _files(db, session_id, owner))
     if used + len(raw) > settings.DRAFT_TOTAL_MAX_MB * 1024 * 1024:
+        await db.rollback()
         raise ValueError(f"Файлы черновика больше {settings.DRAFT_TOTAL_MAX_MB} МБ — этот не синхронизируется")
     mime = (mime or "application/octet-stream")[:200]
     f = models.DraftFile(
@@ -122,15 +177,13 @@ async def add_file(db, session_id: int, owner: int, *, name: str, mime: str, kin
     )
     db.add(f)
     await db.flush()
-    row = await _row(db, session_id, owner)
-    if row is None:
-        row = models.ChatDraft(session_id=session_id, owner_id=owner, text="", files=[], version=0)
-        db.add(row)
     row.files = [*(row.files or []), f.id]
-    row.version = (row.version or 0) + 1
+    version = row.version
+    meta = _file_meta(f)
+    await _ensure_chat(db, session_id)
     await db.commit()
-    _announce(session_id, owner, row.version, origin)
-    return {**_file_meta(f), "version": row.version}
+    _announce(session_id, owner, version, origin)
+    return {**meta, "version": version}
 
 
 async def file_data(db, session_id: int, owner: int, fid: int) -> tuple[bytes, str, str] | None:
@@ -144,18 +197,55 @@ async def file_data(db, session_id: int, owner: int, fid: int) -> tuple[bytes, s
     return base64.b64decode(b64), f.mime, f.name
 
 
-async def clear(db, session_id: int, owner: int, origin: str = "") -> None:
-    """Сообщение ушло — черновик пуст на всех устройствах (сам коммит — у вызывающего)."""
-    row = await _row(db, session_id, owner)
-    await db.execute(sql_delete(models.DraftFile).where(
-        models.DraftFile.session_id == session_id, models.DraftFile.owner_id == owner))
-    if row is None:
-        return
-    row.text, row.reply_to_id, row.files = "", None, []
-    row.version = (row.version or 0) + 1
-    version = row.version
+def _ints(xs) -> set[int]:
+    out = set()
+    for x in xs or []:
+        try:
+            out.add(int(x))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+async def clear(db, session_id: int, owner: int, *, sent_text: str | None = None,
+                version: int | None = None, fids=None, origin: str = "") -> None:
+    """
+    Сообщение ушло — убираем из черновика ОТПРАВЛЕННОЕ, на всех устройствах.
+
+    version — версия черновика, когда нажали «Отправить», fids — его файлы,
+    ушедшие с сообщением. Ход стартует не мгновенно (загрузка большого файла —
+    минуты), и человек мог уже начать следующее сообщение: если черновик с тех
+    пор менялся, его новый текст и новые файлы не трогаем, удаляем только
+    отправленные файлы. Текст очищаем, если версия та же или в черновике лежит
+    ровно отправленный текст (сохранение, ушедшее за миг до отправки).
+    version=None — старый клиент без этих сведений: очищаем всё, как раньше.
+    """
+    sent = _ints(fids)
+    if await _row(db, session_id, owner) is None:
+        return   # черновика не было — убирать нечего
+    row = await _bump(db, session_id, owner)   # замок до чтения: не разминуться с сохранением
+    current = (row.version or 1) - 1           # версия до этой записи
+    untouched = version is None or current <= version
+    same_text = row is not None and sent_text is not None \
+        and (row.text or "").strip() == (sent_text or "").strip()
+    if untouched:
+        await db.execute(sql_delete(models.DraftFile).where(
+            models.DraftFile.session_id == session_id, models.DraftFile.owner_id == owner))
+    elif sent:
+        await db.execute(sql_delete(models.DraftFile).where(
+            models.DraftFile.session_id == session_id, models.DraftFile.owner_id == owner,
+            models.DraftFile.id.in_(sent)))
+    files = [] if untouched else [f for f in (row.files or []) if f not in sent]
+    clear_text = untouched or same_text
+    if not clear_text and files == list(row.files or []):
+        await db.rollback()
+        return   # отправленного в черновике уже нет — нечего менять
+    if clear_text:
+        row.text, row.reply_to_id = "", None
+    row.files = files
+    new_version = row.version
     await db.commit()
-    _announce(session_id, owner, version, origin)
+    _announce(session_id, owner, new_version, origin)
 
 
 async def drop_session(db, session_id: int) -> None:

@@ -95,3 +95,71 @@ def test_deleting_chat_removes_its_draft(client):
     new = _chat(client, "Новый")
     # id чата SQLite может отдать новому — чужой черновик там всплывать не должен.
     assert client.get(f"/api/sessions/{new}/draft").json()["text"] == ""
+
+
+def _send_ws(client, sid, payload):
+    with patch("backend.llm_gateway.litellm.acompletion", new=_fake_llm):
+        with client.websocket_connect(f"/ws/chat/{sid}") as ws:
+            ws.send_json({"type": "user_message", "client_id": "c1", **payload})
+            for _ in range(100):
+                if ws.receive_json()["type"] == "done":
+                    break
+
+
+def test_send_clears_only_what_was_sent(client):
+    """Пока ход стартовал, человек начал следующее сообщение — его не стираем."""
+    sid = _chat(client)
+    client.put(f"/api/sessions/{sid}/draft", json={"text": "первое"})
+    f1 = client.post(f"/api/sessions/{sid}/draft/files", files={"file": ("a.txt", b"a", "text/plain")}).json()
+    sent_version = f1["version"]
+    # После «Отправить» (до старта хода на сервере): новый текст и новый файл.
+    client.put(f"/api/sessions/{sid}/draft", json={"text": "второе", "files": [f1["fid"]], "base_version": sent_version})
+    f2 = client.post(f"/api/sessions/{sid}/draft/files", files={"file": ("b.txt", b"b", "text/plain")}).json()
+    _send_ws(client, sid, {"content": "первое", "draft_version": sent_version, "draft_fids": [f1["fid"]]})
+    d = client.get(f"/api/sessions/{sid}/draft").json()
+    assert d["text"] == "второе"
+    assert [f["fid"] for f in d["files"]] == [f2["fid"]]
+
+
+def test_send_clears_text_saved_just_before_send(client):
+    """Сохранение, ушедшее за миг до «Отправить», двинуло версию — текст тот же, его чистим."""
+    sid = _chat(client)
+    v = client.put(f"/api/sessions/{sid}/draft", json={"text": "привет"}).json()["version"]
+    client.put(f"/api/sessions/{sid}/draft", json={"text": "привет, мир  ", "base_version": v})
+    _send_ws(client, sid, {"content": "привет, мир", "draft_version": v, "draft_fids": []})
+    assert client.get(f"/api/sessions/{sid}/draft").json()["text"] == ""
+
+
+def test_draft_file_is_not_served_as_active_content(client):
+    sid = _chat(client)
+    up = client.post(f"/api/sessions/{sid}/draft/files",
+                     files={"file": ("x.html", b"<script>alert(1)</script>", "text/html")}).json()
+    r = client.get(f"/api/sessions/{sid}/draft/files/{up['fid']}")
+    assert r.headers["content-type"] == "application/octet-stream"
+    assert r.headers["content-disposition"].startswith("attachment")
+    assert r.headers["x-content-type-options"] == "nosniff" and "sandbox" in r.headers["content-security-policy"]
+    img = client.post(f"/api/sessions/{sid}/draft/files", files={"file": ("k.png", b"png", "image/png")}).json()
+    r = client.get(f"/api/sessions/{sid}/draft/files/{img['fid']}")
+    assert r.headers["content-type"] == "image/png" and r.headers["content-disposition"].startswith("inline")
+
+
+def test_concurrent_saves_with_same_base_do_not_both_win(client):
+    """Два устройства сохраняют разом с одной базой: одно проходит, другое — 409 (сольёт)."""
+    import asyncio
+
+    from backend import drafts
+    from backend.database import AsyncSessionLocal
+
+    sid = _chat(client)
+    v = client.put(f"/api/sessions/{sid}/draft", json={"text": "база"}).json()["version"]
+
+    async def both():
+        async def one(text):
+            async with AsyncSessionLocal() as db:
+                ok, _ = await drafts.save(db, sid, 0, text=text, reply_to_id=None, files=[], base_version=v)
+                return ok
+        return await asyncio.gather(one("с телефона"), one("с компьютера"))
+
+    assert sorted(client.portal.call(both)) == [False, True]
+    d = client.get(f"/api/sessions/{sid}/draft").json()
+    assert d["version"] == v + 1 and d["text"] in ("с телефона", "с компьютера")

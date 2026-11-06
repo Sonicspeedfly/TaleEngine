@@ -3725,7 +3725,7 @@ async def ws_chat(websocket: WebSocket, session_id: int):
                 await _foreign_turn(session_id, ws_user)
             except Exception:  # noqa: BLE001 — ход уже идёт; указатель памяти догонит
                 _turn_log.exception("Не удалось сдвинуть память о пользователе (чат %s)", session_id)
-            await _clear_draft(session_id, ws_user)
+            await _clear_draft(session_id, ws_user, raw)
         job = generation_manager.get(job_id)
         if job is None:
             return
@@ -3896,11 +3896,16 @@ async def sse_events(request: Request):
 
 
 # ============================ ЧЕРНОВИКИ СООБЩЕНИЙ ============================
-async def _clear_draft(session_id: int, user) -> None:
-    """Реплика сохранена — черновик этого чата пуст на всех устройствах."""
+async def _clear_draft(session_id: int, user, msg: dict | None = None) -> None:
+    """Реплика сохранена — отправленное уходит из черновика на всех устройствах."""
+    msg = msg or {}
+    version = msg.get("draft_version")
     try:
         async with AsyncSessionLocal() as db:
-            await drafts.clear(db, session_id, drafts.owner_of(user))
+            await drafts.clear(
+                db, session_id, drafts.owner_of(user), sent_text=msg.get("content") or "",
+                version=version if isinstance(version, int) else None, fids=msg.get("draft_fids"),
+            )
     except Exception:  # noqa: BLE001 — ход уже идёт; черновик клиент очистит и сам
         _turn_log.exception("Не удалось очистить черновик (чат %s)", session_id)
 
@@ -3927,10 +3932,13 @@ async def draft_put(session_id: int, payload: DraftIn, user=Depends(current_user
     сервере новее (правили с другого устройства) — 409 и текущий черновик.
     """
     await _draft_chat(db, session_id, user)
-    ok, draft = await drafts.save(
-        db, session_id, drafts.owner_of(user), text=payload.text, reply_to_id=payload.reply_to_id,
-        files=payload.files, base_version=payload.base_version, origin=payload.origin,
-    )
+    try:
+        ok, draft = await drafts.save(
+            db, session_id, drafts.owner_of(user), text=payload.text, reply_to_id=payload.reply_to_id,
+            files=payload.files, base_version=payload.base_version, origin=payload.origin,
+        )
+    except drafts.ChatGone:
+        raise HTTPException(404, "Чат удалён") from None
     if not ok:
         return JSONResponse({"detail": "Черновик изменён на другом устройстве", "draft": draft},
                             status_code=409)
@@ -3953,6 +3961,8 @@ async def draft_file_add(
             db, session_id, drafts.owner_of(user), name=file.filename or "файл",
             mime=file.content_type or "application/octet-stream", kind=kind, raw=raw, origin=origin,
         )
+    except drafts.ChatGone:
+        raise HTTPException(404, "Чат удалён") from None
     except ValueError as exc:
         raise HTTPException(413, str(exc)) from exc
 
@@ -3967,9 +3977,17 @@ async def draft_file_get(session_id: int, fid: int, user=Depends(current_user),
     raw, mime, name = got
     from urllib.parse import quote
 
-    return Response(content=raw, media_type=mime,
+    # Тип файла задал загрузивший: показываем «на месте» только картинки и
+    # медиа (не SVG), остальное — скачиванием и без исполнения. Иначе ссылка на
+    # HTML-«файл черновика» исполнила бы скрипт от имени приложения.
+    low = (mime or "").lower()
+    inline = low.split("/")[0] in ("image", "audio", "video") and "svg" not in low
+    return Response(content=raw, media_type=mime if inline else "application/octet-stream",
                     headers={"Cache-Control": "private, no-store",
-                             "Content-Disposition": "inline; filename*=UTF-8''" + quote(name)})
+                             "X-Content-Type-Options": "nosniff",
+                             "Content-Security-Policy": "sandbox",
+                             "Content-Disposition": ("inline" if inline else "attachment")
+                             + "; filename*=UTF-8''" + quote(name)})
 
 
 @app.post("/api/sessions/{session_id}/send")
@@ -3995,7 +4013,7 @@ async def http_send(
     except TurnBusy as busy:
         return _busy_response(busy.job)
     await _foreign_turn(session_id, user)
-    await _clear_draft(session_id, user)
+    await _clear_draft(session_id, user, msg.model_dump(include={"content", "draft_version", "draft_fids"}))
     return {"job_id": job_id}
 
 
@@ -4053,7 +4071,7 @@ async def http_send_form(
     except TurnBusy as busy:
         return _busy_response(busy.job)
     await _foreign_turn(session_id, user)
-    await _clear_draft(session_id, user)
+    await _clear_draft(session_id, user, data)
     return {"job_id": job_id}
 
 

@@ -318,6 +318,11 @@ class WSUserMessage(BaseModel):
     params: Optional[GenerationParams] = None
     # Ответ на конкретное сообщение (его id) — модель поймёт, к чему обращаются.
     reply_to_message_id: Optional[int] = None
+    # Черновик, из которого ушло сообщение (2.14.0): версия на момент отправки и
+    # его файлы. Сервер очищает черновик только от отправленного — то, что
+    # человек успел набрать или прикрепить после «Отправить», остаётся.
+    draft_version: Optional[int] = None
+    draft_fids: list[int] = Field(default_factory=list, max_length=200)
 
 
 class WSRegenerate(BaseModel):

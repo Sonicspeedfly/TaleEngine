@@ -3832,7 +3832,7 @@ createApp({
       // запускаем ответ заново — без звука и плашки, ответа ещё нет. Пока
       // перечитывали, открыли другой чат — правка ушла бы в него: текст
       // возвращаем в поле ввода.
-      if (append && this.sessionId !== sid) { this.input = append; return; }
+      if (append && this.sessionId !== sid) { this._draftAppendAway(sid, append); return; }
       if (append) return this._applyAppend(append);
       if (this.sessionId !== sid) return;
       // Реплика так и не сохранилась (ход не стартовал, сервер не подтвердил,
@@ -4086,10 +4086,13 @@ createApp({
       // Текст реплики — на случай, если она не сохранится (сервер не подтвердил,
       // ход не стартовал, «в чате уже идёт ответ»): finishStream вернёт его в поле.
       this._turnSendText = content;
+      const sentRaw = this.input;
       this.input = "";
       this.pendingAttachments = [];
       this.replyToId = null;
-      this._draftSent(pend);   // черновик очистит сервер, приняв реплику
+      // Из какой версии черновика ушла реплика: сервер, приняв её, уберёт из
+      // черновика ровно отправленное.
+      const draftInfo = this._draftSent(pend, sentRaw);
       this.resetComposerHeight();
       if (this.sendScroll) this.scrollDown();
       if (bigList.length) {
@@ -4103,7 +4106,7 @@ createApp({
         }
         const fd = new FormData();
         fd.append("payload", JSON.stringify({
-          content, attachments: metas, params: this.params, reply_to_message_id: replyTo,
+          content, attachments: metas, params: this.params, reply_to_message_id: replyTo, ...draftInfo,
         }));
         // Файлы из очереди убираем, но держим под рукой: на 409 («в чате уже
         // идёт ответ») реплика не сохранена, и вложения возвращаются в поле.
@@ -4111,22 +4114,22 @@ createApp({
         for (const a of bigList) { fd.append("files", attFiles[a.id], a.name || "file"); bigFiles[a.id] = attFiles[a.id]; }
         for (const a of bigList) delete attFiles[a.id];
         this._postWithProgress("/sessions/" + sid + "/send_form", fd)
-          .then((r) => this._onHttpTurnStarted(sid, clientId, r))
-          .catch((e) => this._onHttpTurnFailed(sid, clientId, e, "Не удалось отправить файл: ", { content, pend, bigFiles }));
+          .then((r) => { this._draftSendSettled(pend, !!(r && r.job_id), sid); this._onHttpTurnStarted(sid, clientId, r); })
+          .catch((e) => { this._draftSendSettled(pend, false, sid); this._onHttpTurnFailed(sid, clientId, e, "Не удалось отправить файл: ", { content, pend, bigFiles }); });
       } else if (attachments.length) {
         // Вложения (особенно аудио/видео) не влезают в WebSocket-кадр (~16 МБ) —
         // отправляем ход по HTTP с ПРОГРЕССОМ загрузки, ответ слушаем по SSE.
         this._postWithProgress("/sessions/" + sid + "/send", {
-          content, attachments, params: this.params, reply_to_message_id: replyTo,
+          content, attachments, params: this.params, reply_to_message_id: replyTo, ...draftInfo,
         })
-          .then((r) => this._onHttpTurnStarted(sid, clientId, r))
-          .catch((e) => this._onHttpTurnFailed(sid, clientId, e, "Не удалось отправить вложение: ", { content, pend, bigFiles: {} }));
+          .then((r) => { this._draftSendSettled(pend, !!(r && r.job_id), sid); this._onHttpTurnStarted(sid, clientId, r); })
+          .catch((e) => { this._draftSendSettled(pend, false, sid); this._onHttpTurnFailed(sid, clientId, e, "Не удалось отправить вложение: ", { content, pend, bigFiles: {} }); });
       } else {
         this._wsSend({
           type: "user_message", content,
           attachments, params: this.params,
           reply_to_message_id: replyTo,
-          client_id: clientId,
+          client_id: clientId, ...draftInfo,
         });
         this._armAccept(clientId);
       }
@@ -4593,8 +4596,11 @@ createApp({
     _draftState() {
       if (!this._draft) {
         this._draft = {
-          sid: null, version: 0, dirty: false, timer: null, saving: false, again: false,
+          sid: null, version: 0, dirty: false, timer: null, again: false,
+          savingSid: null,   // чат, чьё сохранение сейчас в полёте (одно на вкладку)
+          baseText: "",      // текст сервера, от которого идут здешние правки (для слияния)
           edits: 0, lastSig: "", removed: new Set(), uploads: 0, off: false, fileMax: 25,
+          missed: false,
           away: {},   // sid → промис сохранения, ушедшего вместе с прежним чатом
         };
         this._draftMem = {};   // sid → то, что было в поле (мгновенно при возврате)
@@ -4607,6 +4613,11 @@ createApp({
       if (this.adminPassword) h["X-Admin-Password"] = this.adminPassword;
       if (this.userToken) h["X-User-Token"] = this.userToken;
       return h;
+    },
+    // Сервер без черновиков (старая версия): маршрута нет — 404 «Not Found» или 405.
+    // 404 «Чат удалён» — это не то: черновики работают, просто чата больше нет.
+    _draftUnsupported(status, data) {
+      return status === 405 || (status === 404 && !!data && data.detail === "Not Found");
     },
     // Запрос к черновику без api(): тому 409 — ошибка, а нам нужен свежий черновик из тела.
     async _draftReq(method, sid, body) {
@@ -4628,6 +4639,18 @@ createApp({
         files: this.pendingAttachments.filter((a) => a.draftFid).map((a) => a.draftFid),
       };
     },
+    // Слияние текста при конфликте (правили и здесь, и на другом устройстве).
+    // base — текст сервера, от которого шли здешние правки. Изменилась только
+    // одна сторона — берём её; дописывали в конец — приклеиваем дописанное к
+    // серверному тексту; иначе оставляем оба куска, ничего не теряя.
+    _mergeText(base, mine, theirs) {
+      base = base || ""; mine = mine || ""; theirs = theirs || "";
+      if (theirs === base || theirs === mine) return mine;
+      if (mine === base) return theirs;
+      if (base && mine.startsWith(base)) return theirs + mine.slice(base.length);
+      if (base && theirs.startsWith(base)) return mine + theirs.slice(base.length);
+      return theirs + (theirs && mine ? "\n\n" : "") + mine;
+    },
     // Смена открытого чата (sync-наблюдатель sessionId — ловит любой способ
     // переключения): недописанное прежнего чата уходит в ЕГО черновик, поле
     // показывает черновик нового.
@@ -4636,13 +4659,10 @@ createApp({
       clearTimeout(d.timer); d.timer = null;
       if (oldSid && d.sid === oldSid) {
         this._draftMem[oldSid] = {
-          text: this.input || "", reply: this.replyToId, atts: this.pendingAttachments.slice(), version: d.version,
+          text: this.input || "", reply: this.replyToId, atts: this.pendingAttachments.slice(),
+          version: d.version, baseText: d.dirty ? d.baseText : (this.input || ""),
         };
-        if (d.dirty && !d.off) {
-          const p = this._putDraftAway(oldSid, this._draftBody(), d.version, new Set(d.removed));
-          d.away[oldSid] = p;
-          p.finally(() => { if (d.away[oldSid] === p) delete d.away[oldSid]; });
-        }
+        if (d.dirty && !d.off) this._sendAway(oldSid, this._draftBody(), d.version, new Set(d.removed), d.baseText);
       }
       const mem = (newSid && this._draftMem[newSid]) || null;
       this.input = mem ? mem.text : "";
@@ -4650,32 +4670,48 @@ createApp({
       this.pendingAttachments = mem ? mem.atts : [];
       d.sid = newSid || null;
       d.version = mem ? mem.version : 0;
+      d.baseText = mem ? (mem.baseText != null ? mem.baseText : mem.text) : "";
       d.dirty = false;
       d.again = false;
+      d.missed = false;
       d.removed = new Set();
       d.edits++;
       d.lastSig = this.draftSig;
       this.resetComposerHeight();
       if (newSid) this.$nextTick(() => { this.autoGrow(); this._loadDraft(newSid); });
     },
+    // Сохранение черновика другого (не открытого) чата: после уже идущего.
+    _sendAway(sid, body, base, removed, baseText) {
+      const d = this._draftState();
+      const prev = d.away[sid] || Promise.resolve();
+      const p = prev.catch(() => {}).then(() => this._putDraftAway(sid, body, base, removed, baseText));
+      d.away[sid] = p;
+      p.finally(() => { if (d.away[sid] === p) delete d.away[sid]; });
+      return p;
+    },
     // Черновик прежнего чата дописываем «в фоне»: поле уже показывает другой чат.
-    async _putDraftAway(sid, body, base, removed) {
+    async _putDraftAway(sid, body, base, removed, baseText) {
+      const mem0 = this._draftMem[sid];
+      if (mem0 && mem0.version > base) base = mem0.version;   // предыдущее сохранение уже прошло
       for (let attempt = 0; attempt < 3; attempt++) {
         let r;
         try { r = await this._draftReq("PUT", sid, { ...body, base_version: base, origin: TAB_ID }); } catch (e) { return; }
         if (r.ok) {
           const mem = this._draftMem[sid];
-          if (mem && r.data) mem.version = r.data.version;
+          if (mem && r.data) { mem.version = r.data.version; mem.baseText = body.text; }
           return;
         }
         if (r.status !== 409 || !r.data || !r.data.draft) return;
-        // Пока писали здесь, черновик поменяли на другом устройстве: наш текст
-        // свежее, а файлы — объединяем (кроме тех, что здесь убрали).
+        // Пока писали здесь, черновик поменяли на другом устройстве: текст
+        // сливаем, файлы объединяем (кроме тех, что здесь убрали).
         const srv = r.data.draft;
         const files = body.files.slice();
         for (const f of srv.files || []) if (!files.includes(f.fid) && !removed.has(f.fid)) files.push(f.fid);
-        body = { ...body, files };
+        body = { ...body, files, text: this._mergeText(baseText, body.text, srv.text) };
+        baseText = srv.text || "";
         base = srv.version;
+        const mem = this._draftMem[sid];
+        if (mem) mem.text = body.text;
       }
     },
     // Подпись поля поменялась (наблюдатель draftSig) — правка человека: сохраняем с задержкой.
@@ -4692,36 +4728,48 @@ createApp({
       const d = this._draftState();
       clearTimeout(d.timer); d.timer = null;
       if (!d.dirty || !d.sid || d.off) return;
-      if (d.saving) { d.again = true; return; }
+      if (d.savingSid === d.sid) { d.again = true; return; }
+      // Сохранение прежнего чата ещё в полёте — подождём его, а не будем ждать «again».
+      if (d.savingSid != null) { d.timer = setTimeout(() => this._saveDraft(), 200); return; }
       // Файл ещё грузится в черновик: его id пока неизвестен, а сохранение без
       // него удалило бы файл на сервере. Подождём.
       if (d.uploads > 0) { d.timer = setTimeout(() => this._saveDraft(), 500); return; }
       const sid = d.sid;
       const edits = d.edits;
       const removed = new Set(d.removed);
-      d.saving = true;
+      const body = this._draftBody();
+      d.savingSid = sid;
       let r = null;
       try {
-        r = await this._draftReq("PUT", sid, { ...this._draftBody(), base_version: d.version, origin: TAB_ID });
+        r = await this._draftReq("PUT", sid, { ...body, base_version: d.version, origin: TAB_ID });
       } catch (e) {
         r = null;
       } finally {
-        d.saving = false;
+        d.savingSid = null;
       }
-      if (d.sid !== sid) return;   // ушли в другой чат — дописал _draftSwitch
+      if (d.sid !== sid) {
+        // Ушли в другой чат — недописанное прежнего дописал _draftSwitch. У
+        // нового чата могли отложиться сохранение или загрузка — запускаем.
+        if (d.dirty) d.timer = setTimeout(() => this._saveDraft(), 50);
+        this._draftCatchUp();
+        return;
+      }
       if (!r) {   // нет сети — повторим, правка не потеряется
         d.timer = setTimeout(() => this._saveDraft(), 3000);
         return;
       }
       if (r.ok && r.data) {
         d.version = r.data.version;
+        d.baseText = body.text;
         for (const fid of removed) d.removed.delete(fid);
         if (d.edits === edits && !d.again) { d.dirty = false; this._draftCatchUp(); return; }
       } else if (r.status === 409 && r.data && r.data.draft) {
         this._mergeDraft(sid, r.data.draft);
-      } else if (r.status === 404 || r.status === 405) {
+      } else if (this._draftUnsupported(r.status, r.data)) {
         d.off = true;   // сервер без черновиков — поле живёт как раньше
         return;
+      } else if (r.status === 403 || r.status === 404) {
+        return;   // чата больше нет или доступ закрыт — сохранять некуда
       } else {
         d.timer = setTimeout(() => this._saveDraft(), 5000);
         return;
@@ -4729,35 +4777,48 @@ createApp({
       d.again = false;
       d.timer = setTimeout(() => this._saveDraft(), 50);
     },
-    // 409: черновик правили на другом устройстве. Текст — наш (мы печатаем
-    // прямо сейчас), файлы — объединение: чужие добавленные видны и здесь.
+    // Черновик правили на другом устройстве, а здесь есть несохранённая правка:
+    // текст сливаем (_mergeText), файлы объединяем — чужие добавленные видны и здесь.
     _mergeDraft(sid, srv) {
       const d = this._draftState();
       d.version = srv.version || 0;
+      const merged = this._mergeText(d.baseText, this.input, srv.text);
+      d.baseText = srv.text || "";
+      if (merged !== this.input) {
+        this.input = merged;
+        this.$nextTick(() => this.autoGrow());
+      }
       const have = new Set(this.pendingAttachments.filter((a) => a.draftFid).map((a) => a.draftFid));
       const extra = (srv.files || []).filter((f) => !have.has(f.fid) && !d.removed.has(f.fid));
-      if (extra.length) {
-        this.pendingAttachments = [...this.pendingAttachments, ...extra.map((f) => this._remoteAtt(sid, f))];
-        d.lastSig = this.draftSig;
-      }
+      if (extra.length) this.pendingAttachments = [...this.pendingAttachments, ...extra.map((f) => this._remoteAtt(sid, f))];
+      d.lastSig = this.draftSig;
     },
-    // Прочитать черновик с сервера и показать — если человек тем временем не начал печатать.
+    // Прочитать черновик с сервера и показать. Если человек тем временем начал
+    // печатать — не затираем, а сливаем с его правкой.
     async _loadDraft(sid) {
       const d = this._draftState();
       if (d.off || !sid) return;
       if (d.away[sid]) { try { await d.away[sid]; } catch (e) {} }
       const edits = d.edits;
       let r;
-      try { r = await this._draftReq("GET", sid); } catch (e) { return; }
-      if (r.status === 404 || r.status === 405) { d.off = true; return; }
+      try { r = await this._draftReq("GET", sid); } catch (e) { r = null; }
+      if (d.sid !== sid) return;
+      if (!r) { d.missed = true; setTimeout(() => this._draftCatchUp(), 5000); return; }
+      if (this._draftUnsupported(r.status, r.data)) { d.off = true; return; }
       if (!r.ok || !r.data) return;
-      if (d.sid !== sid || d.edits !== edits || d.dirty || d.saving) return;
+      if (r.data.file_max_mb) d.fileMax = r.data.file_max_mb;
+      if (d.savingSid === sid || d.uploads) { d.missed = true; return; }   // перечитаем, когда освободимся
+      if (d.edits !== edits || d.dirty) {
+        // Пока читали, человек начал печатать (например, поверх старой копии
+        // из памяти вкладки): свежее с сервера сливаем с его правкой.
+        if ((r.data.version || 0) > d.version) this._mergeDraft(sid, r.data);
+        return;
+      }
       this._applyDraft(sid, r.data);
     },
     _applyDraft(sid, draft) {
       const d = this._draftState();
       d.version = draft.version || 0;
-      if (draft.file_max_mb) d.fileMax = draft.file_max_mb;
       const cur = this.pendingAttachments;
       const byFid = new Map(cur.filter((a) => a.draftFid).map((a) => [a.draftFid, a]));
       const next = (draft.files || []).map((f) => byFid.get(f.fid) || this._remoteAtt(sid, f));
@@ -4768,6 +4829,7 @@ createApp({
       if (this.input !== text) this.input = text;
       this.replyToId = typeof draft.reply_to_id === "number" ? draft.reply_to_id : null;
       this.pendingAttachments = next;
+      d.baseText = text;
       d.dirty = false;
       d.removed = new Set();
       d.lastSig = this.draftSig;
@@ -4789,12 +4851,13 @@ createApp({
       if (this._attFiles) delete this._attFiles[a.id];
       if (a.preview && !a.remote) { try { URL.revokeObjectURL(a.preview); } catch (e) {} }
     },
-    // Положить файл в черновик открытого чата. Слишком большой — остаётся
-    // только на этом устройстве (как раньше), о чём и говорим.
-    async _draftUpload(att, blob, name) {
+    // Положить файл в черновик чата sid (по умолчанию — открытого). Слишком
+    // большой — остаётся только на этом устройстве (как раньше), о чём и говорим.
+    async _draftUpload(att, blob, name, sid = this.sessionId) {
       const d = this._draftState();
-      const sid = this.sessionId;
-      if (!sid || d.off || d.sid !== sid) return;
+      // Чат успели сменить (запись голоса ещё кодировалась) — файл остаётся в
+      // поле своего чата только на этом устройстве, но не уезжает в чужой.
+      if (!sid || d.off || d.sid !== sid || sid !== this.sessionId) return;
       if (blob.size > d.fileMax * 1024 * 1024) {
         att.localOnly = true;
         this.showToast("«" + name + "» больше " + d.fileMax + " МБ — в черновике он только на этом устройстве");
@@ -4814,13 +4877,20 @@ createApp({
         if (!res.ok || !meta || !meta.fid) {
           att.localOnly = true;
           if (res.status === 413) this.showToast("«" + name + "»: " + ((meta && meta.detail) || "файл велик для черновика") + " — он только на этом устройстве");
-          if (res.status === 404 || res.status === 405) d.off = true;
+          if (this._draftUnsupported(res.status, meta)) d.off = true;
           return;
         }
         att.draftFid = meta.fid;
         if (d.sid === sid && meta.version === d.version + 1) d.version = meta.version;
-        // Файл убрали или отправили, пока он грузился, — в черновике он лишний.
+        else if (d.sid !== sid) {
+          const mem = this._draftMem[sid];
+          if (mem && meta.version === mem.version + 1) mem.version = meta.version;
+        }
+        // Файл убрали, пока он грузился, — в черновике он лишний. Ушёл с
+        // сообщением — тоже, но решаем это, когда ясен исход отправки (409
+        // «в чате уже идёт ответ» вернёт его в поле).
         if (att._gone) this._draftDropFile(sid, meta.fid);
+        else if (att._sending === "accepted") { att._gone = true; this._draftDropFile(sid, meta.fid); }
       } catch (e) {
         att.localOnly = true;
       } finally {
@@ -4828,37 +4898,66 @@ createApp({
         this._draftCatchUp();
       }
     },
+    // Убрать один файл из черновика чата — только на сервере, не трогая поле
+    // ввода: оно могло уже очиститься отправкой (тогда его сохранение стёрло бы
+    // черновик, который ещё может вернуться — 409 «идёт ответ»).
     async _draftDropFile(sid, fid) {
       const d = this._draftState();
-      if (d.sid === sid) {
-        d.removed.add(fid);
-        d.dirty = true;
-        clearTimeout(d.timer);
-        d.timer = setTimeout(() => this._saveDraft(), 300);
-        return;
-      }
-      try {
-        const r = await this._draftReq("GET", sid);
+      if (d.sid === sid) d.removed.add(fid);
+      for (let attempt = 0; attempt < 3; attempt++) {
+        let r;
+        try { r = await this._draftReq("GET", sid); } catch (e) { return; }
         if (!r.ok || !r.data) return;
         const files = (r.data.files || []).map((f) => f.fid).filter((x) => x !== fid);
         if (files.length === (r.data.files || []).length) return;
-        await this._draftReq("PUT", sid, {
-          text: r.data.text || "", reply_to_id: r.data.reply_to_id, files, base_version: r.data.version, origin: "",
-        });
-      } catch (e) {}
+        let w;
+        try {
+          w = await this._draftReq("PUT", sid, {
+            text: r.data.text || "", reply_to_id: r.data.reply_to_id, files,
+            base_version: r.data.version, origin: TAB_ID,
+          });
+        } catch (e) { return; }
+        if (w.status !== 409) {
+          if (w.ok && w.data && d.sid === sid && d.version === r.data.version) d.version = w.data.version;
+          return;
+        }
+      }
     },
-    // Сообщение ушло: черновик очищает сервер (на всех устройствах сразу), а
-    // здесь не сохраняем «пустое поле» сами — иначе при отказе («в чате уже
-    // идёт ответ») вернувшиеся в поле файлы черновика были бы уже удалены.
-    _draftSent(atts) {
+    // «Отправить»: возвращает, из какой версии черновика и с какими его
+    // файлами ушло сообщение. Сервер, приняв реплику, уберёт из черновика
+    // ровно это (то, что успели набрать после, останется). Здесь «пустое поле»
+    // не сохраняем — иначе при отказе («в чате уже идёт ответ») вернувшиеся в
+    // поле файлы черновика были бы уже удалены.
+    _draftSent(atts, sentText) {
       const d = this._draftState();
       clearTimeout(d.timer); d.timer = null;
-      for (const a of atts || []) if (!a.draftFid) a._gone = true;
+      const info = {
+        draft_version: d.version,
+        draft_fids: (atts || []).filter((a) => a.draftFid).map((a) => a.draftFid),
+      };
+      for (const a of atts || []) if (!a.draftFid && !a.localOnly) a._sending = true;
       d.dirty = false;
       d.again = false;
       d.removed = new Set();
+      // Сервер ещё держит отправленный текст (до очистки): при слиянии он —
+      // «исходник», и не воскреснет поверх следующего сообщения.
+      d.baseText = sentText || "";
       d.edits++;
       d.lastSig = this.draftSig;
+      return d.off ? {} : info;
+    },
+    // Исход отправки известен: файлы, догружавшиеся в черновик, пока сообщение
+    // уходило, либо убираем из него (принято), либо оставляем (вернулись в поле).
+    _draftSendSettled(atts, accepted, sid) {
+      for (const a of atts || []) {
+        if (!a._sending) continue;
+        if (accepted) {
+          a._sending = "accepted";
+          if (a.draftFid) { a._gone = true; this._draftDropFile(sid, a.draftFid); }
+        } else {
+          a._sending = false;
+        }
+      }
     },
     // Файлы черновика с другого устройства — перед отправкой скачиваем.
     // Небольшие — в data:URI (как прочитанные с диска), большие — File для multipart.
@@ -4891,20 +4990,34 @@ createApp({
           });
       }
     },
+    // Текст, вернувшийся из хода чата sid, когда открыт уже другой чат («Дописать»
+    // не успел): кладём его в черновик ТОГО чата, а не в поле открытого.
+    _draftAppendAway(sid, text) {
+      const d = this._draftState();
+      const mem = this._draftMem[sid] || (this._draftMem[sid] = { text: "", reply: null, atts: [], version: 0, baseText: "" });
+      const base = (mem.text || "").replace(/\s+$/, "");
+      const prevText = mem.text;
+      mem.text = base ? base + "\n\n" + text : text;
+      if (d.off) return;
+      this._sendAway(sid, {
+        text: mem.text, reply_to_id: typeof mem.reply === "number" ? mem.reply : null,
+        files: mem.atts.filter((a) => a.draftFid).map((a) => a.draftFid),
+      }, mem.version, new Set(), mem.baseText != null ? mem.baseText : prevText);
+    },
     // Событие шины: черновик этого чата поменяли на другом устройстве (или сервер
-    // очистил после отправки). Свою несохранённую правку не затираем — она
+    // убрал отправленное). Свою несохранённую правку не затираем — она
     // сольётся через 409 при сохранении.
     _onDraftEvent(ev) {
       const d = this._draftState();
       if (ev.origin && ev.origin === TAB_ID) return;
       if (ev.session_id !== d.sid || !(ev.version > d.version)) return;
-      if (d.dirty || d.saving || d.uploads) { d.missed = true; return; }
+      if (d.dirty || d.savingSid === d.sid || d.uploads) { d.missed = true; return; }
       this._loadDraft(d.sid);
     },
     // Пропущенное (пока сохраняли/грузили) событие черновика — перечитываем, когда освободились.
     _draftCatchUp() {
       const d = this._draftState();
-      if (!d.missed || d.dirty || d.saving || d.uploads || !d.sid) return;
+      if (!d.missed || d.dirty || d.savingSid === d.sid || d.uploads || !d.sid) return;
       d.missed = false;
       this._loadDraft(d.sid);
     },
@@ -5035,6 +5148,7 @@ createApp({
           stream.getTracks().forEach((t) => t.stop()); // отпускаем микрофон
           this.recording = false;
           const src = new Blob(this.recChunks, { type: this.mediaRecorder.mimeType || "audio/webm" });
+          const recSid = this.sessionId;   // запись — в черновик ЭТОГО чата, даже если пока кодируем, откроют другой
           // Плашка со спиннером сразу — конвертация в MP3 занимает мгновение.
           const raw = {
             id: (this._attSeq = (this._attSeq || 0) + 1),
@@ -5048,7 +5162,7 @@ createApp({
             att.mime = mime;
             att.name = "Голосовое сообщение." + ext;
             att.size = blob.size;
-            this._draftUpload(att, blob, att.name);
+            this._draftUpload(att, blob, att.name, recSid);
             const reader = new FileReader();
             reader.onload = () => { att.data = reader.result; att.loading = false; };
             reader.onerror = () => { att.error = true; att.loading = false; };
@@ -5102,11 +5216,15 @@ createApp({
     async sendArt() {
       const desc = this.input.trim();
       if (!desc && this.pendingAttachments.length === 0) return;
+      // Чат, где нажали: пока дочитываются файлы, могли открыть другой — тогда
+      // не отправляем (описание и файлы остаются в черновике своего чата).
+      const sid = this.sessionId;
       this._hydrateDraftFiles();
       if (this.attachmentsLoading) {  // ждём дочитывания прикреплённых фото-референсов
         this.waitingFiles = true;
         await this._awaitAttachments();
         this.waitingFiles = false;
+        if (this.switchingChat || this.sessionId !== sid) return;
       }
       this._dropBadAttachments();
       this.chatError = "";
@@ -5117,10 +5235,10 @@ createApp({
       this.resetComposerHeight();
       try {
         // Фото-референсы могут быть тяжёлыми — грузим с прогрессом.
-        await this._postWithProgress("/sessions/" + this.sessionId + "/image",
+        await this._postWithProgress("/sessions/" + sid + "/image",
           { prompt: desc, mode: "prompt", attachments });
-        await this.loadMessages();
-        this.notifyChatListChanged(this.sessionId);
+        if (this.sessionId === sid) await this.loadMessages();
+        this.notifyChatListChanged(sid);
       } catch (e) {
         this.chatError = "Арт не удался: " + e.message;
       }

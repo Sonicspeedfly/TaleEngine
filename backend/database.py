@@ -240,7 +240,7 @@ def _cleanup_orphans(sync_conn) -> None:
         return
     # 1. Осиротевшие дочерние строки (чат, на который они ссылаются, уже удалён).
     for tbl in ("messages", "group_members", "canvases", "session_shares", "horae_facts",
-                "horae_chat_state", "horae_memory_docs"):
+                "horae_chat_state", "horae_memory_docs", "chat_drafts", "draft_files"):
         if tbl in tables:
             sync_conn.execute(text(
                 f"DELETE FROM {tbl} WHERE session_id NOT IN (SELECT id FROM chat_sessions)"
