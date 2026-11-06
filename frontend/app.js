@@ -151,6 +151,9 @@ createApp({
       // --- Редактирование сообщений ---
       editingId: null,
       editingText: "",
+      // Правка вложений сообщения (2.15.0): убираемые (индексы) и добавляемые файлы.
+      editRemove: [],
+      editAdd: [],
 
       // --- Правая панель ---
       drawerTab: null,         // generation | connection | character | memory | persona | null (по умолчанию СКРЫТ)
@@ -4308,6 +4311,8 @@ createApp({
     startEdit(msg) {
       this.editingId = msg.id;
       this.editingText = msg.content;
+      this.editRemove = [];
+      this.editAdd = [];
       // Авто-фокус + высота под содержимое: правка начинается сразу, без лишних кликов.
       this.$nextTick(() => {
         let el = this.$refs.editArea;
@@ -4336,8 +4341,12 @@ createApp({
       if (id == null || this.busyMsg[id]) return;
       this.busyMsg[id] = "edit";
       try {
-        await this.api("/messages/" + id, { method: "PATCH", body: JSON.stringify({ content: this.editingText }) });
-        if (this.editingId === id) this.editingId = null;
+        const msg = this.messages.find((x) => x.id === id);
+        if (!msg || msg.content !== this.editingText) {
+          await this.api("/messages/" + id, { method: "PATCH", body: JSON.stringify({ content: this.editingText }) });
+        }
+        if (this.editRemove.length || this.editAdd.length) await this._saveEditAttachments(id, msg);
+        if (this.editingId === id) { this.editingId = null; this.editRemove = []; this.editAdd = []; }
         this.loadMessages().catch(() => {});
         this.notifyChatListChanged(this.sessionId);   // правка последней реплики меняет превью
       } catch (e) {
@@ -4346,6 +4355,50 @@ createApp({
       } finally {
         delete this.busyMsg[id];
       }
+    },
+    // ---------- Вложения при правке сообщения (2.15.0) ----------
+    // Забыли файл — докидываем в готовое сообщение, лишний — убираем; заново
+    // сообщение собирать не нужно. Сохраняется вместе с текстом («Сохранить»).
+    onEditAttach(e) {
+      this._editAddFiles(e.target.files);
+      e.target.value = "";
+    },
+    onEditPaste(e) {
+      const files = [...((e.clipboardData && e.clipboardData.items) || [])]
+        .filter((it) => it.kind === "file").map((it) => it.getAsFile()).filter(Boolean);
+      if (!files.length) return;   // обычный текст вставляется как всегда
+      e.preventDefault();
+      this._editAddFiles(files);
+    },
+    _editAddFiles(files) {
+      for (const file of [...(files || [])]) {
+        const mime = file.type || "application/octet-stream";
+        const type = mime.startsWith("image") ? "image" : mime.startsWith("audio") ? "audio"
+          : mime.startsWith("video") ? "video" : "document";
+        this.editAdd.push({ id: (this._attSeq = (this._attSeq || 0) + 1), file, type, mime, name: file.name || "файл", size: file.size || 0 });
+      }
+    },
+    toggleEditRemove(ai) {
+      const i = this.editRemove.indexOf(ai);
+      if (i >= 0) this.editRemove.splice(i, 1);
+      else this.editRemove.push(ai);
+    },
+    async _saveEditAttachments(id, msg) {
+      const atts = (msg && msg.attachments) || [];
+      const fd = new FormData();
+      fd.append("remove", JSON.stringify(this.editRemove.map((idx) => ({ idx, v: (atts[idx] && atts[idx].v) || null }))));
+      for (const f of this.editAdd) fd.append("files", f.file, f.name);
+      const res = await fetch("/api/messages/" + id + "/attachments", {
+        method: "POST", headers: this.authHeaders(), body: fd,
+      });
+      if (!res.ok) {
+        let detail = "HTTP " + res.status;
+        try { const j = await res.json(); if (j && j.detail) detail = j.detail; } catch (e) {}
+        if (res.status === 401) this.needAccess = true;
+        throw new Error(detail);
+      }
+      const data = await res.json();
+      if (msg && data && Array.isArray(data.attachments)) msg.attachments = data.attachments;
     },
     async deleteMessage(msg) {
       if (this.busyMsg[msg.id]) return;
@@ -4569,7 +4622,12 @@ createApp({
     // URL вложения сохранённого сообщения (данные грузятся лениво, не в списке чата).
     attUrl(m, i) {
       const q = this._authQuery();
-      return "/api/messages/" + m.id + "/att/" + i + (q ? "?" + q : "");
+      // v — версия файла: после правки вложений под тем же индексом может быть
+      // другой файл, а браузер держит ссылку в кэше неделю.
+      const a = (m.attachments || [])[i];
+      const v = a && a.v ? "v=" + a.v : "";
+      const qs = [q, v].filter(Boolean).join("&");
+      return "/api/messages/" + m.id + "/att/" + i + (qs ? "?" + qs : "");
     },
     fmtSize(bytes) {
       if (!bytes) return "";
@@ -7417,8 +7475,32 @@ createApp({
                    в ленте на сорок сообщений было не понять, какое правишь. -->
               <textarea ref="editArea" v-model="editingText" class="edit-area"
                         aria-label="Правка сообщения"
-                        @input="autoGrowEdit" @keydown="onEditKeydown"></textarea>
+                        @input="autoGrowEdit" @keydown="onEditKeydown" @paste="onEditPaste"></textarea>
+              <!-- Вложения сообщения в правке: ✕ — убрать (↺ — вернуть), 📎 — докинуть файл. -->
+              <div v-if="(m.attachments && m.attachments.length) || editAdd.length" class="chips edit-atts"
+                   role="list" aria-label="Вложения сообщения">
+                <span v-for="(a, ai) in (m.attachments || [])" :key="'old' + ai" role="listitem"
+                      class="chip att-chip" :class="{ 'att-removed': editRemove.includes(ai) }">
+                  <span class="att-state">{{ attIcon(a) }}</span>
+                  <span class="att-name" :title="a.name || ''">{{ a.name || 'файл' }}<i v-if="a.size"> · {{ fmtSize(a.size) }}</i></span>
+                  <a href="#" class="att-x" @click.prevent="toggleEditRemove(ai)"
+                     :title="editRemove.includes(ai) ? 'Вернуть' : 'Убрать из сообщения'"
+                     :aria-label="(editRemove.includes(ai) ? 'Вернуть вложение ' : 'Убрать вложение ') + (a.name || '')">{{ editRemove.includes(ai) ? '↺' : '✕' }}</a>
+                </span>
+                <span v-for="(f, fi) in editAdd" :key="'new' + f.id" role="listitem" class="chip att-chip att-new">
+                  <span class="att-state" title="Новый файл">{{ attIcon(f) }}</span>
+                  <span class="att-name" :title="f.name">{{ f.name }}<i v-if="f.size"> · {{ fmtSize(f.size) }}</i></span>
+                  <a href="#" class="att-x" @click.prevent="editAdd.splice(fi, 1)" title="Не добавлять"
+                     :aria-label="'Не добавлять ' + f.name">✕</a>
+                </span>
+              </div>
               <div class="row edit-actions">
+                <label class="btn edit-attach" tabindex="0" role="button"
+                       @keydown.enter.prevent="$event.currentTarget.querySelector('input').click()"
+                       @keydown.space.prevent="$event.currentTarget.querySelector('input').click()"
+                       title="Добавить файл в сообщение (фото, аудио, видео, документ)">
+                  📎 Файл<input type="file" multiple hidden @change="onEditAttach" />
+                </label>
                 <span class="muted edit-hint">Ctrl+Enter — сохранить · Esc — отмена</span>
                 <div style="flex:1"></div>
                 <button @click="editingId = null">Отмена</button>

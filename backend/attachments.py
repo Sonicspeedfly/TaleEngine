@@ -121,6 +121,10 @@ def att_cache_get(key):
     return _att_cache.get(key)
 
 
+def att_cache_clear() -> None:
+    _att_cache.clear()
+
+
 def att_cache_put(key, raw: bytes) -> None:
     if len(raw) > _ATT_CACHE_BYTES // 2:
         return

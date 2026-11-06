@@ -70,6 +70,7 @@ from backend import (
     user_memory,
 )
 from backend.attachments import (
+    att_cache_clear,
     att_cache_get,
     att_cache_put,
     attachment_data,
@@ -1420,7 +1421,11 @@ def _att_meta(a: dict) -> dict:
     """Мета вложения для списка сообщений (без тяжёлого base64 `data`)."""
     data = a.get("data") or ""
     size = int(len(data) * 0.75) if data else int(a.get("size") or 0)  # ~сырой размер
-    return {"type": a.get("type"), "mime": a.get("mime"), "name": a.get("name"), "size": size}
+    # v — версия файла (его blob): клиент добавляет её к ссылке на вложение.
+    # После правки вложений (2.15.0) под тем же индексом может оказаться другой
+    # файл, а браузер держит /att/{idx} в кэше неделю.
+    return {"type": a.get("type"), "mime": a.get("mime"), "name": a.get("name"), "size": size,
+            "v": a.get("blob_id")}
 
 
 def _utcnow():
@@ -1842,6 +1847,76 @@ async def edit_message(
         # Свайп переключили или вписали теги — документ поиска Horae догонит.
         _spawn_bg(horae_tasks.after_turn(msg.session_id, None))
     return {"ok": True, "content": msg.content, "active_swipe": msg.active_swipe}
+
+
+def _kind_of(mime: str) -> str:
+    """Вид вложения по MIME — как его определяет клиент при прикреплении."""
+    mime = (mime or "").lower()
+    for kind in ("image", "audio", "video"):
+        if mime.startswith(kind + "/"):
+            return kind
+    return "document"
+
+
+@app.post("/api/messages/{message_id}/attachments")
+async def edit_message_attachments(
+    message_id: int,
+    remove: str = Form("[]"),
+    files: list[UploadFile] = File(default=[]),
+    user=Depends(current_user), db: AsyncSession = Depends(get_session),
+):
+    """
+    Правка вложений готового сообщения (2.15.0): докинуть забытый файл или убрать
+    лишний, не пересоздавая сообщение. remove — JSON-список
+    [{"idx": N, "v": blob_id}] убираемых вложений (v сверяется: индексы
+    сдвигаются, и устаревший запрос не должен снести соседний файл); files —
+    новые файлы, встают в конец. Ответ — новая мета вложений сообщения.
+    """
+    msg = await db.get(models.Message, message_id)
+    if not msg:
+        raise HTTPException(404, "Сообщение не найдено")
+    if not await _can_access_session(db, await db.get(models.ChatSession, msg.session_id), user):
+        raise HTTPException(403, "Нет доступа к этому чату")
+    try:
+        drop_req = json.loads(remove or "[]")
+        assert isinstance(drop_req, list)
+    except Exception:  # noqa: BLE001
+        raise HTTPException(422, "Некорректный список удаляемых вложений") from None
+    atts = [a for a in (msg.attachments or [])]
+    drop_idx: set[int] = set()
+    for item in drop_req:
+        if not isinstance(item, dict) or not isinstance(item.get("idx"), int):
+            continue
+        i = item["idx"]
+        if not (0 <= i < len(atts)) or not isinstance(atts[i], dict):
+            raise HTTPException(409, "Вложения сообщения изменились — обновите чат")
+        if (item.get("v") or None) != (atts[i].get("blob_id") or None):
+            raise HTTPException(409, "Вложения сообщения изменились — обновите чат")
+        drop_idx.add(i)
+    new_in: list[AttachmentIn] = []
+    for upload in files or []:
+        raw = await upload.read()
+        mime = upload.content_type or "application/octet-stream"
+        new_in.append(AttachmentIn(
+            type=_kind_of(mime), mime=mime, name=upload.filename or "файл",
+            data=f"data:{mime};base64," + base64.b64encode(raw).decode(),
+        ))
+    if not drop_idx and not new_in:
+        return {"attachments": [_att_meta(a) if isinstance(a, dict) else a for a in atts]}
+    gone_blobs = [atts[i].get("blob_id") for i in drop_idx if atts[i].get("blob_id")]
+    kept = [a for i, a in enumerate(atts) if i not in drop_idx]
+    added = await store_attachments(db, msg.id, new_in)
+    msg.attachments = kept + added   # новый список — JSON-колонка видит изменение
+    if gone_blobs:
+        await db.execute(sql_delete(models.AttachmentBlob).where(
+            models.AttachmentBlob.id.in_(gone_blobs), models.AttachmentBlob.message_id == msg.id))
+    await db.commit()
+    if gone_blobs:
+        att_cache_clear()
+        media_refs.uploader.sweep_soon()   # копии убранных файлов в хранилище модели — тоже
+    if added:
+        media_refs.enqueue_message(added, None, await get_connection(db))
+    return {"attachments": [_att_meta(a) if isinstance(a, dict) else a for a in msg.attachments]}
 
 
 # Ходы, которые отвечают на ПОСЛЕДНЮЮ реплику пользователя (а не дописывают
