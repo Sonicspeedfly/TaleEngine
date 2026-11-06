@@ -4658,6 +4658,11 @@ createApp({
           savingSid: null,   // чат, чьё сохранение сейчас в полёте (одно на вкладку)
           baseText: "",      // текст сервера, от которого идут здешние правки (для слияния)
           edits: 0, lastSig: "", removed: new Set(), uploads: 0, off: false, fileMax: 25,
+          // Файлы черновика, ушедшие с сообщением или убранные здесь: пока сервер
+          // их не вычистил, перечитанный черновик ещё содержит их — в поле они
+          // возвращаться не должны (иначе «отправленное» голосовое висит в поле
+          // и уйдёт повторно со следующим сообщением). id файлов не переиспользуются.
+          goneFids: new Set(),
           missed: false,
           away: {},   // sid → промис сохранения, ушедшего вместе с прежним чатом
         };
@@ -4764,7 +4769,8 @@ createApp({
         // сливаем, файлы объединяем (кроме тех, что здесь убрали).
         const srv = r.data.draft;
         const files = body.files.slice();
-        for (const f of srv.files || []) if (!files.includes(f.fid) && !removed.has(f.fid)) files.push(f.fid);
+        const gone = this._draftState().goneFids;
+        for (const f of srv.files || []) if (!files.includes(f.fid) && !removed.has(f.fid) && !gone.has(f.fid)) files.push(f.fid);
         body = { ...body, files, text: this._mergeText(baseText, body.text, srv.text) };
         baseText = srv.text || "";
         base = srv.version;
@@ -4847,7 +4853,7 @@ createApp({
         this.$nextTick(() => this.autoGrow());
       }
       const have = new Set(this.pendingAttachments.filter((a) => a.draftFid).map((a) => a.draftFid));
-      const extra = (srv.files || []).filter((f) => !have.has(f.fid) && !d.removed.has(f.fid));
+      const extra = (srv.files || []).filter((f) => !have.has(f.fid) && !d.removed.has(f.fid) && !d.goneFids.has(f.fid));
       if (extra.length) this.pendingAttachments = [...this.pendingAttachments, ...extra.map((f) => this._remoteAtt(sid, f))];
       d.lastSig = this.draftSig;
     },
@@ -4879,7 +4885,8 @@ createApp({
       d.version = draft.version || 0;
       const cur = this.pendingAttachments;
       const byFid = new Map(cur.filter((a) => a.draftFid).map((a) => [a.draftFid, a]));
-      const next = (draft.files || []).map((f) => byFid.get(f.fid) || this._remoteAtt(sid, f));
+      const next = (draft.files || []).filter((f) => !d.goneFids.has(f.fid))
+        .map((f) => byFid.get(f.fid) || this._remoteAtt(sid, f));
       // Файлы, ещё не попавшие в черновик (грузятся или только на этом устройстве), остаются.
       for (const a of cur) if (!a.draftFid) next.push(a);
       for (const a of cur) if (a.draftFid && !next.includes(a)) this._releaseAtt(a);
@@ -4949,6 +4956,7 @@ createApp({
         // «в чате уже идёт ответ» вернёт его в поле).
         if (att._gone) this._draftDropFile(sid, meta.fid);
         else if (att._sending === "accepted") { att._gone = true; this._draftDropFile(sid, meta.fid); }
+        else if (att._sending) d.goneFids.add(meta.fid);   // уходит с сообщением прямо сейчас
       } catch (e) {
         att.localOnly = true;
       } finally {
@@ -4961,6 +4969,7 @@ createApp({
     // черновик, который ещё может вернуться — 409 «идёт ответ»).
     async _draftDropFile(sid, fid) {
       const d = this._draftState();
+      d.goneFids.add(fid);
       if (d.sid === sid) d.removed.add(fid);
       for (let attempt = 0; attempt < 3; attempt++) {
         let r;
@@ -4993,7 +5002,10 @@ createApp({
         draft_version: d.version,
         draft_fids: (atts || []).filter((a) => a.draftFid).map((a) => a.draftFid),
       };
-      for (const a of atts || []) if (!a.draftFid && !a.localOnly) a._sending = true;
+      for (const a of atts || []) {
+        if (a.draftFid) d.goneFids.add(a.draftFid);
+        else if (!a.localOnly) a._sending = true;
+      }
       d.dirty = false;
       d.again = false;
       d.removed = new Set();
@@ -5007,7 +5019,10 @@ createApp({
     // Исход отправки известен: файлы, догружавшиеся в черновик, пока сообщение
     // уходило, либо убираем из него (принято), либо оставляем (вернулись в поле).
     _draftSendSettled(atts, accepted, sid) {
+      const d = this._draftState();
       for (const a of atts || []) {
+        // Не отправилось («в чате уже идёт ответ», сбой) — файлы снова в черновике.
+        if (!accepted && a.draftFid && !a._gone) d.goneFids.delete(a.draftFid);
         if (!a._sending) continue;
         if (accepted) {
           a._sending = "accepted";
