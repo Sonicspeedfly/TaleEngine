@@ -43,6 +43,10 @@ HTTP Basic Auth поверх всего нужен ещё заголовок `Au
 | GET | `/api/messages/{id}/att/{idx}` | Байты одного вложения сообщения (лениво грузят `<img>`/`<audio>`, кэшируется). Авторизация — заголовком или `?token=`/`?access_code=` (теги не шлют заголовки). Поддерживает `Range: bytes=…` (206 / 416, `Accept-Ranges: bytes`) — без этого браузер не перематывает аудио и видео |
 | PATCH | `/api/messages/{id}` | Редактировать сообщение/свайп. Нужен доступ к чату сообщения (иначе 403). Идущий в чате ход правку не блокирует |
 | DELETE | `/api/messages/{id}` | Удалить сообщение. Нужен доступ к чату (иначе 403). Если это последняя реплика пользователя, на которую сейчас идёт ответ (`send`/`retry`/`group`), ход сначала отменяется БЕЗ сохранения ответа |
+| GET | `/api/sessions/{id}/draft` | Черновик сообщения этого чата (свой у каждого пользователя): `{text, reply_to_id, files:[{fid,type,mime,name,size}], version, file_max_mb}`. Пустой — `version: 0` |
+| PUT | `/api/sessions/{id}/draft` | Сохранить черновик: `{text, reply_to_id, files:[fid…], base_version, origin}`. `files` — id файлов черновика по порядку; не перечисленные удаляются. `base_version` старее серверной (правили на другом устройстве) → **409** `{"detail", "draft": <текущий черновик>}`. `origin` — id вкладки, вернётся в событии шины |
+| POST | `/api/sessions/{id}/draft/files` | Файл в черновик (multipart: `file`, `kind` = image/audio/video/document, `origin`) → `{fid, type, mime, name, size, version}`. Больше `DRAFT_FILE_MAX_MB` (25) или всего больше `DRAFT_TOTAL_MAX_MB` (100) — **413**: файл остаётся только на устройстве |
+| GET | `/api/sessions/{id}/draft/files/{fid}` | Байты файла черновика (`Cache-Control: private, no-store`). Авторизация — как у `/api/messages/{id}/att/{idx}` |
 | GET | `/api/sessions/{id}/active_job` | Идущий ход чата: `{"job": null}` или `{"job": {job_id, session_id, kind, stage, started_at, elapsed, chars}}` (доступ к чату). По нему клиент находит ход после F5/смены чата |
 | GET | `/api/sessions/{id}/export` | **Нативный экспорт чата AiChat** |
 | POST | `/api/sessions/import` | Импорт чата (нативный AiChat **или** SillyTavern — автоопределение) |
@@ -358,6 +362,9 @@ HTTP-отправка с вложениями). Сначала повтор (`re
 - `{"type":"turn_started", session_id, job_id, kind}`
 - `{"type":"turn_done", session_id, job_id, kind, ok, error, stopped, message_id, preview}` —
   `preview` — первые ~140 символов ответа; `error` — текст ошибки или `null`
+- `{"type":"draft", session_id, owner_id, version, origin}` — черновик чата
+  изменился (правка с другого устройства или очистка после отправки). Приходит
+  только владельцу черновика; вкладка с `origin` = своему id его пропускает
 
 ### `/api/health`
 Проверка здоровья без авторизации (опрашивается `start.bat` при запуске). Открыт даже

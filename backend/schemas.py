@@ -301,6 +301,15 @@ class ImagePrompt(BaseModel):
 
 
 # ----- Протокол WebSocket -----
+class DraftIn(BaseModel):
+    """Черновик сообщения чата (backend/drafts.py)."""
+    text: str = Field(default="", max_length=200_000)
+    reply_to_id: Optional[int] = None
+    files: list[int] = Field(default_factory=list, max_length=200)   # id файлов черновика по порядку
+    base_version: Optional[int] = None
+    origin: str = Field(default="", max_length=64)   # метка вкладки: своё событие она пропустит
+
+
 class WSUserMessage(BaseModel):
     """Сообщение, которое клиент шлёт серверу по WebSocket."""
     type: Literal["user_message"] = "user_message"
@@ -309,6 +318,11 @@ class WSUserMessage(BaseModel):
     params: Optional[GenerationParams] = None
     # Ответ на конкретное сообщение (его id) — модель поймёт, к чему обращаются.
     reply_to_message_id: Optional[int] = None
+    # Черновик, из которого ушло сообщение (2.14.0): версия на момент отправки и
+    # его файлы. Сервер очищает черновик только от отправленного — то, что
+    # человек успел набрать или прикрепить после «Отправить», остаётся.
+    draft_version: Optional[int] = None
+    draft_fids: list[int] = Field(default_factory=list, max_length=200)
 
 
 class WSRegenerate(BaseModel):
