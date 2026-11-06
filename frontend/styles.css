@@ -2352,3 +2352,9 @@ input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
 .gcp-settings label { display: block; margin-bottom: 6px; }
 .gcp-settings label.check { display: flex; }
 .gcp-settings input:not([type="checkbox"]) { width: 100%; box-sizing: border-box; }
+
+/* Вложения в правке сообщения (2.15.0): убираемое — зачёркнуто, новое — акцентом. */
+.edit-atts { margin-top: 6px; flex-wrap: wrap; gap: 6px; }
+.edit-atts .att-chip.att-removed { opacity: 0.55; text-decoration: line-through; }
+.edit-atts .att-chip.att-new { border-color: var(--accent); }
+.edit-attach { cursor: pointer; margin-right: 8px; }
