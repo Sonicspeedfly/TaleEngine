@@ -21,7 +21,6 @@ import io
 import json
 import os
 import re
-import shutil
 import sqlite3
 import sys
 import time
@@ -133,7 +132,13 @@ def main() -> int:
             return 1
 
     backup = "%s.bak-secrets-%s" % (args.db, time.strftime("%Y%m%d-%H%M%S"))
-    shutil.copy(args.db, backup)
+    # Через backup API: база в режиме WAL (2.16.0), и копия одного файла .db
+    # могла не содержать последних записей из журнала.
+    dst = sqlite3.connect(backup)
+    try:
+        con.backup(dst)
+    finally:
+        dst.close()
     print("Резервная копия: %s" % backup)
 
     for key, names in FIELDS.items():

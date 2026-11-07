@@ -1849,6 +1849,22 @@ async def edit_message(
     return {"ok": True, "content": msg.content, "active_swipe": msg.active_swipe}
 
 
+async def _user_content(text: str, attachments):
+    """
+    Реплика с файлами — в потоке: base64-копии, разбор Word/PDF (а то и запуск
+    LibreOffice) иначе шли в единственном цикле событий, и ответы других
+    пользователей стояли, пока файл обрабатывался. Без файлов — как раньше.
+    """
+    if not attachments:
+        return build_user_content(text, attachments, current=True)
+    return await asyncio.to_thread(build_user_content, text, attachments, True)
+
+
+async def _data_uri(raw: bytes, mime: str) -> str:
+    """data:URI файла — кодирование большого файла в base64 в потоке (см. _user_content)."""
+    return await asyncio.to_thread(lambda: f"data:{mime};base64," + base64.b64encode(raw).decode())
+
+
 def _kind_of(mime: str) -> str:
     """Вид вложения по MIME — как его определяет клиент при прикреплении."""
     mime = (mime or "").lower()
@@ -1899,7 +1915,7 @@ async def edit_message_attachments(
         mime = upload.content_type or "application/octet-stream"
         new_in.append(AttachmentIn(
             type=_kind_of(mime), mime=mime, name=upload.filename or "файл",
-            data=f"data:{mime};base64," + base64.b64encode(raw).decode(),
+            data=await _data_uri(raw, mime),
         ))
     if not drop_idx and not new_in:
         return {"attachments": [_att_meta(a) if isinstance(a, dict) else a for a in atts]}
@@ -2891,7 +2907,7 @@ async def canvas_generate(
         .where(models.Message.session_id == session_id, models.Message.id < user_msg.id)
         .order_by(models.Message.id)
     )).scalars().all()
-    user_content = build_user_content(prompt, attachments, current=True)
+    user_content = await _user_content(prompt, attachments)
     messages = await build_context_from_db(
         db, sess, character, prompt, user_content, _ctx_budget(params),
         history=await messages_to_history_db(db, prior), history_ids=[m.id for m in prior],
@@ -3355,7 +3371,7 @@ async def _start_user_turn(session_id, content, attachments, params, db, reply_t
 
     # Для модели добавляем ссылку на сообщение, на которое отвечает пользователь.
     model_text = (await _reply_prefix(db, reply_to_message_id, session_id)) + content
-    user_content = build_user_content(model_text, attachments, current=True)
+    user_content = await _user_content(model_text, attachments)
     # Контекст строим ДО сохранения нового сообщения (иначе оно задвоится).
     messages = await build_context_from_db(
         db, sess, character, model_text, user_content, _ctx_budget(params),
@@ -4132,7 +4148,7 @@ async def http_send_form(
         mime = meta.get("mime") or upload.content_type or "application/octet-stream"
         attachments.append(AttachmentIn(
             type=meta.get("type") or "document",
-            data=f"data:{mime};base64," + base64.b64encode(raw).decode(),
+            data=await _data_uri(raw, mime),
             mime=mime,
             name=meta.get("name") or upload.filename or "файл",
         ))

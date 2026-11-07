@@ -290,7 +290,8 @@ async def _generate_reply(session_id: int, text: str, attachments: list[Attachme
         sess = await db.get(models.ChatSession, session_id)
         character = await db.get(models.Character, sess.character_id)
         connection = await get_connection(db)
-        user_content = build_user_content(text, attachments, current=True)
+        user_content = (await asyncio.to_thread(build_user_content, text, attachments, True)
+                        if attachments else build_user_content(text, attachments, current=True))
         # Файлы истории — заготовками: ссылками на копии в хранилище модели или
         # целиком в пределах INLINE_FILES_MB (см. backend/media_refs.py).
         messages = await build_context_from_db(

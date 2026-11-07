@@ -6,6 +6,7 @@ SQLite выбран ради простоты развёртывания: оди
 """
 import os
 
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -38,6 +39,25 @@ engine = create_async_engine(
     connect_args={"timeout": 30} if _is_sqlite else {},
     **({"poolclass": NullPool} if _is_sqlite else {}),
 )
+
+if _is_sqlite and settings.SQLITE_WAL:
+    @event.listens_for(engine.sync_engine, "connect")
+    def _sqlite_wal(dbapi_conn, _record):
+        """
+        WAL: читатели не ждут писателя, а писатель — читателей. В режиме журнала
+        по умолчанию (DELETE) коммит одного пользователя (сохранение ответа,
+        фоновая память) запирал файл, и сборка контекста другого стояла в
+        очереди; каждый коммит к тому же — полный fsync. synchronous=NORMAL в
+        WAL безопасен для целостности (при сбое питания теряется лишь последний
+        коммит). Соединение новое на каждую сессию (NullPool) — ставим всегда.
+        """
+        cur = dbapi_conn.cursor()
+        try:
+            cur.execute("PRAGMA journal_mode=WAL")
+            cur.execute("PRAGMA synchronous=NORMAL")
+        finally:
+            cur.close()
+
 
 # Фабрика сессий. expire_on_commit=False — чтобы ORM-объекты оставались
 # пригодными к чтению после commit (удобно для возврата из эндпоинтов).

@@ -13,12 +13,13 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from sqlalchemy import delete as sql_delete, select
+from sqlalchemy import Text, delete as sql_delete, select, type_coerce
 
 from backend import horae_rpg, horae_settings, horae_state as hs, horae_tables, horae_time
 from backend import models
@@ -258,15 +259,32 @@ def with_appended_meta(horae, swipes_count: int, meta: dict | None) -> dict:
     return with_meta(horae, max(0, swipes_count - 1), meta)
 
 
+def _entries_from_raw(rows) -> list[tuple[int, str, dict | None, bool]]:
+    out = []
+    for mid, role, raw, active in rows:
+        if isinstance(raw, (dict, list)):
+            horae = raw   # драйвер уже разобрал JSON (PostgreSQL/asyncpg)
+        else:
+            try:
+                horae = json.loads(raw) if raw else None
+            except (TypeError, ValueError):
+                horae = None
+        out.append((mid, role, active_meta(horae, active), is_side(horae)))
+    return out
+
+
 async def load_entries(db, session_id: int) -> list[tuple[int, str, dict | None, bool]]:
     """[(id, роль, мета активного свайпа, побочная)] по возрастанию id — без текстов."""
+    # Мету берём сырым текстом и разбираем в потоке: на длинном чате это JSON
+    # всех свайпов всех ответов, и его разбор в цикле событий замораживал
+    # ответы, которые в это время шли другим пользователям.
     rows = (await db.execute(
-        select(models.Message.id, models.Message.role, models.Message.horae,
-               models.Message.active_swipe)
+        select(models.Message.id, models.Message.role,
+               type_coerce(models.Message.horae, Text), models.Message.active_swipe)
         .where(models.Message.session_id == session_id)
         .order_by(models.Message.id)
     )).all()
-    return [(r.id, r.role, active_meta(r.horae, r.active_swipe), is_side(r.horae)) for r in rows]
+    return await asyncio.to_thread(_entries_from_raw, [tuple(r) for r in rows])
 
 
 # ---------------------------------------------------------------------------
@@ -328,15 +346,20 @@ async def compute(db, session, *, character=None, until: int | None = None,
         settings = await effective_settings(db, session, character, data)
     names = await scene_names(db, session, character)
     entries = await load_entries(db, session.id)
-    state = hs.replay(entries, ops=data.get("ops") or [], seed=data.get("seed"), until=until,
-                      settings=settings, names=names, rpg_config=data.get("rpg_config") or {})
     tables = await resolved_tables(db, session, character, data)
-    contributions = [
-        (mid, meta.get("tables") or []) for mid, _role, meta, side in entries
-        if not side and isinstance(meta, dict) and meta.get("tables")
-        and (until is None or mid <= until)
-    ]
-    results = horae_tables.replay(tables, contributions) if tables else {}
+
+    def _replay():
+        # Чистый пересчёт по всем ходам чата — в потоке (см. load_entries).
+        st = hs.replay(entries, ops=data.get("ops") or [], seed=data.get("seed"), until=until,
+                       settings=settings, names=names, rpg_config=data.get("rpg_config") or {})
+        contributions = [
+            (mid, meta.get("tables") or []) for mid, _role, meta, side in entries
+            if not side and isinstance(meta, dict) and meta.get("tables")
+            and (until is None or mid <= until)
+        ]
+        return st, (horae_tables.replay(tables, contributions) if tables else {})
+
+    state, results = await asyncio.to_thread(_replay)
     return Computed(settings=settings, names=names, data=data, entries=entries, state=state,
                     tables=tables, table_results=results,
                     calendar=horae_time.normalize_calendar(settings.get("calendar")), until=until)

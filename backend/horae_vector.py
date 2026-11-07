@@ -23,6 +23,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -561,7 +562,10 @@ async def recall(db, session, comp, *, user_message: str, connection: dict,
     ordered_metas = [(mid, metas[mid]) for mid in sorted(metas) if not excluded(mid)]
 
     layers: list[tuple[list[dict], float]] = []
-    structured = structured_hits(ordered_metas, user_q, known, top_k=top_k, pure=bool(s.get("recall_pure")))
+    # Поиск по документам — чистый Python над всей памятью чата: в потоке,
+    # чтобы ответы, идущие в других чатах, не замирали на время отбора.
+    structured = await asyncio.to_thread(structured_hits, ordered_metas, user_q, known,
+                                         top_k=top_k, pure=bool(s.get("recall_pure")))
     if structured:
         layers.append(([{**h, "key": h["mid"]} for h in structured], 1.0))
 
@@ -573,9 +577,11 @@ async def recall(db, session, comp, *, user_message: str, connection: dict,
     pool = top_k * CANDIDATE_FACTOR
     if query_vec:
         threshold = dynamic_threshold(float(s.get("recall_threshold") or 0.72), len(docs))
-        layers.append((vector_search(query_vec, docs, threshold, pool, pure=bool(s.get("recall_pure"))), 1.0))
+        layers.append((await asyncio.to_thread(vector_search, query_vec, docs, threshold, pool,
+                                               pure=bool(s.get("recall_pure"))), 1.0))
     else:
-        layers.append((lexical_search(user_q, sq, docs, float(s.get("recall_lexical_threshold") or 0.3), pool), 1.0))
+        layers.append((await asyncio.to_thread(lexical_search, user_q, sq, docs,
+                                               float(s.get("recall_lexical_threshold") or 0.3), pool), 1.0))
 
     intent = ""
     if s.get("recall_query_rewrite"):
@@ -588,9 +594,11 @@ async def recall(db, session, comp, *, user_message: str, connection: dict,
                     qv = await _embed([q], connection)
                     if qv:
                         threshold = dynamic_threshold(float(s.get("recall_threshold") or 0.72), len(docs))
-                        layers.append((vector_search(qv[0], docs, threshold, pool, pure=True), 1 / max(1, len(queries))))
+                        layers.append((await asyncio.to_thread(vector_search, qv[0], docs, threshold, pool,
+                                                               pure=True), 1 / max(1, len(queries))))
                 else:
-                    layers.append((lexical_search(q, "", docs, float(s.get("recall_lexical_threshold") or 0.3), pool),
+                    layers.append((await asyncio.to_thread(lexical_search, q, "", docs,
+                                                           float(s.get("recall_lexical_threshold") or 0.3), pool),
                                    1 / max(1, len(queries))))
         except Exception as exc:  # noqa: BLE001
             log.warning("Переписывание запроса Horae не сработало: %s", exc)
