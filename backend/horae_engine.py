@@ -262,10 +262,13 @@ def with_appended_meta(horae, swipes_count: int, meta: dict | None) -> dict:
 def _entries_from_raw(rows) -> list[tuple[int, str, dict | None, bool]]:
     out = []
     for mid, role, raw, active in rows:
-        try:
-            horae = json.loads(raw) if raw else None
-        except (TypeError, ValueError):
-            horae = None
+        if isinstance(raw, (dict, list)):
+            horae = raw   # драйвер уже разобрал JSON (PostgreSQL/asyncpg)
+        else:
+            try:
+                horae = json.loads(raw) if raw else None
+            except (TypeError, ValueError):
+                horae = None
         out.append((mid, role, active_meta(horae, active), is_side(horae)))
     return out
 

@@ -19,10 +19,12 @@ mime по data:URI и шлёт Gemini как inline_data. Это тот же п�
 import base64
 import io
 import os
+import pathlib
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
 
 # Что считаем документом (не картинка/не аудио).
 DOC_EXTS = {
@@ -91,18 +93,33 @@ def find_libreoffice() -> str | None:
     return None
 
 
+# LibreOffice — по одному на процесс и со СВОИМ профилем (2.16.0). Файлы
+# реплик теперь разбираются в потоках, и два документа, присланные разом,
+# запускали два soffice на общем профиле: второй молча отдавал работу первому
+# и выходил без PDF — документ уходил модели голым текстом. Отдельный профиль
+# процесса не пересекается ни с Telegram-ботом, ни с открытым у человека
+# LibreOffice; замок не даёт двум конвертациям в одном процессе (и памяти на
+# 4 ГБ сервере) столкнуться.
+_SOFFICE_LOCK = threading.Lock()
+
+
+def _soffice_profile() -> str:
+    return pathlib.Path(tempfile.gettempdir(), f"taleengine_lo_{os.getpid()}").as_uri()
+
+
 def convert_to_pdf(src_bytes: bytes, ext: str) -> bytes | None:
     """Конвертировать документ в PDF через LibreOffice (если он есть). Иначе None."""
     exe = find_libreoffice()
     if not exe:
         return None
     try:
-        with tempfile.TemporaryDirectory() as d:
+        with _SOFFICE_LOCK, tempfile.TemporaryDirectory() as d:
             src = os.path.join(d, "input" + ext)
             with open(src, "wb") as f:
                 f.write(src_bytes)
             subprocess.run(
-                [exe, "--headless", "--convert-to", "pdf", "--outdir", d, src],
+                [exe, "-env:UserInstallation=" + _soffice_profile(),
+                 "--headless", "--convert-to", "pdf", "--outdir", d, src],
                 check=True, timeout=90,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
