@@ -99,3 +99,64 @@ def test_image_of_foreign_character_is_hidden(client):
     finally:
         cache.clear()
         cache.update(old)
+
+
+def test_broken_and_unsupported_images_do_not_break_saves(client):
+    from backend import images
+
+    cid = client.post("/api/characters", json={"name": "Битый"}).json()["id"]
+    # Не base64 и битый base64 — сохранение проходит, отдаётся исходник.
+    for bad in ("data:image/png;base64,abc", "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'/>"):
+        r = client.patch(f"/api/characters/{cid}", json={"avatar_path": bad})
+        assert r.status_code == 200, r.text
+        assert r.json()["avatar_path"] == bad
+    # SVG не сжимается: версия помечена, повторных попыток нет.
+    spawned = []
+    orig = images._spawn_ensure
+    images._spawn_ensure = lambda kind, oid: spawned.append((kind, oid))
+    try:
+        listed = next(c for c in client.get("/api/characters").json() if c["id"] == cid)
+    finally:
+        images._spawn_ensure = orig
+    assert listed["avatar_path"].startswith("data:image/svg") and not spawned
+    # Отдача по ссылке — исходник в песочнице (SVG не исполнит скрипт).
+    r = client.get(f"/api/img/character/{cid}/thumb")
+    assert r.status_code == 200 and r.headers["content-security-policy"] == "sandbox"
+
+
+def test_multi_frame_phone_jpeg_is_compressed():
+    from backend import images
+
+    big = Image.effect_noise((3000, 2000), 50).convert("RGB")
+    depth = Image.new("RGB", (600, 400), (128, 128, 128))
+    buf = io.BytesIO()
+    big.save(buf, "MPO", save_all=True, append_images=[depth], quality=90)
+    value = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+    data, mime, w, h = images.render(value, 256)
+    assert mime == "image/webp" and max(w, h) <= 256 and len(data) < len(buf.getvalue()) / 20
+
+
+def test_deleted_user_avatar_copy_is_dropped(client):
+
+    from backend import images, models
+    from backend.database import AsyncSessionLocal
+    from sqlalchemy import select
+
+    async def scenario():
+        async with AsyncSessionLocal() as db:
+            u = models.User(username="img_gone", password_hash="x", avatar_path=_photo(400, 400))
+            db.add(u)
+            await db.commit()
+            uid = u.id
+            assert await images.ensure(db, "user", uid)
+        return uid
+
+    uid = client.portal.call(scenario)
+    client.delete(f"/api/admin/users/{uid}")
+
+    async def left():
+        async with AsyncSessionLocal() as db:
+            return (await db.execute(select(models.ImageVariant).where(
+                models.ImageVariant.kind == "user", models.ImageVariant.owner_id == uid))).first()
+
+    assert client.portal.call(left) is None

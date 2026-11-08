@@ -644,7 +644,7 @@ async def _image_access(db, kind: str, oid: int, user):
         raise HTTPException(404, "Нет такой картинки")
     if kind == "session_bg":
         sess = await db.get(models.ChatSession, oid)
-        if not await _can_access_session(db, sess, user):
+        if sess is None or not await _can_access_session(db, sess, user):
             raise HTTPException(404, "Нет такой картинки")
         return sess
     if kind == "user":
@@ -674,38 +674,55 @@ async def get_image(kind: str, oid: int, variant: str, v: str = "", name: str = 
     скачать оригинал). Ссылку с ?v= браузер кэширует навсегда: при смене
     картинки сменится и версия.
     """
-    await _image_access(db, kind, oid, user)
+    if await _image_access(db, kind, oid, user) is None:
+        raise HTTPException(404, "Нет такой картинки")
     spec = images.KINDS[kind]
-    if variant == "orig":
+    # Картинку загрузил пользователь — SVG мог бы исполнить скрипт, открой его
+    # адрес напрямую; песочница этого не даёт (в <img> SVG и так без скриптов).
+    safe = {"X-Content-Type-Options": "nosniff", "Content-Security-Policy": "sandbox"}
+
+    async def original(disposition: str):
         value = (await db.execute(select(getattr(spec.model, spec.column))
                                   .where(spec.model.id == oid))).scalar_one_or_none()
         if not images.is_data_image(value):
             raise HTTPException(404, "Исходника нет")
-        raw, mime = await asyncio.to_thread(images.decode_data_uri, value)
-        ext = (mime.split("/", 1)[1] if "/" in mime else "img").split("+", 1)[0].replace("jpeg", "jpg")
-        fname = (name or f"{kind}-{oid}").strip()[:120] + "." + ext
-        return Response(content=raw, media_type=mime, headers={
-            "Cache-Control": "private, no-cache",
-            "X-Content-Type-Options": "nosniff",
-            "Content-Disposition": "attachment; filename*=UTF-8''" + urllib.parse.quote(fname),
-        })
+        try:
+            raw, mime = await asyncio.to_thread(images.decode_data_uri, value)
+        except ValueError:
+            raise HTTPException(404, "Исходник не читается") from None
+        headers = {"Cache-Control": "private, no-cache", **safe}
+        if disposition:
+            ext = (mime.split("/", 1)[1] if "/" in mime else "img").split("+", 1)[0].replace("jpeg", "jpg")
+            fname = (name or f"{kind}-{oid}").strip()[:120] + "." + ext
+            headers["Content-Disposition"] = disposition + "; filename*=UTF-8''" + urllib.parse.quote(fname)
+        return Response(content=raw, media_type=mime, headers=headers)
+
+    if variant == "orig":
+        return await original("attachment")
     if variant != spec.variant:
         raise HTTPException(404, "Нет такой картинки")
-    row = (await db.execute(select(models.ImageVariant).where(
-        models.ImageVariant.kind == kind, models.ImageVariant.owner_id == oid,
-        models.ImageVariant.variant == variant))).scalar_one_or_none()
-    if row is None:
-        await images.ensure(db, kind, oid)
-        row = (await db.execute(select(models.ImageVariant).where(
+    # Копия должна быть снята с ТЕКУЩЕЙ картинки: id владельцев переиспользуются,
+    # а картинку могли сменить в обход API (импорт) — тогда пересоздаём.
+    cur = await images.current_version(db, kind, oid)
+    if cur is None:
+        raise HTTPException(404, "Картинки нет")
+
+    async def load_row():
+        return (await db.execute(select(models.ImageVariant).where(
             models.ImageVariant.kind == kind, models.ImageVariant.owner_id == oid,
             models.ImageVariant.variant == variant))).scalar_one_or_none()
-    if row is None:
-        raise HTTPException(404, "Картинки нет")
+
+    row = await load_row()
+    if row is None or row.src_ver != cur:
+        await images.ensure(db, kind, oid)
+        row = await load_row()
+    if row is None or row.src_ver != cur or not row.mime:
+        return await original("")   # не сжимается (SVG, HEIC…) — исходник как есть
     fresh = bool(v) and v == row.src_ver
     return Response(content=row.data, media_type=row.mime, headers={
         # Версия совпала — содержимое по этому адресу уже не изменится.
         "Cache-Control": "private, max-age=31536000, immutable" if fresh else "private, no-cache",
-        "X-Content-Type-Options": "nosniff",
+        **safe,
     })
 
 
@@ -4731,6 +4748,7 @@ async def admin_delete_user(user_id: int, db: AsyncSession = Depends(get_session
         ).scalars().all():
             await db.delete(t)
         await db.delete(u)
+        await images.drop(db, "user", user_id)   # id переиспользуется — копия не должна достаться другому
         await db.commit()
     return {"ok": True}
 

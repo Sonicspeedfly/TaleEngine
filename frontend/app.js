@@ -4628,10 +4628,13 @@ createApp({
       return this.imgSrc(base + "?name=" + encodeURIComponent(name || "аватар"));
     },
     // Авторизация в query — для <img>/<audio>, которые не умеют слать заголовки.
+    // Все удостоверения, что есть: режим доступа мог смениться, а в браузере
+    // остался токен прежнего — с ним одним ссылки ловили 401 в режиме кода.
     _authQuery() {
-      if (this.userToken) return "token=" + encodeURIComponent(this.userToken);
-      if (this.accessCode) return "access_code=" + encodeURIComponent(this.accessCode);
-      return "";
+      const qs = [];
+      if (this.userToken) qs.push("token=" + encodeURIComponent(this.userToken));
+      if (this.accessCode) qs.push("access_code=" + encodeURIComponent(this.accessCode));
+      return qs.join("&");
     },
     // URL вложения сохранённого сообщения (данные грузятся лениво, не в списке чата).
     attUrl(m, i) {
