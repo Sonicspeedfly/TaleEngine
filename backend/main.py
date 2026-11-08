@@ -44,6 +44,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import delete as sql_delete
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import defer
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from fastapi import Header, Request
@@ -56,6 +57,7 @@ from backend import (
     gcp_billing,
     group_chat,
     horae_api,
+    images,
     horae_engine,
     horae_state,
     horae_tasks,
@@ -194,6 +196,9 @@ async def lifespan(app: FastAPI):
         except Exception:  # noqa: BLE001 — без ссылок всё работает как раньше
             logger.exception("Не удалось загрузить состояние хранилища файлов")
     media_refs.uploader.start()
+    # Сжатые копии аватарок и фонов, которых ещё нет (база из прошлых версий) —
+    # фоном, по одной: до их готовности списки отдают исходники, как раньше.
+    _spawn_bg(images.backfill())
     # Автозапуск Telegram-бота, если он включён в админке, задан токен И не
     # запрещён через TELEGRAM_AUTOSTART (защита от двойного polling — Conflict 409,
     # когда второй/тестовый инстанс делит БД с боевым сервером).
@@ -631,16 +636,126 @@ def _make_persist_continue(message_id: int, model_used: str):
 
 
 # ============================ ПЕРСОНАЖИ ============================
+# ============================ КАРТИНКИ (аватары, фоны) ============================
+async def _image_access(db, kind: str, oid: int, user):
+    """Строка-владелец картинки, если пользователю можно её видеть, иначе 404."""
+    spec = images.KINDS.get(kind)
+    if spec is None:
+        raise HTTPException(404, "Нет такой картинки")
+    if kind == "session_bg":
+        sess = await db.get(models.ChatSession, oid)
+        if sess is None or not await _can_access_session(db, sess, user):
+            raise HTTPException(404, "Нет такой картинки")
+        return sess
+    if kind == "user":
+        if user is not None and user.id != oid and user.role != "admin":
+            raise HTTPException(404, "Нет такой картинки")
+        return await db.get(models.User, oid)
+    q = accounts.scope_query(select(spec.model.id).where(spec.model.id == oid), spec.model, user)
+    if (await db.execute(q)).scalar_one_or_none() is None:
+        allowed = False
+        if kind == "character" and user is not None:
+            # Персонаж чужого чата, которым со мной поделились: его аватар в шапке и репликах.
+            allowed = (await db.execute(
+                select(models.SessionShare.id)
+                .join(models.ChatSession, models.ChatSession.id == models.SessionShare.session_id)
+                .where(models.SessionShare.user_id == user.id, models.ChatSession.character_id == oid)
+                .limit(1))).scalar_one_or_none() is not None
+        if not allowed:
+            raise HTTPException(404, "Нет такой картинки")
+    return True
+
+
+@app.get("/api/img/{kind}/{oid}/{variant}")
+async def get_image(kind: str, oid: int, variant: str, v: str = "", name: str = "",
+                    user=Depends(current_user), db: AsyncSession = Depends(get_session)):
+    """
+    Сжатая копия аватара/фона (variant = thumb | view) или исходник (orig —
+    скачать оригинал). Ссылку с ?v= браузер кэширует навсегда: при смене
+    картинки сменится и версия.
+    """
+    if await _image_access(db, kind, oid, user) is None:
+        raise HTTPException(404, "Нет такой картинки")
+    spec = images.KINDS[kind]
+    # Картинку загрузил пользователь — SVG мог бы исполнить скрипт, открой его
+    # адрес напрямую; песочница этого не даёт (в <img> SVG и так без скриптов).
+    safe = {"X-Content-Type-Options": "nosniff", "Content-Security-Policy": "sandbox"}
+
+    async def original(disposition: str):
+        value = (await db.execute(select(getattr(spec.model, spec.column))
+                                  .where(spec.model.id == oid))).scalar_one_or_none()
+        if not images.is_data_image(value):
+            raise HTTPException(404, "Исходника нет")
+        try:
+            raw, mime = await asyncio.to_thread(images.decode_data_uri, value)
+        except ValueError:
+            raise HTTPException(404, "Исходник не читается") from None
+        headers = {"Cache-Control": "private, no-cache", **safe}
+        if disposition:
+            ext = (mime.split("/", 1)[1] if "/" in mime else "img").split("+", 1)[0].replace("jpeg", "jpg")
+            fname = (name or f"{kind}-{oid}").strip()[:120] + "." + ext
+            headers["Content-Disposition"] = disposition + "; filename*=UTF-8''" + urllib.parse.quote(fname)
+        return Response(content=raw, media_type=mime, headers=headers)
+
+    if variant == "orig":
+        return await original("attachment")
+    if variant != spec.variant:
+        raise HTTPException(404, "Нет такой картинки")
+    # Копия должна быть снята с ТЕКУЩЕЙ картинки: id владельцев переиспользуются,
+    # а картинку могли сменить в обход API (импорт) — тогда пересоздаём.
+    cur = await images.current_version(db, kind, oid)
+    if cur is None:
+        raise HTTPException(404, "Картинки нет")
+
+    async def load_row():
+        return (await db.execute(select(models.ImageVariant).where(
+            models.ImageVariant.kind == kind, models.ImageVariant.owner_id == oid,
+            models.ImageVariant.variant == variant))).scalar_one_or_none()
+
+    row = await load_row()
+    if row is None or row.src_ver != cur:
+        await images.ensure(db, kind, oid)
+        row = await load_row()
+    if row is None or row.src_ver != cur or not row.mime:
+        return await original("")   # не сжимается (SVG, HEIC…) — исходник как есть
+    fresh = bool(v) and v == row.src_ver
+    return Response(content=row.data, media_type=row.mime, headers={
+        # Версия совпала — содержимое по этому адресу уже не изменится.
+        "Cache-Control": "private, max-age=31536000, immutable" if fresh else "private, no-cache",
+        **safe,
+    })
+
+
+async def _characters_out(db, chars) -> list[dict]:
+    """
+    Персонажи для клиента: вместо аватара-исходника (data:URI фото, мегабайты) —
+    ссылка на его сжатую копию (backend/images.py). Сам исходник из базы не
+    читается — отсюда defer в запросах.
+    """
+    pub = await images.public_values(db, "character", [c.id for c in chars])
+    out = []
+    for c in chars:
+        d = {name: getattr(c, name) for name in CharacterRead.model_fields if name != "avatar_path"}
+        d["avatar_path"] = pub.get(c.id)
+        out.append(d)
+    return out
+
+
+async def _character_out(db, char) -> dict:
+    return (await _characters_out(db, [char]))[0]
+
+
 @app.get("/api/characters", response_model=list[CharacterRead])
 async def list_characters(user=Depends(current_user), db: AsyncSession = Depends(get_session)):
-    q = accounts.scope_query(select(models.Character), models.Character, user)
+    q = accounts.scope_query(
+        select(models.Character).options(defer(models.Character.avatar_path)), models.Character, user)
     # Закреплённые наверх (см. list_sessions про порядок NULL в SQLite).
     q = q.order_by(
         models.Character.pinned_at.is_(None),
         models.Character.pinned_at.desc(),
         models.Character.id.asc(),
     )
-    return (await db.execute(q)).scalars().all()
+    return await _characters_out(db, (await db.execute(q)).scalars().all())
 
 
 @app.post("/api/characters", response_model=CharacterRead)
@@ -653,7 +768,8 @@ async def create_character(
     db.add(char)
     await db.commit()
     await db.refresh(char)
-    return char
+    await images.ensure(db, "character", char.id)
+    return await _character_out(db, char)
 
 
 def _can_write_character(char, user) -> bool:
@@ -677,6 +793,8 @@ async def update_character(
     if not char:
         raise HTTPException(404, "Персонаж не найден")
     data = payload.model_dump(exclude_none=True)
+    if images.is_our_url(data.get("avatar_path")):
+        data.pop("avatar_path")   # клиент вернул ссылку на копию — аватар не менялся
     if user is not None and user.role != "admin" and char.owner_id not in (None, user.id):
         raise HTTPException(403, "Нет доступа к этому персонажу")
     # Закрепить в списке можно и общего персонажа; править его — только админ.
@@ -688,7 +806,9 @@ async def update_character(
         setattr(char, key, value)
     await db.commit()
     await db.refresh(char)
-    return char
+    if "avatar_path" in data:
+        await images.ensure(db, "character", char.id)
+    return await _character_out(db, char)
 
 
 @app.delete("/api/characters/{character_id}")
@@ -702,6 +822,7 @@ async def delete_character(character_id: int, user=Depends(current_user),
         # следующему новому персонажу, и тот унаследовал бы чужой лорбук.
         await db.execute(sql_delete(models.HoraeEntry).where(models.HoraeEntry.character_id == character_id))
         await db.delete(char)
+        await images.drop(db, "character", character_id)
         await db.commit()
     return {"ok": True}
 
@@ -738,7 +859,8 @@ async def import_character(
             )
         )
     await db.commit()
-    return char
+    await images.ensure(db, "character", char.id)
+    return await _character_out(db, char)
 
 
 @app.get("/api/characters/{character_id}/export")
@@ -807,7 +929,7 @@ async def list_shared_sessions(user=Depends(current_user), db: AsyncSession = De
             "id": s.id, "title": s.title, "is_group": s.is_group,
             "character_id": s.character_id,
             "character_name": ch.name if ch else "",
-            "character_avatar": ch.avatar_path if ch else None,
+            "character_avatar": await images.public_value(db, "character", ch.id) if ch else None,
             "owner": owner.username if owner else "",
             "timezone": s.timezone or "",
             **_preview_fields(s, previews),
@@ -943,7 +1065,9 @@ async def list_sessions(
     db: AsyncSession = Depends(get_session),
 ):
     q = (
-        select(models.ChatSession)
+        # Фон чата — картинка (data:URI) на каждый чат; в списке — ссылка на его
+        # копию (images.public_values), сам фон из базы здесь не читаем.
+        select(models.ChatSession).options(defer(models.ChatSession.background))
         .where(models.ChatSession.is_group == False)  # noqa: E712 — группы отдельно
         # Окончательный порядок задаёт _sort_by_activity ниже; этот — лишь
         # стабильная основа. pinned_at IS NULL идёт первым выражением, потому что
@@ -970,6 +1094,7 @@ async def list_sessions(
             select(models.Character.id, models.Character.name)
             .where(models.Character.id.in_(char_ids))
         )).all())
+    bgs = await images.public_values(db, "session_bg", [s.id for s in rows])
     return [
         {
             "id": s.id,
@@ -978,7 +1103,7 @@ async def list_sessions(
             "character_name": names.get(s.character_id, ""),
             "author_note": s.author_note,
             "persona_id": s.persona_id,
-            "background": s.background,
+            "background": bgs.get(s.id) or "",
             "is_group": s.is_group,
             "director": s.director,
             "timezone": s.timezone or "",
@@ -1351,7 +1476,8 @@ async def update_session(
     if not sess:
         raise HTTPException(404, "Сессия не найдена")
     data = payload.model_dump(exclude_none=True)
-    # pinned — флаг снаружи, дата внутри: при закреплении пишем «сейчас», чтобы
+    if images.is_our_url(data.get("background")):
+        data.pop("background")   # ссылка на копию фона пришла обратно — фон не менялся
     # закреплённые упорядочивались между собой, при снятии — NULL.
     if "pinned" in data:
         # Наивный UTC — та же форма, что пишет SQLite func.now() (см. _iso_utc).
@@ -1359,7 +1485,11 @@ async def update_session(
     for key, value in data.items():
         setattr(sess, key, value)
     await db.commit()
-    return {"ok": True, "pinned": sess.pinned_at is not None}
+    out = {"ok": True, "pinned": sess.pinned_at is not None}
+    if "background" in data:
+        await images.ensure(db, "session_bg", session_id)
+        out["background"] = await images.public_value(db, "session_bg", session_id) or ""
+    return out
 
 
 @app.delete("/api/sessions/{session_id}")
@@ -1411,6 +1541,7 @@ async def delete_session(
     ):
         await db.execute(sql_delete(model).where(model.session_id == session_id))
     await drafts.drop_session(db, session_id)
+    await images.drop(db, "session_bg", session_id)
     if sess:
         await db.delete(sess)
     await db.commit()
@@ -1604,13 +1735,15 @@ async def list_groups(user=Depends(current_user), db: AsyncSession = Depends(get
             models.ChatSession.id.desc(),
         )
     )
-    q = accounts.scope_query(q, models.ChatSession, user)
+    q = accounts.scope_query(q.options(defer(models.ChatSession.background)), models.ChatSession, user)
     rows = (await db.execute(q)).scalars().all()
     previews = await _session_previews(db, [s.id for s in rows])
     rows = _sort_by_activity(rows, previews)
+    bgs = await images.public_values(db, "session_bg", [s.id for s in rows])
     result = []
     for s in rows:
         members = await group_chat.load_members(db, s.id)
+        avas = await images.public_values(db, "character", [c.id for c in members])
         result.append(
             {
                 "id": s.id,
@@ -1625,11 +1758,11 @@ async def list_groups(user=Depends(current_user), db: AsyncSession = Depends(get
                 # первое же изменение на вкладке «Персона» стирало её в базе.
                 "author_note": s.author_note,
                 "persona_id": s.persona_id,
-                "background": s.background,
+                "background": bgs.get(s.id) or "",
                 **_preview_fields(s, previews),
                 # avatar_path нужен для аватарок реплик в групповом чате.
                 "members": [
-                    {"id": c.id, "name": c.name, "avatar_path": c.avatar_path}
+                    {"id": c.id, "name": c.name, "avatar_path": avas.get(c.id)}
                     for c in members
                 ],
             }
@@ -2100,8 +2233,12 @@ async def delete_horae(
 # ============================ ПЕРСОНЫ ============================
 @app.get("/api/personas", response_model=list[PersonaRead])
 async def list_personas(user=Depends(current_user), db: AsyncSession = Depends(get_session)):
-    q = accounts.scope_query(select(models.Persona), models.Persona, user)
-    return (await db.execute(q)).scalars().all()
+    q = accounts.scope_query(
+        select(models.Persona).options(defer(models.Persona.avatar_path)), models.Persona, user)
+    rows = (await db.execute(q)).scalars().all()
+    pub = await images.public_values(db, "persona", [p.id for p in rows])
+    return [{"id": p.id, "name": p.name, "description": p.description, "avatar_path": pub.get(p.id)}
+            for p in rows]
 
 
 @app.post("/api/personas", response_model=PersonaRead)
@@ -2114,7 +2251,9 @@ async def create_persona(
     db.add(persona)
     await db.commit()
     await db.refresh(persona)
-    return persona
+    await images.ensure(db, "persona", persona.id)
+    return {"id": persona.id, "name": persona.name, "description": persona.description,
+            "avatar_path": await images.public_value(db, "persona", persona.id)}
 
 
 @app.delete("/api/personas/{persona_id}")
@@ -2122,6 +2261,7 @@ async def delete_persona(persona_id: int, db: AsyncSession = Depends(get_session
     persona = await db.get(models.Persona, persona_id)
     if persona:
         await db.delete(persona)
+        await images.drop(db, "persona", persona_id)
         await db.commit()
     return {"ok": True}
 
@@ -4249,10 +4389,11 @@ async def auth_login_user(payload: dict, db: AsyncSession = Depends(get_session)
 
 
 @app.get("/api/auth/me")
-async def auth_me(user=Depends(current_user)):
+async def auth_me(user=Depends(current_user), db: AsyncSession = Depends(get_session)):
     if not user:
         return None
     data = _user_public(user)
+    data["avatar_path"] = await images.public_value(db, "user", user.id)
     data["telegram_id"] = user.telegram_id
     return data
 
@@ -4271,10 +4412,15 @@ async def auth_update_me(payload: dict, user=Depends(current_user), db: AsyncSes
     if not user:
         raise HTTPException(401, "Требуется вход")
     db_user = await db.get(models.User, user.id)
-    if "avatar_path" in payload:
+    changed = "avatar_path" in payload and not images.is_our_url(payload["avatar_path"])
+    if changed:
         db_user.avatar_path = payload["avatar_path"]
     await db.commit()
-    return _user_public(db_user)
+    if changed:
+        await images.ensure(db, "user", db_user.id)
+    out = _user_public(db_user)
+    out["avatar_path"] = await images.public_value(db, "user", db_user.id)
+    return out
 
 
 # ----- Друзья (доступно в режиме аккаунтов) -----
@@ -4602,6 +4748,7 @@ async def admin_delete_user(user_id: int, db: AsyncSession = Depends(get_session
         ).scalars().all():
             await db.delete(t)
         await db.delete(u)
+        await images.drop(db, "user", user_id)   # id переиспользуется — копия не должна достаться другому
         await db.commit()
     return {"ok": True}
 

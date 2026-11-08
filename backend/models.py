@@ -10,6 +10,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -170,6 +171,26 @@ class AttachmentBlob(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     message_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     data: Mapped[str] = mapped_column(Text, default="")
+
+
+class ImageVariant(Base):
+    """
+    Сжатая копия картинки интерфейса (аватар, фон чата) — см. backend/images.py.
+    Исходник остаётся в своей колонке; копия знает, с какого он снята (src_ver).
+    """
+    __tablename__ = "image_variants"
+    __table_args__ = (UniqueConstraint("kind", "owner_id", "variant", name="uq_image_variant"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    kind: Mapped[str] = mapped_column(String(20))          # character | persona | user | session_bg
+    owner_id: Mapped[int] = mapped_column(Integer, index=True)
+    variant: Mapped[str] = mapped_column(String(10))       # thumb | view
+    src_ver: Mapped[str] = mapped_column(String(32))
+    mime: Mapped[str] = mapped_column(String(100), default="image/webp")
+    data: Mapped[bytes] = mapped_column(LargeBinary)
+    width: Mapped[int] = mapped_column(Integer, default=0)
+    height: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
 class ChatDraft(Base):

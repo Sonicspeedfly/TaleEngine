@@ -630,12 +630,12 @@ createApp({
     },
     // Аватар в шапке чата: персонаж; для группы — первый участник с аватаркой.
     headerAvatar() {
-      if (this.sharedView) return this.sharedView.character_avatar || "";
+      if (this.sharedView) return this.imgSrc(this.sharedView.character_avatar || "");
       if (this.currentIsGroup) {
         const withAva = (this.currentGroup.members || []).find((m) => m.avatar_path);
-        return withAva ? withAva.avatar_path : "";
+        return withAva ? this.imgSrc(withAva.avatar_path) : "";
       }
-      return (this.selectedCharacter && this.selectedCharacter.avatar_path) || "";
+      return this.imgSrc((this.selectedCharacter && this.selectedCharacter.avatar_path) || "");
     },
     // Список часовых поясов для настройки чата (браузер знает полный список IANA).
     tzOptions() {
@@ -655,7 +655,7 @@ createApp({
       const bg = this.sessionBg;
       if (!bg) return {};
       if (bg.startsWith("data:") || bg.startsWith("http") || bg.startsWith("/")) {
-        return { backgroundImage: 'url("' + bg + '")', backgroundSize: "cover", backgroundPosition: "center" };
+        return { backgroundImage: 'url("' + this.imgSrc(bg) + '")', backgroundSize: "cover", backgroundPosition: "center" };
       }
       return { background: bg }; // CSS-градиент/цвет
     },
@@ -4613,11 +4613,28 @@ createApp({
       if (el) this._floatInline(el);
     },
 
+    // Картинка интерфейса (аватар, фон): сервер отдаёт ссылку на сжатую копию
+    // (/api/img/…, 2.17.0) — к ней, как к вложениям, добавляем авторизацию.
+    // Исходники (data:URI только что выбранного файла) и чужие URL — как есть.
+    imgSrc(u) {
+      if (!u || typeof u !== "string" || !u.startsWith("/api/img/")) return u || "";
+      const q = this._authQuery();
+      return q ? u + (u.includes("?") ? "&" : "?") + q : u;
+    },
+    // Скачать исходник аватара (копия в списках сжата; оригинал хранится как был).
+    origImgUrl(u, name) {
+      if (!u || !u.startsWith("/api/img/")) return "";
+      const base = u.split("?")[0].replace(/\/(thumb|view)$/, "/orig");
+      return this.imgSrc(base + "?name=" + encodeURIComponent(name || "аватар"));
+    },
     // Авторизация в query — для <img>/<audio>, которые не умеют слать заголовки.
+    // Все удостоверения, что есть: режим доступа мог смениться, а в браузере
+    // остался токен прежнего — с ним одним ссылки ловили 401 в режиме кода.
     _authQuery() {
-      if (this.userToken) return "token=" + encodeURIComponent(this.userToken);
-      if (this.accessCode) return "access_code=" + encodeURIComponent(this.accessCode);
-      return "";
+      const qs = [];
+      if (this.userToken) qs.push("token=" + encodeURIComponent(this.userToken));
+      if (this.accessCode) qs.push("access_code=" + encodeURIComponent(this.accessCode));
+      return qs.join("&");
     },
     // URL вложения сохранённого сообщения (данные грузятся лениво, не в списке чата).
     attUrl(m, i) {
@@ -5338,18 +5355,18 @@ createApp({
     memberAvatar(name) {
       const g = this.currentGroup;
       const mem = g && (g.members || []).find((x) => x.name === name);
-      return (mem && mem.avatar_path) || "";
+      return this.imgSrc((mem && mem.avatar_path) || "");
     },
     // Аватар для пузыря сообщения: ассистент — персонаж/участник группы,
     // пользователь — персона этого чата или аватар профиля.
     msgAvatar(m) {
       if (m.role === "assistant") {
         return (m.speaker_name && this.memberAvatar(m.speaker_name))
-          || (this.sharedView && this.sharedView.character_avatar)
-          || (this.selectedCharacter && this.selectedCharacter.avatar_path) || "";
+          || this.imgSrc((this.sharedView && this.sharedView.character_avatar)
+            || (this.selectedCharacter && this.selectedCharacter.avatar_path) || "");
       }
       const p = this.personas.find((x) => x.id === this.sessionPersonaId);
-      return (p && p.avatar_path) || (this.currentUserObj && this.currentUserObj.avatar_path) || "";
+      return this.imgSrc((p && p.avatar_path) || (this.currentUserObj && this.currentUserObj.avatar_path) || "");
     },
     // Буква-заглушка, когда аватарки нет (первая буква имени).
     msgAvatarLetter(m) {
@@ -7194,7 +7211,7 @@ createApp({
             <button type="button" class="row-main" @click="rowMenu = null; selectCharacter(c)"
                     :aria-current="c.id === selectedCharacterId ? 'true' : null"
                     :aria-label="'Персонаж ' + c.name + (c.pinned ? ', закреплён' : '')">
-              <span class="avatar" aria-hidden="true"><img v-if="c.avatar_path" :src="c.avatar_path" class="avatar" alt="" />{{ c.avatar_path ? '' : c.name.charAt(0) }}</span>
+              <span class="avatar" aria-hidden="true"><img v-if="c.avatar_path" :src="imgSrc(c.avatar_path)" class="avatar" alt="" />{{ c.avatar_path ? '' : c.name.charAt(0) }}</span>
               <span class="grow row-title">
                 <span v-if="c.pinned" class="pin-mark" aria-hidden="true">📌</span>
                 <span class="row-name">{{ c.name }}</span>
@@ -8376,11 +8393,16 @@ createApp({
             <label>Имя<input v-model="charEdit.name" placeholder="Имя персонажа" @change="saveCharacter" /></label>
             <label>Аватар</label>
             <div class="row" style="margin-bottom:10px">
-              <img v-if="charEdit.avatar_path" :src="charEdit.avatar_path" class="avatar" style="width:48px;height:48px" alt="" />
+              <img v-if="charEdit.avatar_path" :src="imgSrc(charEdit.avatar_path)" class="avatar" style="width:48px;height:48px" alt="" />
               <label class="btn" style="margin:0; cursor:pointer">Загрузить файл
                 <input type="file" accept="image/*" class="file-input" @change="onAvatarFile"
                        aria-label="Загрузить аватар персонажа" />
               </label>
+              <!-- В списках аватар — сжатая копия; исходный файл хранится как был
+                   и скачивается здесь (2.17.0). -->
+              <a v-if="origImgUrl(charEdit.avatar_path)" class="btn" style="margin:0"
+                 :href="origImgUrl(charEdit.avatar_path, (charEdit.name || 'персонаж') + ' — аватар')"
+                 download title="Скачать аватар в исходном качестве">⬇ Оригинал</a>
               <button v-if="charEdit.avatar_path" class="btn-danger" @click="charEdit.avatar_path=''; saveCharacter()">убрать</button>
             </div>
             <label>Описание
@@ -8762,7 +8784,7 @@ createApp({
           </div>
           <div class="card" v-for="p in personas" :key="p.id">
             <div class="row-between">
-              <span class="row" style="gap:8px"><img v-if="p.avatar_path" :src="p.avatar_path" class="avatar" alt="" /><b>{{ p.name }}</b></span>
+              <span class="row" style="gap:8px"><img v-if="p.avatar_path" :src="imgSrc(p.avatar_path)" class="avatar" alt="" /><b>{{ p.name }}</b></span>
               <button class="btn-danger" @click="deletePersona(p)" :aria-label="'Удалить персону ' + p.name">🗑</button>
             </div>
             <div class="muted">{{ p.description }}</div>
@@ -8978,7 +9000,7 @@ createApp({
         <div class="card" v-for="m in currentGroup.members" :key="'m'+m.id">
           <div class="row-between">
             <span class="row" style="gap:8px">
-              <span class="member-ava"><img v-if="m.avatar_path" :src="m.avatar_path" alt="" /><span v-else>{{ (m.name||'?').charAt(0) }}</span></span>
+              <span class="member-ava"><img v-if="m.avatar_path" :src="imgSrc(m.avatar_path)" alt="" /><span v-else>{{ (m.name||'?').charAt(0) }}</span></span>
               <b>{{ m.name }}</b>
             </span>
             <button class="btn-danger" :disabled="currentGroup.members.length <= 1" @click="removeMember(m)" title="Убрать из группы" aria-label="Убрать из группы">Убрать</button>
@@ -8992,7 +9014,7 @@ createApp({
       <div v-if="!availableToAdd().length" class="muted" style="font-size:var(--fs-100)">Все персонажи уже в чате — создайте нового во вкладке слева.</div>
       <div class="card" v-for="c in availableToAdd()" :key="'add'+c.id">
         <label class="check"><input type="checkbox" :checked="memberAddSelected.includes(c.id)" @change="toggleMemberAdd(c.id)" />
-          <span class="row" style="gap:8px"><span class="member-ava"><img v-if="c.avatar_path" :src="c.avatar_path" alt="" /><span v-else>{{ (c.name||'?').charAt(0) }}</span></span> {{ c.name }}</span>
+          <span class="row" style="gap:8px"><span class="member-ava"><img v-if="c.avatar_path" :src="imgSrc(c.avatar_path)" alt="" /><span v-else>{{ (c.name||'?').charAt(0) }}</span></span> {{ c.name }}</span>
         </label>
       </div>
       <button class="btn-primary" style="margin-top:12px" :disabled="!memberAddSelected.length" @click="addMembers">
