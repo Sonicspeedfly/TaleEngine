@@ -62,6 +62,7 @@ from backend import (
     horae_state,
     horae_tasks,
     knowledge,
+    llm_gateway,
     media_refs,
     memory_service,
     models,
@@ -229,6 +230,17 @@ async def lifespan(app: FastAPI):
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
 
+
+# Журнал приложения (aichat.*): раньше обработчика не было вовсе, и в journalctl
+# доходили только предупреждения и ошибки (через «последний шанс» logging).
+# Теперь и информационные строки — в первую очередь замер каждого хода
+# (generation._log_timing): по ним видно, где ушло время.
+_app_log = logging.getLogger("aichat")
+if not _app_log.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    _app_log.addHandler(_h)
+    _app_log.setLevel(logging.INFO)
 
 app = FastAPI(title=settings.APP_NAME, lifespan=lifespan)
 
@@ -3788,7 +3800,19 @@ async def _guarded_turn(session_id: int, start) -> str:
             job = generation_manager.active_for(session_id)
         if job is not None:
             raise TurnBusy(job)
-        return await start()
+        # Человек ждёт ответа: фоновые запросы к модели не начинаются, пока
+        # собирается контекст, а идущие проходы памяти останавливаются после
+        # текущего запроса (2.22.0, см. llm_gateway._yield_to_users).
+        memory_service.yield_to_turns()
+        t0 = time.monotonic()
+        bg = llm_gateway.background_inflight()
+        with llm_gateway.turn_preparing():
+            job_id = await start()
+        started = generation_manager.get(job_id)
+        if started is not None:
+            started.prep_s = time.monotonic() - t0
+            started.bg_at_start = bg
+        return job_id
 
 
 def _busy_response(job) -> JSONResponse:

@@ -72,9 +72,24 @@ async def _sleep(seconds: float, cancel: asyncio.Event | None) -> None:
 
 
 async def aux_complete(messages: list[dict], settings: dict, connection: dict, *, max_tokens: int = 4096,
-                       temperature: float = 0.3, cancel: asyncio.Event | None = None) -> str:
-    """Один служебный запрос: очередь, пауза, своя модель, свои max_tokens/температура."""
+                       temperature: float = 0.3, cancel: asyncio.Event | None = None,
+                       interactive: bool = False) -> str:
+    """
+    Один служебный запрос: очередь, пауза, своя модель, свои max_tokens/температура.
+
+    interactive — запрос нужен ходу или нажатой кнопке прямо сейчас (переписывание
+    запроса памяти, «дополнить NPC»): он не встаёт в очередь фоновых задач Хроники
+    (их замок держится всё время запроса к модели — ход ждал бы минуты) и не
+    уступает модель ходам (llm_gateway.foreground).
+    """
     global _last_call
+    if interactive:
+        with llm_gateway.foreground(), llm_gateway.sampling_overrides(max_tokens=max_tokens, temperature=temperature):
+            text = await llm_gateway.complete(
+                messages, None, aux_connection(connection, settings), kind="horae")
+        if not (text or "").strip():
+            raise HoraeTaskError("модель вернула пустой ответ")
+        return text
     async with he.loop_lock(_gates, "aux"):
         if cancel is not None and cancel.is_set():
             raise TaskCancelled()
@@ -785,6 +800,7 @@ async def npc_enrich(session_id: int, name: str, aliases: list[str] | None = Non
     snippets = [f"[#{r.id}|{'ПОЛЬЗОВАТЕЛЬ' if r.role == 'user' else 'ИИ'}] "
                 f"{hs.strip_tags_text(r.content or '')[:1000]}" for r in hits]
     text = await aux_complete(hp.npc_enrich_messages(name, aliases, snippets, names.user), settings, connection,
+                              interactive=True,
                               max_tokens=1024)
     fields = hp.parse_npc_enrich(text)
     if not fields:
@@ -810,7 +826,7 @@ async def rewrite_query(db, session, settings: dict, connection: dict) -> tuple[
     if not lines:
         return "", []
     text = await aux_complete(hp.query_rewrite_messages(settings, "\n\n".join(lines)), settings, connection,
-                              max_tokens=1024, temperature=0.7)
+                              max_tokens=1024, temperature=0.7, interactive=True)
     return hp.parse_query_rewrite(text)
 
 

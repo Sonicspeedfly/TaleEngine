@@ -956,6 +956,21 @@ async def chat_lock(session_id: int):
                 del _locks[session_id]
 
 
+def yield_to_turns() -> int:
+    """
+    Начался ход человека: идущие ежеходные проходы памяти (во всех чатах)
+    останавливаются после текущего запроса к модели — оставшиеся пакеты
+    догонят следующие проходы, когда модель свободна (2.22.0). Сделанное
+    сохраняется (статус «cancelled»), ошибкой это не считается.
+    """
+    n = 0
+    for ev in list(_turn_cancels.values()):
+        if not ev.is_set():
+            ev.set()
+            n += 1
+    return n
+
+
 def is_busy(session_id: int) -> bool:
     lock = _locks.get(session_id)
     return session_id in _busy or (lock is not None and lock.locked())
