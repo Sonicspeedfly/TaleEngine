@@ -2505,6 +2505,29 @@ createApp({
         }));
       } catch (e) {}
     },
+    // Быстрое восстановление (2.18.0): карточка одного чата — и он открыт, пока
+    // списки ещё грузятся. Группы и всё необычное — прежним путём после списков.
+    async _restoreLastChatFast() {
+      let saved;
+      try { saved = JSON.parse(localStorage.getItem("lastChat") || "null"); } catch (e) {}
+      if (!saved || !saved.sessionId || saved.isGroup) return false;
+      let card;
+      try { card = await this.api("/sessions/" + saved.sessionId + "/card"); } catch (e) { return false; }
+      if (!card || card.is_group || !card.character_id) return false;
+      if (this.sessionId) return this.sessionId === card.id;   // человек уже открыл другой чат сам
+      this.selectedCharacterId = card.character_id;
+      await this.openSession(card);
+      return this.sessionId === card.id;
+    },
+    // Списки догрузились после быстрого открытия: то, что раньше делал
+    // _restoreLastChat до открытия, — редактор персонажа и его чаты.
+    _afterFastRestore() {
+      const c = this.characters.find((x) => x.id === this.selectedCharacterId);
+      if (c && (!this.charEdit || this.charEdit.id !== c.id)) {
+        this.charEdit = { ...c, generation_params: c.generation_params || {} };
+      }
+      if (this.selectedCharacterId) this.loadSessions().catch(() => {});
+    },
     async _restoreLastChat() {
       let saved;
       try { saved = JSON.parse(localStorage.getItem("lastChat") || "null"); } catch (e) {}
@@ -5466,8 +5489,8 @@ createApp({
     },
 
     // ---------- Сохранение настроек интерфейса в системе (БД) ----------
-    async loadUiPrefs(applyParams = true) {
-      const ui = await this.api("/settings/ui");
+    async loadUiPrefs(applyParams = true, prefetched) {
+      const ui = prefetched !== undefined ? prefetched : await this.api("/settings/ui");
       // Сработала ли разовая миграция: тогда её флаг надо записать сразу, а не
       // ждать, пока человек сам что-нибудь поменяет (флаги пишет saveUiPrefs).
       let migrated = false;
@@ -5672,7 +5695,7 @@ createApp({
     },
 
     // ---------- Пресеты параметров ----------
-    async loadPresets() { this.presets = await this.api("/presets"); },
+    async loadPresets(prefetched) { this.presets = (prefetched !== undefined ? prefetched : await this.api("/presets")) || []; },
     async savePreset() {
       const name = this.presetName.trim() || (await this.askPrompt("Название пресета", { placeholder: "Например: Творческий" }));
       if (!name) return;
@@ -5696,8 +5719,8 @@ createApp({
     },
 
     // ---------- Подключение к LiteLLM ----------
-    async loadConnection() {
-      this.connection = await this.api("/settings/connection");
+    async loadConnection(prefetched) {
+      this.connection = prefetched !== undefined ? prefetched : await this.api("/settings/connection");
       if (!this.params.model) this.params.model = this.connection.default_model || "";
     },
     async saveConnection() {
@@ -6740,21 +6763,36 @@ createApp({
       // Ворота пройдены: с этого момента фоновые перечитки списка чатов
       // (сигнал соседней вкладки, возвращение к окну, минутный опрос) законны.
       this._appReady = true;
-      await this.loadConnection();
-      await this.loadPresets();
+      // Метки «пришёл ответ» из прошлого визита (пользователь уже известен) —
+      // до открытия чата: открытие снимает метку своего чата.
+      this._loadPendingChats();
+      // Всё, что нужно на старте, запрашиваем РАЗОМ (2.18.0). Раньше подключение,
+      // пресеты и настройки шли строго друг за другом, а списки — только после
+      // них: на мобильном интернете каждый лишний круг — это секунда.
+      const ask = (path) => this.api(path).then((v) => ({ v }), (e) => ({ e }));
+      const got = (r) => { if (r.e) throw r.e; return r.v; };
+      const pConn = ask("/settings/connection");
+      const pPresets = ask("/presets");
+      const pUi = ask("/settings/ui");
+      const lists = Promise.all([this.loadCharacters(), this.loadPersonas(), this.loadHorae(),
+        this.loadGroups(), this.loadFriends(), this.loadAllSessions()]);
+      // Порядок применения — прежний: подключение, пресет по умолчанию, настройки.
+      await this.loadConnection(got(await pConn));
+      await this.loadPresets(got(await pPresets));
       const def = this.presets.find((p) => p.is_default);
       // Дефолт-пресет задаёт params; message_preload подтягиваем в любом случае.
-      if (def) { this.applyPreset(def); await this.loadUiPrefs(false); }
-      else await this.loadUiPrefs();
-      await Promise.all([this.loadCharacters(), this.loadPersonas(), this.loadHorae(),
-        this.loadGroups(), this.loadFriends(), this.loadAllSessions()]);
+      if (def) { this.applyPreset(def); await this.loadUiPrefs(false, got(await pUi)); }
+      else await this.loadUiPrefs(true, got(await pUi));
+      // Последний открытый чат — по его карточке, не дожидаясь списков
+      // персонажей и чатов (после F5 сразу можно читать и писать).
+      const fast = this._restoreLastChatFast();
+      await lists;
       this._safetyHint();
-      // Метки «пришёл ответ» из прошлого визита (пользователь уже известен).
-      this._loadPendingChats();
       // Восстанавливаем последний открытый чат (после F5 сразу можно писать);
       // если не вышло — показываем блок быстрого старта, а не открываем первого
       // персонажа молча: раньше это создавало чат как побочный эффект запуска.
-      await this._restoreLastChat();
+      if (await fast) this._afterFastRestore();
+      else if (!this.sessionId) await this._restoreLastChat();
       // Периодически подтягиваем заявки в друзья/общие чаты — чтобы уведомления
       // в колокольчике появлялись без перезагрузки страницы.
       clearInterval(this._friendsTimer);
@@ -7046,12 +7084,16 @@ createApp({
     this.streamFollow = localStorage.getItem("streamFollow") === "1";
     this.sendScroll = localStorage.getItem("sendScroll") === "1";
     this.mediaAutoFloat = localStorage.getItem("mediaAutoFloat") !== "0";
+    // Профиль спрашиваем сразу, вместе со статусом (2.18.0): токен есть —
+    // скорее всего, режим аккаунтов, и второй круг по сети не нужен. Запрос без
+    // побочных эффектов: в другом режиме ответ просто не используется.
+    const meEarly = this.userToken ? this.fetchMe() : null;
     try {
       this.authStatus = await fetch("/api/auth/status").then((r) => r.json());
     } catch (e) {}
     // Режим аккаунтов: нужен вход по логину/паролю.
     if (this.authStatus.accounts_enabled) {
-      const me = this.userToken ? await this.fetchMe() : null;
+      const me = meEarly ? await meEarly : null;
       if (!me) { this.needAuth = true; return; }
       this.currentUserObj = me;
       await this.initApp();
@@ -7211,7 +7253,8 @@ createApp({
             <button type="button" class="row-main" @click="rowMenu = null; selectCharacter(c)"
                     :aria-current="c.id === selectedCharacterId ? 'true' : null"
                     :aria-label="'Персонаж ' + c.name + (c.pinned ? ', закреплён' : '')">
-              <span class="avatar" aria-hidden="true"><img v-if="c.avatar_path" :src="imgSrc(c.avatar_path)" class="avatar" alt="" />{{ c.avatar_path ? '' : c.name.charAt(0) }}</span>
+              <span class="avatar" aria-hidden="true"><img v-if="c.avatar_path" :src="imgSrc(c.avatar_path)" class="avatar" alt=""
+                    fetchpriority="low" decoding="async" />{{ c.avatar_path ? '' : c.name.charAt(0) }}</span>
               <span class="grow row-title">
                 <span v-if="c.pinned" class="pin-mark" aria-hidden="true">📌</span>
                 <span class="row-name">{{ c.name }}</span>
