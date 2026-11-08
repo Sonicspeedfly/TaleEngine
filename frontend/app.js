@@ -4140,7 +4140,10 @@ createApp({
       // Чат, в котором нажали «Отправить»: пока дочитываются файлы, человек мог
       // перейти в другой — тогда не отправляем (текст и файлы остаются в поле).
       const sid = this.sessionId;
-      this._hydrateDraftFiles();   // файлы черновика с другого устройства — скачиваем
+      // Канвасу нужны сами данные файлов; обычному сообщению — нет: файлы,
+      // уже лежащие в черновике (и с другого устройства тоже), уходят ссылкой.
+      const canvasPath = this.composerMode === "canvasGen" || !!(this.canvasOpen && this.canvas && content);
+      if (canvasPath) this._hydrateDraftFiles();
       // Дожидаемся дочитывания ВСЕХ файлов сообщения, прежде чем отправлять — иначе
       // сообщение могло уйти без ещё не загруженного вложения (гонка с FileReader).
       if (this.attachmentsLoading) {
@@ -4148,6 +4151,15 @@ createApp({
         await this._awaitAttachments();
         this.waitingFiles = false;
         if (!this.connected || this.streaming) return; // состояние изменилось, пока ждали
+        if (this.switchingChat || this.sessionId !== sid) return;
+      }
+      // Файл ещё грузится в черновик — ждём (на плашке видно сколько осталось):
+      // догрузится и уйдёт ссылкой, а не второй загрузкой с телефона.
+      if (!canvasPath && this.pendingAttachments.some((a) => a.uploading)) {
+        this.waitingFiles = true;
+        await this._awaitDraftUploads();
+        this.waitingFiles = false;
+        if (!this.connected || this.streaming) return;
         if (this.switchingChat || this.sessionId !== sid) return;
       }
       this._dropBadAttachments(); // выкидываем не прочитавшиеся вложения
@@ -4183,8 +4195,14 @@ createApp({
       this._turnText = content;
       const pend = this.pendingAttachments.slice();
       const attFiles = this._attFiles || {};
-      const bigList = pend.filter((a) => !a.data && attFiles[a.id]); // файлы для multipart
-      const attachments = this._cleanAtts(pend);                     // инлайновые (data:URI)
+      const byRef = (a) => this._attByRef(a);
+      // Файлы для multipart — только те, которых нет в черновике (больше лимита
+      // черновика или его загрузка не удалась): их байты придётся слать сейчас.
+      const bigList = pend.filter((a) => !byRef(a) && !a.data && attFiles[a.id]);
+      // JSON-вложения по порядку: из черновика — ссылкой, остальные — data:URI.
+      const attachments = pend.filter((a) => byRef(a) || a.data).map((a) => (byRef(a)
+        ? { type: a.type, mime: a.mime, name: a.name, draft_fid: a.draftFid }
+        : { type: a.type, data: a.data, mime: a.mime, name: a.name }));
       // Ответ — только на сообщение ЭТОГО чата (выбор из другого чата не уходит).
       const replyTo = this.messages.some((m) => m.id === this.replyToId) ? this.replyToId : null;
       // Оптимистично показываем своё сообщение сразу; для больших файлов
@@ -4215,7 +4233,8 @@ createApp({
         const metas = [];
         let fi = 0;
         for (const a of pend) {
-          if (a.data) metas.push({ type: a.type, data: a.data, mime: a.mime, name: a.name });
+          if (byRef(a)) metas.push({ type: a.type, mime: a.mime, name: a.name, draft_fid: a.draftFid });
+          else if (a.data) metas.push({ type: a.type, data: a.data, mime: a.mime, name: a.name });
           else metas.push({ type: a.type, mime: a.mime, name: a.name, file_index: fi++ });
         }
         const fd = new FormData();
@@ -4309,6 +4328,20 @@ createApp({
       if (current && this._userStopped) { this.finishStream(); return; }
       const msg = prefix + ((e && e.message) || "ошибка");
       if (!current) { this.showToast("⚠ " + msg + " (чат " + this._chatName(sid) + ")", () => this._openById(sid)); return; }
+      // Сервер ответил ошибкой — реплика не сохранена: файлы возвращаем в поле
+      // (как при «уже идёт ответ»), а не теряем вместе с отправкой.
+      if (e && e.status >= 400 && !this.pendingAttachments.length && back && back.pend && back.pend.length) {
+        this._attFiles = Object.assign(this._attFiles || {}, back.bigFiles || {});
+        let pend = back.pend;
+        if (e.status === 422) {
+          // Файла черновика на сервере уже нет (убрали на другом устройстве):
+          // свои файлы шлём в следующий раз байтами, чужие — прикрепить заново.
+          const files = this._attFiles;
+          pend = pend.filter((a) => !a.draftFid || a.data || files[a.id]);
+          for (const a of pend) if (a.draftFid) { a.draftFid = null; a.localOnly = true; }
+        }
+        this.pendingAttachments = pend;
+      }
       this.chatError = msg;
       this._turnFailed = true;
       this.finishStream();
@@ -4767,6 +4800,8 @@ createApp({
       const a = this.pendingAttachments[i];
       if (a) {
         this._releaseAtt(a);
+        // Ещё грузится — прерываем: незачем гнать мегабайты убранного файла.
+        if (a.uploading && a._xhr) { try { a._xhr.abort(); } catch (e) {} }
         a._gone = true;   // ещё грузится в черновик — уберём, когда догрузится
         if (a.draftFid) this._draftState().removed.add(a.draftFid);
       }
@@ -5057,16 +5092,22 @@ createApp({
         return;
       }
       d.uploads++;
+      // Прогресс на плашке файла (кольцо и «3,2 / 12,5 МБ»): файл грузится на
+      // сервер сразу при прикреплении, а «Отправить» потом уходит мгновенно —
+      // сообщение ссылается на уже загруженный файл (2.20.0).
+      att.uploading = true;
+      att.upLoaded = 0;
+      att.upTotal = blob.size || 0;
       try {
         const fd = new FormData();
         fd.append("file", blob, name);
         fd.append("kind", att.type || "document");
         fd.append("origin", TAB_ID);
-        const res = await fetch("/api/sessions/" + sid + "/draft/files", {
-          method: "POST", headers: this._authHeaders(), body: fd,
-        });
-        let meta = null;
-        try { meta = await res.json(); } catch (e) {}
+        const res = await this._xhrUpload("/api/sessions/" + sid + "/draft/files", fd, (loaded, total) => {
+          att.upLoaded = loaded;
+          if (total) att.upTotal = total;
+        }, att);
+        const meta = res.data;
         if (!res.ok || !meta || !meta.fid) {
           att.localOnly = true;
           if (res.status === 413) this.showToast("«" + name + "»: " + ((meta && meta.detail) || "файл велик для черновика") + " — он только на этом устройстве");
@@ -5088,9 +5129,46 @@ createApp({
       } catch (e) {
         att.localOnly = true;
       } finally {
+        att.uploading = false;
+        att._xhr = null;
         d.uploads--;
         this._draftCatchUp();
       }
+    },
+    // POST FormData с прогрессом отправки (fetch его не даёт). {ok, status, data}.
+    _xhrUpload(url, body, onProgress, owner) {
+      return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        if (owner) owner._xhr = xhr;   // убрали файл с плашки — загрузку можно прервать
+        xhr.open("POST", url);
+        const h = this._authHeaders();
+        for (const k in h) xhr.setRequestHeader(k, h[k]);
+        xhr.upload.onprogress = (e) => { if (onProgress) onProgress(e.loaded, e.lengthComputable ? e.total : 0); };
+        xhr.onload = () => {
+          let data = null;
+          try { data = JSON.parse(xhr.responseText || "null"); } catch (e) {}
+          if (xhr.status === 401) this.needAccess = true;
+          resolve({ ok: xhr.status >= 200 && xhr.status < 300, status: xhr.status, data });
+        };
+        xhr.onerror = () => reject(new Error("сеть"));
+        xhr.onabort = () => reject(new Error("прервано"));
+        xhr.send(body);
+      });
+    },
+    // Кольцо загрузки: доля (0..1) и подпись «3,2 / 12,5 МБ».
+    upFrac(a) {
+      return a && a.upTotal ? Math.min(1, (a.upLoaded || 0) / a.upTotal) : 0;
+    },
+    upLabel(a) {
+      const mb = (x) => (x / 1048576).toFixed(x >= 10 * 1048576 ? 0 : 1).replace(".", ",");
+      return a && a.upTotal ? mb(a.upLoaded || 0) + " / " + mb(a.upTotal) + " МБ" : "";
+    },
+    // Файлы ещё грузятся в черновик — «Отправить» подождёт их (они уйдут ссылкой).
+    _awaitDraftUploads() {
+      return new Promise((resolve) => {
+        const check = () => (this.pendingAttachments.some((a) => a.uploading) ? setTimeout(check, 100) : resolve());
+        check();
+      });
     },
     // Убрать один файл из черновика чата — только на сервере, не трогая поле
     // ввода: оно могло уже очиститься отправкой (тогда его сохранение стёрло бы
@@ -5234,8 +5312,12 @@ createApp({
     _dropBadAttachments() {
       const files = this._attFiles || {};
       this.pendingAttachments = this.pendingAttachments.filter(
-        (a) => (a.data || files[a.id]) && !a.error
+        (a) => (a.data || files[a.id] || this._attByRef(a)) && !a.error
       );
+    },
+    // Вложение уйдёт ссылкой на файл черновика (уже на сервере), а не байтами.
+    _attByRef(a) {
+      return !!(a && a.draftFid && !a.uploading && !a.localOnly && !this._draftState().off);
     },
     // Чистый payload для бэкенда: только поля AttachmentIn (без служебных id/size/loading).
     // Файловые (без data) вложения сюда не попадают — их шлёт multipart-путь send().
@@ -7956,8 +8038,18 @@ createApp({
               <span v-else-if="a.type==='video'" class="att-state">🎬</span>
               <span v-else class="att-state">📄</span>
             </template>
+            <!-- Загрузка в черновик (2.20.0): кольцо и «3,2 / 12,5 МБ». Догрузился —
+                 «Отправить» уйдёт мгновенно, файл уже на сервере. -->
+            <span v-if="a.uploading" class="att-ring" role="progressbar" aria-valuemin="0" aria-valuemax="100"
+                  :aria-valuenow="Math.round(upFrac(a) * 100)" :aria-label="'Загрузка ' + (a.name || 'файла') + ': ' + upLabel(a)">
+              <svg viewBox="0 0 36 36" aria-hidden="true">
+                <circle class="att-ring-bg" cx="18" cy="18" r="15.915" />
+                <circle class="att-ring-fg" cx="18" cy="18" r="15.915"
+                        :stroke-dasharray="(upFrac(a) * 100).toFixed(1) + ' 100'" />
+              </svg>
+            </span>
             <span class="att-name" :title="a.name || ''">
-              {{ a.error ? 'ошибка' : (a.name || (a.type==='audio' ? 'аудио' : 'файл')) }}<i v-if="a.size"> · {{ fmtSize(a.size) }}</i><i v-if="a.localOnly" title="Только на этом устройстве — в черновик чата не попал"> · 📱</i>
+              {{ a.error ? 'ошибка' : (a.name || (a.type==='audio' ? 'аудио' : 'файл')) }}<i v-if="a.uploading"> · {{ upLabel(a) }}</i><i v-else-if="a.size"> · {{ fmtSize(a.size) }}</i><i v-if="a.localOnly" title="Только на этом устройстве — в черновик чата не попал"> · 📱</i>
             </span>
             <a href="#" class="att-x" @click.prevent="removeAttachment(i)" title="Убрать" :aria-label="'Убрать вложение ' + (a.name || '')">✕</a>
           </span>

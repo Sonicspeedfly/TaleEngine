@@ -85,10 +85,13 @@ class AttachmentIn(BaseModel):
     """Вложение к сообщению (картинка, аудио, видео или документ Word/PDF/текст)."""
     type: Literal["image", "audio", "video", "document"]
     # base64 (можно с префиксом data URI) или внешний URL.
-    data: str
+    data: str = ""
     mime: Optional[str] = None
     # Имя файла (для документов: по нему определяем формат и показываем в чипе).
     name: Optional[str] = None
+    # Файл уже лежит в черновике этого чата на сервере (2.20.0): вместо данных —
+    # его id. Сервер берёт байты из черновика — второй загрузки нет.
+    draft_fid: Optional[int] = None
 
 
 class CharacterBase(BaseModel):
