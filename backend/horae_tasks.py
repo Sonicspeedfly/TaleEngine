@@ -72,9 +72,24 @@ async def _sleep(seconds: float, cancel: asyncio.Event | None) -> None:
 
 
 async def aux_complete(messages: list[dict], settings: dict, connection: dict, *, max_tokens: int = 4096,
-                       temperature: float = 0.3, cancel: asyncio.Event | None = None) -> str:
-    """Один служебный запрос: очередь, пауза, своя модель, свои max_tokens/температура."""
+                       temperature: float = 0.3, cancel: asyncio.Event | None = None,
+                       interactive: bool = False) -> str:
+    """
+    Один служебный запрос: очередь, пауза, своя модель, свои max_tokens/температура.
+
+    interactive — запрос нужен ходу или нажатой кнопке прямо сейчас (переписывание
+    запроса памяти, «дополнить NPC»): он не встаёт в очередь фоновых задач Хроники
+    (их замок держится всё время запроса к модели — ход ждал бы минуты) и не
+    уступает модель ходам (llm_gateway.foreground).
+    """
     global _last_call
+    if interactive:
+        with llm_gateway.foreground(), llm_gateway.sampling_overrides(max_tokens=max_tokens, temperature=temperature):
+            text = await llm_gateway.complete(
+                messages, None, aux_connection(connection, settings), kind="horae")
+        if not (text or "").strip():
+            raise HoraeTaskError("модель вернула пустой ответ")
+        return text
     async with he.loop_lock(_gates, "aux"):
         if cancel is not None and cancel.is_set():
             raise TaskCancelled()
@@ -82,9 +97,14 @@ async def aux_complete(messages: list[dict], settings: dict, connection: dict, *
         wait = _last_call + delay - time.monotonic()
         await _sleep(wait, cancel)
         try:
-            with llm_gateway.sampling_overrides(max_tokens=max_tokens, temperature=temperature):
+            # «Стоп» задания отменяет и запрос, ждущий свободную модель (2.22.0).
+            stop = cancel.is_set if cancel is not None else None
+            with llm_gateway.sampling_overrides(max_tokens=max_tokens, temperature=temperature), \
+                    llm_gateway.stop_when(stop):
                 text = await llm_gateway.complete(
                     messages, None, aux_connection(connection, settings), kind="horae")
+        except llm_gateway.BackgroundCancelled as exc:
+            raise TaskCancelled() from exc
         finally:
             _last_call = time.monotonic()
     if not (text or "").strip():
@@ -124,7 +144,8 @@ async def _prev_user(db, session_id: int, before_id: int) -> str:
     return ""
 
 
-async def analyze_message(session_id: int, message_id: int, *, merge: bool = True) -> dict:
+async def analyze_message(session_id: int, message_id: int, *, merge: bool = True,
+                          interactive: bool = False) -> dict:
     """
     Извлечь данные Horae из готового ответа отдельным запросом («волшебная
     палочка» плагина). Нужна, когда модель забыла теги или ответ старый.
@@ -151,7 +172,8 @@ async def analyze_message(session_id: int, message_id: int, *, merge: bool = Tru
     prompt = hp.analysis_prompt(settings, context=context, prev_user=prev_user,
                                 content=content[:ANALYSIS_MAX_CHARS], user=names.user, char=names.char)
     text = await aux_complete([{"role": "system", "content": hp.EXTRACTOR_SYSTEM},
-                               {"role": "user", "content": prompt}], settings, connection)
+                               {"role": "user", "content": prompt}], settings, connection,
+                              interactive=interactive)
     _, meta = hs.parse_reply(text, he.parse_context(settings, names))
     if not meta:
         raise HoraeTaskError("модель не вернула разметку Horae")
@@ -659,11 +681,12 @@ async def run_auto_summary(session_id: int, *, max_batches: int = 1, force: bool
 
 
 async def _summarize(prompt: str, settings: dict, connection: dict, session_id: int,
-                     job: HoraeJob | None) -> str:
+                     job: HoraeJob | None, interactive: bool = False) -> str:
     try:
         text = await aux_complete([{"role": "system", "content": hp.SUMMARIZER_SYSTEM},
                                    {"role": "user", "content": prompt}], settings, connection,
-                                  max_tokens=4096, cancel=job.cancel if job else None)
+                                  max_tokens=4096, cancel=job.cancel if job else None,
+                                  interactive=interactive)
         summary = hp.extract_summary(text)
     except hp.TruncatedSummary as exc:
         await _record_summary_error(session_id, str(exc))
@@ -756,7 +779,8 @@ async def compress(session_id: int, refs: list[dict], summary_ids: list[str], mo
             fulltext, _ = await _messages_text(db, session_id, lo, hi, metas)
     prompt = hp.compress_prompt(settings, "fulltext" if mode == "fulltext" else "events", events=events_text,
                                 fulltext=fulltext, count=len(records), user=names.user)
-    text = await _summarize(prompt, settings, connection, session_id, None)
+    # Кнопка «Сжать» ждёт ответа в браузере — без очереди фоновых задач.
+    text = await _summarize(prompt, settings, connection, session_id, None, interactive=True)
     depth = 1 + max([int(s.get("depth") or 1) for s in chosen] or [0])
     async with AsyncSessionLocal() as db:
         return await he.add_summary(db, session_id, lo=lo, hi=hi, text=text, kind="compress",
@@ -785,6 +809,7 @@ async def npc_enrich(session_id: int, name: str, aliases: list[str] | None = Non
     snippets = [f"[#{r.id}|{'ПОЛЬЗОВАТЕЛЬ' if r.role == 'user' else 'ИИ'}] "
                 f"{hs.strip_tags_text(r.content or '')[:1000]}" for r in hits]
     text = await aux_complete(hp.npc_enrich_messages(name, aliases, snippets, names.user), settings, connection,
+                              interactive=True,
                               max_tokens=1024)
     fields = hp.parse_npc_enrich(text)
     if not fields:
@@ -810,7 +835,7 @@ async def rewrite_query(db, session, settings: dict, connection: dict) -> tuple[
     if not lines:
         return "", []
     text = await aux_complete(hp.query_rewrite_messages(settings, "\n\n".join(lines)), settings, connection,
-                              max_tokens=1024, temperature=0.7)
+                              max_tokens=1024, temperature=0.7, interactive=True)
     return hp.parse_query_rewrite(text)
 
 

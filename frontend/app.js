@@ -5486,6 +5486,11 @@ createApp({
         (a) => (a.data || files[a.id] || this._attByRef(a)) && !a.error
       );
     },
+    debugPurpose(p) {
+      const names = { chat: "ход", canvas: "Канвас", summary: "фон: память чата", horae: "фон: Хроника",
+        profile: "фон: память о пользователе", director: "режиссёр группы", service: "служебный" };
+      return names[p] || p || "";
+    },
     // Вернуть в поле файлы неотправленной реплики: к тому, что человек успел
     // прикрепить заново, а не вместо (иначе пропали бы и те, и другие).
     _restoreTurnAtts(pend, bigFiles) {
@@ -9565,6 +9570,13 @@ createApp({
           <span :class="e.status==='ok' ? 'status-ok' : (e.status==='error' ? 'status-err' : 'muted')">{{ e.ts }} · {{ e.status }}<template v-if="e.payload_mb"> · {{ e.payload_mb }} МБ</template></span>
         </div>
         <div class="muted" style="font-size:12px">{{ e.api_base }}</div>
+        <!-- Чей запрос и сколько шёл (2.22.0): ход человека или фоновая работа
+             (память, Хроника, профиль), сколько ждали первого ответа модели и
+             сколько длился весь запрос. Долгое ожидание у «чата» рядом с
+             фоновыми запросами — признак, что ход ждал свободную модель. -->
+        <div v-if="e.purpose || e.dur_s != null" class="muted" style="font-size:12px">
+          {{ debugPurpose(e.purpose) }}<template v-if="e.ttft_s != null"> · первый ответ модели через {{ e.ttft_s }} с</template><template v-if="e.dur_s != null"> · весь запрос {{ e.dur_s }} с</template>
+        </div>
         <div v-if="e.messages" style="font-size:12px; margin-top:4px; display:flex; gap:4px; flex-wrap:wrap">
           <span v-for="(m, j) in e.messages" :key="j" class="tag">{{ m.role }}: {{ m.content }}</span>
         </div>

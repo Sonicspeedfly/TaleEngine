@@ -85,6 +85,10 @@ class GenerationJob:
     # Монотонные часы для дедлайнов (time.time может прыгать при синхронизации).
     started_mono: float = field(default_factory=time.monotonic)
     first_chunk_at: Optional[float] = None
+    # Замер хода (2.22.0): сколько собирался контекст и сколько фоновых
+    # запросов к модели шло в момент старта — в журнал по окончании хода.
+    prep_s: float = 0.0
+    bg_at_start: int = 0
     thought: str = ""                  # накопленные размышления (для повтора)
     sticky: list[dict] = field(default_factory=list)
     speaker: Optional[dict] = None     # группа: кто сейчас отвечает (для повтора)
@@ -491,6 +495,10 @@ class GenerationManager:
             })
         except Exception:  # noqa: BLE001
             logger.exception("Не удалось опубликовать конец хода (job %s)", job.job_id)
+        try:
+            self._log_timing(job)
+        except Exception:  # noqa: BLE001
+            pass
         # Подчищаем job через некоторое время, чтобы реконнект успел забрать кэш.
         try:
             t = asyncio.get_running_loop().create_task(self._cleanup_later(job.job_id))
@@ -498,6 +506,23 @@ class GenerationManager:
             t.add_done_callback(self._cleanups.discard)
         except RuntimeError:
             self._jobs.pop(job.job_id, None)
+
+    @staticmethod
+    def _log_timing(job: GenerationJob) -> None:
+        """
+        Строка в журнал на каждый ход (2.22.0): где ушло время — сборка контекста,
+        ожидание модели (до первого токена/мысли), сам ответ — и сколько фоновых
+        запросов к модели шло в момент старта. По ней видно, ждал ли ход модель
+        (очередь, лимит провайдера) или собирался у нас.
+        """
+        total = time.time() - job.started_at
+        wait = (job.first_chunk_at - job.started_at) if job.first_chunk_at else total
+        answer = total - wait if job.first_chunk_at else 0.0
+        status = "ошибка" if (job.error or job.save_error) else ("остановлен" if job.cancel_requested else "ок")
+        logger.info(
+            "Ход %s чата %s (%s, %s): контекст %.1f с, до первого ответа модели %.1f с, ответ %.1f с, "
+            "фоновых запросов к модели на старте: %d",
+            job.job_id[:8], job.session_id, job.kind, status, job.prep_s, wait, answer, job.bg_at_start)
 
     # ---------------------------------------------------------------- группа
     async def start_runner(self, job_id: str, session_id: int, runner, kind: str = "group") -> "GenerationJob":

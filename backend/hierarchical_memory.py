@@ -1450,9 +1450,10 @@ class HierarchicalMemoryManager:
                     self._emit(phase=phase, retry_in_s=None)
                 try:
                     out = await self._llm(messages)
-                except asyncio.CancelledError:
+                except (asyncio.CancelledError, MemoryCancelled):
                     # Отмена задания или остановка сервера — не сбой провайдера:
-                    # её нельзя ни повторять, ни глотать.
+                    # её нельзя ни повторять, ни глотать. MemoryCancelled — от
+                    # колбэка: прогон отменили, пока запрос ждал свободную модель.
                     raise
                 except Exception as exc:  # noqa: BLE001 — классифицируем любую ошибку провайдера
                     # Конец вызова отмечается при любом исходе, кроме отмены. В том
@@ -1681,7 +1682,8 @@ class HierarchicalMemoryManager:
             on_progress: Callable[[ScanProgress], None] | None = None,
             cancel: asyncio.Event | None = None,
             max_batches: int | None = None,
-            retry_conflicts: bool = True) -> ScanResult:
+            retry_conflicts: bool = True,
+            stop: asyncio.Event | None = None) -> ScanResult:
         """
         Свернуть всё, что ждёт в source, в снимок (§4.8).
 
@@ -1700,6 +1702,8 @@ class HierarchicalMemoryManager:
             перед повторами отмена прерывает сразу, и новых запросов после неё
             нет (_pause): пакет, чьё слияние не успело, не пишется, у слитого
             пропускается только сжатие.
+        :param stop: мягкая остановка — проверяется только МЕЖДУ пакетами,
+            начатый пакет доводится целиком (слияние и факты); статус "limit".
         :param max_batches: сколько попыток, дошедших до commit (принятых и
             отвергнутых), сделать за прогон; ежеходный проход так не занимает
             модель надолго.
@@ -1733,6 +1737,9 @@ class HierarchicalMemoryManager:
                     status = "cancelled"
                     break
                 if max_batches is not None and attempts >= max_batches:
+                    status = "limit"
+                    break
+                if stop is not None and stop.is_set():
                     status = "limit"
                     break
                 state = await source.current_state(state)

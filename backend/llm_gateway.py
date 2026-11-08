@@ -566,6 +566,103 @@ def idle_for() -> float:
     return time.monotonic() - _last_stream_end
 
 
+# ---------------------------------------------------------------------------
+# Пользователь — первым (2.22.0)
+# ---------------------------------------------------------------------------
+# После каждого ответа фоном стартовала служебная работа: сжатие памяти чата
+# (до MEMORY_MAX_BATCHES_PER_TURN больших запросов подряд), память о
+# пользователе, задачи Хроники. Всё — в ту же модель, если не задана отдельная
+# «быстрая» (summary_model). Следующий ход человека попадал в очередь к модели
+# вместе с ними: квота провайдера (особенно у preview-моделей Vertex) уходила
+# фону, ход получал 429, LiteLLM повторял его с паузами — минуты ожидания.
+# Первый ход после перезапуска был быстрым ровно потому, что фон ещё не шёл.
+#
+# Теперь фоновые запросы к модели (виды ниже) ждут, пока нет ни идущего, ни
+# готовящегося хода и прошло BG_QUIET_SECONDS тишины, и идут строго по одному.
+# Запросы, которые нужны самому ходу или нажатой кнопке, помечаются
+# foreground() и не ждут.
+_BACKGROUND_KINDS = frozenset({"summary", "horae", "profile"})
+_preparing = 0                 # ходы, для которых сейчас собирается контекст
+_bg_inflight = 0               # фоновых запросов к модели в полёте
+_foreground: ContextVar[bool] = ContextVar("llm_foreground", default=False)
+_bg_gate: tuple | None = None  # (цикл событий, семафор) — по одному фоновому запросу
+# Отмена фоновой работы («Стоп», «Сбросить память»): ожидание очереди её слушает.
+_bg_stop: ContextVar = ContextVar("llm_bg_stop", default=None)
+
+
+class BackgroundCancelled(Exception):
+    """Фоновую работу отменили, пока её запрос ждал свободную модель: запроса не было."""
+
+
+@contextmanager
+def stop_when(check):
+    """check() → True — фоновый запрос, ещё ждущий очереди, не уходит (BackgroundCancelled)."""
+    token = _bg_stop.set(check)
+    try:
+        yield
+    finally:
+        _bg_stop.reset(token)
+
+
+@contextmanager
+def foreground():
+    """Запрос нужен человеку прямо сейчас (ход, кнопка) — не ставить его в фоновую очередь."""
+    token = _foreground.set(True)
+    try:
+        yield
+    finally:
+        _foreground.reset(token)
+
+
+@contextmanager
+def turn_preparing():
+    """Ход собирает контекст: фоновые запросы к модели пока не начинаются."""
+    global _preparing
+    _preparing += 1
+    try:
+        yield
+    finally:
+        _preparing -= 1
+
+
+def background_inflight() -> int:
+    return _bg_inflight
+
+
+def users_busy() -> bool:
+    """Идёт или готовится ход человека (ответ стримится, сохраняется, собирается контекст)."""
+    from backend.generation import generation_manager
+
+    return bool(_preparing or _user_streams or generation_manager.active())
+
+
+def _bg_semaphore() -> asyncio.Semaphore:
+    global _bg_gate
+    loop = asyncio.get_running_loop()
+    if _bg_gate is None or _bg_gate[0] is not loop:
+        _bg_gate = (loop, asyncio.Semaphore(1))
+    return _bg_gate[1]
+
+
+async def _yield_to_users(kind: str) -> None:
+    """Подождать, пока люди не ждут ответа (не дольше BG_MAX_WAIT_SECONDS)."""
+    import time
+
+    started = time.monotonic()
+    quiet = max(0.0, float(settings.BG_QUIET_SECONDS))
+    stop = _bg_stop.get()
+    while True:
+        if stop is not None and stop():
+            raise BackgroundCancelled()
+        if not users_busy() and idle_for() >= quiet:
+            return
+        if time.monotonic() - started >= settings.BG_MAX_WAIT_SECONDS:
+            logging.getLogger("aichat.llm").info(
+                "Фоновый запрос (%s) ждал свободной модели %d с — запускаю", kind, settings.BG_MAX_WAIT_SECONDS)
+            return
+        await asyncio.sleep(0.5)
+
+
 def _notify(on_notice, note: str) -> None:
     if on_notice:
         try:
@@ -809,8 +906,14 @@ async def _stream_once(
             # Вес запроса с файлами (base64): видно, какой ход упёрся в лимит
             # прокси или провайдера, а какой прошёл.
             "payload_mb": round(_payload_bytes(messages) / (1024 * 1024), 1),
+            # Чей запрос (chat — ход человека; summary/horae/profile — фон) и
+            # сколько он шёл: до первого ответа модели и целиком (2.22.0).
+            "purpose": kind,
         },
     )
+    import time as _time
+
+    _t_start = _time.monotonic()
     global _ask_usage
     if _ask_usage:
         # Просим провайдера прислать usage в последнем чанке стрима. Без этого
@@ -838,6 +941,8 @@ async def _stream_once(
         thought_len = 0
         usage: dict = {}
         async for chunk in _idle_guarded(response):
+            if "ttft_s" not in entry:
+                entry["ttft_s"] = round(_time.monotonic() - _t_start, 1)
             # usage приходит отдельным служебным чанком в самом конце стрима
             # (иногда — прицепом к последнему содержательному). Забираем и то, и то.
             usage = usage_stats.extract_usage(chunk) or usage
@@ -861,6 +966,7 @@ async def _stream_once(
             if delta:
                 text += delta
                 yield delta
+        entry["dur_s"] = round(_time.monotonic() - _t_start, 1)
         if finish_reason:
             entry["finish_reason"] = finish_reason
         probe = _FINISH_PROBE.get()
@@ -930,7 +1036,34 @@ async def complete(
 
     :param kind: вид запроса для статистики расхода (summary / director / canvas…).
         По умолчанию «service» — так фоновые вызовы не смешиваются с самим чатом.
+        Фоновые виды (_BACKGROUND_KINDS) уступают модель ходам людей.
     """
+    global _bg_inflight
+    if kind in _BACKGROUND_KINDS and not _foreground.get():
+        stop = _bg_stop.get()
+        sem = _bg_semaphore()
+        # Очередь к семафору тоже слушает отмену: за ним может стоять чужой
+        # фоновый запрос на минуты.
+        # Опрос, а не wait_for(acquire): свободный семафор берётся без
+        # переключения задач, а wait_for на гонке с таймаутом терял бы место.
+        while True:
+            if stop is not None and stop():
+                raise BackgroundCancelled()
+            if not sem.locked():
+                await sem.acquire()
+                break
+            await asyncio.sleep(0.5)
+        try:
+            await _yield_to_users(kind)
+            _bg_inflight += 1
+            try:
+                return "".join([
+                    chunk async for chunk in stream_completion(messages, params, connection, kind=kind)
+                ])
+            finally:
+                _bg_inflight -= 1
+        finally:
+            sem.release()
     return "".join([
         chunk async for chunk in stream_completion(messages, params, connection, kind=kind)
     ])
