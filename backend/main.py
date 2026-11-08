@@ -3945,6 +3945,7 @@ async def ws_chat(websocket: WebSocket, session_id: int):
                     start = lambda: _start_retry(session_id, rparams, db)  # noqa: E731
                 else:
                     msg = WSUserMessage(**raw)
+                    msg.attachments = await _resolve_draft_refs(session_id, ws_user, msg.attachments)
                     start = lambda: _start_user_turn(  # noqa: E731
                         session_id, msg.content, msg.attachments, msg.params, db,
                         reply_to_message_id=msg.reply_to_message_id,
@@ -4149,6 +4150,46 @@ async def sse_events(request: Request):
 
 
 # ============================ ЧЕРНОВИКИ СООБЩЕНИЙ ============================
+class DraftFileMissing(HTTPException):
+    """422 с перечнем пропавших файлов: клиент чинит только их, остальные вложения не трогает."""
+    def __init__(self, missing: list[int]):
+        super().__init__(422, {
+            "code": "draft_file_missing", "missing": missing,
+            "detail": "Файл из черновика не найден (его убрали на другом устройстве?) — прикрепите его заново",
+        })
+
+
+async def _resolve_draft_refs(session_id: int, user, atts) -> list:
+    """
+    Вложения-ссылки на файлы черновика (draft_fid) — в обычные: байты берём из
+    черновика ЭТОГО чата у ЭТОГО пользователя. Файл уже на сервере, поэтому
+    сообщение с ним уходит мгновенно, без второй загрузки (2.20.0).
+    """
+    refs = [a.draft_fid for a in atts or [] if getattr(a, "draft_fid", None)]
+    if not refs:
+        if any(not a.data for a in atts or []):
+            raise HTTPException(422, "Пустое вложение: нет ни данных, ни файла черновика")
+        return list(atts or [])
+    async with AsyncSessionLocal() as db:
+        rows = {f.id: f for f in (await db.execute(select(models.DraftFile).where(
+            models.DraftFile.id.in_(refs), models.DraftFile.session_id == session_id,
+            models.DraftFile.owner_id == drafts.owner_of(user)))).scalars().all()}
+    missing = [a.draft_fid for a in atts if getattr(a, "draft_fid", None)
+               and (rows.get(a.draft_fid) is None or not rows[a.draft_fid].data)]
+    if missing:
+        raise DraftFileMissing(missing)
+    out = []
+    for a in atts:
+        if not getattr(a, "draft_fid", None):
+            if not a.data:
+                raise HTTPException(422, "Пустое вложение: нет ни данных, ни файла черновика")
+            out.append(a)
+            continue
+        f = rows[a.draft_fid]
+        kind = a.type if a.type in ("image", "audio", "video", "document") else (f.type or "document")
+        out.append(AttachmentIn(type=kind, data=f.data, mime=a.mime or f.mime, name=a.name or f.name))
+    return out
+
 async def _clear_draft(session_id: int, user, msg: dict | None = None) -> None:
     """Реплика сохранена — отправленное уходит из черновика на всех устройствах."""
     msg = msg or {}
@@ -4258,9 +4299,10 @@ async def http_send(
     sess = await db.get(models.ChatSession, session_id)
     if not await _can_access_session(db, sess, user):
         raise HTTPException(403, "Нет доступа к этому чату")
+    atts = await _resolve_draft_refs(session_id, user, msg.attachments)
     try:
         job_id = await _guarded_turn(session_id, lambda: _start_user_turn(
-            session_id, msg.content, msg.attachments, msg.params, db,
+            session_id, msg.content, atts, msg.params, db,
             reply_to_message_id=msg.reply_to_message_id,
         ))
     except TurnBusy as busy:
@@ -4316,6 +4358,7 @@ async def http_send_form(
         ))
 
     params = GenerationParams(**(data.get("params") or {})) if data.get("params") else None
+    attachments = await _resolve_draft_refs(session_id, user, attachments)
     try:
         job_id = await _guarded_turn(session_id, lambda: _start_user_turn(
             session_id, (data.get("content") or ""), attachments, params, db,

@@ -2358,3 +2358,9 @@ input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
 .edit-atts .att-chip.att-removed { opacity: 0.55; text-decoration: line-through; }
 .edit-atts .att-chip.att-new { border-color: var(--accent); }
 .edit-attach { cursor: pointer; margin-right: 8px; }
+
+/* Кольцо загрузки файла в черновик (2.20.0). */
+.att-ring { display: inline-flex; width: 22px; height: 22px; flex: 0 0 auto; }
+.att-ring svg { width: 100%; height: 100%; transform: rotate(-90deg); }
+.att-ring-bg { fill: none; stroke: var(--border-subtle); stroke-width: 4; }
+.att-ring-fg { fill: none; stroke: var(--accent); stroke-width: 4; stroke-linecap: round; transition: stroke-dasharray 0.2s linear; }
