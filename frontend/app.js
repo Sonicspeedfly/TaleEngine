@@ -2890,6 +2890,94 @@ createApp({
     },
     // Метки «пришёл ответ» живут в localStorage — отдельно для каждого
     // пользователя: в режиме аккаунтов один браузер делят несколько человек.
+    // ---------- Боковая панель из памяти браузера (2.19.0) ----------
+    // Списки (персонажи, чаты, группы, персоны, «поделились со мной») после
+    // каждой загрузки запоминаются в localStorage; при следующем заходе панель
+    // рисуется из них сразу, а свежие данные с сервера тихо их заменяют. На
+    // мобильном интернете панель видна мгновенно, а не через секунды. Ключ — свой
+    // у каждого аккаунта; выход из аккаунта память очищает. Картинки — только
+    // ссылками на сжатые копии (их кэширует сам браузер), исходники data:URI не
+    // храним (лимит localStorage ~5 МБ).
+    _listsKey() {
+      const u = this.currentUserObj;
+      return "taleLists:v1:" + (u ? (u.id || u.username || "u") : "anon");
+    },
+    _slimImg(v) {
+      return typeof v === "string" && v.startsWith("data:") ? null : v;
+    },
+    _snapshotLists() {
+      const img = (v) => this._slimImg(v);
+      return {
+        at: Date.now(),
+        characters: (this.characters || []).map((c) => ({ ...c, avatar_path: img(c.avatar_path) })),
+        allSessions: (this.allSessions || []).map((s) => ({ ...s, background: img(s.background) || "" })),
+        groups: (this.groups || []).map((g) => ({
+          ...g, background: img(g.background) || "",
+          members: (g.members || []).map((m) => ({ ...m, avatar_path: img(m.avatar_path) })),
+        })),
+        personas: (this.personas || []).map((p) => ({ ...p, avatar_path: img(p.avatar_path) })),
+        sharedSessions: (this.sharedSessions || []).map((s) => ({ ...s, character_avatar: img(s.character_avatar) })),
+      };
+    },
+    _saveListsSoon() {
+      if (!this._listsFresh) return;   // пока на экране память — писать её же обратно незачем
+      clearTimeout(this._listsSaveTimer);
+      this._listsSaveTimer = setTimeout(() => {
+        try {
+          const json = JSON.stringify(this._snapshotLists());
+          if (json.length > 2_500_000) { localStorage.removeItem(this._listsKey()); return; }
+          localStorage.setItem(this._listsKey(), json);
+          localStorage.setItem("taleLists:last", this._listsKey());
+        } catch (e) {}   // переполнено / приватный режим — просто без памяти
+      }, 800);
+    },
+    // Показать списки из памяти (до ответа сервера). true — было что показать.
+    // key — чью память брать; по умолчанию — текущего аккаунта.
+    _applyCachedLists(key) {
+      let snap = null;
+      try { snap = JSON.parse(localStorage.getItem(key || this._listsKey()) || "null"); } catch (e) {}
+      if (!snap || typeof snap !== "object") return false;
+      // Подставляем только в пустые списки: если сервер успел ответить раньше
+      // памяти (быстрая сеть), свежее не затираем.
+      const put = (key) => {
+        if (Array.isArray(snap[key]) && !(this[key] || []).length) this[key] = snap[key];
+      };
+      ["characters", "allSessions", "groups", "personas", "sharedSessions"].forEach(put);
+      // Чем был персонаж в памяти — чтобы, открыв редактор до свежих данных, не
+      // сохранить потом устаревшую карточку (см. _onFreshLists).
+      this._cachedChars = {};
+      for (const c of snap.characters || []) this._cachedChars[c.id] = c;
+      return true;
+    },
+    // Свежие списки пришли: дальше память можно обновлять, а редактор персонажа,
+    // открытый по данным из памяти и не тронутый человеком, — подменить свежим.
+    _onFreshLists() {
+      this._listsFresh = true;
+      const ce = this.charEdit;
+      const was = ce && this._cachedChars && this._cachedChars[ce.id];
+      if (was) {
+        const fresh = this.characters.find((x) => x.id === ce.id);
+        const untouched = Object.keys(was).every((k) => k === "generation_params"
+          || JSON.stringify(was[k]) === JSON.stringify(ce[k]));
+        if (fresh && untouched) this.charEdit = { ...fresh, generation_params: fresh.generation_params || {} };
+      }
+      this._cachedChars = null;
+      this._saveListsSoon();
+    },
+    // Вход не прошёл — показанная заранее память не остаётся в странице.
+    _dropEarlyLists() {
+      if (!this._earlyListsKey) return;
+      for (const k of ["characters", "allSessions", "groups", "personas", "sharedSessions"]) this[k] = [];
+      this._earlyListsKey = null;
+    },
+    _clearListsCache() {
+      try {
+        for (let i = localStorage.length - 1; i >= 0; i--) {
+          const k = localStorage.key(i);
+          if (k && k.startsWith("taleLists:")) localStorage.removeItem(k);
+        }
+      } catch (e) {}
+    },
     _pendingKey() {
       const u = this.currentUserObj;
       return "pendingChats" + (u ? ":" + (u.id || u.username || "") : "");
@@ -6365,6 +6453,7 @@ createApp({
       await this.initApp();
     },
     logout() {
+      this._clearListsCache();   // списки чатов и персонажей этого аккаунта — не для следующего
       localStorage.removeItem("userToken");
       this.userToken = "";
       this.currentUserObj = null;
@@ -6763,6 +6852,14 @@ createApp({
       // Ворота пройдены: с этого момента фоновые перечитки списка чатов
       // (сигнал соседней вкладки, возвращение к окну, минутный опрос) законны.
       this._appReady = true;
+      // Панель из памяти браузера — сразу, до первого ответа сервера (этап 3).
+      // Её уже могли показать ещё до проверки входа (mounted) — по памяти
+      // последнего аккаунта; вошёл другой — та память не его, убираем.
+      if (this._earlyListsKey && this._earlyListsKey !== this._listsKey()) {
+        for (const k of ["characters", "allSessions", "groups", "personas", "sharedSessions"]) this[k] = [];
+      }
+      this._earlyListsKey = null;
+      this._applyCachedLists();
       // Метки «пришёл ответ» из прошлого визита (пользователь уже известен) —
       // до открытия чата: открытие снимает метку своего чата.
       this._loadPendingChats();
@@ -6787,6 +6884,7 @@ createApp({
       // персонажей и чатов (после F5 сразу можно читать и писать).
       const fast = this._restoreLastChatFast();
       await lists;
+      this._onFreshLists();
       this._safetyHint();
       // Восстанавливаем последний открытый чат (после F5 сразу можно писать);
       // если не вышло — показываем блок быстрого старта, а не открываем первого
@@ -6873,6 +6971,12 @@ createApp({
   },
 
   watch: {
+    // Списки сайдбара поменялись (перечитаны, мутация) — обновить их память.
+    characters() { this._saveListsSoon(); },
+    allSessions() { this._saveListsSoon(); },
+    groups() { this._saveListsSoon(); },
+    personas() { this._saveListsSoon(); },
+    sharedSessions() { this._saveListsSoon(); },
     draftSig(sig) { this._onComposerChanged(sig); },
     // Новые пустые чаты ловим на любом перечитывании списков — откуда бы чат ни
     // взялся: эта вкладка, соседняя, импорт или Telegram-бот.
@@ -7088,13 +7192,21 @@ createApp({
     // скорее всего, режим аккаунтов, и второй круг по сети не нужен. Запрос без
     // побочных эффектов: в другом режиме ответ просто не используется.
     const meEarly = this.userToken ? this.fetchMe() : null;
+    // Панель из памяти — ещё до ответа о входе (этап 3): память последнего
+    // аккаунта на этом устройстве. initApp проверит, что вошёл тот же.
+    try {
+      const last = localStorage.getItem("taleLists:last");
+      if (last && (this.userToken || last.endsWith(":anon")) && this._applyCachedLists(last)) {
+        this._earlyListsKey = last;
+      }
+    } catch (e) {}
     try {
       this.authStatus = await fetch("/api/auth/status").then((r) => r.json());
     } catch (e) {}
     // Режим аккаунтов: нужен вход по логину/паролю.
     if (this.authStatus.accounts_enabled) {
       const me = meEarly ? await meEarly : null;
-      if (!me) { this.needAuth = true; return; }
+      if (!me) { this._dropEarlyLists(); this.needAuth = true; return; }
       this.currentUserObj = me;
       await this.initApp();
       return;
@@ -7102,7 +7214,7 @@ createApp({
     // Иначе — код доступа (если задан).
     if (this.authStatus.access_required) {
       const ok = this.accessCode && (await this.checkCode(this.accessCode));
-      if (!ok) { this.needAccess = true; return; }
+      if (!ok) { this._dropEarlyLists(); this.needAccess = true; return; }
     }
     await this.initApp();
   },
