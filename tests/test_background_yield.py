@@ -71,14 +71,63 @@ async def test_background_runs_after_max_wait(monkeypatch):
             llm_gateway.complete([], None, {}, kind="summary"), 2) == "ok"
 
 
-def test_turn_start_stops_memory_passes():
+async def test_cancel_while_waiting_sends_nothing(monkeypatch):
+    """«Стоп»/«Сбросить память», пока фоновый запрос ждёт модель: запроса нет."""
+    calls: list = []
+    monkeypatch.setattr(llm_gateway, "stream_completion", _fake_stream(calls))
+    stop = asyncio.Event()
+    with llm_gateway.turn_preparing():
+        async def bg():
+            with llm_gateway.stop_when(stop.is_set):
+                return await llm_gateway.complete([], None, {}, kind="horae")
+        task = asyncio.create_task(bg())
+        await asyncio.sleep(0.3)
+        stop.set()
+        try:
+            await asyncio.wait_for(task, 3)
+            raise AssertionError("ожидался BackgroundCancelled")
+        except llm_gateway.BackgroundCancelled:
+            pass
+    assert calls == []
+    assert llm_gateway.background_inflight() == 0
+    # Семафор освобождён: следующий фоновый запрос проходит.
+    monkeypatch.setattr(settings, "BG_QUIET_SECONDS", 0.0)
+    assert await asyncio.wait_for(llm_gateway.complete([], None, {}, kind="summary"), 3) == "ok"
+
+
+async def test_memory_core_does_not_retry_cancel():
+    """MemoryCancelled из колбэка модели — не сбой провайдера: без повторов."""
+    from backend import hierarchical_memory as hm
+
+    n = 0
+
+    async def llm(messages):
+        nonlocal n
+        n += 1
+        raise hm.MemoryCancelled()
+
+    mgr = hm.HierarchicalMemoryManager(llm, hm.MemoryConfig(delay_ms=0))
+    try:
+        await mgr.call([{"role": "user", "content": "x"}])
+        raise AssertionError("ожидался MemoryCancelled")
+    except hm.MemoryCancelled:
+        pass
+    assert n == 1
+
+
+def test_turn_start_stops_memory_passes_softly():
     a, b = asyncio.Event(), asyncio.Event()
-    memory_service._turn_cancels[901] = a
-    memory_service._turn_cancels[902] = b
+    hard = asyncio.Event()
+    memory_service._turn_yields[901] = a
+    memory_service._turn_yields[902] = b
+    memory_service._turn_cancels[901] = hard
     try:
         assert memory_service.yield_to_turns() == 2
         assert a.is_set() and b.is_set()
+        # Жёсткая отмена (факты записанного пакета) ход не трогает.
+        assert not hard.is_set()
         assert memory_service.yield_to_turns() == 0
     finally:
+        memory_service._turn_yields.pop(901, None)
+        memory_service._turn_yields.pop(902, None)
         memory_service._turn_cancels.pop(901, None)
-        memory_service._turn_cancels.pop(902, None)

@@ -586,6 +586,22 @@ _preparing = 0                 # ходы, для которых сейчас с
 _bg_inflight = 0               # фоновых запросов к модели в полёте
 _foreground: ContextVar[bool] = ContextVar("llm_foreground", default=False)
 _bg_gate: tuple | None = None  # (цикл событий, семафор) — по одному фоновому запросу
+# Отмена фоновой работы («Стоп», «Сбросить память»): ожидание очереди её слушает.
+_bg_stop: ContextVar = ContextVar("llm_bg_stop", default=None)
+
+
+class BackgroundCancelled(Exception):
+    """Фоновую работу отменили, пока её запрос ждал свободную модель: запроса не было."""
+
+
+@contextmanager
+def stop_when(check):
+    """check() → True — фоновый запрос, ещё ждущий очереди, не уходит (BackgroundCancelled)."""
+    token = _bg_stop.set(check)
+    try:
+        yield
+    finally:
+        _bg_stop.reset(token)
 
 
 @contextmanager
@@ -634,7 +650,10 @@ async def _yield_to_users(kind: str) -> None:
 
     started = time.monotonic()
     quiet = max(0.0, float(settings.BG_QUIET_SECONDS))
+    stop = _bg_stop.get()
     while True:
+        if stop is not None and stop():
+            raise BackgroundCancelled()
         if not users_busy() and idle_for() >= quiet:
             return
         if time.monotonic() - started >= settings.BG_MAX_WAIT_SECONDS:
@@ -1021,7 +1040,20 @@ async def complete(
     """
     global _bg_inflight
     if kind in _BACKGROUND_KINDS and not _foreground.get():
-        async with _bg_semaphore():
+        stop = _bg_stop.get()
+        sem = _bg_semaphore()
+        # Очередь к семафору тоже слушает отмену: за ним может стоять чужой
+        # фоновый запрос на минуты.
+        # Опрос, а не wait_for(acquire): свободный семафор берётся без
+        # переключения задач, а wait_for на гонке с таймаутом терял бы место.
+        while True:
+            if stop is not None and stop():
+                raise BackgroundCancelled()
+            if not sem.locked():
+                await sem.acquire()
+                break
+            await asyncio.sleep(0.5)
+        try:
             await _yield_to_users(kind)
             _bg_inflight += 1
             try:
@@ -1030,6 +1062,8 @@ async def complete(
                 ])
             finally:
                 _bg_inflight -= 1
+        finally:
+            sem.release()
     return "".join([
         chunk async for chunk in stream_completion(messages, params, connection, kind=kind)
     ])

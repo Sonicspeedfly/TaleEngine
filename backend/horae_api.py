@@ -125,7 +125,8 @@ def build_router(current_user, can_access_session) -> APIRouter:
     async def analyze(message_id: int, user=Depends(current_user), db: AsyncSession = Depends(get_session)):
         msg = await message(db, message_id, user)
         try:
-            await horae_tasks.analyze_message(msg.session_id, msg.id)
+            # Кнопка — человек ждёт ответа: без очереди фоновых задач (2.22.0).
+            await horae_tasks.analyze_message(msg.session_id, msg.id, interactive=True)
         except horae_tasks.HoraeTaskError as exc:
             raise HTTPException(400, str(exc)) from exc
         await db.refresh(msg)

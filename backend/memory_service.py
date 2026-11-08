@@ -403,10 +403,16 @@ def build_manager(connection, ui_value, deps: MemoryDeps,
     limits = {"max_tokens": out_tokens}
 
     async def ask(messages: list[dict], max_tokens: int) -> str:
+        # Пока запрос ждёт свободную модель (ходы людей — первыми), «Стоп» и
+        # «Сбросить память» его отменяют: запроса и оплаты не будет.
         with llm_gateway.sampling_overrides(max_tokens=max_tokens,
                                             temperature=settings.MEMORY_TEMPERATURE), \
-                llm_gateway.finish_reason_probe() as probe:
-            text = await deps.complete(messages, None, bg_conn, kind="summary")
+                llm_gateway.finish_reason_probe() as probe, \
+                llm_gateway.stop_when(lambda: manager._cancel_requested()):
+            try:
+                text = await deps.complete(messages, None, bg_conn, kind="summary")
+            except llm_gateway.BackgroundCancelled as exc:
+                raise hm.MemoryCancelled() from exc
         # Непустой ответ, оборванный лимитом вывода, шлюз отдаёт как успех.
         # Для снимка это length: ядро сожмёт хронику и повторит слияние, а
         # не будет слать корректирующие ходы с тем же лимитом (финальное
@@ -959,12 +965,12 @@ async def chat_lock(session_id: int):
 def yield_to_turns() -> int:
     """
     Начался ход человека: идущие ежеходные проходы памяти (во всех чатах)
-    останавливаются после текущего запроса к модели — оставшиеся пакеты
-    догонят следующие проходы, когда модель свободна (2.22.0). Сделанное
-    сохраняется (статус «cancelled»), ошибкой это не считается.
+    не начинают новых пакетов — текущий доводится (слияние и факты), остальные
+    догонят следующие проходы, когда модель свободна (2.22.0). Статус прохода
+    «limit», как при потолке пакетов за ход; ошибкой это не считается.
     """
     n = 0
-    for ev in list(_turn_cancels.values()):
+    for ev in list(_turn_yields.values()):
         if not ev.is_set():
             ev.set()
             n += 1
@@ -1009,6 +1015,10 @@ _turn_errors: dict[int, dict] = {}
 # ставит, и проход останавливается после текущего запроса к модели, а не
 # доделывает до шести пакетов (см. purge).
 _turn_cancels: dict[int, asyncio.Event] = {}
+# Мягкая остановка ежеходного прохода (2.22.0): начался ход человека — новых
+# пакетов не начинать. Текущий пакет доводится целиком (слияние и его факты):
+# жёсткая отмена выше потеряла бы факты уже записанного пакета.
+_turn_yields: dict[int, asyncio.Event] = {}
 
 
 def describe_error(err: BaseException) -> tuple[str, str]:
@@ -1110,6 +1120,7 @@ async def run_incremental(session_id: int, deps: MemoryDeps, *, max_batches: int
     async with chat_lock(session_id):
         _busy.add(session_id)
         cancel = _turn_cancels[session_id] = asyncio.Event()
+        soft = _turn_yields[session_id] = asyncio.Event()
         try:
             async with AsyncSessionLocal() as db:
                 # Выключатель (вкладка «Память»): settings/ui -> auto_summary=false.
@@ -1131,7 +1142,7 @@ async def run_incremental(session_id: int, deps: MemoryDeps, *, max_batches: int
             try:
                 result = await manager.scan_and_compress_history(
                     source, on_progress=on_progress, max_batches=max_batches,
-                    retry_conflicts=False, cancel=cancel)
+                    retry_conflicts=False, cancel=cancel, stop=soft)
             except Exception as err:
                 try:
                     await _record_turn_error(session_id, err)
@@ -1145,6 +1156,8 @@ async def run_incremental(session_id: int, deps: MemoryDeps, *, max_batches: int
             _busy.discard(session_id)
             if _turn_cancels.get(session_id) is cancel:
                 del _turn_cancels[session_id]
+            if _turn_yields.get(session_id) is soft:
+                del _turn_yields[session_id]
 
 
 # ============================================================================
