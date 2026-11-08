@@ -2994,7 +2994,7 @@ createApp({
         let msgs = this.messages.filter((m) => typeof m.id === "number").slice(-40).map(strip);
         const row = this._sessionCard(sid) || {};
         const card = {
-          ...row, id: sid, character_id: this.selectedCharacterId || row.character_id,
+          ...row, id: sid, character_id: row.character_id || this.selectedCharacterId,
           author_note: this.authorNote || "", persona_id: this.sessionPersonaId || null,
           background: this._slimImg(this.sessionBg) || "", timezone: this.sessionTimezone || "",
           is_group: false,
@@ -3024,10 +3024,20 @@ createApp({
       this._chatPreviewCard = snap.card;
       this.selectedCharacterId = snap.card.character_id || saved.characterId || null;
       this.messages = snap.messages;
+      // Свежая карточка — сразу, параллельно с сообщениями: заметка автора из
+      // памяти не должна жить дольше, чем нужно (её сохранение по blur затёрло
+      // бы правку с другого устройства).
+      this.api("/sessions/" + sid + "/card").then((card) => this._applyFreshCard(card)).catch(() => {});
+      // Свежая лента не пришла (нет сети, сервер перезапускается) — пробуем ещё,
+      // пока чат открыт по памяти: иначе правка и свайпы остались бы закрыты.
+      const retry = (delay) => setTimeout(() => {
+        if (this._chatPreviewSid !== sid || this.sessionId !== sid) return;
+        this.loadMessages(true).catch(() => retry(Math.min(delay * 2, 30000)));
+      }, delay);
       this.openSession(snap.card).catch((e) => {
         // Чата больше нет (удалили на другом устройстве) или нет доступа — не
         // держим его на экране по памяти. Сбой сети — держим: это и есть смысл памяти.
-        if (!e || (e.status !== 403 && e.status !== 404)) return;
+        if (!e || (e.status !== 403 && e.status !== 404)) { retry(3000); return; }
         if (this.sessionId === sid && this._chatPreviewSid === sid) {
           this._chatPreviewSid = null;
           this.sessionId = null;
@@ -3044,6 +3054,11 @@ createApp({
       const was = this._chatPreviewCard;
       this._chatPreviewCard = null;
       if (!was || !card || card.id !== this.sessionId) return;
+      // Персонаж чата — с сервера (в памяти мог оказаться выбранный в панели).
+      if (card.character_id && card.character_id !== this.selectedCharacterId) {
+        this.selectedCharacterId = card.character_id;
+        this._rememberLastChat();
+      }
       if (this.authorNote === (was.author_note || "")) this.authorNote = card.author_note || "";
       if (this.sessionPersonaId === (was.persona_id || null)) this.sessionPersonaId = card.persona_id || null;
       if (this.sessionBg === (was.background || "")) this.sessionBg = card.background || "";
@@ -3384,6 +3399,12 @@ createApp({
       const wasNearBottom = fresh || !el || (el.scrollHeight - el.scrollTop - el.clientHeight < 160);
       // Открыт по памяти (последний чат после F5) — показанное из памяти держим,
       // пока не пришло свежее: экран не мигает пустотой.
+      // Превью — только для того чата, что открыт по памяти: ушли в другой —
+      // флаг больше не действует (иначе при возврате осталась бы чужая лента).
+      if (fresh && this._chatPreviewSid && this._chatPreviewSid !== this.sessionId) {
+        this._chatPreviewSid = null;
+        this._chatPreviewCard = null;
+      }
       const preview = fresh && this._chatPreviewSid === this.sessionId;
       if (fresh && !preview) { this.messages = []; this.noMoreMessages = false; }
       // Окно = столько же, сколько уже показано (сохраняем прокрутку вверх), но не всё:
@@ -3402,6 +3423,7 @@ createApp({
     // Подгрузка порции более старых сообщений при скролле вверх (сохраняем позицию).
     async loadOlder() {
       if (!this.sessionId || this.loadingOlder || this.noMoreMessages || !this.messages.length) return;
+      if (this._chatPreviewSid === this.sessionId) return;   // лента из памяти — ждём свежую
       const oldest = this.messages[0];
       if (!oldest || oldest.id === "tmp") return;
       this.loadingOlder = true;
@@ -3414,9 +3436,13 @@ createApp({
           "/sessions/" + sid + "/messages?before=" + oldest.id + "&limit=" + page
         );
         if (sid !== this.sessionId) return;   // открыли другой чат, пока ждали
+        // Пока ждали, ленту заменили целиком (свежая загрузка) — эта порция к ней не относится.
+        if (this.messages[0] !== oldest) return;
         if (older.length < page) this.noMoreMessages = true;
-        if (older.length) {
-          this.messages = older.concat(this.messages);
+        const have = new Set(this.messages.map((m) => m.id));
+        const add = older.filter((m) => !have.has(m.id));
+        if (add.length) {
+          this.messages = add.concat(this.messages);
           // Держим кадр на месте: добавили сверху -> компенсируем прирост высоты.
           this.$nextTick(() => { if (el) el.scrollTop += el.scrollHeight - prevH; });
         }
@@ -4548,7 +4574,17 @@ createApp({
     },
 
     // ---------- Действия над сообщениями ----------
+    // Лента пока из памяти браузера (свежая ещё грузится): правка, свайп и
+    // удаление по ней могли бы затереть изменения с другого устройства.
+    _previewBlocked() {
+      if (this._chatPreviewSid && this._chatPreviewSid === this.sessionId) {
+        this.showToast("Загружаю свежие сообщения — секунду");
+        return true;
+      }
+      return false;
+    },
     async swipe(msg, dir) {
+      if (this._previewBlocked()) return;
       const total = (msg.swipes || []).length;
       const next = msg.active_swipe + dir;
       if (next < 0) return;
@@ -4563,6 +4599,7 @@ createApp({
       this.notifyChatListChanged(this.sessionId);
     },
     startEdit(msg) {
+      if (this._previewBlocked()) return;
       this.editingId = msg.id;
       this.editingText = msg.content;
       this.editRemove = [];
@@ -4655,6 +4692,7 @@ createApp({
       if (msg && data && Array.isArray(data.attachments)) msg.attachments = data.attachments;
     },
     async deleteMessage(msg) {
+      if (this._previewBlocked()) return;
       if (this.busyMsg[msg.id]) return;
       if (!(await this.askConfirm("Удалить сообщение?", { okText: "Удалить" }))) return;
       this.busyMsg[msg.id] = "del";
