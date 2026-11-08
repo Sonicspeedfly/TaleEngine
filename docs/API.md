@@ -49,6 +49,7 @@ HTTP Basic Auth поверх всего нужен ещё заголовок `Au
 | PUT | `/api/sessions/{id}/draft` | Сохранить черновик: `{text, reply_to_id, files:[fid…], base_version, origin}`. `files` — id файлов черновика по порядку; не перечисленные удаляются. `base_version` старее серверной (правили на другом устройстве) → **409** `{"detail", "draft": <текущий черновик>}`. `origin` — id вкладки, вернётся в событии шины |
 | POST | `/api/sessions/{id}/draft/files` | Файл в черновик (multipart: `file`, `kind` = image/audio/video/document, `origin`) → `{fid, type, mime, name, size, version}`. Больше `DRAFT_FILE_MAX_MB` (25) или всего больше `DRAFT_TOTAL_MAX_MB` (100) — **413**: файл остаётся только на устройстве |
 | GET | `/api/sessions/{id}/draft/files/{fid}` | Байты файла черновика (`Cache-Control: private, no-store`). Авторизация — как у `/api/messages/{id}/att/{idx}` |
+| GET | `/api/sessions/{id}/card` | Карточка одного своего чата — та же строка, что в `/api/sessions` (2.18.0). По ней страница открывает последний чат после F5, не дожидаясь списков. Группа, чужой или удалённый чат — 404 |
 | GET | `/api/sessions/{id}/active_job` | Идущий ход чата: `{"job": null}` или `{"job": {job_id, session_id, kind, stage, started_at, elapsed, chars}}` (доступ к чату). По нему клиент находит ход после F5/смены чата |
 | GET | `/api/sessions/{id}/export` | **Нативный экспорт чата AiChat** |
 | POST | `/api/sessions/import` | Импорт чата (нативный AiChat **или** SillyTavern — автоопределение) |

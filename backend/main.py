@@ -1082,6 +1082,11 @@ async def list_sessions(
         q = q.where(models.ChatSession.character_id == character_id)
     q = accounts.scope_query(q, models.ChatSession, user)
     rows = (await db.execute(q)).scalars().all()
+    return await _session_rows(db, rows)
+
+
+async def _session_rows(db, rows) -> list[dict]:
+    """Строки списка чатов (тот же вид у списка и у карточки одного чата)."""
     previews = await _session_previews(db, [s.id for s in rows])
     rows = _sort_by_activity(rows, previews)
     # Имена персонажей одним запросом на весь список, а не по одному на строку.
@@ -1113,6 +1118,23 @@ async def list_sessions(
         }
         for s in rows
     ]
+
+
+@app.get("/api/sessions/{session_id}/card")
+async def session_card(session_id: int, user=Depends(current_user), db: AsyncSession = Depends(get_session)):
+    """
+    Карточка одного своего чата — та же строка, что в /api/sessions (2.18.0).
+    По ней страница открывает последний чат сразу после F5, не дожидаясь
+    списков персонажей и чатов: на мобильном интернете это секунды.
+    """
+    q = accounts.scope_query(
+        select(models.ChatSession).options(defer(models.ChatSession.background))
+        .where(models.ChatSession.id == session_id, models.ChatSession.is_group == False),  # noqa: E712
+        models.ChatSession, user)
+    rows = (await db.execute(q)).scalars().all()
+    if not rows:
+        raise HTTPException(404, "Чат не найден")
+    return (await _session_rows(db, rows))[0]
 
 
 async def _accessible_session_ids(db, user) -> list[int]:
