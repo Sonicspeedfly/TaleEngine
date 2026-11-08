@@ -2520,7 +2520,8 @@ createApp({
       let card;
       try { card = await this.api("/sessions/" + saved.sessionId + "/card"); } catch (e) { return false; }
       if (!card || card.is_group || !card.character_id) return false;
-      if (this.sessionId) return this.sessionId === card.id;   // человек уже открыл другой чат сам
+      if (this.sessionId === card.id) { this._applyFreshCard(card); return true; }   // открыт по памяти
+      if (this.sessionId) return false;   // человек уже открыл другой чат сам
       this.selectedCharacterId = card.character_id;
       await this.openSession(card);
       return this.sessionId === card.id;
@@ -2970,6 +2971,91 @@ createApp({
       this._cachedChars = null;
       this._saveListsSoon();
     },
+    // ---------- Последний чат из памяти браузера (2.21.0) ----------
+    // Последние сообщения открытого чата и его карточка запоминаются; при
+    // следующем заходе чат открывается сразу из памяти, свежие сообщения с
+    // сервера тихо заменяют показанное. Файлы — только мета (по ссылке).
+    _chatKey() {
+      return this._listsKey().replace("taleLists:", "taleChat:");
+    },
+    _saveChatSoon() {
+      if (this._chatPreviewSid || !this.sessionId || this.sharedView || this.currentIsGroup) return;
+      clearTimeout(this._chatSaveTimer);
+      this._chatSaveTimer = setTimeout(() => {
+        const sid = this.sessionId;
+        if (!sid || this.sharedView || this.currentIsGroup) return;
+        const strip = (m) => ({
+          ...m, attachments: (m.attachments || []).map((a) => {
+            const out = { ...a };
+            delete out.data; delete out.preview;
+            return out;
+          }),
+        });
+        let msgs = this.messages.filter((m) => typeof m.id === "number").slice(-40).map(strip);
+        const row = this._sessionCard(sid) || {};
+        const card = {
+          ...row, id: sid, character_id: this.selectedCharacterId || row.character_id,
+          author_note: this.authorNote || "", persona_id: this.sessionPersonaId || null,
+          background: this._slimImg(this.sessionBg) || "", timezone: this.sessionTimezone || "",
+          is_group: false,
+        };
+        try {
+          let json = JSON.stringify({ sid, card, messages: msgs, at: Date.now() });
+          while (json.length > 1_500_000 && msgs.length > 4) {
+            msgs = msgs.slice(Math.ceil(msgs.length / 4));
+            json = JSON.stringify({ sid, card, messages: msgs, at: Date.now() });
+          }
+          if (json.length > 1_500_000) { localStorage.removeItem(this._chatKey()); return; }
+          localStorage.setItem(this._chatKey(), json);
+        } catch (e) {}
+      }, 1000);
+    },
+    // Открыть последний чат по памяти — сразу, ещё до ответа сервера.
+    _openChatFromCache() {
+      let saved = null, snap = null;
+      try {
+        saved = JSON.parse(localStorage.getItem("lastChat") || "null");
+        snap = JSON.parse(localStorage.getItem(this._chatKey()) || "null");
+      } catch (e) {}
+      if (!saved || saved.isGroup || !snap || snap.sid !== saved.sessionId || !snap.card
+          || !Array.isArray(snap.messages) || this.sessionId) return false;
+      const sid = snap.sid;
+      this._chatPreviewSid = sid;
+      this._chatPreviewCard = snap.card;
+      this.selectedCharacterId = snap.card.character_id || saved.characterId || null;
+      this.messages = snap.messages;
+      this.openSession(snap.card).catch((e) => {
+        // Чата больше нет (удалили на другом устройстве) или нет доступа — не
+        // держим его на экране по памяти. Сбой сети — держим: это и есть смысл памяти.
+        if (!e || (e.status !== 403 && e.status !== 404)) return;
+        if (this.sessionId === sid && this._chatPreviewSid === sid) {
+          this._chatPreviewSid = null;
+          this.sessionId = null;
+          this.messages = [];
+        }
+        try { localStorage.removeItem(this._chatKey()); } catch (e) {}
+      });
+      this.$nextTick(() => this.scrollDown());
+      return true;
+    },
+    // Свежая карточка открытого по памяти чата: поля, которые человек ещё не
+    // трогал, берём с сервера (заметку автора могли поменять на другом устройстве).
+    _applyFreshCard(card) {
+      const was = this._chatPreviewCard;
+      this._chatPreviewCard = null;
+      if (!was || !card || card.id !== this.sessionId) return;
+      if (this.authorNote === (was.author_note || "")) this.authorNote = card.author_note || "";
+      if (this.sessionPersonaId === (was.persona_id || null)) this.sessionPersonaId = card.persona_id || null;
+      if (this.sessionBg === (was.background || "")) this.sessionBg = card.background || "";
+      if (this.sessionTimezone === (was.timezone || "") && card.timezone) this.sessionTimezone = card.timezone;
+    },
+    // Запуск оборвался (нет связи с сервером): раньше это было необработанное
+    // исключение и пустая страница; теперь на экране — то, что в памяти
+    // браузера (панель, последний чат), и понятное сообщение.
+    _startFailed(e) {
+      console.warn("Запуск не завершился:", e);
+      this.showToast("⚠ Нет связи с сервером — показываю сохранённое на устройстве. Обновите страницу, когда связь появится");
+    },
     // Вход не прошёл — показанная заранее память не остаётся в странице.
     _dropEarlyLists() {
       if (!this._earlyListsKey) return;
@@ -2980,7 +3066,7 @@ createApp({
       try {
         for (let i = localStorage.length - 1; i >= 0; i--) {
           const k = localStorage.key(i);
-          if (k && k.startsWith("taleLists:")) localStorage.removeItem(k);
+          if (k && (k.startsWith("taleLists:") || k.startsWith("taleChat:"))) localStorage.removeItem(k);
         }
       } catch (e) {}
     },
@@ -3296,7 +3382,10 @@ createApp({
       // при обновлении (после хода/правки). Прыгаем вниз только у нижней кромки/на открытии.
       const el = this.$refs.messages;
       const wasNearBottom = fresh || !el || (el.scrollHeight - el.scrollTop - el.clientHeight < 160);
-      if (fresh) { this.messages = []; this.noMoreMessages = false; }
+      // Открыт по памяти (последний чат после F5) — показанное из памяти держим,
+      // пока не пришло свежее: экран не мигает пустотой.
+      const preview = fresh && this._chatPreviewSid === this.sessionId;
+      if (fresh && !preview) { this.messages = []; this.noMoreMessages = false; }
       // Окно = столько же, сколько уже показано (сохраняем прокрутку вверх), но не всё:
       // на открытии — msgPageSize (настройка), максимум 400.
       const limit = Math.min(400, Math.max(this.msgPageSize, this.messages.length + 2));
@@ -3306,7 +3395,9 @@ createApp({
       if (sid !== this.sessionId) return;
       this.messages = rows;
       this.noMoreMessages = rows.length < limit; // получили меньше лимита → старых нет
+      if (this._chatPreviewSid === sid) this._chatPreviewSid = null;
       if (wasNearBottom) this.scrollDown();
+      this._saveChatSoon();
     },
     // Подгрузка порции более старых сообщений при скролле вверх (сохраняем позицию).
     async loadOlder() {
@@ -6994,6 +7085,8 @@ createApp({
       // Метки «пришёл ответ» из прошлого визита (пользователь уже известен) —
       // до открытия чата: открытие снимает метку своего чата.
       this._loadPendingChats();
+      // Последний чат — по памяти, сразу (свежие сообщения догонят, 2.21.0).
+      this._openChatFromCache();
       // Всё, что нужно на старте, запрашиваем РАЗОМ (2.18.0). Раньше подключение,
       // пресеты и настройки шли строго друг за другом, а списки — только после
       // них: на мобильном интернете каждый лишний круг — это секунда.
@@ -7004,6 +7097,9 @@ createApp({
       const pUi = ask("/settings/ui");
       const lists = Promise.all([this.loadCharacters(), this.loadPersonas(), this.loadHorae(),
         this.loadGroups(), this.loadFriends(), this.loadAllSessions()]);
+      // Запуск может оборваться раньше, чем дойдёт до await lists (нет связи):
+      // отказ списков тогда не должен стать необработанной ошибкой страницы.
+      lists.catch(() => {});
       // Порядок применения — прежний: подключение, пресет по умолчанию, настройки.
       await this.loadConnection(got(await pConn));
       await this.loadPresets(got(await pPresets));
@@ -7020,8 +7116,8 @@ createApp({
       // Восстанавливаем последний открытый чат (после F5 сразу можно писать);
       // если не вышло — показываем блок быстрого старта, а не открываем первого
       // персонажа молча: раньше это создавало чат как побочный эффект запуска.
-      if (await fast) this._afterFastRestore();
-      else if (!this.sessionId) await this._restoreLastChat();
+      if ((await fast) || this.sessionId) this._afterFastRestore();
+      else await this._restoreLastChat();
       // Периодически подтягиваем заявки в друзья/общие чаты — чтобы уведомления
       // в колокольчике появлялись без перезагрузки страницы.
       clearInterval(this._friendsTimer);
@@ -7339,7 +7435,7 @@ createApp({
       const me = meEarly ? await meEarly : null;
       if (!me) { this._dropEarlyLists(); this.needAuth = true; return; }
       this.currentUserObj = me;
-      await this.initApp();
+      await this.initApp().catch((e) => this._startFailed(e));
       return;
     }
     // Иначе — код доступа (если задан).
@@ -7347,7 +7443,7 @@ createApp({
       const ok = this.accessCode && (await this.checkCode(this.accessCode));
       if (!ok) { this._dropEarlyLists(); this.needAccess = true; return; }
     }
-    await this.initApp();
+    await this.initApp().catch((e) => this._startFailed(e));
   },
 
   template: `
