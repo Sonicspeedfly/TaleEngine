@@ -41,6 +41,7 @@ def test_draft_ref_of_other_chat_is_rejected(client):
     r = client.post(f"/api/sessions/{b}/send", json={
         "content": "чужое", "attachments": [{"type": "audio", "name": "x", "draft_fid": f["fid"]}]})
     assert r.status_code == 422
+    assert r.json()["detail"]["code"] == "draft_file_missing" and r.json()["detail"]["missing"] == [f["fid"]]
     # Пустое вложение без ссылки — тоже ошибка, а не «файл» без данных.
     r = client.post(f"/api/sessions/{b}/send", json={"content": "пусто", "attachments": [{"type": "image"}]})
     assert r.status_code == 422

@@ -1402,16 +1402,22 @@ createApp({
             if (xhr.status === 401) this.needAccess = true;
             let detail = "HTTP " + xhr.status;
             let jobId = null;
+            let code = "", missing = [];
             try {
               const j = JSON.parse(xhr.responseText);
-              if (j && j.detail && typeof j.detail === "object") detail = j.detail.detail || j.detail.message || detail;
-              else if (j && j.detail) detail = j.detail;
+              if (j && j.detail && typeof j.detail === "object") {
+                detail = j.detail.detail || j.detail.message || detail;
+                code = j.detail.code || "";
+                missing = Array.isArray(j.detail.missing) ? j.detail.missing : [];
+              } else if (j && j.detail) detail = j.detail;
               jobId = (j && (j.job_id || (j.detail && j.detail.job_id))) || null;
             } catch (e) {}
             // Статус и job_id — как у api(): на 409 send() подпишется на идущий ход.
             const err = new Error(detail);
             err.status = xhr.status;
             err.jobId = jobId;
+            err.code = code;          // draft_file_missing — каких файлов черновика нет
+            err.missing = missing;
             reject(err);
           }
         };
@@ -3592,6 +3598,7 @@ createApp({
     // Начать ход в открытом чате. Возвращает client_id: им сервер подтвердит приём.
     _beginTurn(streamKind) {
       this._clearTurnTimers();
+      this._turnRestoreAtts = null;
       this.chatError = "";
       this.currentReply = "";
       this.currentThought = "";
@@ -3916,6 +3923,8 @@ createApp({
       const sig = this._turnSig;
       const restore = this._turnSendText;
       this._turnSendText = "";
+      const backAtts = this._turnRestoreAtts;   // файлы реплики после отказа 5xx (см. _onHttpTurnFailed)
+      this._turnRestoreAtts = null;
       const floor = this._turnFloor || 0;
       this._genSeq = (this._genSeq || 0) + 1;   // ответ закончился (см. stop)
       this.streamKind = "";
@@ -3951,10 +3960,13 @@ createApp({
       if (this.sessionId !== sid) return;
       // Реплика так и не сохранилась (ход не стартовал, сервер не подтвердил,
       // остановили до сохранения) — текст возвращаем в поле ввода, а не теряем.
-      if (restore && !this.input.trim()
-          && !this.messages.some((m) => m.role === "user" && typeof m.id === "number" && m.id > floor)) {
+      const unsaved = !this.messages.some((m) => m.role === "user" && typeof m.id === "number" && m.id > floor);
+      if (restore && !this.input.trim() && unsaved) {
         this.input = restore;
       }
+      // Файлы реплики, отказ по которой мог прийти и после сохранения (5xx):
+      // возвращаем, только если реплики в чате правда нет.
+      if (backAtts && unsaved) this._restoreTurnAtts(backAtts.pend, backAtts.bigFiles);
       // «Ответ получен» — только если ответ правда появился: новый последний
       // ответ ассистента, ход не остановлен и без ошибки.
       const last = this.messages[this.messages.length - 1];
@@ -4134,7 +4146,7 @@ createApp({
       await this.reviseCanvas(cmd);
     },
     async send() {
-      const content = this.input.trim();
+      let content = this.input.trim();
       if ((!content && this.pendingAttachments.length === 0) || !this.connected || this.streaming) return;
       if (this.switchingChat) return;   // сокет ещё от прежнего чата (см. openSession)
       // Чат, в котором нажали «Отправить»: пока дочитываются файлы, человек мог
@@ -4162,6 +4174,8 @@ createApp({
         if (!this.connected || this.streaming) return;
         if (this.switchingChat || this.sessionId !== sid) return;
       }
+      // Пока ждали файлы, человек мог дописать текст — уходит то, что в поле сейчас.
+      content = this.input.trim();
       this._dropBadAttachments(); // выкидываем не прочитавшиеся вложения
       if (!content && this.pendingAttachments.length === 0) return; // всё отвалилось
       // ===== Умная маршрутизация интентов для Canvas =====
@@ -4328,19 +4342,24 @@ createApp({
       if (current && this._userStopped) { this.finishStream(); return; }
       const msg = prefix + ((e && e.message) || "ошибка");
       if (!current) { this.showToast("⚠ " + msg + " (чат " + this._chatName(sid) + ")", () => this._openById(sid)); return; }
-      // Сервер ответил ошибкой — реплика не сохранена: файлы возвращаем в поле
-      // (как при «уже идёт ответ»), а не теряем вместе с отправкой.
-      if (e && e.status >= 400 && !this.pendingAttachments.length && back && back.pend && back.pend.length) {
-        this._attFiles = Object.assign(this._attFiles || {}, back.bigFiles || {});
+      // Сервер отказал ДО сохранения реплики (проверка, нет доступа, файл велик,
+      // файла черновика нет) — файлы возвращаем в поле сразу, а не теряем. На
+      // прочие ошибки (5xx, прокси) реплика могла и сохраниться — решит
+      // finishStream, перечитав чат (как с текстом).
+      if (back && back.pend && back.pend.length) {
         let pend = back.pend;
-        if (e.status === 422) {
-          // Файла черновика на сервере уже нет (убрали на другом устройстве):
-          // свои файлы шлём в следующий раз байтами, чужие — прикрепить заново.
-          const files = this._attFiles;
-          pend = pend.filter((a) => !a.draftFid || a.data || files[a.id]);
-          for (const a of pend) if (a.draftFid) { a.draftFid = null; a.localOnly = true; }
+        if (e && e.code === "draft_file_missing") {
+          // Этих файлов черновика уже нет (убрали на другом устройстве): свои —
+          // в следующий раз байтами, чужие — прикрепить заново. Остальные — как были.
+          const gone = new Set(e.missing || []);
+          const files = Object.assign({}, this._attFiles || {}, back.bigFiles || {});
+          pend = pend.filter((a) => !gone.has(a.draftFid) || a.data || files[a.id]);
+          for (const a of pend) if (gone.has(a.draftFid)) { a.draftFid = null; a.localOnly = true; }
+          const lost = back.pend.length - pend.length;
+          if (lost) this.showToast("Файл с другого устройства убрали из черновика — прикрепите его заново");
         }
-        this.pendingAttachments = pend;
+        if (e && [400, 403, 404, 413, 422].includes(e.status)) this._restoreTurnAtts(pend, back.bigFiles);
+        else this._turnRestoreAtts = { pend, bigFiles: back.bigFiles };
       }
       this.chatError = msg;
       this._turnFailed = true;
@@ -4801,7 +4820,7 @@ createApp({
       if (a) {
         this._releaseAtt(a);
         // Ещё грузится — прерываем: незачем гнать мегабайты убранного файла.
-        if (a.uploading && a._xhr) { try { a._xhr.abort(); } catch (e) {} }
+        if (a.uploading && a._xhr && !a._bodySent) { try { a._xhr.abort(); } catch (e) {} }
         a._gone = true;   // ещё грузится в черновик — уберём, когда догрузится
         if (a.draftFid) this._draftState().removed.add(a.draftFid);
       }
@@ -4826,6 +4845,10 @@ createApp({
           // возвращаться не должны (иначе «отправленное» голосовое висит в поле
           // и уйдёт повторно со следующим сообщением). id файлов не переиспользуются.
           goneFids: new Set(),
+          // Файлы черновика, на которые ссылается сообщение в полёте: пока сервер
+          // его не принял, сохранение черновика (человек уже печатает следующее)
+          // не должно их удалить — иначе отправка упала бы «файла нет».
+          inflight: new Set(),
           missed: false,
           away: {},   // sid → промис сохранения, ушедшего вместе с прежним чатом
         };
@@ -4862,7 +4885,8 @@ createApp({
       return {
         text: this.input || "",
         reply_to_id: typeof this.replyToId === "number" ? this.replyToId : null,
-        files: this.pendingAttachments.filter((a) => a.draftFid).map((a) => a.draftFid),
+        files: [...new Set([...this.pendingAttachments.filter((a) => a.draftFid).map((a) => a.draftFid),
+          ...this._draftState().inflight])],
       };
     },
     // Слияние текста при конфликте (правили и здесь, и на другом устройстве).
@@ -5139,11 +5163,26 @@ createApp({
     _xhrUpload(url, body, onProgress, owner) {
       return new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
-        if (owner) owner._xhr = xhr;   // убрали файл с плашки — загрузку можно прервать
+        if (owner) { owner._xhr = xhr; owner._bodySent = false; }   // убрали файл — загрузку можно прервать
         xhr.open("POST", url);
         const h = this._authHeaders();
         for (const k in h) xhr.setRequestHeader(k, h[k]);
-        xhr.upload.onprogress = (e) => { if (onProgress) onProgress(e.loaded, e.lengthComputable ? e.total : 0); };
+        // Сторож: связь на телефоне «подвисла» без ошибки — загрузка стояла бы
+        // вечно, а «Отправить» ждало бы её. Нет прогресса 45 с (или ответа 3 мин
+        // после отправки тела) — прерываем: файл уйдёт с сообщением байтами.
+        let last = Date.now(), bodyAt = 0;
+        const guard = setInterval(() => {
+          const idle = Date.now() - (bodyAt || last);
+          if (idle > (bodyAt ? 180000 : 45000)) { try { xhr.abort(); } catch (e) {} }
+        }, 5000);
+        xhr.addEventListener("loadend", () => clearInterval(guard));
+        xhr.upload.onprogress = (e) => {
+          last = Date.now();
+          if (onProgress) onProgress(e.loaded, e.lengthComputable ? e.total : 0);
+        };
+        // Тело целиком ушло: дальше сервер сохраняет файл — отменять поздно
+        // (файл всё равно появится), убранный файл удалит путь _gone.
+        xhr.upload.onload = () => { bodyAt = Date.now(); if (owner) owner._bodySent = true; };
         xhr.onload = () => {
           let data = null;
           try { data = JSON.parse(xhr.responseText || "null"); } catch (e) {}
@@ -5209,7 +5248,7 @@ createApp({
         draft_fids: (atts || []).filter((a) => a.draftFid).map((a) => a.draftFid),
       };
       for (const a of atts || []) {
-        if (a.draftFid) d.goneFids.add(a.draftFid);
+        if (a.draftFid) { d.goneFids.add(a.draftFid); d.inflight.add(a.draftFid); }
         else if (!a.localOnly) a._sending = true;
       }
       d.dirty = false;
@@ -5226,6 +5265,9 @@ createApp({
     // уходило, либо убираем из него (принято), либо оставляем (вернулись в поле).
     _draftSendSettled(atts, accepted, sid) {
       const d = this._draftState();
+      // Сервер ответил: принятые файлы он сам уберёт из черновика, отказанные
+      // вернулись в поле — держать их «в полёте» больше незачем.
+      for (const a of atts || []) if (a.draftFid) d.inflight.delete(a.draftFid);
       for (const a of atts || []) {
         // Не отправилось («в чате уже идёт ответ», сбой) — файлы снова в черновике.
         if (!accepted && a.draftFid && !a._gone) d.goneFids.delete(a.draftFid);
@@ -5314,6 +5356,13 @@ createApp({
       this.pendingAttachments = this.pendingAttachments.filter(
         (a) => (a.data || files[a.id] || this._attByRef(a)) && !a.error
       );
+    },
+    // Вернуть в поле файлы неотправленной реплики: к тому, что человек успел
+    // прикрепить заново, а не вместо (иначе пропали бы и те, и другие).
+    _restoreTurnAtts(pend, bigFiles) {
+      this._attFiles = Object.assign(this._attFiles || {}, bigFiles || {});
+      const have = new Set(this.pendingAttachments.map((a) => a.id));
+      this.pendingAttachments = [...(pend || []).filter((a) => !have.has(a.id)), ...this.pendingAttachments];
     },
     // Вложение уйдёт ссылкой на файл черновика (уже на сервере), а не байтами.
     _attByRef(a) {

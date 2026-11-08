@@ -4151,9 +4151,12 @@ async def sse_events(request: Request):
 
 # ============================ ЧЕРНОВИКИ СООБЩЕНИЙ ============================
 class DraftFileMissing(HTTPException):
-    def __init__(self):
-        super().__init__(422, "Файл из черновика не найден (его убрали на другом устройстве?) — "
-                              "прикрепите его заново")
+    """422 с перечнем пропавших файлов: клиент чинит только их, остальные вложения не трогает."""
+    def __init__(self, missing: list[int]):
+        super().__init__(422, {
+            "code": "draft_file_missing", "missing": missing,
+            "detail": "Файл из черновика не найден (его убрали на другом устройстве?) — прикрепите его заново",
+        })
 
 
 async def _resolve_draft_refs(session_id: int, user, atts) -> list:
@@ -4171,6 +4174,10 @@ async def _resolve_draft_refs(session_id: int, user, atts) -> list:
         rows = {f.id: f for f in (await db.execute(select(models.DraftFile).where(
             models.DraftFile.id.in_(refs), models.DraftFile.session_id == session_id,
             models.DraftFile.owner_id == drafts.owner_of(user)))).scalars().all()}
+    missing = [a.draft_fid for a in atts if getattr(a, "draft_fid", None)
+               and (rows.get(a.draft_fid) is None or not rows[a.draft_fid].data)]
+    if missing:
+        raise DraftFileMissing(missing)
     out = []
     for a in atts:
         if not getattr(a, "draft_fid", None):
@@ -4178,9 +4185,7 @@ async def _resolve_draft_refs(session_id: int, user, atts) -> list:
                 raise HTTPException(422, "Пустое вложение: нет ни данных, ни файла черновика")
             out.append(a)
             continue
-        f = rows.get(a.draft_fid)
-        if f is None or not f.data:
-            raise DraftFileMissing()
+        f = rows[a.draft_fid]
         kind = a.type if a.type in ("image", "audio", "video", "document") else (f.type or "document")
         out.append(AttachmentIn(type=kind, data=f.data, mime=a.mime or f.mime, name=a.name or f.name))
     return out
