@@ -8813,18 +8813,29 @@ createApp({
           <label v-if="isAdmin && presetsPersonal()" class="check"><input type="checkbox" v-model="presetShared" /> Общий для всех (иначе — только ваш)</label>
           <p v-if="presetsPersonal()" class="muted" style="margin:4px 0">👤 — ваш пресет по умолчанию: применяется при запуске у вас. ⭐ — общий по умолчанию: у тех, кто свой не выбрал{{ isAdmin ? ' (задаёте вы, только из общих)' : '' }}.</p>
           <p v-else class="muted" style="margin:4px 0">⭐ — пресет по умолчанию (применяется при запуске).</p>
-          <div class="card" v-for="p in presets" :key="p.id">
-            <div class="row-between"><b>{{ p.my_default ? '👤 ' : '' }}{{ p.is_default ? '⭐ ' : '' }}{{ p.name }}<span v-if="presetsPersonal()" class="muted" style="font-weight:normal; font-size:12px"> · {{ p.shared ? 'общий' : 'личный' }}</span></b>
-              <span>
-                <button @click="applyPreset(p)">Применить</button>
-                <button v-if="presetsPersonal()" @click="toggleMyDefaultPreset(p)" :class="{ 'btn-primary': p.my_default }"
-                  :title="p.my_default ? 'Снять: при запуске будет общий' : 'Мой по умолчанию'" :aria-label="p.my_default ? 'Снять мой пресет по умолчанию' : 'Сделать моим по умолчанию'">👤</button>
-                <button v-if="!presetsPersonal() || (isAdmin && p.shared)" @click="setDefaultPreset(p)" :class="{ 'btn-primary': p.is_default }"
-                  :title="p.is_default ? 'Снять общий по умолчанию' : 'Общий по умолчанию'" :aria-label="p.is_default ? 'Снять общий пресет по умолчанию' : 'Сделать общим по умолчанию'">⭐</button>
-                <button v-if="isAdmin && presetsPersonal()" @click="togglePresetShared(p)"
-                  :title="p.shared ? 'Сделать личным' : 'Сделать общим'" :aria-label="p.shared ? 'Сделать пресет личным' : 'Сделать пресет общим'">{{ p.shared ? '🔒' : '🌐' }}</button>
-                <button v-if="p.can_edit" class="btn-danger" @click="deletePreset(p)" :aria-label="'Удалить пресет ' + p.name">🗑</button>
-              </span></div>
+          <!-- Пресет (2.23.1): имя — своей строкой во всю ширину, под ним метки
+               слева и кнопки одной полосой справа. Раньше пять кнопок не влезали
+               рядом с именем и разъезжались как попало. -->
+          <div class="preset-row" v-for="p in presets" :key="p.id"
+            :class="{ 'is-start': p.my_default || (p.is_default && !presets.some((x) => x.my_default)) }">
+            <div class="preset-name">{{ p.name }}</div>
+            <div class="preset-bottom">
+            <div class="preset-meta">
+              <span v-if="presetsPersonal() && !p.is_default" class="tag">{{ p.shared ? 'общий' : 'личный' }}</span>
+              <span v-if="p.my_default" class="tag tag-on" title="Ваш пресет при запуске">👤 мой</span>
+              <span v-if="p.is_default" class="tag tag-on" :title="presetsPersonal() ? 'Общий при запуске — у тех, кто свой не выбрал' : 'При запуске'">⭐ {{ presetsPersonal() ? 'для всех' : 'при запуске' }}</span>
+            </div>
+            <div class="preset-actions">
+              <button class="pa-apply" @click="applyPreset(p)">Применить</button>
+              <button v-if="presetsPersonal()" class="pa-icon" @click="toggleMyDefaultPreset(p)" :class="{ 'btn-primary': p.my_default }"
+                :title="p.my_default ? 'Снять: при запуске будет общий' : 'Мой при запуске'" :aria-label="p.my_default ? 'Снять мой пресет по умолчанию' : 'Сделать моим по умолчанию'">👤</button>
+              <button v-if="!presetsPersonal() || (isAdmin && p.shared)" class="pa-icon" @click="setDefaultPreset(p)" :class="{ 'btn-primary': p.is_default }"
+                :title="p.is_default ? 'Снять общий по умолчанию' : 'Общий при запуске (для всех, кто свой не выбрал)'" :aria-label="p.is_default ? 'Снять общий пресет по умолчанию' : 'Сделать общим по умолчанию'">⭐</button>
+              <button v-if="isAdmin && presetsPersonal()" class="pa-icon" @click="togglePresetShared(p)"
+                :title="p.shared ? 'Сделать личным (только для вас)' : 'Сделать общим (видят все)'" :aria-label="p.shared ? 'Сделать пресет личным' : 'Сделать пресет общим'">{{ p.shared ? '🔒' : '🌐' }}</button>
+              <button v-if="p.can_edit" class="pa-icon btn-danger" @click="deletePreset(p)" :title="'Удалить'" :aria-label="'Удалить пресет ' + p.name">🗑</button>
+            </div>
+            </div>
           </div>
         </div>
 

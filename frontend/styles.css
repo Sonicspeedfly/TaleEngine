@@ -2364,3 +2364,16 @@ input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
 .att-ring svg { width: 100%; height: 100%; transform: rotate(-90deg); }
 .att-ring-bg { fill: none; stroke: var(--border-subtle); stroke-width: 4; }
 .att-ring-fg { fill: none; stroke: var(--accent); stroke-width: 4; stroke-linecap: round; transition: stroke-dasharray 0.2s linear; }
+
+/* Пресеты (2.23.1): имя — своей строкой, под ним метки слева и кнопки справа. */
+.preset-row { padding: 8px 10px; margin-bottom: 6px;
+  background: var(--surface-2); border: 1px solid var(--border-subtle); border-radius: var(--r-md); }
+.preset-row.is-start { border-color: var(--accent); }
+.preset-name { font-weight: 600; overflow-wrap: anywhere; line-height: 1.3; }
+.preset-bottom { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+.preset-meta { flex: 1; min-width: 0; display: flex; flex-wrap: wrap; gap: 4px; }
+.preset-meta .tag { white-space: nowrap; }
+.tag.tag-on { color: var(--accent); }
+.preset-actions { display: flex; gap: 4px; flex: none; }
+.preset-actions .pa-apply { padding: 4px 10px; font-size: var(--fs-100); height: 28px; }
+.preset-actions .pa-icon { width: 28px; height: 28px; padding: 0; display: inline-grid; place-items: center; font-size: 14px; line-height: 1; }
