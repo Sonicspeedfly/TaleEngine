@@ -211,6 +211,7 @@ createApp({
       },
       presets: [],
       presetName: "",
+      presetShared: false,   // админ: сохранить пресет общим (видят все)
 
       // --- Подключение к LiteLLM (вкладка Connection) ---
       connection: { use_proxy: true, base_url: "http://localhost:4000", api_key: "", default_model: "gpt-4o", image_model: "", image_via_chat: false, fallback_model: "", auto_fallback: true, summary_model: "", embedding_model: "" },
@@ -6052,8 +6053,46 @@ createApp({
     async savePreset() {
       const name = this.presetName.trim() || (await this.askPrompt("Название пресета", { placeholder: "Например: Творческий" }));
       if (!name) return;
-      await this.api("/presets", { method: "POST", body: JSON.stringify({ name, params: this.params }) });
+      const body = { name, params: this.params };
+      // Флажок «общий» — только для нового пресета: пересохранение под тем же
+      // именем меняет параметры, а вид пресета остаётся (иначе общий ⭐ молча
+      // стал бы личным и пропал у остальных). Вид меняет кнопка 🌐/🔒.
+      const isNew = !this.presets.some((p) => p.name === name);
+      if (isNew && this.isAdmin && this.authStatus.accounts_enabled) body.shared = !!this.presetShared;
+      try {
+        await this.api("/presets", { method: "POST", body: JSON.stringify(body) });
+      } catch (e) {
+        this.showToast("Пресет не сохранён: " + e.message);
+        return;
+      }
       this.presetName = "";
+      await this.loadPresets();
+    },
+    // Пресет, который применяется при запуске (2.23.0): свой, а если его нет —
+    // общий (⭐, задаёт админ).
+    _startupPreset() {
+      return this.presets.find((p) => p.my_default) || this.presets.find((p) => p.is_default);
+    },
+    // Личные «по умолчанию» есть только в режиме аккаунтов: без него один
+    // общий ⭐ на всех.
+    presetsPersonal() { return !!this.authStatus.accounts_enabled; },
+    async toggleMyDefaultPreset(p) {
+      try {
+        if (p.my_default) await this.api("/presets/default?scope=mine", { method: "DELETE" });
+        else await this.api("/presets/" + p.id + "/default?scope=mine", { method: "POST" });
+        this.showToast(p.my_default ? "Свой пресет по умолчанию снят — при запуске будет общий"
+          : "«" + p.name + "» — ваш пресет по умолчанию");
+      } catch (e) {
+        this.showToast("Не вышло: " + e.message);
+      }
+      await this.loadPresets();
+    },
+    async togglePresetShared(p) {
+      try {
+        await this.api("/presets", { method: "POST", body: JSON.stringify({ name: p.name, params: p.params, shared: !p.shared }) });
+      } catch (e) {
+        this.showToast("Не вышло: " + e.message);
+      }
       await this.loadPresets();
     },
     applyPreset(p) { this.params = this._stripLegacyParams({ ...this.params, ...p.params }); },
@@ -6065,9 +6104,17 @@ createApp({
       delete params.history_files_turns;
       return params;
     },
-    async deletePreset(p) { await this.api("/presets/" + p.id, { method: "DELETE" }); await this.loadPresets(); },
+    async deletePreset(p) {
+      try { await this.api("/presets/" + p.id, { method: "DELETE" }); } catch (e) { this.showToast("Не удалён: " + e.message); }
+      await this.loadPresets();
+    },
     async setDefaultPreset(p) {
-      await this.api("/presets/" + p.id + "/default", { method: "POST" });
+      try {
+        if (p.is_default) await this.api("/presets/default?scope=global", { method: "DELETE" });
+        else await this.api("/presets/" + p.id + "/default?scope=global", { method: "POST" });
+      } catch (e) {
+        this.showToast("Не вышло: " + e.message);
+      }
       await this.loadPresets();
     },
 
@@ -7146,7 +7193,7 @@ createApp({
       // Порядок применения — прежний: подключение, пресет по умолчанию, настройки.
       await this.loadConnection(got(await pConn));
       await this.loadPresets(got(await pPresets));
-      const def = this.presets.find((p) => p.is_default);
+      const def = this._startupPreset();
       // Дефолт-пресет задаёт params; message_preload подтягиваем в любом случае.
       if (def) { this.applyPreset(def); await this.loadUiPrefs(false, got(await pUi)); }
       else await this.loadUiPrefs(true, got(await pUi));
@@ -8763,13 +8810,20 @@ createApp({
           <h3>Пресеты</h3>
           <div class="row"><input v-model="presetName" placeholder="имя пресета" />
             <button class="btn-primary" @click="savePreset">Сохранить</button></div>
-          <p class="muted" style="margin:4px 0">⭐ — пресет по умолчанию (применяется при запуске).</p>
+          <label v-if="isAdmin && presetsPersonal()" class="check"><input type="checkbox" v-model="presetShared" /> Общий для всех (иначе — только ваш)</label>
+          <p v-if="presetsPersonal()" class="muted" style="margin:4px 0">👤 — ваш пресет по умолчанию: применяется при запуске у вас. ⭐ — общий по умолчанию: у тех, кто свой не выбрал{{ isAdmin ? ' (задаёте вы, только из общих)' : '' }}.</p>
+          <p v-else class="muted" style="margin:4px 0">⭐ — пресет по умолчанию (применяется при запуске).</p>
           <div class="card" v-for="p in presets" :key="p.id">
-            <div class="row-between"><b>{{ p.is_default ? '⭐ ' : '' }}{{ p.name }}</b>
+            <div class="row-between"><b>{{ p.my_default ? '👤 ' : '' }}{{ p.is_default ? '⭐ ' : '' }}{{ p.name }}<span v-if="presetsPersonal()" class="muted" style="font-weight:normal; font-size:12px"> · {{ p.shared ? 'общий' : 'личный' }}</span></b>
               <span>
                 <button @click="applyPreset(p)">Применить</button>
-                <button @click="setDefaultPreset(p)" :title="'Сделать по умолчанию'" :aria-label="'Сделать по умолчанию'">⭐</button>
-                <button class="btn-danger" @click="deletePreset(p)" :aria-label="'Удалить пресет ' + p.name">🗑</button>
+                <button v-if="presetsPersonal()" @click="toggleMyDefaultPreset(p)" :class="{ 'btn-primary': p.my_default }"
+                  :title="p.my_default ? 'Снять: при запуске будет общий' : 'Мой по умолчанию'" :aria-label="p.my_default ? 'Снять мой пресет по умолчанию' : 'Сделать моим по умолчанию'">👤</button>
+                <button v-if="!presetsPersonal() || (isAdmin && p.shared)" @click="setDefaultPreset(p)" :class="{ 'btn-primary': p.is_default }"
+                  :title="p.is_default ? 'Снять общий по умолчанию' : 'Общий по умолчанию'" :aria-label="p.is_default ? 'Снять общий пресет по умолчанию' : 'Сделать общим по умолчанию'">⭐</button>
+                <button v-if="isAdmin && presetsPersonal()" @click="togglePresetShared(p)"
+                  :title="p.shared ? 'Сделать личным' : 'Сделать общим'" :aria-label="p.shared ? 'Сделать пресет личным' : 'Сделать пресет общим'">{{ p.shared ? '🔒' : '🌐' }}</button>
+                <button v-if="p.can_edit" class="btn-danger" @click="deletePreset(p)" :aria-label="'Удалить пресет ' + p.name">🗑</button>
               </span></div>
           </div>
         </div>
