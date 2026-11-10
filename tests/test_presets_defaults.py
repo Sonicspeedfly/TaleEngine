@@ -78,3 +78,35 @@ def test_personal_default_beats_shared(client):
         cache.clear()
         cache.update(old)
         client.delete("/api/presets/default?scope=global")
+
+
+def test_deleted_personal_default_does_not_stick_to_reused_id(client):
+    from backend import admin_service
+
+    cache = admin_service.security_cache()
+    old = dict(cache)
+    cache["accounts_enabled"] = True
+    try:
+        client.post("/api/auth/register", json={"username": "pr_first", "password": "pass12345"})
+        a = client.post("/api/auth/register", json={"username": "pr_a", "password": "pass12345"}).json()
+        if not a.get("token"):
+            return
+        ha = {"X-User-Token": a["token"]}
+        x = client.post("/api/presets", json={"name": "PR-x", "params": {}}, headers=ha).json()
+        client.post(f"/api/presets/{x['id']}/default?scope=mine", headers=ha)
+        assert client.delete(f"/api/presets/{x['id']}", headers=ha).status_code == 200
+        # SQLite может отдать новому пресету тот же номер — 👤 на нём быть не должно.
+        y = client.post("/api/presets", json={"name": "PR-y", "params": {}}, headers=ha).json()
+        assert not any(p["my_default"] for p in client.get("/api/presets", headers=ha).json()), y
+    finally:
+        cache.clear()
+        cache.update(old)
+
+
+def test_resave_keeps_shared_preset_shared(client):
+    p = client.post("/api/presets", json={"name": "RS-shared", "params": {"model": "a"}}).json()
+    client.post(f"/api/presets/{p['id']}/default")
+    # Пересохранение без флажка «общий» меняет только параметры.
+    again = client.post("/api/presets", json={"name": "RS-shared", "params": {"model": "b"}}).json()
+    assert again["shared"] and again["is_default"] and again["params"] == {"model": "b"}
+    client.delete("/api/presets/default?scope=global")

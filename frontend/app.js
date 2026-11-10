@@ -6054,7 +6054,11 @@ createApp({
       const name = this.presetName.trim() || (await this.askPrompt("Название пресета", { placeholder: "Например: Творческий" }));
       if (!name) return;
       const body = { name, params: this.params };
-      if (this.isAdmin && this.authStatus.accounts_enabled) body.shared = !!this.presetShared;
+      // Флажок «общий» — только для нового пресета: пересохранение под тем же
+      // именем меняет параметры, а вид пресета остаётся (иначе общий ⭐ молча
+      // стал бы личным и пропал у остальных). Вид меняет кнопка 🌐/🔒.
+      const isNew = !this.presets.some((p) => p.name === name);
+      if (isNew && this.isAdmin && this.authStatus.accounts_enabled) body.shared = !!this.presetShared;
       try {
         await this.api("/presets", { method: "POST", body: JSON.stringify(body) });
       } catch (e) {

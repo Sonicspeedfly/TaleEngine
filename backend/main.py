@@ -2315,14 +2315,38 @@ def _preset_default_key(user) -> str | None:
 
 
 async def _my_default_preset_id(db, user) -> int | None:
+    """
+    Личный «по умолчанию». В записи — номер и имя пресета: SQLite отдаёт номер
+    удалённой строки новой, и по одному номеру чужой новый пресет мог бы сам
+    стать чьим-то 👤. Имя не совпало — записи будто нет (стоит общий ⭐).
+    """
     key = _preset_default_key(user)
     if key is None:
         return None
     row = await db.get(models.AppSetting, key)
+    val = (row.value or {}) if row else {}
     try:
-        return int((row.value or {}).get("id")) if row else None
+        pid = int(val.get("id"))
     except (TypeError, ValueError):
         return None
+    preset = await db.get(models.SamplingPreset, pid)
+    if preset is None or preset.name != val.get("name"):
+        return None
+    return pid
+
+
+async def _drop_personal_defaults(db, preset_id: int, keep_owner: int | None = None) -> None:
+    """Снять пресет из личных «по умолчанию» (удалён или стал чужим личным)."""
+    rows = (await db.execute(select(models.AppSetting).where(
+        models.AppSetting.key.like("preset_default:%")))).scalars().all()
+    for row in rows:
+        if keep_owner is not None and row.key == f"preset_default:{keep_owner}":
+            continue
+        try:
+            if int((row.value or {}).get("id")) == preset_id:
+                await db.delete(row)
+        except (TypeError, ValueError):
+            continue
 
 
 def _preset_visible(p, user) -> bool:
@@ -2382,6 +2406,8 @@ async def create_preset(payload: PresetBase, user=Depends(current_user),
             existing.owner_id = None if payload.shared else user.id
             if not payload.shared:
                 existing.is_default = False  # общий дефолт не может быть личным
+                # Другим он больше не виден — и их 👤 на нём не остаётся.
+                await _drop_personal_defaults(db, existing.id, keep_owner=user.id)
         await db.commit()
         await db.refresh(existing)
         return _preset_view(existing, user, await _my_default_preset_id(db, user))
@@ -2410,6 +2436,7 @@ async def delete_preset(preset_id: int, user=Depends(current_user),
             raise HTTPException(404, "Пресет не найден")
         if not _preset_editable(preset, user):
             raise HTTPException(403, "Общий пресет удаляет администратор")
+        await _drop_personal_defaults(db, preset.id)
         await db.delete(preset)
         await db.commit()
     return {"ok": True}
@@ -2434,10 +2461,11 @@ async def set_default_preset(preset_id: int, scope: str | None = None, user=Depe
             scope = "global"  # без аккаунтов «личный» и «общий» — одно и то же
         else:
             row = await db.get(models.AppSetting, key)
+            value = {"id": preset.id, "name": preset.name}
             if row is None:
-                db.add(models.AppSetting(key=key, value={"id": preset.id}))
+                db.add(models.AppSetting(key=key, value=value))
             else:
-                row.value = {"id": preset.id}
+                row.value = value
             await db.commit()
             return {"ok": True}
     if scope != "global":
