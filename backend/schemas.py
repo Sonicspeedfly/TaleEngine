@@ -235,12 +235,20 @@ class PersonaRead(PersonaBase):
 class PresetBase(BaseModel):
     name: str
     params: dict[str, Any] = Field(default_factory=dict)
+    # Общий пресет (видят все) — только у админа; остальные сохраняют личные.
+    shared: Optional[bool] = None
 
 
-class PresetRead(PresetBase):
-    model_config = ConfigDict(from_attributes=True)
+class PresetRead(BaseModel):
     id: int
+    name: str
+    params: dict[str, Any] = Field(default_factory=dict)
+    # Общий по умолчанию: применяется у тех, кто не выбрал свой.
     is_default: bool = False
+    # Личный по умолчанию этого пользователя — главнее общего.
+    my_default: bool = False
+    shared: bool = True       # виден всем (owner_id пуст)
+    can_edit: bool = True     # можно перезаписать/удалить
 
 
 # ----- Обновление сессии / сообщения -----

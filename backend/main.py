@@ -2301,15 +2301,72 @@ async def delete_persona(persona_id: int, db: AsyncSession = Depends(get_session
 
 
 # ============================ ПРЕСЕТЫ ГЕНЕРАЦИИ ============================
+# Два уровня «по умолчанию» (2.23.0): общий (⭐, is_default — задаёт админ) и
+# личный у каждого пользователя (AppSetting "preset_default:<id>"). При запуске
+# страница применяет личный, а если его нет — общий. Пресеты бывают общими
+# (owner_id пуст: видят все, правит админ) и личными (видит и правит владелец).
+def _preset_admin(user) -> bool:
+    """Режим без аккаунтов (user None) — полные права, как у админа."""
+    return user is None or user.role == "admin"
+
+
+def _preset_default_key(user) -> str | None:
+    return f"preset_default:{user.id}" if user is not None else None
+
+
+async def _my_default_preset_id(db, user) -> int | None:
+    key = _preset_default_key(user)
+    if key is None:
+        return None
+    row = await db.get(models.AppSetting, key)
+    try:
+        return int((row.value or {}).get("id")) if row else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _preset_visible(p, user) -> bool:
+    return user is None or p.owner_id is None or p.owner_id == user.id
+
+
+def _preset_editable(p, user) -> bool:
+    if user is None:
+        return True
+    return p.owner_id == user.id or (p.owner_id is None and user.role == "admin")
+
+
+def _preset_view(p, user, my_default: int | None) -> dict:
+    return {
+        "id": p.id, "name": p.name, "params": p.params or {},
+        "is_default": bool(p.is_default), "my_default": p.id == my_default,
+        "shared": p.owner_id is None, "can_edit": _preset_editable(p, user),
+    }
+
+
+async def _visible_preset(db, preset_id: int, user):
+    preset = await db.get(models.SamplingPreset, preset_id)
+    if preset is None or not _preset_visible(preset, user):
+        raise HTTPException(404, "Пресет не найден")
+    return preset
+
+
 @app.get("/api/presets", response_model=list[PresetRead])
 async def list_presets(user=Depends(current_user), db: AsyncSession = Depends(get_session)):
-    q = accounts.scope_query(select(models.SamplingPreset), models.SamplingPreset, user)
-    return (await db.execute(q)).scalars().all()
+    """Общие пресеты и свои личные (чужие личные не видны и админу — у каждого свои)."""
+    q = select(models.SamplingPreset).order_by(models.SamplingPreset.id)
+    if user is not None:
+        q = q.where(or_(models.SamplingPreset.owner_id.is_(None),
+                        models.SamplingPreset.owner_id == user.id))
+    rows = (await db.execute(q)).scalars().all()
+    mine = await _my_default_preset_id(db, user)
+    return [_preset_view(p, user, mine) for p in rows]
 
 
 @app.post("/api/presets", response_model=PresetRead)
-async def create_preset(payload: PresetBase, db: AsyncSession = Depends(get_session)):
-    # upsert по имени, чтобы «Сохранить» перезаписывал одноимённый пресет.
+async def create_preset(payload: PresetBase, user=Depends(current_user),
+                        db: AsyncSession = Depends(get_session)):
+    # upsert по имени, чтобы «Сохранить» перезаписывал одноимённый пресет —
+    # но только свой (или общий у админа): имя уникально на всю базу.
     existing = (
         await db.execute(
             select(models.SamplingPreset).where(
@@ -2318,32 +2375,98 @@ async def create_preset(payload: PresetBase, db: AsyncSession = Depends(get_sess
         )
     ).scalars().first()
     if existing:
+        if not _preset_editable(existing, user):
+            raise HTTPException(409, "Пресет с таким именем уже есть — выберите другое имя")
         existing.params = payload.params
+        if payload.shared is not None and user is not None and user.role == "admin":
+            existing.owner_id = None if payload.shared else user.id
+            if not payload.shared:
+                existing.is_default = False  # общий дефолт не может быть личным
         await db.commit()
         await db.refresh(existing)
-        return existing
-    preset = models.SamplingPreset(**payload.model_dump())
+        return _preset_view(existing, user, await _my_default_preset_id(db, user))
+    # Без аккаунтов — общий; у админа — как выбрал (по умолчанию личный: дорогую
+    # модель из своего пресета второй пользователь случайно не применит);
+    # у остальных — всегда личный.
+    if user is None:
+        owner = None
+    elif user.role == "admin" and payload.shared:
+        owner = None
+    else:
+        owner = user.id
+    preset = models.SamplingPreset(name=payload.name, params=payload.params, owner_id=owner)
     db.add(preset)
     await db.commit()
     await db.refresh(preset)
-    return preset
+    return _preset_view(preset, user, await _my_default_preset_id(db, user))
 
 
-@app.delete("/api/presets/{preset_id}")
-async def delete_preset(preset_id: int, db: AsyncSession = Depends(get_session)):
+@app.delete("/api/presets/{preset_id:int}")
+async def delete_preset(preset_id: int, user=Depends(current_user),
+                        db: AsyncSession = Depends(get_session)):
     preset = await db.get(models.SamplingPreset, preset_id)
     if preset:
+        if not _preset_visible(preset, user):
+            raise HTTPException(404, "Пресет не найден")
+        if not _preset_editable(preset, user):
+            raise HTTPException(403, "Общий пресет удаляет администратор")
         await db.delete(preset)
         await db.commit()
     return {"ok": True}
 
 
 @app.post("/api/presets/{preset_id}/default")
-async def set_default_preset(preset_id: int, db: AsyncSession = Depends(get_session)):
-    """Делает пресет дефолтным (применяется автоматически при загрузке UI)."""
+async def set_default_preset(preset_id: int, scope: str | None = None, user=Depends(current_user),
+                             db: AsyncSession = Depends(get_session)):
+    """
+    Сделать пресет «по умолчанию» (применяется при загрузке страницы).
+
+    scope=mine — личный по умолчанию (любой пользователь, любой видимый ему
+    пресет); scope=global — общий (только админ и только общий пресет).
+    Без scope: админ и режим без аккаунтов — общий, остальные — личный.
+    """
+    preset = await _visible_preset(db, preset_id, user)
+    if scope is None:
+        scope = "global" if _preset_admin(user) else "mine"
+    if scope == "mine":
+        key = _preset_default_key(user)
+        if key is None:
+            scope = "global"  # без аккаунтов «личный» и «общий» — одно и то же
+        else:
+            row = await db.get(models.AppSetting, key)
+            if row is None:
+                db.add(models.AppSetting(key=key, value={"id": preset.id}))
+            else:
+                row.value = {"id": preset.id}
+            await db.commit()
+            return {"ok": True}
+    if scope != "global":
+        raise HTTPException(400, "scope: mine или global")
+    if not _preset_admin(user):
+        raise HTTPException(403, "Общий пресет по умолчанию задаёт администратор")
+    if preset.owner_id is not None:
+        raise HTTPException(400, "Сначала сделайте пресет общим — личный другим не виден")
     presets = (await db.execute(select(models.SamplingPreset))).scalars().all()
     for p in presets:
         p.is_default = p.id == preset_id
+    await db.commit()
+    return {"ok": True}
+
+
+@app.delete("/api/presets/default")
+async def clear_default_preset(scope: str = "mine", user=Depends(current_user),
+                               db: AsyncSession = Depends(get_session)):
+    """Снять «по умолчанию»: личный — вернуться к общему; общий — только админ."""
+    if scope == "mine" and _preset_default_key(user) is not None:
+        row = await db.get(models.AppSetting, _preset_default_key(user))
+        if row is not None:
+            await db.delete(row)
+            await db.commit()
+        return {"ok": True}
+    if not _preset_admin(user):
+        raise HTTPException(403, "Общий пресет по умолчанию задаёт администратор")
+    for p in (await db.execute(select(models.SamplingPreset))).scalars().all():
+        p.is_default = False
     await db.commit()
     return {"ok": True}
 
