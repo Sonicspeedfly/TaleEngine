@@ -92,6 +92,10 @@ class ChatSession(Base):
     persona_id: Mapped[int | None] = mapped_column(
         ForeignKey("personas.id"), nullable=True
     )
+    # Пресет этого чата (2.24.0): применяется на странице при открытии чата,
+    # в остальных — обычный (👤/⭐). Без внешнего ключа: удаление пресета само
+    # снимает его с чатов (delete_preset), а не падает на ограничении.
+    preset_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Часовой пояс пользователя ДЛЯ ЭТОГО чата (IANA-имя или смещение "+03:00").
     # Нейросеть видит по нему текущее время собеседника; настраивается в UI на чат.
     timezone: Mapped[str] = mapped_column(String(64), default="")

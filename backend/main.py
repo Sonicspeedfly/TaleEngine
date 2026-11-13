@@ -42,7 +42,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import delete as sql_delete
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import defer
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -243,6 +243,24 @@ if not _app_log.handlers:
     _app_log.setLevel(logging.INFO)
 
 app = FastAPI(title=settings.APP_NAME, lifespan=lifespan)
+
+
+@app.exception_handler(Exception)
+async def _unhandled_error(request: Request, exc: Exception):
+    """
+    Непойманная ошибка: в ответе — её вид и короткий текст (2.24.0). Раньше
+    страница показывала голое «500», и причину можно было узнать только из
+    журнала сервера. «База занята» — отдельным понятным текстом: это не
+    поломка, а долгая запись рядом (повтор через минуту обычно проходит).
+    Полный traceback по-прежнему уходит в журнал (Starlette после ответа
+    пробрасывает ошибку дальше, и её пишет uvicorn).
+    """
+    text = str(exc)
+    if "database is locked" in text:
+        msg = "База занята другой долгой записью — повторите через минуту"
+    else:
+        msg = f"Ошибка сервера: {type(exc).__name__}: {text[:300]}"
+    return JSONResponse({"detail": msg}, status_code=500)
 
 # Открытые пути (не требуют авторизации): здоровье, вход, регистрация, статус.
 _OPEN_PATHS = {
@@ -1120,6 +1138,7 @@ async def _session_rows(db, rows) -> list[dict]:
             "character_name": names.get(s.character_id, ""),
             "author_note": s.author_note,
             "persona_id": s.persona_id,
+            "preset_id": s.preset_id,
             "background": bgs.get(s.id) or "",
             "is_group": s.is_group,
             "director": s.director,
@@ -1422,6 +1441,7 @@ async def fork_session(
         owner_id=src.owner_id,
         author_note=src.author_note,
         persona_id=src.persona_id,
+        preset_id=src.preset_id,
         background=src.background,
         timezone=src.timezone,
         is_group=src.is_group,
@@ -1437,6 +1457,10 @@ async def fork_session(
         .order_by(models.Message.id)
     )).scalars().all()
     id_map: dict[int, int] = {}
+    # Все копии — одной пачкой INSERT (раньше: запрос на каждую реплику, у чата
+    # в тысячи реплик это десятки секунд на медленном диске). Файлы — после,
+    # когда id копий известны; данные файлов копирует сама база.
+    copies = []
     for m in msgs:
         copy_msg = models.Message(
             session_id=fork.id,
@@ -1452,8 +1476,10 @@ async def fork_session(
             created_at=m.created_at,
             horae=m.horae,      # данные Horae — вместе с сообщением
         )
-        db.add(copy_msg)
-        await db.flush()
+        copies.append(copy_msg)
+    db.add_all(copies)
+    await db.flush()
+    for m, copy_msg in zip(msgs, copies):
         if m.attachments:
             copy_msg.attachments = await copy_attachments(db, copy_msg.id, m)
         id_map[m.id] = copy_msg.id
@@ -1504,12 +1530,22 @@ async def create_session(
 
 @app.patch("/api/sessions/{session_id}")
 async def update_session(
-    session_id: int, payload: SessionUpdate, db: AsyncSession = Depends(get_session)
+    session_id: int, payload: SessionUpdate, user=Depends(current_user),
+    db: AsyncSession = Depends(get_session),
 ):
     sess = await db.get(models.ChatSession, session_id)
     if not sess:
         raise HTTPException(404, "Сессия не найдена")
     data = payload.model_dump(exclude_none=True)
+    if "preset_id" in data:
+        # Пресет чата: 0 — снять; иначе — пресет, который этот человек видит
+        # (свой личный или общий), иначе чужой личный пресет прилип бы к чату.
+        if not data["preset_id"]:
+            data["preset_id"] = None
+        else:
+            preset = await db.get(models.SamplingPreset, data["preset_id"])
+            if preset is None or not _preset_visible(preset, user):
+                raise HTTPException(404, "Пресет не найден")
     if images.is_our_url(data.get("background")):
         data.pop("background")   # ссылка на копию фона пришла обратно — фон не менялся
     # закреплённые упорядочивались между собой, при снятии — NULL.
@@ -1792,6 +1828,7 @@ async def list_groups(user=Depends(current_user), db: AsyncSession = Depends(get
                 # первое же изменение на вкладке «Персона» стирало её в базе.
                 "author_note": s.author_note,
                 "persona_id": s.persona_id,
+                "preset_id": s.preset_id,
                 "background": bgs.get(s.id) or "",
                 **_preview_fields(s, previews),
                 # avatar_path нужен для аватарок реплик в групповом чате.
@@ -2437,6 +2474,10 @@ async def delete_preset(preset_id: int, user=Depends(current_user),
         if not _preset_editable(preset, user):
             raise HTTPException(403, "Общий пресет удаляет администратор")
         await _drop_personal_defaults(db, preset.id)
+        # И с чатов: новый пресет с тем же номером (SQLite) иначе сам стал бы
+        # пресетом чужих чатов.
+        await db.execute(update(models.ChatSession)
+                         .where(models.ChatSession.preset_id == preset.id).values(preset_id=None))
         await db.delete(preset)
         await db.commit()
     return {"ok": True}

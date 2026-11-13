@@ -76,6 +76,27 @@ async def attachment_data(db, att: dict, owner: int | None = None) -> str:
     return (att.get("data") or "") or await load_blob(db, att.get("blob_id"), owner)
 
 
+async def _copy_blob_in_db(db, blob_id, owner: int, message_id: int) -> int | None:
+    """
+    Копия файла внутри базы (INSERT … SELECT): данные не проходят через память
+    программы. Ветка большого чата раньше поднимала в Python каждый файл
+    (аудио по 70 МБ — это сотни МБ base64) и писала его обратно. None — файла
+    нет или он не этого сообщения (см. load_blob про owner).
+    """
+    from sqlalchemy import insert, literal, select
+
+    try:
+        bid = int(blob_id)
+    except (TypeError, ValueError):
+        return None
+    src = select(literal(message_id), models.AttachmentBlob.data).where(
+        models.AttachmentBlob.id == bid, models.AttachmentBlob.message_id == owner)
+    stmt = (insert(models.AttachmentBlob)
+            .from_select(["message_id", "data"], src)
+            .returning(models.AttachmentBlob.id))
+    return (await db.execute(stmt)).scalar_one_or_none()
+
+
 async def copy_attachments(db, message_id: int, source) -> list[dict]:
     """
     Вложения сообщения-копии (ветка, продолжение): свои blob'ы, а не ссылки на
@@ -86,6 +107,11 @@ async def copy_attachments(db, message_id: int, source) -> list[dict]:
     for a in source.attachments or []:
         if not isinstance(a, dict):
             continue
+        if not a.get("data") and a.get("blob_id"):
+            new_id = await _copy_blob_in_db(db, a["blob_id"], source.id, message_id)
+            if new_id is not None:
+                out.append({**{k: v for k, v in a.items() if k != "data"}, "blob_id": new_id})
+                continue
         data = await attachment_data(db, a, owner=source.id)
         if data:
             out.extend(await store_attachments(db, message_id, [{**a, "data": data}]))
