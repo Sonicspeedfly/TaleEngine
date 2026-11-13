@@ -255,11 +255,18 @@ async def _unhandled_error(request: Request, exc: Exception):
     Полный traceback по-прежнему уходит в журнал (Starlette после ответа
     пробрасывает ошибку дальше, и её пишет uvicorn).
     """
-    text = str(exc)
+    # Ошибка базы — только текст драйвера: str() у SQLAlchemy несёт сам запрос
+    # с параметрами (там бывают ключи и пароли). Остальное — без адресов и
+    # ключей: текст увидит любой пользователь страницы.
+    from sqlalchemy.exc import DBAPIError
+
+    text = str(exc.orig) if isinstance(exc, DBAPIError) and exc.orig is not None else str(exc)
     if "database is locked" in text:
         msg = "База занята другой долгой записью — повторите через минуту"
     else:
-        msg = f"Ошибка сервера: {type(exc).__name__}: {text[:300]}"
+        text = re.sub(r"https?://\S+", "[адрес]", text.splitlines()[0] if text else "")
+        text = re.sub(r"\b(sk|AIza|ya29)[\w.-]{6,}", "[ключ]", text)
+        msg = f"Ошибка сервера: {type(exc).__name__}: {text[:200]}"
     return JSONResponse({"detail": msg}, status_code=500)
 
 # Открытые пути (не требуют авторизации): здоровье, вход, регистрация, статус.
@@ -1288,8 +1295,15 @@ async def inspect_context(
     # числам, а настоящий ход шёл бы по другим.
     ui_row = await db.get(models.AppSetting, "ui")
     ui = (ui_row.value if ui_row else {}) or {}
+    raw = dict(ui.get("params") or ui or {})
+    # Пресет чата (2.24.0): страница кладёт его поверх обычных параметров —
+    # так же и здесь, иначе в таком чате отчёт считал бы по чужим числам.
+    if sess.preset_id:
+        preset = await db.get(models.SamplingPreset, sess.preset_id)
+        if preset is not None and _preset_visible(preset, user) and isinstance(preset.params, dict):
+            raw.update(preset.params)
     try:
-        params = GenerationParams(**(ui.get("params") or ui or {}))
+        params = GenerationParams(**raw)
     except Exception:  # noqa: BLE001 — чужие поля в настройках не должны ронять инспектор
         params = GenerationParams()
 
@@ -1572,7 +1586,53 @@ async def delete_session(
     В SQLite id удалённой строки ПЕРЕИСПОЛЬЗУЕТСЯ, и новый чат наследовал чужих
     осиротевших участников (группа «пухла» с каждым пересозданием). Каскад это чинит.
     """
+    # Одно удаление чата за раз (2.24.0): повторное нажатие на большом чате
+    # раньше запускало второе удаление, оно ждало первое в базе и падало с
+    # «database is locked». Теперь второе ждёт здесь и видит, что чата нет.
+    async with horae_engine.loop_lock(_session_delete_locks, session_id):
+        blob_ids = await _delete_session_rows(db, session_id, user)
+    _session_delete_locks.pop(session_id, None)
+    if blob_ids:
+        _spawn_bg(_purge_blobs(blob_ids))
+    return {"ok": True}
+
+
+_session_delete_locks: dict = {}
+_PURGE_CHUNK = 8
+
+
+async def _purge_blobs(blob_ids: list[int]) -> None:
+    """
+    Файлы удалённого чата — фоном, маленькими порциями (2.24.0). Стирание
+    сотен мегабайт одним запросом держало базу занятой, и всё, что писало
+    рядом (ход, черновик, память), ждало и падало с «database is locked».
+    Сообщений этих файлов уже нет — файлы никому не видны.
+    """
+    from backend.attachments import _att_cache
+    from backend.media_refs import uploader
+
+    _att_cache.clear()
+    for i in range(0, len(blob_ids), _PURGE_CHUNK):
+        part = blob_ids[i:i + _PURGE_CHUNK]
+        for attempt in range(3):
+            try:
+                async with AsyncSessionLocal() as db:
+                    await db.execute(sql_delete(models.AttachmentBlob).where(models.AttachmentBlob.id.in_(part)))
+                    await db.commit()
+                break
+            except Exception:  # noqa: BLE001 — база занята: повторим позже
+                if attempt == 2:
+                    logger.exception("Файлы удалённого чата не стёрлись (%d шт.)", len(part))
+                await asyncio.sleep(2)
+        await asyncio.sleep(0)
+    uploader.sweep_soon()
+
+
+async def _delete_session_rows(db, session_id: int, user) -> list[int]:
+    """Строки чата — одной быстрой транзакцией; id его файлов — для фоновой чистки."""
     sess = await db.get(models.ChatSession, session_id)
+    if sess is None:
+        return []   # уже удалён (повторный запрос): ответ тот же — «готово»
     if not await _can_access_session(db, sess, user):
         raise HTTPException(403, "Нет доступа к этому чату")
     # Идущий ответ этого чата снимается без сохранения и дожидается ДО удаления
@@ -1593,10 +1653,14 @@ async def delete_session(
     memory_service.forget_job(session_id)
     horae_tasks.forget_job(session_id)
     await horae_engine.on_session_deleted(db, session_id)
-    # Данные вложений сообщений этого чата (blob-таблица) — до удаления сообщений.
-    await delete_message_blobs(
-        db, select(models.Message.id).where(models.Message.session_id == session_id)
-    )
+    # Данные вложений сообщений этого чата: сами файлы стираются фоном
+    # (_purge_blobs), здесь — только их id. Ссылок на них после удаления
+    # сообщений не остаётся. Хозяин файла проверяется при каждом чтении
+    # (load_blob), так что сообщение с тем же id чужой файл не получит.
+    blob_ids = list((await db.execute(
+        select(models.AttachmentBlob.id).where(models.AttachmentBlob.message_id.in_(
+            select(models.Message.id).where(models.Message.session_id == session_id)))
+    )).scalars().all())
     # Blob'ы файлов базы знаний этого чата.
     kb_blob_ids = [
         f.blob_id for f in await knowledge.list_files(db, session_id) if f.blob_id
@@ -1612,10 +1676,9 @@ async def delete_session(
         await db.execute(sql_delete(model).where(model.session_id == session_id))
     await drafts.drop_session(db, session_id)
     await images.drop(db, "session_bg", session_id)
-    if sess:
-        await db.delete(sess)
+    await db.delete(sess)
     await db.commit()
-    return {"ok": True}
+    return blob_ids
 
 
 def _att_meta(a: dict) -> dict:

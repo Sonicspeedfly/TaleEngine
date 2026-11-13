@@ -3211,12 +3211,21 @@ createApp({
       this.dismissToast(t.id);
     },
     async deleteSession(s) {
+      // Удаление этого чата уже идёт: второе нажатие не шлёт второй запрос
+      // (2.24.0). Два удаления одного большого чата ждали друг друга в базе,
+      // и второе падало с «database is locked».
+      this._deletingChats = this._deletingChats || new Set();
+      if (this._deletingChats.has(s.id)) { this.showToast("Чат уже удаляется…"); return; }
       if (!(await this.askConfirm("Удалить этот чат?", { okText: "Удалить" }))) return;
+      if (this._deletingChats.has(s.id)) return;
+      this._deletingChats.add(s.id);
       try {
         await this.api("/sessions/" + s.id, { method: "DELETE" });
       } catch (e) {
         this.showToast("⚠ Не удалось удалить чат: " + e.message);
         return;
+      } finally {
+        this._deletingChats.delete(s.id);
       }
       // Сервер отменил ход удалённого чата — его «идёт ответ» на экране тоже снимаем.
       if (this.sessionId === s.id) {
@@ -6158,7 +6167,19 @@ createApp({
       return params;
     },
     async deletePreset(p) {
-      try { await this.api("/presets/" + p.id, { method: "DELETE" }); } catch (e) { this.showToast("Не удалён: " + e.message); }
+      try {
+        await this.api("/presets/" + p.id, { method: "DELETE" });
+        // Сервер снял пресет с чатов — снимаем и здесь: его номер может
+        // достаться новому пресету, и тот сам применился бы в этих чатах.
+        for (const list of [this.sessions, this.allSessions, this.groups, this.sharedSessions]) {
+          for (const row of list || []) if (row.preset_id === p.id) row.preset_id = null;
+        }
+        if (this.sessionPresetId === p.id) this.sessionPresetId = null;
+        if (this._chatPreviewCard && this._chatPreviewCard.preset_id === p.id) this._chatPreviewCard.preset_id = null;
+        this._saveChatSoon();
+      } catch (e) {
+        this.showToast("Не удалён: " + e.message);
+      }
       await this.loadPresets();
     },
     async setDefaultPreset(p) {
