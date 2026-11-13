@@ -8905,13 +8905,18 @@ createApp({
                рядом с именем и разъезжались как попало. -->
           <div class="preset-row" v-for="p in presets" :key="p.id"
             :class="{ 'is-start': activePresetId() === p.id }">
-            <div class="preset-name">{{ p.name }}</div>
-            <div class="preset-bottom">
-            <div class="preset-meta">
-              <span v-if="presetsPersonal() && !p.is_default" class="tag">{{ p.shared ? 'общий' : 'личный' }}</span>
+            <!-- Имя и метки состояния — одной строкой во всю ширину (2.24.1):
+                 внизу слева их было до трёх, и они складывались столбиком
+                 рядом с кнопками, растягивая карточку. -->
+            <div class="preset-head">
+              <span class="preset-name">{{ p.name }}</span>
               <span v-if="sessionId && sessionPresetId === p.id" class="tag tag-on" title="Пресет этого чата">💬 этот чат</span>
               <span v-if="p.my_default" class="tag tag-on" title="Ваш пресет при запуске">👤 мой</span>
               <span v-if="p.is_default" class="tag tag-on" :title="presetsPersonal() ? 'Общий при запуске — у тех, кто свой не выбрал' : 'При запуске'">⭐ {{ presetsPersonal() ? 'для всех' : 'при запуске' }}</span>
+            </div>
+            <div class="preset-bottom">
+            <div class="preset-meta">
+              <span v-if="presetsPersonal()" class="preset-kind">{{ p.shared ? 'общий' : 'личный' }}</span>
             </div>
             <div class="preset-actions">
               <button class="pa-apply" @click="applyPreset(p)">Применить</button>
