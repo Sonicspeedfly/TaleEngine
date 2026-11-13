@@ -110,3 +110,84 @@ def test_resave_keeps_shared_preset_shared(client):
     again = client.post("/api/presets", json={"name": "RS-shared", "params": {"model": "b"}}).json()
     assert again["shared"] and again["is_default"] and again["params"] == {"model": "b"}
     client.delete("/api/presets/default?scope=global")
+
+
+def test_chat_preset_roundtrip(client):
+    cid = client.post("/api/characters", json={"name": "ЧатПресет", "first_message": "Привет"}).json()["id"]
+    sid = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]
+    p = client.post("/api/presets", json={"name": "CP-argon", "params": {"model": "argon"}}).json()
+
+    assert client.patch(f"/api/sessions/{sid}", json={"preset_id": p["id"]}).status_code == 200
+    assert client.get(f"/api/sessions/{sid}/card").json()["preset_id"] == p["id"]
+    rows = client.get(f"/api/sessions?character_id={cid}").json()
+    assert any(r["id"] == sid and r["preset_id"] == p["id"] for r in rows)
+
+    # Ветка наследует пресет чата.
+    mid = client.get(f"/api/sessions/{sid}/messages").json()
+    assert mid, "у персонажа есть приветствие — в чате одно сообщение"
+    fork = client.post(f"/api/sessions/{sid}/fork", json={"message_id": mid[-1]["id"]}).json()
+    assert client.get(f"/api/sessions/{fork['session_id']}/card").json()["preset_id"] == p["id"]
+
+    # Несуществующий пресет не прилипает; 0 — снять.
+    assert client.patch(f"/api/sessions/{sid}", json={"preset_id": 999999}).status_code == 404
+    assert client.patch(f"/api/sessions/{sid}", json={"preset_id": 0}).status_code == 200
+    assert client.get(f"/api/sessions/{sid}/card").json()["preset_id"] is None
+
+    # Удалённый пресет снимается с чатов (номер может достаться новому).
+    client.patch(f"/api/sessions/{sid}", json={"preset_id": p["id"]})
+    client.delete(f"/api/presets/{p['id']}")
+    assert client.get(f"/api/sessions/{sid}/card").json()["preset_id"] is None
+
+
+def test_unhandled_error_has_readable_detail(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from backend import knowledge
+    from backend.main import app
+
+    async def boom(*a, **k):
+        raise RuntimeError("database is locked")
+
+    with TestClient(app, raise_server_exceptions=False) as c:
+        cid = c.post("/api/characters", json={"name": "Сбой"}).json()["id"]
+        sid = c.post(f"/api/sessions?character_id={cid}").json()["session_id"]
+        monkeypatch.setattr(knowledge, "list_files", boom)
+        r = c.delete(f"/api/sessions/{sid}")
+        assert r.status_code == 500
+        assert "База занята" in r.json()["detail"]
+
+
+def test_error_detail_hides_sql_and_keys(monkeypatch):
+    from fastapi.testclient import TestClient
+    from sqlalchemy.exc import OperationalError
+
+    from backend import knowledge
+    from backend.main import app
+
+    async def boom(*a, **k):
+        raise OperationalError("UPDATE app_settings SET value=?", ({"api_key": "sk-secret123456"},),
+                               Exception("disk I/O error"))
+
+    with TestClient(app, raise_server_exceptions=False) as c:
+        cid = c.post("/api/characters", json={"name": "СбойSQL"}).json()["id"]
+        sid = c.post(f"/api/sessions?character_id={cid}").json()["session_id"]
+        monkeypatch.setattr(knowledge, "list_files", boom)
+        detail = c.delete(f"/api/sessions/{sid}").json()["detail"]
+        assert "disk I/O error" in detail
+        assert "sk-secret" not in detail and "UPDATE" not in detail
+
+
+def test_context_report_uses_chat_preset(client):
+    cid = client.post("/api/characters", json={"name": "Инспектор", "first_message": "Привет"}).json()["id"]
+    sid = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]
+    p = client.post("/api/presets", json={"name": "CTX-preset", "params": {"model": "chat-preset-model"}}).json()
+    client.patch(f"/api/sessions/{sid}", json={"preset_id": p["id"]})
+    r = client.get(f"/api/sessions/{sid}/context")
+    assert r.status_code == 200 and r.json()["model"] == "chat-preset-model"
+
+
+def test_double_delete_is_idempotent(client):
+    cid = client.post("/api/characters", json={"name": "Дважды"}).json()["id"]
+    sid = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]
+    assert client.delete(f"/api/sessions/{sid}").status_code == 200
+    assert client.delete(f"/api/sessions/{sid}").status_code == 200

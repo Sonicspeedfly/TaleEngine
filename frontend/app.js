@@ -319,6 +319,7 @@ createApp({
       personaNew: { name: "", description: "", avatar_path: null },
       authorNote: "",
       sessionPersonaId: null,
+      sessionPresetId: null,   // пресет этого чата (2.24.0), null — обычный 👤/⭐
       // Часовой пояс ТЕКУЩЕГО чата (IANA-имя): нейросеть видит время пользователя,
       // а метки времени сообщений показываются в этом поясе.
       sessionTimezone: "",
@@ -2463,6 +2464,7 @@ createApp({
       const card = ("author_note" in s) ? s : (this._sessionCard(s.id) || s);
       this.authorNote = card.author_note || "";
       this.sessionPersonaId = card.persona_id || null;
+      this.sessionPresetId = card.preset_id || null;
       this.sessionBg = card.background || "";
       this.sessionTimezone = card.timezone || "";
       // Пояс ещё не задан — определяем по браузеру и сохраняем за этим чатом.
@@ -2580,6 +2582,8 @@ createApp({
       this._clearPending(s.id);
       this.authorNote = "";
       this.sessionPersonaId = null;
+      // Пресет владельца — только если он виден и мне (общий); его личный — нет.
+      this.sessionPresetId = s.preset_id || null;
       this.sessionBg = s.background || "";
       this.sessionTimezone = s.timezone || ""; // чужой чат: пояс владельца, не перезаписываем
       this.closeSidebarOnMobile();
@@ -2997,6 +3001,7 @@ createApp({
         const card = {
           ...row, id: sid, character_id: row.character_id || this.selectedCharacterId,
           author_note: this.authorNote || "", persona_id: this.sessionPersonaId || null,
+          preset_id: this.sessionPresetId || null,
           background: this._slimImg(this.sessionBg) || "", timezone: this.sessionTimezone || "",
           is_group: false,
         };
@@ -3062,6 +3067,7 @@ createApp({
       }
       if (this.authorNote === (was.author_note || "")) this.authorNote = card.author_note || "";
       if (this.sessionPersonaId === (was.persona_id || null)) this.sessionPersonaId = card.persona_id || null;
+      if (this.sessionPresetId === (was.preset_id || null)) this.sessionPresetId = card.preset_id || null;
       if (this.sessionBg === (was.background || "")) this.sessionBg = card.background || "";
       if (this.sessionTimezone === (was.timezone || "") && card.timezone) this.sessionTimezone = card.timezone;
     },
@@ -3205,12 +3211,21 @@ createApp({
       this.dismissToast(t.id);
     },
     async deleteSession(s) {
+      // Удаление этого чата уже идёт: второе нажатие не шлёт второй запрос
+      // (2.24.0). Два удаления одного большого чата ждали друг друга в базе,
+      // и второе падало с «database is locked».
+      this._deletingChats = this._deletingChats || new Set();
+      if (this._deletingChats.has(s.id)) { this.showToast("Чат уже удаляется…"); return; }
       if (!(await this.askConfirm("Удалить этот чат?", { okText: "Удалить" }))) return;
+      if (this._deletingChats.has(s.id)) return;
+      this._deletingChats.add(s.id);
       try {
         await this.api("/sessions/" + s.id, { method: "DELETE" });
       } catch (e) {
         this.showToast("⚠ Не удалось удалить чат: " + e.message);
         return;
+      } finally {
+        this._deletingChats.delete(s.id);
       }
       // Сервер отменил ход удалённого чата — его «идёт ответ» на экране тоже снимаем.
       if (this.sessionId === s.id) {
@@ -5988,7 +6003,9 @@ createApp({
         this.api("/settings/ui", {
           method: "PUT",
           body: JSON.stringify({
-            params: this.params,
+            // В чате со своим пресетом сохраняем обычные параметры, а не его:
+            // пресет чата не должен стать умолчанием для остальных чатов.
+            params: this._chatPresetOn != null && this._baseParams ? this._baseParams : this.params,
             message_preload: this.msgPageSize,
             auto_summary: this.autoSummary,
             group_reply_delay: this.groupReplyDelay,
@@ -6049,7 +6066,45 @@ createApp({
     },
 
     // ---------- Пресеты параметров ----------
-    async loadPresets(prefetched) { this.presets = (prefetched !== undefined ? prefetched : await this.api("/presets")) || []; },
+    async loadPresets(prefetched) {
+      this.presets = (prefetched !== undefined ? prefetched : await this.api("/presets")) || [];
+      if (this._presetsReady) this._syncChatPreset();
+    },
+    // Пресет чата (2.24.0). Открыли чат со своим пресетом — параметры берутся из
+    // него поверх обычных (запомненных); ушли в чат без пресета — обычные
+    // возвращаются. Правки параметров в таком чате — временные, на этот заход.
+    _syncChatPreset() {
+      if (!this._presetsReady) return;
+      const id = this.sessionId ? this.sessionPresetId : null;
+      const p = id ? this.presets.find((x) => x.id === id) : null;
+      const key = p ? p.id : null;
+      if (key === (this._chatPresetOn ?? null)) return;
+      if (p) {
+        if (this._chatPresetOn == null) this._baseParams = JSON.parse(JSON.stringify(this.params));
+        this._chatPresetOn = p.id;
+        this.params = this._stripLegacyParams({ ...JSON.parse(JSON.stringify(this._baseParams)), ...JSON.parse(JSON.stringify(p.params || {})) });
+      } else {
+        if (this._chatPresetOn != null && this._baseParams) this.params = this._baseParams;
+        this._chatPresetOn = null;
+        this._baseParams = null;
+      }
+    },
+    async setChatPreset(value) {
+      const sid = this.sessionId;
+      if (!sid) return;
+      const id = Number(value) || null;
+      try {
+        await this.api("/sessions/" + sid, { method: "PATCH", body: JSON.stringify({ preset_id: id || 0 }) });
+      } catch (e) {
+        this.showToast("Не вышло: " + e.message);
+        return;
+      }
+      this._patchSessionRow(sid, { preset_id: id });
+      if (this.sessionId !== sid) return;
+      this.sessionPresetId = id;
+      const p = id && this.presets.find((x) => x.id === id);
+      this.showToast(p ? "💬 В этом чате теперь «" + p.name + "»" : "Пресет чата снят — здесь обычный");
+    },
     async savePreset() {
       const name = this.presetName.trim() || (await this.askPrompt("Название пресета", { placeholder: "Например: Творческий" }));
       if (!name) return;
@@ -6076,6 +6131,13 @@ createApp({
     // Личные «по умолчанию» есть только в режиме аккаунтов: без него один
     // общий ⭐ на всех.
     presetsPersonal() { return !!this.authStatus.accounts_enabled; },
+    // Какой пресет сейчас «действует по умолчанию» (обведён): пресет чата, иначе
+    // свой 👤, иначе общий ⭐.
+    activePresetId() {
+      if (this.sessionId && this.sessionPresetId && this.presets.some((x) => x.id === this.sessionPresetId)) return this.sessionPresetId;
+      const p = this._startupPreset();
+      return p ? p.id : null;
+    },
     async toggleMyDefaultPreset(p) {
       try {
         if (p.my_default) await this.api("/presets/default?scope=mine", { method: "DELETE" });
@@ -6105,7 +6167,19 @@ createApp({
       return params;
     },
     async deletePreset(p) {
-      try { await this.api("/presets/" + p.id, { method: "DELETE" }); } catch (e) { this.showToast("Не удалён: " + e.message); }
+      try {
+        await this.api("/presets/" + p.id, { method: "DELETE" });
+        // Сервер снял пресет с чатов — снимаем и здесь: его номер может
+        // достаться новому пресету, и тот сам применился бы в этих чатах.
+        for (const list of [this.sessions, this.allSessions, this.groups, this.sharedSessions]) {
+          for (const row of list || []) if (row.preset_id === p.id) row.preset_id = null;
+        }
+        if (this.sessionPresetId === p.id) this.sessionPresetId = null;
+        if (this._chatPreviewCard && this._chatPreviewCard.preset_id === p.id) this._chatPreviewCard.preset_id = null;
+        this._saveChatSoon();
+      } catch (e) {
+        this.showToast("Не удалён: " + e.message);
+      }
       await this.loadPresets();
     },
     async setDefaultPreset(p) {
@@ -7197,6 +7271,10 @@ createApp({
       // Дефолт-пресет задаёт params; message_preload подтягиваем в любом случае.
       if (def) { this.applyPreset(def); await this.loadUiPrefs(false, got(await pUi)); }
       else await this.loadUiPrefs(true, got(await pUi));
+      // Обычные параметры на месте — теперь можно накладывать пресет чата
+      // (последний чат мог открыться по памяти ещё до пресетов).
+      this._presetsReady = true;
+      this._syncChatPreset();
       // Последний открытый чат — по его карточке, не дожидаясь списков
       // персонажей и чатов (после F5 сразу можно читать и писать).
       const fast = this._restoreLastChatFast();
@@ -7309,6 +7387,8 @@ createApp({
     },
     // Любое изменение параметров генерации сохраняем в системе (с дебаунсом).
     params: { handler() { this.saveUiPrefs(); }, deep: true },
+    sessionId() { this._syncChatPreset(); },
+    sessionPresetId() { this._syncChatPreset(); },
     // Бюджет хода — знаменатель монитора токенов и полосы в шапке: после его
     // сохранения (PUT уходит из наблюдателя выше) отчёт перечитываем, иначе
     // «из бюджета хода» до следующего хода показывал бы прежнее число.
@@ -8813,15 +8893,23 @@ createApp({
           <label v-if="isAdmin && presetsPersonal()" class="check"><input type="checkbox" v-model="presetShared" /> Общий для всех (иначе — только ваш)</label>
           <p v-if="presetsPersonal()" class="muted" style="margin:4px 0">👤 — ваш пресет по умолчанию: применяется при запуске у вас. ⭐ — общий по умолчанию: у тех, кто свой не выбрал{{ isAdmin ? ' (задаёте вы, только из общих)' : '' }}.</p>
           <p v-else class="muted" style="margin:4px 0">⭐ — пресет по умолчанию (применяется при запуске).</p>
+          <label v-if="sessionId && !sharedView" class="chat-preset">💬 Пресет этого чата
+            <select :value="sessionPresetId || ''" @change="setChatPreset($event.target.value)">
+              <option value="">— обычный ({{ presetsPersonal() ? '👤 или ⭐' : '⭐' }}) —</option>
+              <option v-for="p in presets" :key="p.id" :value="p.id">{{ p.name }}</option>
+            </select>
+          </label>
+          <p v-if="sessionId && !sharedView" class="muted" style="margin:2px 0 6px">Открываете этот чат — применяется выбранный пресет; в других чатах — обычный.</p>
           <!-- Пресет (2.23.1): имя — своей строкой во всю ширину, под ним метки
                слева и кнопки одной полосой справа. Раньше пять кнопок не влезали
                рядом с именем и разъезжались как попало. -->
           <div class="preset-row" v-for="p in presets" :key="p.id"
-            :class="{ 'is-start': p.my_default || (p.is_default && !presets.some((x) => x.my_default)) }">
+            :class="{ 'is-start': activePresetId() === p.id }">
             <div class="preset-name">{{ p.name }}</div>
             <div class="preset-bottom">
             <div class="preset-meta">
               <span v-if="presetsPersonal() && !p.is_default" class="tag">{{ p.shared ? 'общий' : 'личный' }}</span>
+              <span v-if="sessionId && sessionPresetId === p.id" class="tag tag-on" title="Пресет этого чата">💬 этот чат</span>
               <span v-if="p.my_default" class="tag tag-on" title="Ваш пресет при запуске">👤 мой</span>
               <span v-if="p.is_default" class="tag tag-on" :title="presetsPersonal() ? 'Общий при запуске — у тех, кто свой не выбрал' : 'При запуске'">⭐ {{ presetsPersonal() ? 'для всех' : 'при запуске' }}</span>
             </div>

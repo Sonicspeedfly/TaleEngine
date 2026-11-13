@@ -259,6 +259,8 @@ class SessionUpdate(BaseModel):
     pinned: Optional[bool] = None
     author_note: Optional[str] = None
     persona_id: Optional[int] = None
+    # Пресет чата (2.24.0); 0 — снять.
+    preset_id: Optional[int] = None
     background: Optional[str] = None
     director: Optional[bool] = None
     scenario: Optional[str] = None

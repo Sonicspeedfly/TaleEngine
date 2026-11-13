@@ -872,7 +872,7 @@ async def carryover(session_id: int, *, keep: int = 5, vectors: bool = True, use
         dst = models.ChatSession(
             title=(base + " · продолжение")[:200], character_id=src.character_id, user_key=src.user_key,
             owner_id=src.owner_id, author_note=src.author_note, persona_id=src.persona_id,
-            background=src.background, timezone=src.timezone, is_group=src.is_group,
+            preset_id=src.preset_id, background=src.background, timezone=src.timezone, is_group=src.is_group,
             director=src.director, scenario=src.scenario,
         )
         db.add(dst)

@@ -317,6 +317,7 @@ def _sqlite_add_missing_columns(sync_conn) -> None:
             "timezone": "VARCHAR(64) DEFAULT ''",
             "profile_upto": "INTEGER DEFAULT 0",
             "profile_root": "INTEGER DEFAULT 0",
+            "preset_id": "INTEGER",
         },
         "messages": {
             "swipes": "JSON",

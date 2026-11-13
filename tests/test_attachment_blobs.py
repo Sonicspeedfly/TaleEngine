@@ -334,3 +334,47 @@ def test_shared_blob_links_split_on_startup(client):
         assert "blob_id" not in alien_atts[0]
         assert c2.get(f"/api/messages/{copy_id}/att/0").content == raw
         assert c2.get(f"/api/messages/{alien_id}/att/0").status_code == 404
+
+
+def test_fork_copies_files_inside_db(client):
+    """Ветка: файлы копируются базой (INSERT … SELECT), у копии — свой blob."""
+    import asyncio
+    import base64
+
+    from backend import models
+    from backend.attachments import store_attachments
+    from backend.database import AsyncSessionLocal
+
+    cid = client.post("/api/characters", json={"name": "ВеткаФайлы"}).json()["id"]
+    sid = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]
+    data = "data:audio/mpeg;base64," + base64.b64encode(b"ID3" + b"x" * 5000).decode()
+
+    async def add():
+        async with AsyncSessionLocal() as db:
+            m = models.Message(session_id=sid, role="user", content="песня", swipes=["песня"], active_swipe=0)
+            db.add(m)
+            await db.flush()
+            m.attachments = await store_attachments(db, m.id, [{"type": "audio", "mime": "audio/mpeg", "name": "a.mp3", "data": data}])
+            await db.commit()
+            return m.id, m.attachments[0]["blob_id"]
+
+    mid, old_blob = asyncio.run(add())
+    fork = client.post(f"/api/sessions/{sid}/fork", json={"message_id": mid}).json()
+
+    async def check():
+        async with AsyncSessionLocal() as db:
+            from sqlalchemy import select
+            msgs = (await db.execute(select(models.Message).where(
+                models.Message.session_id == fork["session_id"]).order_by(models.Message.id))).scalars().all()
+            copy = msgs[-1]
+            att = copy.attachments[0]
+            blob = await db.get(models.AttachmentBlob, att["blob_id"])
+            return att, blob.message_id, blob.data, copy.id
+
+    att, owner, got, copy_id = asyncio.run(check())
+    assert att["blob_id"] != old_blob and owner == copy_id and got == data
+    assert att["name"] == "a.mp3" and att["size"] > 0
+    # Удаление исходного чата не задевает файл ветки.
+    assert client.delete(f"/api/sessions/{sid}").status_code == 200
+    r = client.get(f"/api/messages/{copy_id}/att/0")
+    assert r.status_code == 200 and r.content.startswith(b"ID3")
