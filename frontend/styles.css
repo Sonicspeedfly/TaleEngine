@@ -2369,7 +2369,10 @@ input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
 .preset-row { padding: 8px 10px; margin-bottom: 6px;
   background: var(--surface-2); border: 1px solid var(--border-subtle); border-radius: var(--r-md); }
 .preset-row.is-start { border-color: var(--accent); }
-.preset-name { font-weight: 600; overflow-wrap: anywhere; line-height: 1.3; }
+.preset-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; }
+.preset-head .tag { white-space: nowrap; }
+.preset-name { font-weight: 600; overflow-wrap: anywhere; line-height: 1.3; margin-right: 2px; }
+.preset-kind { font-size: var(--fs-100); color: var(--text-secondary); }
 .preset-bottom { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
 .preset-meta { flex: 1; min-width: 0; display: flex; flex-wrap: wrap; gap: 4px; }
 .preset-meta .tag { white-space: nowrap; }
