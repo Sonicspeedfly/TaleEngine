@@ -863,6 +863,65 @@ async def _close_stream(response) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# Кэш промпта провайдера (2.26.0)
+# ---------------------------------------------------------------------------
+# LiteLLM для Gemini (и Anthropic) собирает ВСЕ system-сообщения, где бы они ни
+# стояли, в одно поле в самом начале запроса. Наш хвост — снимок состояния,
+# найденные воспоминания, время, заметка автора — меняется каждый ход, и
+# оказывался перед историей: начало запроса не совпадало с прошлым ни разу,
+# неявный кэш Google промахивался (из кэша шло ~3% входа). Теперь system после
+# начала переписки уходят служебной вставкой от пользователя на своём месте —
+# как это делают другие клиенты Gemini; в начале остаётся только неизменное.
+CONTEXT_NOTE_HEADER = ("[Служебный контекст движка для этого ответа — не реплика собеседника: "
+                       "учитывай его и следуй его указаниям, но не пересказывай его]")
+
+
+def cache_friendly_messages(messages: list[dict]) -> list[dict]:
+    """
+    Хвост хода — подряд идущие system прямо перед последней репликой
+    пользователя — одной user-вставкой с пометкой на том же месте. Только он
+    меняется от хода к ходу; всё до истории (системный промпт, база знаний,
+    снимок памяти) остаётся system, как раньше, — оно стабильно и кэшируется.
+    System ПОСЛЕ последней реплики (инструкция канваса) не трогаем.
+    Выключается PROMPT_CACHING=false.
+    """
+    if not settings.PROMPT_CACHING or not messages:
+        return messages
+    last = len(messages) - 1
+    while last >= 0 and messages[last].get("role") == "system":
+        last -= 1
+    if last <= 0 or messages[last].get("role") != "user":
+        return messages
+    first = last
+    while first > 0 and messages[first - 1].get("role") == "system":
+        first -= 1
+    # Нечего переносить, или перед хвостом нет переписки (одни system —
+    # служебный запрос: память, профиль) — оставляем как есть.
+    if first == last or first == 0:
+        return messages
+    texts: list = []
+    has_media = False
+    for m in messages[first:last]:
+        c = m.get("content")
+        if isinstance(c, str):
+            if c.strip():
+                texts.append(c)
+        elif isinstance(c, list) and c:
+            texts.append(list(c))
+            has_media = True
+    if not texts:
+        return messages
+    if not has_media:
+        note = {"role": "user", "content": CONTEXT_NOTE_HEADER + "\n\n" + "\n\n".join(texts)}
+    else:
+        parts: list = [{"type": "text", "text": CONTEXT_NOTE_HEADER}]
+        for t in texts:
+            parts.extend([{"type": "text", "text": t}] if isinstance(t, str) else t)
+        note = {"role": "user", "content": parts}
+    return messages[:first] + [note] + messages[last:]
+
+
 async def _stream_once(
     messages: list[dict],
     params: Optional[GenerationParams] = None,
@@ -874,7 +933,7 @@ async def _stream_once(
 ) -> AsyncGenerator[str, None]:
     """Одна попытка запроса к модели со стримом (см. stream_completion)."""
     call_kwargs: dict = {
-        "messages": messages,
+        "messages": cache_friendly_messages(messages),
         "stream": True,
         # Большой мультимодальный запрос (видео/аудио) получает увеличенный таймаут —
         # и файлы, переданные ссылкой, тоже: модель читает их у себя, и на час
@@ -930,7 +989,8 @@ async def _stream_once(
     entry = debug_log.log_request(
         "chat", call_kwargs["model"], call_kwargs.get("api_base"),
         {
-            "messages": debug_log.summarize_messages(messages),
+            # Как реально ушло (после cache_friendly_messages): хвост — вставкой.
+            "messages": debug_log.summarize_messages(call_kwargs["messages"]),
             "params": {k: call_kwargs.get(k) for k in ("temperature", "top_p", "max_tokens")},
             "safety_off": safety_off,
             "reasoning": reasoning or "auto",

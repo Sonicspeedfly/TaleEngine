@@ -33,8 +33,20 @@ def _marks(m) -> int:
 
 def test_window_keeps_files_of_last_messages_only():
     hist = _hist(5)                                   # 10 сообщений, файлы у 0, 2, 4, 6, 8
-    out = window_history_media(hist, 4)              # последние 4: индексы 6..9
+    out = window_history_media(hist, 4)              # последние 4: индексы 6..9 (ступень 2: граница 6)
     assert [_marks(m) for m in out] == [0, 0, 0, 0, 0, 0, 1, 0, 1, 0]
+    # Ступень (2.26.0): граница округляется вверх — файлов никогда не больше окна,
+    # а середина истории меняется не на каждом ходу (кэш промпта провайдера).
+    for n in range(8, 30):
+        h = _hist(n)
+        out10 = window_history_media(h, 10)
+        with_files = [i for i, m in enumerate(out10) if _marks(m)]
+        assert with_files and min(with_files) >= len(h) - 10            # не больше окна
+    a = [_marks(m) for m in window_history_media(_hist(12), 10)]       # 24 сообщения: граница 15
+    b = [_marks(m) for m in window_history_media(_hist(13), 10)]       # 26 сообщений: граница 20
+    assert a[:15] == b[:15]                                             # ход не тронул начало
+    # Маленькое окно — точная граница.
+    assert [_marks(m) for m in window_history_media(_hist(5), 1)] == [0] * 10
     old = out[0]["content"]
     assert files_window_note(4) in [b.get("text") for b in old]       # пометка вместо файла
     assert any("«f0.png»" in (b.get("text") or "") for b in old)      # имя файла осталось
