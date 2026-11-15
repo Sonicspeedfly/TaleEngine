@@ -93,14 +93,39 @@ async def set_connection(db, data: dict) -> dict:
         clean[k] = v.strip() if isinstance(v, str) else v
     if "accounts" in clean:
         clean["accounts"] = clean_accounts(clean["accounts"])
-    if "active_account" in clean:
+    if "accounts" in clean and "active_account" not in clean and "active_prefix" not in data:
+        # Список сменился, а активный не прислали — держимся прежнего по префиксу.
+        old = (row.value or {}) if row else {}
+        old_list = old.get("accounts") or []
+        try:
+            old_idx = int(old.get("active_account") or 0)
+        except (TypeError, ValueError):
+            old_idx = 0
+        prev = old_list[old_idx].get("prefix", "") if 0 <= old_idx < len(old_list) and isinstance(old_list[old_idx], dict) else ""
+        clean["active_account"] = next((i for i, a in enumerate(clean["accounts"]) if a.get("prefix") == prev), 0)
+    elif "active_account" in clean or "active_prefix" in data:
         accounts = clean.get("accounts") or ((row.value or {}).get("accounts") if row else None) \
             or default_connection()["accounts"]
-        try:
-            idx = int(clean["active_account"])
-        except (TypeError, ValueError):
-            idx = 0
-        clean["active_account"] = idx if 0 <= idx < len(accounts) else 0
+        # Активный — по ПРЕФИКСУ, а не по номеру: чистка списка выкидывает
+        # пустые и повторные строки, и номер из запроса указал бы на соседа —
+        # запросы ушли бы в чужой проект (ревью 2.25.0).
+        want = data.get("active_prefix")
+        if want is None:
+            raw = data.get("accounts") if isinstance(data.get("accounts"), list) else None
+            try:
+                idx = int(clean.get("active_account") or 0)
+            except (TypeError, ValueError):
+                idx = 0
+            if raw is not None and 0 <= idx < len(raw) and isinstance(raw[idx], dict):
+                want = raw[idx].get("prefix") or ""
+            elif 0 <= idx < len(accounts):
+                want = accounts[idx].get("prefix") or ""
+            else:
+                want = ""
+        want = "".join(str(want).split())
+        if want and not want.endswith("/"):
+            want += "/"
+        clean["active_account"] = next((i for i, a in enumerate(accounts) if a.get("prefix") == want), 0)
     if row is None:
         row = AppSetting(key=CONNECTION_KEY, value=clean)
         db.add(row)

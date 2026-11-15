@@ -2676,7 +2676,11 @@ async def switch_account(payload: dict = Body(...), user=Depends(current_user),
     """Переключить аккаунт Google одним нажатием (2.25.0) — только админ."""
     if user is not None and user.role != "admin":
         raise HTTPException(403, "Только администратор")
-    conn = await set_connection(db, {"active_account": payload.get("index")})
+    # По префиксу (надёжно при правке списка); номер — для старых клиентов.
+    if "prefix" in payload:
+        conn = await set_connection(db, {"active_prefix": payload.get("prefix") or ""})
+    else:
+        conn = await set_connection(db, {"active_account": payload.get("index")})
     media_refs.remember_connection(conn)
     return conn
 

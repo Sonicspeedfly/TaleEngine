@@ -6210,7 +6210,9 @@ createApp({
     },
     addAccount() {
       const list = this.connection.accounts || (this.connection.accounts = [{ name: "Основной", prefix: "" }]);
-      const n = list.length + 1;
+      // Свободный префикс: после удаления «acc2/» новый не должен совпасть с «acc3/».
+      let n = 2;
+      while (list.some((a) => (a.prefix || "").replace(/\/$/, "") === "acc" + n)) n++;
       list.push({ name: "Аккаунт " + n, prefix: "acc" + n + "/" });
     },
     removeAccount(i) {
@@ -6224,8 +6226,14 @@ createApp({
     async switchAccount(i) {
       try {
         // Сначала сохраняем правки списка (имена, префиксы), потом переключаем.
+        // Аккаунт — по префиксу: сервер чистит список (пустые, повторы), и номер
+        // после сохранения мог бы указать на соседний аккаунт.
+        let prefix = ((this.connection.accounts || [])[i] || {}).prefix || "";
+        prefix = prefix.replace(/\s+/g, "");
+        if (prefix && !prefix.endsWith("/")) prefix += "/";
         await this.saveConnection();
-        this.connection = await this.api("/settings/account", { method: "POST", body: JSON.stringify({ index: i }) });
+        if (i > 0 && !prefix) { this.showToast("У аккаунта нет префикса — заполните поле префикса"); return; }
+        this.connection = await this.api("/settings/account", { method: "POST", body: JSON.stringify({ prefix }) });
         const a = (this.connection.accounts || [])[this.activeAccountIndex()] || {};
         this.showToast("☁ Аккаунт: " + (a.name || "Основной") + (a.prefix ? " (" + a.prefix + ")" : ""));
       } catch (e) {
@@ -8979,7 +8987,7 @@ createApp({
           <label class="check"><input type="checkbox" v-model="connection.image_via_chat" /> Арт через чат (nano-banana: модель «видит» аватары и фото из чата). Иначе — image_generation (imagen).</label>
           <div class="hr"></div>
           <h3>Аккаунты Google</h3>
-          <p class="muted">Переключение одним нажатием — здесь или в меню ⋮. Префикс аккаунта (например <code>acc2/</code>) дописывается ко всем запросам; в config.yaml LiteLLM ему соответствует шаблон <code>acc2/*</code> со своим ключом.</p>
+          <p class="muted">Переключение одним нажатием — здесь или в меню ⋮. Префикс аккаунта (например <code>acc2/</code>) дописывается ко всем запросам; в config.yaml LiteLLM ему соответствует шаблон <code>acc2/*</code> со своим ключом. Псевдонимы, которые не совпадают с именем модели в Vertex (модель артов, эмбеддингов, «…-priority»), нужно добавить и для этого аккаунта отдельной строкой <code>acc2/псевдоним</code>.</p>
           <div v-for="(a, i) in connection.accounts" :key="'acc-edit' + i" class="acc-row" :class="{ 'is-active': i === activeAccountIndex() }">
             <label class="check acc-pick"><input type="radio" name="active-account" :checked="i === activeAccountIndex()" @change="switchAccount(i)" :aria-label="'Активный: ' + a.name" /></label>
             <input v-model="a.name" :placeholder="i === 0 ? 'Основной' : 'Название'" class="acc-name" :aria-label="'Название аккаунта ' + (i + 1)" />

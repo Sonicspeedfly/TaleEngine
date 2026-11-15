@@ -34,7 +34,7 @@ from typing import Awaitable, Callable, Optional
 
 from backend import turn_events
 from backend.config import settings
-from backend.llm_gateway import effective_model, stream_completion
+from backend.llm_gateway import effective_model, stream_completion, with_account
 from backend.schemas import GenerationParams
 
 logger = logging.getLogger("aichat.generation")
@@ -409,7 +409,11 @@ class GenerationManager:
         # вместо того чтобы сразу показывать ошибку. После Stop — не повторяем.
         fb = ((connection or {}).get("fallback_model") or "").strip()
         auto = (connection or {}).get("auto_fallback", True)
-        if fb and auto and fb != effective_model(params, connection) and not job.stopping:
+        # Сравниваем имена, как они уйдут в прокси (с префиксом аккаунта):
+        # запасная «acc2/модель» при активном acc2 — та же модель того же
+        # аккаунта, повтор ею ничего не дал бы.
+        same = with_account(connection, fb) == with_account(connection, effective_model(params, connection))
+        if fb and auto and not same and not job.stopping:
             await self._run_fallback(job, messages, params, connection, fb, exc)
         else:
             job.error = str(exc)

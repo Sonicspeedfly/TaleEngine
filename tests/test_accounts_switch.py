@@ -83,3 +83,56 @@ async def test_model_list_hides_patterns_and_other_accounts(monkeypatch):
 
     monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
     assert await settings_service.fetch_proxy_models(CONN) == ["gemini-4-carbon", "gemini-4-argon"]
+
+
+def test_active_account_follows_prefix_when_list_is_cleaned(client):
+    saved = client.get("/api/settings/connection").json()
+    try:
+        accs = [{"name": "Основной", "prefix": ""}, {"name": "A", "prefix": "acc2/"}, {"name": "B", "prefix": "acc3/"}]
+        client.put("/api/settings/connection", json={**saved, "accounts": accs, "active_account": 2})
+        # A потерял префикс (его стёрли, чтобы перепечатать) — B должен остаться активным.
+        broken = [accs[0], {"name": "A", "prefix": ""}, accs[2], {"name": "C", "prefix": "acc4/"}]
+        r = client.put("/api/settings/connection", json={**saved, "accounts": broken, "active_account": 2}).json()
+        assert r["accounts"][r["active_account"]]["prefix"] == "acc3/"
+        # Переключение по префиксу.
+        r = client.post("/api/settings/account", json={"prefix": "acc4"}).json()
+        assert r["accounts"][r["active_account"]]["prefix"] == "acc4/"
+        # Список без активного: держимся прежнего префикса.
+        body = {k: v for k, v in r.items() if k != "active_account"}
+        body["accounts"] = [accs[0], {"name": "C", "prefix": "acc4/"}]
+        r = client.put("/api/settings/connection", json=body).json()
+        assert r["accounts"][r["active_account"]]["prefix"] == "acc4/"
+    finally:
+        client.put("/api/settings/connection", json={**saved, "accounts": [{"name": "Основной", "prefix": ""}],
+                                                     "active_account": 0})
+
+
+async def test_fallback_to_same_account_model_is_skipped(monkeypatch):
+    from backend.generation import GenerationManager
+
+    calls = []
+
+    async def fake_fallback(self, job, messages, params, connection, fb, exc):
+        calls.append(fb)
+
+    monkeypatch.setattr(GenerationManager, "_run_fallback", fake_fallback)
+
+    class Job:
+        job_id = "j"
+        stopping = False
+        error = None
+
+    gm = GenerationManager()
+
+    async def boom(job, gen):
+        return RuntimeError("429")
+
+    monkeypatch.setattr(gm, "_drive", boom)
+    monkeypatch.setattr(gm, "_stream", lambda *a, **k: None)
+    conn = {**CONN, "fallback_model": "acc2/gemini-4-carbon", "auto_fallback": True}
+    job = Job()
+    await gm._generate(job, [], None, conn)
+    assert calls == [] and job.error == "429"
+    # С основного аккаунта запасная «acc2/…» — другой аккаунт: повтор идёт.
+    await gm._generate(Job(), [], None, {**conn, "active_account": 0})
+    assert calls == ["acc2/gemini-4-carbon"]
