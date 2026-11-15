@@ -32,9 +32,16 @@ def _marks(m) -> int:
 
 
 def test_window_keeps_files_of_last_messages_only():
-    hist = _hist(5)                                   # 10 сообщений, файлы у 0, 2, 4, 6, 8
-    out = window_history_media(hist, 4)              # последние 4: индексы 6..9
-    assert [_marks(m) for m in out] == [0, 0, 0, 0, 0, 0, 1, 0, 1, 0]
+    hist = _hist(10)                                  # 20 сообщений, файлы у чётных
+    out = window_history_media(hist, 4)              # граница 16 (ступень 8): индексы 16..19
+    assert [_marks(m) for m in out] == [0] * 16 + [1, 0, 1, 0]
+    # Ступень (2.26.0): ещё два хода — граница та же, середина истории не меняется
+    # (кэш промпта провайдера не ломается на каждом ходу).
+    more = window_history_media(_hist(11), 4)
+    assert [_marks(m) for m in more] == [0] * 16 + [1, 0, 1, 0, 1, 0]
+    hist = _hist(13)                                  # 26 сообщений: 26 - 4 = 22 → ступень вниз = 16
+    out = window_history_media(hist, 4)
+    assert sum(_marks(m) for m in out[:16]) == 0 and all(_marks(m) for m in out[16::2])
     old = out[0]["content"]
     assert files_window_note(4) in [b.get("text") for b in old]       # пометка вместо файла
     assert any("«f0.png»" in (b.get("text") or "") for b in old)      # имя файла осталось

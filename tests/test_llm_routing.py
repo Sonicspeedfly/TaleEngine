@@ -573,3 +573,57 @@ def test_model_max_output_tokens_knows_only_mapped_models():
     assert llm_gateway.model_max_output_tokens("  gpt-4o \n") == expected
     assert llm_gateway.model_max_output_tokens("my-proxy-alias-that-does-not-exist") is None
     assert llm_gateway.model_max_output_tokens("") is None
+
+
+def test_cache_friendly_messages_moves_tail_system_into_user_note(monkeypatch):
+    """2.26.0: system после начала переписки — служебной вставкой на своём месте."""
+    from backend import llm_gateway
+    from backend.config import settings
+
+    msgs = [
+        {"role": "system", "content": "ШАПКА"},
+        {"role": "system", "content": "СНИМОК"},
+        {"role": "user", "content": "привет"},
+        {"role": "assistant", "content": "здравствуй"},
+        {"role": "system", "content": "СОСТОЯНИЕ"},
+        {"role": "system", "content": "ВРЕМЯ 12:05"},
+        {"role": "user", "content": "что дальше?"},
+    ]
+    out = llm_gateway.cache_friendly_messages(msgs)
+    assert [m["role"] for m in out] == ["system", "system", "user", "assistant", "user", "user"]
+    note = out[4]["content"]
+    assert note.startswith(llm_gateway.CONTEXT_NOTE_HEADER) and note.index("СОСТОЯНИЕ") < note.index("ВРЕМЯ")
+    assert out[:4] == msgs[:4] and out[-1] == msgs[-1]
+    # Только ведущие system — ничего не меняется.
+    plain = [{"role": "system", "content": "a"}, {"role": "user", "content": "b"}]
+    assert llm_gateway.cache_friendly_messages(plain) is plain
+    monkeypatch.setattr(settings, "PROMPT_CACHING", False)
+    assert llm_gateway.cache_friendly_messages(msgs) is msgs
+
+
+def test_snapshot_goes_before_history_and_prefix_is_stable():
+    """Два хода подряд: всё до новой реплики совпадает, снимок — перед историей."""
+    from backend import llm_gateway
+    from backend.horae_memory import HoraeRecord, assemble_context
+
+    snap = "\n\n".join(f"## [{s}]\nтекст" for s in (
+        "ХРОНИКА И СОБЫТИЙНЫЙ КАРКАС", "АКТИВНЫЕ ПЕРСОНАЖИ И ИХ СТАТУСЫ",
+        "ФАКТОЛОГИЧЕСКИЙ РЕЕСТР И ЛОР", "СПИСКИ И МЕДИА-АНКОРЫ"))
+    rec = HoraeRecord(category="summary", title="Память чата", content=snap,
+                      keywords=[], always_on=True, enabled=True, priority=0)
+    hist = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"реплика {i}"} for i in range(10)]
+
+    def build(h, text, clock):
+        return llm_gateway.cache_friendly_messages(assemble_context(
+            character={"name": "Ирвен", "description": "персонаж"}, horae_records=[rec],
+            history=h, user_message=text, token_budget=200000, user_time=clock))
+
+    a = build(hist, "ход 1", "12:00")
+    b = build(hist + [{"role": "user", "content": "ход 1"}, {"role": "assistant", "content": "ответ"}],
+              "ход 2", "12:07")
+    snap_at = next(i for i, m in enumerate(a) if isinstance(m["content"], str) and "Мастер-снимок" in m["content"])
+    first_hist = next(i for i, m in enumerate(a) if m["content"] == "реплика 0")
+    assert snap_at < first_hist and a[snap_at]["role"] == "system"
+    # Всё, что было до хвоста хода 1, совпадает с началом хода 2.
+    tail_at = len(a) - 2
+    assert b[:tail_at] == a[:tail_at]

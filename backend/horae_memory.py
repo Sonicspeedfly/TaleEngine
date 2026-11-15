@@ -224,6 +224,11 @@ NOTE_MEDIA_WINDOW = ("[содержимое файла в этот запрос 
                      "свою долю окна контекста]")
 
 
+# Ступень границы окна файлов (window_history_media): кэш промпта не ломается
+# на каждом ходу.
+_FILES_STEP = 8
+
+
 # Сколько последних реплик истории модель видит всегда, даже если бюджет окна
 # целиком занят несжимаемой частью хода.
 _MIN_HISTORY_TAIL = 4
@@ -250,6 +255,12 @@ def window_history_media(history: list[dict], window: int | None) -> list[dict]:
     if window is None or window < 0:
         return history
     cut = len(history) - window   # сообщения с индексом < cut — без файлов
+    # Граница — ступенями (2.26.0): раньше каждый новый ход снимал файл ещё с
+    # одного старого сообщения, и середина истории менялась — кэш провайдера
+    # промахивался на всём, что после неё. Ступень: файлы видны у window …
+    # window + _FILES_STEP - 1 последних сообщений, граница двигается редко.
+    if window > 0:
+        cut = (cut // _FILES_STEP) * _FILES_STEP
     if cut <= 0:
         return history
     note = {"type": "text", "text": files_window_note(window)}
@@ -914,7 +925,21 @@ def _context_tiers(report: dict, *, avatar_msgs, knowledge_msgs, window_tokens: 
     return tiers
 
 
-def _summary_tail(summary_recs, *, state_follows: bool = False) -> list[tuple[str, str]]:
+def snapshot_before_history() -> bool:
+    """
+    Снимок памяти — перед историей, а не в хвосте (2.26.0). В хвосте его
+    ~30 тыс. токенов оплачивались целиком на КАЖДОМ ходу: хвост стоит после
+    новых реплик и в кэш провайдера не попадает. Перед историей снимок
+    меняется только вместе с обновлением памяти (раз в несколько ходов) — и
+    тогда же сдвигается окно истории, так что промах кэша один на обновление.
+    """
+    from backend.config import settings
+
+    return bool(settings.PROMPT_CACHING and settings.SNAPSHOT_BEFORE_HISTORY)
+
+
+def _summary_tail(summary_recs, *, state_follows: bool = False,
+                  before_history: bool = False) -> list[tuple[str, str]]:
     """
     Блок хвоста «Что было в истории» (мастер-снимок и прочие записи категории
     summary) → [("snapshot", текст)] или [] — записей нет.
@@ -952,7 +977,8 @@ def _summary_tail(summary_recs, *, state_follows: bool = False) -> list[tuple[st
         body = listed
     else:
         body = (
-            "Мастер-снимок старой части чата; последние сообщения выше идут дословно.\n\n"
+            "Мастер-снимок старой части чата; последние сообщения "
+            + ("ниже" if before_history else "выше") + " идут дословно.\n\n"
             + snapshot.content.strip()
         )
         if listed:
@@ -1224,9 +1250,11 @@ def assemble_context(
     knowledge_msgs = knowledge_block(knowledge_text, knowledge_media)
     # Хвост — в два приёма: блок снимка первым, статичные блоки последними, а
     # между ними после обрезки встанут факты и манифест (порядок хвоста прежний).
+    snapshot_head = snapshot_before_history()
     snapshot_tail = _summary_tail(
         summary_recs,
         state_follows=horae is not None and bool((getattr(horae, "state_block", "") or "").strip()),
+        before_history=snapshot_head,
     )
     static_tail = _static_tail(
         character, character_avatar=character_avatar, persona_avatar=persona_avatar,
@@ -1325,6 +1353,12 @@ def assemble_context(
         messages.append({"role": "system", "content": system_prompt})
     messages.extend(avatar_msgs)
     messages.extend(knowledge_msgs)
+    # Снимок памяти — после неизменных блоков (системный промпт, аватары, база
+    # знаний) и перед историей: меняется редко, поэтому берётся из кэша
+    # провайдера (snapshot_before_history).
+    head_blocks: list[tuple[str, str]] = list(snapshot_tail) if snapshot_head else []
+    head = [{"role": "system", "content": text} for _, text in head_blocks]
+    messages.extend(head)
     messages.extend(trimmed_history)
 
     # ===== Переинъекция в КОНЕЦ (сильнейшая позиция — recency bias) =====
@@ -1333,7 +1367,7 @@ def assemble_context(
     # Блоки — парами (ключ, текст): в модель уходит текст, ключ (snapshot,
     # recalled, anchor, …) нужен только отчёту — монитор токенов делит хвост
     # по уровням памяти (§7 спеки).
-    tail_blocks: list[tuple[str, str]] = list(snapshot_tail) + horae_tail
+    tail_blocks: list[tuple[str, str]] = ([] if snapshot_head else list(snapshot_tail)) + horae_tail
 
     # Факты из давней части чата, похожие на текущую реплику. Нет таких — нет и
     # блока: пустой или натянутый блок памяти модель охотно «дополняет» выдумкой.
@@ -1370,11 +1404,13 @@ def assemble_context(
         # strict: блок, добавленный в tail мимо tail_blocks, без strict молча
         # сдвинул бы ключи всех следующих блоков и выронил бы последний из
         # отчёта (а с ним tail_tokens и tiers) — инспектор врал бы без ошибки.
+        # Снимок перед историей учитывается вместе с хвостом: для монитора это
+        # тот же уровень памяти, меняется только место в запросе.
         report["tail"] = [
             {"key": key,
              "tokens": estimate_content_tokens(m.get("content")),
              "text": m.get("content") if isinstance(m.get("content"), str) else ""}
-            for key, m in zip(tail_keys, tail, strict=True)
+            for key, m in zip([k for k, _ in head_blocks] + tail_keys, head + tail, strict=True)
         ]
         report["tail_tokens"] = sum(b["tokens"] for b in report["tail"])
         report["total_tokens"] = sum(

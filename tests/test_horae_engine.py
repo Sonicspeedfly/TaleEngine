@@ -55,7 +55,11 @@ def _turn(client, sid, reply, text="привет", seen=None, kind="user_message
 
 
 def _system_text(messages):
-    return "\n".join(m["content"] for m in messages if m["role"] == "system" and isinstance(m["content"], str))
+    """Служебный текст хода: system и служебная вставка хвоста (2.26.0 — кэш промпта)."""
+    from backend.llm_gateway import CONTEXT_NOTE_HEADER
+
+    return "\n".join(m["content"] for m in messages if isinstance(m["content"], str) and (
+        m["role"] == "system" or m["content"].startswith(CONTEXT_NOTE_HEADER)))
 
 
 def test_turn_with_tags_saves_clean_text_meta_and_state(client):
@@ -87,9 +91,10 @@ def test_next_turn_context_has_rules_state_and_reminder(client):
     assert "[Снимок текущего состояния" in system and "[Сцена|Таверна]" in system
     assert "#001 🗝Ключ[важно] | ржавый = Вольф@карман" in system
     assert "[Horae — формат ответа]" in system
-    # Напоминание — последним system перед фокусом и репликой.
-    tail = [m for m in messages if m["role"] == "system"][-2:]
-    assert tail[0]["content"].startswith("[Horae — формат ответа]")
+    # Напоминание — последним блоком хвоста перед фокусом и репликой.
+    note = messages[-2]["content"]
+    assert note.index("[Horae — формат ответа]") < note.index("[Отвечай на это сообщение]")
+    assert note.rstrip().endswith(note[note.index("[Отвечай на это сообщение]"):].rstrip())
 
 
 def test_regenerate_does_not_see_own_meta(client):
