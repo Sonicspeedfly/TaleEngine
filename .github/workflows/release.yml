@@ -1,0 +1,38 @@
+# Теги и релизы из CHANGELOG.md (scripts/release_from_changelog.py).
+#
+# Мерж в main, меняющий CHANGELOG.md, выпускает верхнюю (новую) версию: тег
+# vX.Y.Z на этом мерже и релиз «TaleEngine vX.Y.Z Beta» с текстом раздела.
+# Ручной запуск (Actions → «Релизы из CHANGELOG» → Run workflow) догоняет все
+# версии без релиза.
+name: Релизы из CHANGELOG
+
+on:
+  push:
+    branches: [main]
+    paths: [CHANGELOG.md]
+  workflow_dispatch:
+    inputs:
+      backfill:
+        description: "Создать теги и релизы для ВСЕХ версий из CHANGELOG, у которых их нет"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: releases
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Теги и релизы
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BACKFILL: ${{ github.event_name == 'workflow_dispatch' && inputs.backfill }}
+        run: python3 scripts/release_from_changelog.py
