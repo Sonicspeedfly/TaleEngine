@@ -214,7 +214,7 @@ createApp({
       presetShared: false,   // админ: сохранить пресет общим (видят все)
 
       // --- Подключение к LiteLLM (вкладка Connection) ---
-      connection: { use_proxy: true, base_url: "http://localhost:4000", api_key: "", default_model: "gpt-4o", image_model: "", image_via_chat: false, fallback_model: "", auto_fallback: true, summary_model: "", embedding_model: "" },
+      connection: { use_proxy: true, base_url: "http://localhost:4000", api_key: "", default_model: "gpt-4o", image_model: "", image_via_chat: false, fallback_model: "", auto_fallback: true, summary_model: "", embedding_model: "", accounts: [{ name: "Основной", prefix: "" }], active_account: 0 },
       models: [],
       connStatus: "",
       connOk: null,
@@ -6202,6 +6202,44 @@ createApp({
       this.connStatus = "Сохранено";
       this.connOk = true;
     },
+    // ---------- Аккаунты Google (2.25.0) ----------
+    activeAccountIndex() {
+      const n = (this.connection.accounts || []).length;
+      const i = Number(this.connection.active_account) || 0;
+      return i >= 0 && i < n ? i : 0;
+    },
+    addAccount() {
+      const list = this.connection.accounts || (this.connection.accounts = [{ name: "Основной", prefix: "" }]);
+      // Свободный префикс: после удаления «acc2/» новый не должен совпасть с «acc3/».
+      let n = 2;
+      while (list.some((a) => (a.prefix || "").replace(/\/$/, "") === "acc" + n)) n++;
+      list.push({ name: "Аккаунт " + n, prefix: "acc" + n + "/" });
+    },
+    removeAccount(i) {
+      const list = this.connection.accounts || [];
+      if (i <= 0 || i >= list.length) return;
+      list.splice(i, 1);
+      const act = this.activeAccountIndex();
+      if (act === i) this.connection.active_account = 0;
+      else if (act > i) this.connection.active_account = act - 1;
+    },
+    async switchAccount(i) {
+      try {
+        // Сначала сохраняем правки списка (имена, префиксы), потом переключаем.
+        // Аккаунт — по префиксу: сервер чистит список (пустые, повторы), и номер
+        // после сохранения мог бы указать на соседний аккаунт.
+        let prefix = ((this.connection.accounts || [])[i] || {}).prefix || "";
+        prefix = prefix.replace(/\s+/g, "");
+        if (prefix && !prefix.endsWith("/")) prefix += "/";
+        await this.saveConnection();
+        if (i > 0 && !prefix) { this.showToast("У аккаунта нет префикса — заполните поле префикса"); return; }
+        this.connection = await this.api("/settings/account", { method: "POST", body: JSON.stringify({ prefix }) });
+        const a = (this.connection.accounts || [])[this.activeAccountIndex()] || {};
+        this.showToast("☁ Аккаунт: " + (a.name || "Основной") + (a.prefix ? " (" + a.prefix + ")" : ""));
+      } catch (e) {
+        this.showToast("Не переключилось: " + e.message);
+      }
+    },
     async testConnection() {
       this.connStatus = "Проверяю...";
       this.connOk = null;
@@ -7981,6 +8019,11 @@ createApp({
             <button v-if="sessionId" @click="bgPicker=!bgPicker; headerMenu=false">🖼 Фон чата</button>
             <button @click="openDebug(); headerMenu=false">🐞 Отладка LLM</button>
             <button v-if="isAdmin" @click="openAdmin(); headerMenu=false">🛡 Администрирование</button>
+            <!-- Аккаунт Google одним нажатием (2.25.0): только когда их больше одного. -->
+            <template v-if="isAdmin && (connection.accounts || []).length > 1">
+              <button v-for="(a, i) in connection.accounts" :key="'acc' + i" @click="switchAccount(i); headerMenu=false"
+                :aria-pressed="i === activeAccountIndex()">{{ i === activeAccountIndex() ? '✓' : '☁' }} {{ a.name }}</button>
+            </template>
           </div>
         </div>
       </div>
@@ -8942,6 +8985,16 @@ createApp({
           <label>Модель по умолчанию<input v-model="connection.default_model" placeholder="gpt-4o" /></label>
           <label>Модель для генерации артов (необязательно)<input v-model="connection.image_model" placeholder="например imagen-4 / nano-banana" /></label>
           <label class="check"><input type="checkbox" v-model="connection.image_via_chat" /> Арт через чат (nano-banana: модель «видит» аватары и фото из чата). Иначе — image_generation (imagen).</label>
+          <div class="hr"></div>
+          <h3>Аккаунты Google</h3>
+          <p class="muted">Переключение одним нажатием — здесь или в меню ⋮. Префикс аккаунта (например <code>acc2/</code>) дописывается ко всем запросам; в config.yaml LiteLLM ему соответствует шаблон <code>acc2/*</code> со своим ключом. Псевдонимы, которые не совпадают с именем модели в Vertex (модель артов, эмбеддингов, «…-priority»), нужно добавить и для этого аккаунта отдельной строкой <code>acc2/псевдоним</code>.</p>
+          <div v-for="(a, i) in connection.accounts" :key="'acc-edit' + i" class="acc-row" :class="{ 'is-active': i === activeAccountIndex() }">
+            <label class="check acc-pick"><input type="radio" name="active-account" :checked="i === activeAccountIndex()" @change="switchAccount(i)" :aria-label="'Активный: ' + a.name" /></label>
+            <input v-model="a.name" :placeholder="i === 0 ? 'Основной' : 'Название'" class="acc-name" :aria-label="'Название аккаунта ' + (i + 1)" />
+            <input v-model="a.prefix" :disabled="i === 0" :placeholder="i === 0 ? '—' : 'acc2/'" :title="i === 0 ? 'Основной аккаунт — без префикса' : 'Префикс моделей в LiteLLM'" class="acc-prefix" :aria-label="'Префикс аккаунта ' + (i + 1)" />
+            <button v-if="i > 0" class="btn-danger" @click="removeAccount(i)" :aria-label="'Удалить аккаунт ' + a.name">🗑</button>
+          </div>
+          <div class="row"><button @click="addAccount">+ Аккаунт</button></div>
           <div class="hr"></div>
           <h3>Запасная модель</h3>
           <p class="muted">Если основная модель не ответила (ошибка провайдера, пустой ответ) — ход можно повторить запасной: автоматически или кнопкой «⚡ запасной моделью» в баннере ошибки.</p>

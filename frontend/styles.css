@@ -2382,3 +2382,9 @@ input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
 .preset-actions .pa-icon { width: 28px; height: 28px; padding: 0; display: inline-grid; place-items: center; font-size: 14px; line-height: 1; }
 .chat-preset { display: block; margin: 6px 0 0; }
 .chat-preset select { width: 100%; margin-top: 4px; }
+/* Аккаунты Google (2.25.0) */
+.acc-row { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; }
+.acc-row .acc-pick { flex: none; margin: 0; }
+.acc-row .acc-name { flex: 1 1 auto; min-width: 0; }
+.acc-row .acc-prefix { flex: 0 0 96px; min-width: 0; }
+.acc-row.is-active .acc-name { border-color: var(--accent); }
