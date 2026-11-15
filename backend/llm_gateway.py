@@ -873,51 +873,53 @@ async def _close_stream(response) -> None:
 # неявный кэш Google промахивался (из кэша шло ~3% входа). Теперь system после
 # начала переписки уходят служебной вставкой от пользователя на своём месте —
 # как это делают другие клиенты Gemini; в начале остаётся только неизменное.
-CONTEXT_NOTE_HEADER = ("[Служебный контекст движка для этого ответа — не реплика собеседника; "
-                       "учитывай его, но не цитируй и не отвечай на него]")
+CONTEXT_NOTE_HEADER = ("[Служебный контекст движка для этого ответа — не реплика собеседника: "
+                       "учитывай его и следуй его указаниям, но не пересказывай его]")
 
 
 def cache_friendly_messages(messages: list[dict]) -> list[dict]:
     """
-    System-сообщения после первого не-system — в user-вставку с пометкой
-    (подряд идущие — одной вставкой). Ведущие system не трогаем: это и есть
-    неизменная «шапка», которая кэшируется. Выключается PROMPT_CACHING=false.
+    Хвост хода — подряд идущие system прямо перед последней репликой
+    пользователя — одной user-вставкой с пометкой на том же месте. Только он
+    меняется от хода к ходу; всё до истории (системный промпт, база знаний,
+    снимок памяти) остаётся system, как раньше, — оно стабильно и кэшируется.
+    System ПОСЛЕ последней реплики (инструкция канваса) не трогаем.
+    Выключается PROMPT_CACHING=false.
     """
     if not settings.PROMPT_CACHING or not messages:
         return messages
-    lead = 0
-    while lead < len(messages) and messages[lead].get("role") == "system":
-        lead += 1
-    if lead == len(messages) or not any(m.get("role") == "system" for m in messages[lead:]):
+    last = len(messages) - 1
+    while last >= 0 and messages[last].get("role") == "system":
+        last -= 1
+    if last <= 0 or messages[last].get("role") != "user":
         return messages
-    out = list(messages[:lead])
-    buf: list = []
-
-    def flush():
-        if not buf:
-            return
-        if all(isinstance(b, str) for b in buf):
-            out.append({"role": "user", "content": CONTEXT_NOTE_HEADER + "\n\n" + "\n\n".join(buf)})
-        else:
-            parts: list = [{"type": "text", "text": CONTEXT_NOTE_HEADER}]
-            for b in buf:
-                parts.extend([{"type": "text", "text": b}] if isinstance(b, str) else b)
-            out.append({"role": "user", "content": parts})
-        buf.clear()
-
-    for m in messages[lead:]:
-        if m.get("role") != "system":
-            flush()
-            out.append(m)
-            continue
+    first = last
+    while first > 0 and messages[first - 1].get("role") == "system":
+        first -= 1
+    # Нечего переносить, или перед хвостом нет переписки (одни system —
+    # служебный запрос: память, профиль) — оставляем как есть.
+    if first == last or first == 0:
+        return messages
+    texts: list = []
+    has_media = False
+    for m in messages[first:last]:
         c = m.get("content")
         if isinstance(c, str):
             if c.strip():
-                buf.append(c)
+                texts.append(c)
         elif isinstance(c, list) and c:
-            buf.append(list(c))
-    flush()
-    return out
+            texts.append(list(c))
+            has_media = True
+    if not texts:
+        return messages
+    if not has_media:
+        note = {"role": "user", "content": CONTEXT_NOTE_HEADER + "\n\n" + "\n\n".join(texts)}
+    else:
+        parts: list = [{"type": "text", "text": CONTEXT_NOTE_HEADER}]
+        for t in texts:
+            parts.extend([{"type": "text", "text": t}] if isinstance(t, str) else t)
+        note = {"role": "user", "content": parts}
+    return messages[:first] + [note] + messages[last:]
 
 
 async def _stream_once(

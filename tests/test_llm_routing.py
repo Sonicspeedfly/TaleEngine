@@ -597,6 +597,16 @@ def test_cache_friendly_messages_moves_tail_system_into_user_note(monkeypatch):
     # Только ведущие system — ничего не меняется.
     plain = [{"role": "system", "content": "a"}, {"role": "user", "content": "b"}]
     assert llm_gateway.cache_friendly_messages(plain) is plain
+    # Всё до истории (аватар user-сообщением, база знаний и снимок system) — как было;
+    # system после последней реплики (инструкция канваса) — тоже.
+    kb = [{"role": "system", "content": "ШАПКА"}, {"role": "user", "content": [{"type": "text", "text": "аватар"}]},
+          {"role": "system", "content": "БАЗА ЗНАНИЙ"}, {"role": "system", "content": "СНИМОК"},
+          {"role": "user", "content": "привет"}, {"role": "assistant", "content": "да"},
+          {"role": "system", "content": "ВРЕМЯ"}, {"role": "user", "content": "сделай"},
+          {"role": "system", "content": "Верни только документ"}]
+    out = llm_gateway.cache_friendly_messages(kb)
+    assert out[:6] == kb[:6] and out[-2:] == kb[-2:]
+    assert out[6]["role"] == "user" and "ВРЕМЯ" in out[6]["content"] and len(out) == len(kb)
     monkeypatch.setattr(settings, "PROMPT_CACHING", False)
     assert llm_gateway.cache_friendly_messages(msgs) is msgs
 

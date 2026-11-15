@@ -257,10 +257,12 @@ def window_history_media(history: list[dict], window: int | None) -> list[dict]:
     cut = len(history) - window   # сообщения с индексом < cut — без файлов
     # Граница — ступенями (2.26.0): раньше каждый новый ход снимал файл ещё с
     # одного старого сообщения, и середина истории менялась — кэш провайдера
-    # промахивался на всём, что после неё. Ступень: файлы видны у window …
-    # window + _FILES_STEP - 1 последних сообщений, граница двигается редко.
-    if window > 0:
-        cut = (cut // _FILES_STEP) * _FILES_STEP
+    # промахивался на всём, что после неё. Округляем только ВВЕРХ: файлов не
+    # больше, чем выбрал человек (window), а не меньше window - step + 1;
+    # у маленького окна ступень мельче (при окне 1–3 граница точная).
+    step = min(_FILES_STEP, max(1, window // 2))
+    if window > 0 and cut > 0 and step > 1:
+        cut = -(-cut // step) * step
     if cut <= 0:
         return history
     note = {"type": "text", "text": files_window_note(window)}
