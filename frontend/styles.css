@@ -2388,3 +2388,17 @@ input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
 .acc-row .acc-name { flex: 1 1 auto; min-width: 0; }
 .acc-row .acc-prefix { flex: 0 0 96px; min-width: 0; }
 .acc-row.is-active .acc-name { border-color: var(--accent); }
+/* Аватар в редакторе персонажа (2.26.1): крупный, кнопки — одной полосой. */
+.avatar-edit { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+.avatar-edit-img { width: 72px; height: 72px; border-radius: 50%; object-fit: cover; flex: none;
+  border: 1px solid var(--border-subtle); background: var(--surface-3); }
+.avatar-edit-empty { display: grid; place-items: center; font-size: 28px; font-weight: 600; color: var(--text-secondary); }
+.avatar-edit-actions { display: flex; flex-direction: column; align-items: stretch; gap: 4px; min-width: 0; }
+.avatar-edit-actions .btn { display: inline-flex; align-items: center; justify-content: flex-start; gap: 6px; }
+@media (max-width: 767.98px) {
+  .avatar-edit-actions { flex-direction: row; flex-wrap: wrap; }
+}
+.avatar-edit-actions .btn { margin: 0; padding: 5px 10px; font-size: var(--fs-100); white-space: nowrap;
+  text-decoration: none; color: var(--text-primary); cursor: pointer; }
+.avatar-edit-actions .avatar-edit-remove { color: var(--danger); }
+.avatar-edit-actions .avatar-edit-remove:hover { border-color: var(--danger); background: var(--danger-subtle); }

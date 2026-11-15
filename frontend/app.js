@@ -9038,18 +9038,25 @@ createApp({
             <p class="muted" style="margin:0 0 8px">Изменения сохраняются автоматически при выходе из поля.</p>
             <label>Имя<input v-model="charEdit.name" placeholder="Имя персонажа" @change="saveCharacter" /></label>
             <label>Аватар</label>
-            <div class="row" style="margin-bottom:10px">
-              <img v-if="charEdit.avatar_path" :src="imgSrc(charEdit.avatar_path)" class="avatar" style="width:48px;height:48px" alt="" />
-              <label class="btn" style="margin:0; cursor:pointer">Загрузить файл
-                <input type="file" accept="image/*" class="file-input" @change="onAvatarFile"
-                       aria-label="Загрузить аватар персонажа" />
-              </label>
-              <!-- В списках аватар — сжатая копия; исходный файл хранится как был
-                   и скачивается здесь (2.17.0). -->
-              <a v-if="origImgUrl(charEdit.avatar_path)" class="btn" style="margin:0"
-                 :href="origImgUrl(charEdit.avatar_path, (charEdit.name || 'персонаж') + ' — аватар')"
-                 download title="Скачать аватар в исходном качестве">⬇ Оригинал</a>
-              <button v-if="charEdit.avatar_path" class="btn-danger" @click="charEdit.avatar_path=''; saveCharacter()">убрать</button>
+            <!-- Аватар крупно, кнопки — одна полоса одинаковых (2.26.1). Раньше
+                 картинка 48 px терялась, а «Оригинал» был ссылкой в две строки
+                 и «убрать» — красным текстом: три вида на три кнопки. -->
+            <div class="avatar-edit">
+              <img v-if="charEdit.avatar_path" :src="imgSrc(charEdit.avatar_path)" class="avatar-edit-img" alt="Аватар персонажа" />
+              <div v-else class="avatar-edit-img avatar-edit-empty" aria-hidden="true">{{ (charEdit.name || '?').trim().charAt(0).toUpperCase() || '?' }}</div>
+              <div class="avatar-edit-actions">
+                <label class="btn">{{ charEdit.avatar_path ? '🖼 Заменить' : '🖼 Загрузить' }}
+                  <input type="file" accept="image/*" class="file-input" @change="onAvatarFile"
+                         aria-label="Загрузить аватар персонажа" />
+                </label>
+                <!-- В списках аватар — сжатая копия; исходный файл хранится как был
+                     и скачивается здесь (2.17.0). -->
+                <a v-if="origImgUrl(charEdit.avatar_path)" class="btn"
+                   :href="origImgUrl(charEdit.avatar_path, (charEdit.name || 'персонаж') + ' — аватар')"
+                   download title="Скачать аватар в исходном качестве">⬇ Оригинал</a>
+                <button v-if="charEdit.avatar_path" class="btn avatar-edit-remove" @click="charEdit.avatar_path=''; saveCharacter()"
+                        title="Убрать аватар">✕ Убрать</button>
+              </div>
             </div>
             <label>Описание
               <textarea rows="4" v-model="charEdit.description" @change="saveCharacter" data-first-field
