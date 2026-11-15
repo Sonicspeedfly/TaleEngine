@@ -28,6 +28,7 @@ from datetime import datetime, timezone as _tz
 from pathlib import Path
 
 from fastapi import (
+    Body,
     Depends,
     FastAPI,
     File,
@@ -2667,6 +2668,17 @@ async def media_probe(payload: dict | None = None, user=Depends(current_user),
     _media_probe_at["any"] = now
     await media_refs.probe(route)
     return await media_refs.status(db, params, connection)
+
+
+@app.post("/api/settings/account")
+async def switch_account(payload: dict = Body(...), user=Depends(current_user),
+                         db: AsyncSession = Depends(get_session)):
+    """Переключить аккаунт Google одним нажатием (2.25.0) — только админ."""
+    if user is not None and user.role != "admin":
+        raise HTTPException(403, "Только администратор")
+    conn = await set_connection(db, {"active_account": payload.get("index")})
+    media_refs.remember_connection(conn)
+    return conn
 
 
 @app.get("/api/models")

@@ -354,7 +354,12 @@ def route_for(params=None, connection: dict | None = None, model: str | None = N
     conn = connection or {}
     use_proxy = conn.get("use_proxy", settings.LITELLM_USE_PROXY)
     base = (conn.get("base_url", settings.LITELLM_BASE_URL) or "").strip().rstrip("/")
-    alias = (model or effective_model(params, connection) or "").strip()
+    from backend.llm_gateway import with_account
+
+    # Модель из настроек — с префиксом активного аккаунта (2.25.0): файлы
+    # грузятся в хранилище того аккаунта, которым идёт запрос. Явно
+    # переданное имя (из записи проверки) — уже полное, его не трогаем.
+    alias = (model or with_account(connection, effective_model(params, connection)) or "").strip()
     if alias.startswith("litellm_proxy/"):
         alias = alias[len("litellm_proxy/"):]
     if not (use_proxy and base and alias):

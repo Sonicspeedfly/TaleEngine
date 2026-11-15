@@ -54,6 +54,19 @@ model_list:
       model: vertex_ai/text-embedding-005
       vertex_location: "global"
 
+  # --------- Второй аккаунт Google (TaleEngine 2.25.0) ---------
+  # В TaleEngine: «Подключение» → «Аккаунты Google» → «+ Аккаунт», префикс acc2/.
+  # Одна запись-шаблон отдаёт ВСЕ модели второго аккаунта: запрос «acc2/gemini-4-carbon»
+  # уходит в vertex_ai/gemini-4-carbon с ключом и проектом второго аккаунта.
+  # Если псевдоним модели не совпадает с её id в Vertex (например «…-priority» со
+  # своими заголовками), добавьте для него отдельную запись «acc2/<псевдоним>».
+  - model_name: "acc2/*"
+    litellm_params:
+      model: "vertex_ai/*"
+      vertex_project: "id-второго-проекта"
+      vertex_location: "global"
+      vertex_credentials: "/root/Ai-proxy/acc2-key.json"   # JSON-ключ сервисного аккаунта
+
 litellm_settings:
   drop_params: true
   # !!! ОБЯЗАТЕЛЬНО ДЛЯ КАРТИНОК !!!

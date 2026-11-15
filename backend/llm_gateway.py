@@ -414,6 +414,36 @@ def _is_stream_options_rejection(msg: str) -> bool:
 DUMMY_PROXY_KEY = "sk-no-key-required"
 
 
+def account_prefix(connection: Optional[dict]) -> str:
+    """Префикс активного аккаунта Google на прокси («» — основной), 2.25.0."""
+    conn = connection or {}
+    accounts = conn.get("accounts") or []
+    try:
+        idx = int(conn.get("active_account") or 0)
+    except (TypeError, ValueError):
+        idx = 0
+    if 0 <= idx < len(accounts) and isinstance(accounts[idx], dict):
+        return "".join(str(accounts[idx].get("prefix") or "").split())
+    return ""
+
+
+def with_account(connection: Optional[dict], model_name: str) -> str:
+    """
+    Имя модели на прокси с префиксом активного аккаунта. Имя, уже несущее
+    префикс какого-то аккаунта, не трогаем: его выбрали явно (например,
+    запасная модель «acc2/…» — второй аккаунт как запасной).
+    """
+    prefix = account_prefix(connection)
+    name = (model_name or "").strip()
+    if not prefix or not name:
+        return name
+    known = [str(a.get("prefix") or "").strip() for a in (connection or {}).get("accounts") or []
+             if isinstance(a, dict)]
+    if any(p and name.startswith(p) for p in known):
+        return name
+    return prefix + name
+
+
 def _route_kwargs(connection: Optional[dict], model_name: str) -> dict:
     """
     Готовит ключи маршрутизации (model / api_base / api_key):
@@ -429,7 +459,8 @@ def _route_kwargs(connection: Optional[dict], model_name: str) -> dict:
 
     if use_proxy and base_url:
         return {
-            "model": f"litellm_proxy/{model_name}",
+            # Аккаунт Google — префиксом имени: прокси выберет его ключ.
+            "model": f"litellm_proxy/{with_account(conn, model_name)}",
             "api_base": base_url,
             # Если ключ не задан — подставляем заглушку, иначе LiteLLM не отправит запрос.
             "api_key": api_key or DUMMY_PROXY_KEY,

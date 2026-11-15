@@ -217,6 +217,9 @@ class ConnectionSettings(BaseModel):
     # было невозможно, хотя сервер их читал.
     summary_model: str = ""
     embedding_model: str = ""
+    # Аккаунты Google на прокси и активный (2.25.0). None — не менять.
+    accounts: Optional[list[dict[str, Any]]] = None
+    active_account: Optional[int] = None
 
 
 # ----- Персоны пользователя -----
