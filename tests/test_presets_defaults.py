@@ -191,3 +191,38 @@ def test_double_delete_is_idempotent(client):
     sid = client.post(f"/api/sessions?character_id={cid}").json()["session_id"]
     assert client.delete(f"/api/sessions/{sid}").status_code == 200
     assert client.delete(f"/api/sessions/{sid}").status_code == 200
+
+
+def test_shared_chat_carries_owner_chat_preset(client):
+    """2.26.2: пресет чата владельца приходит и тому, с кем чатом поделились."""
+    from backend import admin_service
+
+    cache = admin_service.security_cache()
+    old = dict(cache)
+    cache["accounts_enabled"] = True
+    try:
+        client.post("/api/auth/register", json={"username": "sp_first", "password": "pass12345"})
+        a = client.post("/api/auth/register", json={"username": "sp_a", "password": "pass12345"}).json()
+        b = client.post("/api/auth/register", json={"username": "sp_b", "password": "pass12345"}).json()
+        if not (a.get("token") and b.get("token")):
+            return
+        ha, hb = {"X-User-Token": a["token"]}, {"X-User-Token": b["token"]}
+        p = client.post("/api/presets", json={"name": "SP-argon", "params": {"model": "argon"}}, headers=ha).json()
+        assert not p["shared"]   # личный пресет A — в списке у B его нет
+        cid = client.post("/api/characters", json={"name": "Общий", "first_message": "Привет"}, headers=ha).json()["id"]
+        sid = client.post(f"/api/sessions?character_id={cid}", headers=ha).json()["session_id"]
+        assert client.patch(f"/api/sessions/{sid}", json={"preset_id": p["id"]}, headers=ha).status_code == 200
+        # Своему — в строке чата и карточке.
+        card = client.get(f"/api/sessions/{sid}/card", headers=ha).json()
+        assert card["preset"] == {"id": p["id"], "name": "SP-argon", "params": {"model": "argon"}}
+        # Дружба и шаринг.
+        client.post("/api/friends/add", json={"username": "sp_b"}, headers=ha)
+        inc = client.get("/api/friends", headers=hb).json()["incoming"]
+        client.post(f"/api/friends/{inc[0]['friendship_id']}/accept", headers=hb)
+        assert client.post(f"/api/sessions/{sid}/share", json={"username": "sp_b"}, headers=ha).status_code == 200
+        assert not any(x["id"] == p["id"] for x in client.get("/api/presets", headers=hb).json())
+        shared = next(s for s in client.get("/api/sessions/shared", headers=hb).json() if s["id"] == sid)
+        assert shared["preset_id"] == p["id"] and shared["preset"]["params"] == {"model": "argon"}
+    finally:
+        cache.clear()
+        cache.update(old)
