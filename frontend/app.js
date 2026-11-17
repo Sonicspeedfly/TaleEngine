@@ -2812,6 +2812,29 @@ createApp({
       if (this._isDone(j.job_id)) return;
       this._adoptJob(sid, { job_id: j.job_id, kind: j.kind, stage: j.stage || "waiting", elapsed: j.elapsed || 0 });
       if (this.streaming && this.currentJobId === j.job_id) this.resumeSSE(j.job_id);
+      // Реплику того, кто начал ход (собеседник в общем чате, другая вкладка,
+      // Telegram), показываем сразу, а не после ответа модели (2.26.3): она уже
+      // сохранена до старта хода. Раньше было видно только «обработку».
+      this._pullNewMessages(sid).catch(() => {});
+    },
+    // Новые сохранённые сообщения чата — к концу ленты, перед временными
+    // (идущий ответ). Только сообщения новее показанных: свои неотправленные
+    // (временные id) и правки старых не трогаем.
+    async _pullNewMessages(sid) {
+      const rows = await this.api("/sessions/" + sid + "/messages?limit=20");
+      if (sid !== this.sessionId || !Array.isArray(rows)) return;
+      const saved = this.messages.filter((m) => typeof m.id === "number");
+      const have = new Set(saved.map((m) => m.id));
+      const lastId = saved.reduce((a, m) => Math.max(a, m.id), 0);
+      const fresh = rows.filter((m) => typeof m.id === "number" && !have.has(m.id) && m.id > lastId);
+      if (!fresh.length) return;
+      const el = this.$refs.messages;
+      const nearBottom = !el || (el.scrollHeight - el.scrollTop - el.clientHeight < 160);
+      let at = this.messages.length;
+      while (at > 0 && typeof this.messages[at - 1].id !== "number") at--;
+      this.messages.splice(at, 0, ...fresh);
+      if (nearBottom) this.$nextTick(() => this.scrollDown());
+      this._saveChatSoon();
     },
     _onTurnDone(ev) {
       const sid = ev.session_id;
