@@ -959,6 +959,7 @@ async def list_shared_sessions(user=Depends(current_user), db: AsyncSession = De
     rows = sorted(
         rows, key=lambda s: (_utc_ts(_activity_at(s, previews)), s.id), reverse=True,
     )
+    presets = await _chat_presets(db, rows)
     out = []
     for s in rows:
         ch = await db.get(models.Character, s.character_id)
@@ -966,6 +967,9 @@ async def list_shared_sessions(user=Depends(current_user), db: AsyncSession = De
         out.append({
             "id": s.id, "title": s.title, "is_group": s.is_group,
             "character_id": s.character_id,
+            # Пресет чата владельца — и мне: модель в общем чате одна (2.26.2).
+            "preset_id": s.preset_id,
+            "preset": presets.get(s.preset_id),
             "character_name": ch.name if ch else "",
             "character_avatar": await images.public_value(db, "character", ch.id) if ch else None,
             "owner": owner.username if owner else "",
@@ -1123,6 +1127,22 @@ async def list_sessions(
     return await _session_rows(db, rows)
 
 
+async def _chat_presets(db, rows) -> dict[int, dict]:
+    """
+    Пресеты чатов строк: {id: {id, name, params}} (2.26.2). Отдаются каждому,
+    у кого есть доступ к чату, — и тем, кому чат расшарили или передали:
+    пресет чата — настройка самого чата. Раньше человек видел только номер,
+    а личный пресет владельца в его списке не находился, и у него
+    включался свой обычный (например, дешёвая модель вместо выбранной).
+    """
+    ids = {s.preset_id for s in rows if getattr(s, "preset_id", None)}
+    if not ids:
+        return {}
+    found = (await db.execute(
+        select(models.SamplingPreset).where(models.SamplingPreset.id.in_(ids)))).scalars().all()
+    return {p.id: {"id": p.id, "name": p.name, "params": p.params or {}} for p in found}
+
+
 async def _session_rows(db, rows) -> list[dict]:
     """Строки списка чатов (тот же вид у списка и у карточки одного чата)."""
     previews = await _session_previews(db, [s.id for s in rows])
@@ -1138,6 +1158,7 @@ async def _session_rows(db, rows) -> list[dict]:
             .where(models.Character.id.in_(char_ids))
         )).all())
     bgs = await images.public_values(db, "session_bg", [s.id for s in rows])
+    presets = await _chat_presets(db, rows)
     return [
         {
             "id": s.id,
@@ -1147,6 +1168,7 @@ async def _session_rows(db, rows) -> list[dict]:
             "author_note": s.author_note,
             "persona_id": s.persona_id,
             "preset_id": s.preset_id,
+            "preset": presets.get(s.preset_id),
             "background": bgs.get(s.id) or "",
             "is_group": s.is_group,
             "director": s.director,
@@ -1874,6 +1896,7 @@ async def list_groups(user=Depends(current_user), db: AsyncSession = Depends(get
     previews = await _session_previews(db, [s.id for s in rows])
     rows = _sort_by_activity(rows, previews)
     bgs = await images.public_values(db, "session_bg", [s.id for s in rows])
+    presets = await _chat_presets(db, rows)
     result = []
     for s in rows:
         members = await group_chat.load_members(db, s.id)
@@ -1893,6 +1916,7 @@ async def list_groups(user=Depends(current_user), db: AsyncSession = Depends(get
                 "author_note": s.author_note,
                 "persona_id": s.persona_id,
                 "preset_id": s.preset_id,
+                "preset": presets.get(s.preset_id),
                 "background": bgs.get(s.id) or "",
                 **_preview_fields(s, previews),
                 # avatar_path нужен для аватарок реплик в групповом чате.
