@@ -2422,3 +2422,7 @@ input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
   padding: 4px 8px; border-radius: 999px; border: 1px solid var(--border-subtle); background: transparent;
   color: var(--text-secondary); font: inherit; font-size: var(--fs-100); cursor: pointer; }
 .addr-pick.on { color: var(--text-primary); background: var(--surface-selected); border-color: var(--accent-border, var(--border-subtle)); }
+
+/* Дневник персонажа (2.28.0) */
+.diary-text { white-space: pre-wrap; line-height: 1.5; margin-top: 6px; font-style: italic; }
+.diary-day textarea { width: 100%; margin: 6px 0; }

@@ -1008,7 +1008,7 @@ def _summary_tail(summary_recs, *, state_follows: bool = False,
 def _static_tail(character: dict, *, character_avatar, persona_avatar, send_avatars: bool,
                  web_access: bool, user_time: str, author_note: str,
                  post_history_instructions: str, global_instructions: str, ooc: bool,
-                 user_attachments_content) -> list[tuple[str, str]]:
+                 user_attachments_content, diary: str = "") -> list[tuple[str, str]]:
     """
     Конец хвоста — блоки, которые от обрезки истории не зависят: внешность,
     веб, время, заметка автора, якорь, post-history, глобальные инструкции и
@@ -1040,6 +1040,11 @@ def _static_tail(character: dict, *, character_avatar, persona_avatar, send_avat
     # Текущее время пользователя (часовой пояс — настройка чата).
     if user_time:
         blocks.append(("time", f"[Время пользователя] Сейчас у пользователя {user_time}."))
+
+    # Дневник персонажа и дела человека (backend/diary.py, 2.28.0): меняется
+    # каждый день — поэтому здесь, в хвосте, а не в начале запроса (кэш).
+    if diary and diary.strip():
+        blocks.append(("diary", diary.strip()))
 
     # Author's Note (заметка автора) — у самого конца.
     if author_note and author_note.strip():
@@ -1122,6 +1127,7 @@ def assemble_context(
     horae=None,
     user_memory: str = "",
     files_window: int | None = None,
+    diary: str = "",
 ) -> list[dict]:
     """
     ЧИСТАЯ функция сборки контекста. Возвращает messages для LiteLLM:
@@ -1276,7 +1282,7 @@ def assemble_context(
         send_avatars=send_avatars, web_access=web_access, user_time=user_time,
         author_note=author_note, post_history_instructions=post_history_instructions,
         global_instructions=global_instructions, ooc=ooc,
-        user_attachments_content=user_attachments_content,
+        user_attachments_content=user_attachments_content, diary=diary,
     )
     # Horae: блок состояния сюжета (и правила, если они в хвосте) — сразу
     # после мастер-снимка; напоминание формата — последним перед фокусом, в
@@ -1645,6 +1651,9 @@ async def build_context_from_db(
     from backend import user_memory as _user_memory
 
     about_user = await _user_memory.prompt_block(session_db, session)
+    from backend import diary as _diary
+
+    diary_block = await _diary.prompt_block(session_db, session)
     # База знаний чата (справочные файлы) — доступна модели в каждом ходе.
     from backend.knowledge import build_knowledge
 
@@ -1754,6 +1763,7 @@ async def build_context_from_db(
         horae=horae_parts,
         user_memory=about_user,
         files_window=resolve_files_window(params),
+        diary=diary_block,
     ))
 
 

@@ -99,6 +99,8 @@ class ChatSession(Base):
     # Часовой пояс пользователя ДЛЯ ЭТОГО чата (IANA-имя или смещение "+03:00").
     # Нейросеть видит по нему текущее время собеседника; настраивается в UI на чат.
     timezone: Mapped[str] = mapped_column(String(64), default="")
+    # Дневник (2.28.0): id последней реплики, уже разобранной в дневник.
+    diary_upto: Mapped[int] = mapped_column(Integer, default=0)
     # Общий чат (2.27.0): "auto" — персонаж отвечает, когда обращаются к нему
     # (решает backend/messenger.py), "always" — на каждую реплику, как раньше.
     reply_mode: Mapped[str] = mapped_column(String(16), default="auto")
@@ -435,6 +437,52 @@ class UserMemory(Base):
     # только если это другая фраза в другом чате (копия ветки — не повтор).
     sessions_seen: Mapped[list | None] = mapped_column(JSON, nullable=True)
     meta: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class DiaryDay(Base):
+    """
+    Дневник персонажа (2.28.0): запись об одном дне с человеком — от первого
+    лица персонажа, с его чувствами. Одна на (владелец, персонаж, день) — общая
+    для всех чатов человека с этим персонажем. day — местная дата "YYYY-MM-DD"
+    (по поясу чата). edited — человек правил запись: модель её дописывает, но
+    не переписывает заново (см. backend/diary.py).
+    """
+    __tablename__ = "diary_days"
+    __table_args__ = (UniqueConstraint("profile_key", "character_id", "day", name="uq_diary_day"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    profile_key: Mapped[str] = mapped_column(String(100), index=True)
+    character_id: Mapped[int] = mapped_column(Integer, index=True)
+    day: Mapped[str] = mapped_column(String(10))
+    mood: Mapped[str] = mapped_column(String(16), default="")
+    text: Mapped[str] = mapped_column(Text, default="")
+    edited: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class DiaryPlan(Base):
+    """
+    Дело или план человека с датой (2.28.0): «20.11 — сходить к врачу». Видно
+    всем его персонажам (или только тому, с кем говорил, — настройка), чтобы
+    напоминание дошло в любом чате. status: planned | done | cancelled.
+    reminded_on — местная дата, когда персонаж уже напомнил (не повторяться).
+    """
+    __tablename__ = "diary_plans"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    profile_key: Mapped[str] = mapped_column(String(100), index=True)
+    character_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    session_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    due: Mapped[str] = mapped_column(String(10))
+    time: Mapped[str] = mapped_column(String(5), default="")
+    text: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(16), default="planned")
+    source: Mapped[str] = mapped_column(String(16), default="auto")
+    quote: Mapped[str] = mapped_column(Text, default="")
+    reminded_on: Mapped[str] = mapped_column(String(10), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 

@@ -612,7 +612,7 @@ def idle_for() -> float:
 # готовящегося хода и прошло BG_QUIET_SECONDS тишины, и идут строго по одному.
 # Запросы, которые нужны самому ходу или нажатой кнопке, помечаются
 # foreground() и не ждут.
-_BACKGROUND_KINDS = frozenset({"summary", "horae", "profile"})
+_BACKGROUND_KINDS = frozenset({"summary", "horae", "profile", "diary"})
 _preparing = 0                 # ходы, для которых сейчас собирается контекст
 _bg_inflight = 0               # фоновых запросов к модели в полёте
 _foreground: ContextVar[bool] = ContextVar("llm_foreground", default=False)

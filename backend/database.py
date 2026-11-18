@@ -319,6 +319,7 @@ def _sqlite_add_missing_columns(sync_conn) -> None:
             "profile_root": "INTEGER DEFAULT 0",
             "preset_id": "INTEGER",
             "reply_mode": "VARCHAR(16) DEFAULT 'auto'",
+            "diary_upto": "INTEGER DEFAULT 0",
         },
         "messages": {
             "swipes": "JSON",
