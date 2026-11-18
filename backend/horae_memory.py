@@ -1216,9 +1216,6 @@ def assemble_context(
              "tokens": _w(part_user_memory), "text": part_user_memory},
             {"key": "horae", "label": "Память Horae (лор)",
              "tokens": _w(part_horae), "text": part_horae},
-            # В хвосте после истории, но видно здесь же — что знает персонаж.
-            {"key": "diary", "label": "Дневник персонажа и дела (в конце запроса)",
-             "tokens": _w(diary), "text": diary or ""},
             {"key": "guides", "label": "Инструкции поведения и стиля",
              "tokens": _w(part_behaviour) + _w(part_style),
              "text": part_behaviour + "\n\n" + part_style},

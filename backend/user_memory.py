@@ -620,6 +620,8 @@ async def skip_to_end(db, session_id: int) -> None:
         last = (await db.execute(select(func.max(models.Message.id)).where(
             models.Message.session_id == session_id))).scalar()
         sess.profile_upto = max(int(sess.profile_upto or 0), int(last or 0))
+        # Те же реплики (друга, админа, копии) — и не для дневника владельца (2.28.0).
+        sess.diary_upto = max(int(sess.diary_upto or 0), int(last or 0))
 
 
 async def mark_copied(db, session_id: int, source=None) -> None:
@@ -628,10 +630,7 @@ async def mark_copied(db, session_id: int, source=None) -> None:
     не новые слова человека. source — исходный чат: новое в копии считается
     тем же разговором и повтором «в другом чате» не будет.
     """
-    await skip_to_end(db, session_id)
-    from backend import diary   # копия — не новые дни для дневника (2.28.0)
-
-    await diary.skip_to_end(db, session_id)
+    await skip_to_end(db, session_id)   # двигает и указатель дневника
     sess = await db.get(models.ChatSession, session_id)
     if sess is not None and source is not None:
         sess.profile_root = conversation_of(source)

@@ -79,8 +79,8 @@ def _scan(client, sid, reply, seen=None):
 
 
 def _block(client, sid):
-    blocks = client.get(f"/api/sessions/{sid}/context").json().get("blocks") or []
-    return next((b["text"] for b in blocks if b["key"] == "diary"), "")
+    tail = client.get(f"/api/sessions/{sid}/context").json().get("tail") or []
+    return next((b["text"] for b in tail if b["key"] == "diary"), "")
 
 
 # ---------------------------------------------------------------- чистые функции
@@ -92,6 +92,9 @@ def test_when_label_and_mentions():
     assert diary.when_label("2026-11-18", "", today).endswith("(прошло)")
     assert diary.mentions("Не забудь, завтра стоматолог в шесть!", "сходить к стоматологу")
     assert not diary.mentions("Как прошёл день?", "сходить к стоматологу")
+    # Одно общее слово — не напоминание.
+    assert not diary.mentions("Давай сходим погулять!", "сходить к врачу")
+    assert diary.mentions("Не забудь: тебе завтра сходить к врачу", "сходить к врачу")
 
 
 def test_screen_plan_needs_quote_date_and_future():
@@ -164,7 +167,7 @@ def test_diary_flow(client, diary_on):
     assert "— сходить к стоматологу" not in _block(client, sid)
 
     # Другой персонаж: дела видны (по умолчанию), записи дней — нет.
-    client.post("/api/diary/plans", json={"due": tomorrow, "text": "позвонить маме"})
+    client.post("/api/diary/plans", json={"due": tomorrow, "text": "позвонить маме", "character_id": cid})
     cid2, sid2 = _chat(client, "Другая")
     other = _block(client, sid2)
     assert "позвонить маме" in other and "признался" not in other
@@ -211,3 +214,72 @@ def test_group_chat_has_no_diary(client, diary_on):
     b = client.post("/api/characters", json={"name": "ГрБ"}).json()["id"]
     gid = client.post("/api/groups", json={"name": "Г", "character_ids": [a, b]}).json()["session_id"]
     assert client.portal.call(functools.partial(diary.maybe_update, gid, force=True)) is None
+
+
+def test_review_fixes_pointer_manual_and_conflict(client, diary_on):
+    """Ручной режим копит реплики до кнопки; правка во время запроса не затирается."""
+    cid, sid = _chat(client, "Ручная")
+    client.put("/api/diary/settings", json={"auto": False})
+    try:
+        _say(client, sid, "сегодня был трудный день на работе, устал")
+        assert client.portal.call(functools.partial(diary.maybe_update, sid)) is None
+        today = datetime.now(timezone.utc).date().isoformat()
+        stats = _scan(client, sid, {"days": [{"day": today, "entry": "Он устал на работе. Я хотела его согреть."}]})
+        assert stats["days"] == 1   # «Записать сейчас» видит накопленное
+    finally:
+        client.put("/api/diary/settings", json={"auto": True})
+
+    # Пока модель думала, человек поправил запись — её не затираем, пакет повторим.
+    _say(client, sid, "а вечером посмотрел хороший фильм")
+    row = client.get(f"/api/diary?character_id={cid}").json()["days"][0]
+
+    async def edit_then_reply(*args, **kwargs):
+        messages = kwargs.get("messages") or []
+        if messages and "ЛИЧНЫЙ ДНЕВНИК" in str(messages[0].get("content")):
+            from backend.database import AsyncSessionLocal
+            from backend import models
+            async with AsyncSessionLocal() as db:
+                r = await db.get(models.DiaryDay, row["id"])
+                r.text, r.edited = "Моя правка дня.", True
+                await db.commit()
+            text = json.dumps({"days": [{"day": today, "entry": "Модель затёрла бы правку."}]}, ensure_ascii=False)
+        else:
+            text = "Ок."
+
+        async def gen():
+            yield _chunk(text)
+        return gen()
+
+    with patch("backend.llm_gateway.litellm.acompletion", new=edit_then_reply):
+        client.portal.call(functools.partial(diary.maybe_update, sid, force=True))
+    day = client.get(f"/api/diary?character_id={cid}").json()["days"][0]
+    assert day["text"] == "Моя правка дня."
+    # Указатель не сдвинут — следующий разбор видит правку с пометкой «сохрани».
+    seen = []
+    _scan(client, sid, {"days": [{"day": today, "entry": "Моя правка дня. А вечером — фильм."}]}, seen=seen)
+    assert "(поправлено человеком — сохрани): Моя правка дня." in seen[0][1][1]["content"]
+    assert "фильм" in seen[0][1][1]["content"]
+    assert client.get(f"/api/diary?character_id={cid}").json()["days"][0]["text"].endswith("фильм.")
+
+
+def test_backlog_is_processed_in_order(client, diary_on, monkeypatch):
+    """Хвост больше пакета не теряется: следующий разбор продолжает с указателя."""
+    monkeypatch.setattr(diary, "BATCH_MESSAGES", 4)
+    cid, sid = _chat(client, "Очередная")
+    _say(client, sid, "первая реплика про утро")
+    _scan(client, sid, {})                       # первый разбор: указатель в конец
+    for i in range(4):
+        _say(client, sid, f"реплика номер {i}")
+    seen = []
+    _scan(client, sid, {}, seen=seen)
+    _scan(client, sid, {}, seen=seen)
+    first, second = (s[1][1]["content"] for s in seen)
+    assert "реплика номер 0" in first and "реплика номер 1" in first and "реплика номер 2" not in first
+    assert "реплика номер 2" in second and "реплика номер 3" in second
+
+
+def test_parse_reply_skips_braces_before_json():
+    raw = 'Думаю {так}. Ответ: {"days": [], "plans": [{"due": "2030-01-01"}], "done": ["1", true]}'
+    out = diary.parse_reply(raw)
+    assert out["plans"] == [{"due": "2030-01-01"}]
+    assert [diary._as_index(x) for x in out["done"]] == [1, None]

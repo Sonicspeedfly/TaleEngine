@@ -35,7 +35,7 @@ import re
 import time
 from datetime import date, datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from backend import llm_gateway, models
 from backend.config import settings
@@ -83,7 +83,7 @@ DIARY_PROMPT = (
     '"plans": [{{"due": "YYYY-MM-DD", "time": "HH:MM или пусто", "text": "<дело>", "quote": "<цитата>"}}], '
     '"done": [<номер дела>], "cancel": [<номер дела>]}}\n\n'
     "ДНЕВНИК (days):\n"
-    "- день — только из дней переписки; запись — 3–7 предложений о дне: что {user} рассказывал "
+    "- день — только из дней переписки; запись — 3–7 предложений (до 1200 символов: насыщенный день — сожми прежнее, а не новое) о дне: что {user} рассказывал "
     "и делал, что между вами происходило, что было важным, как ты это восприняла(-л), что "
     "почувствовала(-л), о чём думаешь и чего ждёшь;\n"
     "- это дневник, а не протокол: без цитат реплик целиком, без перечисления по порядку, без "
@@ -183,10 +183,23 @@ def _clean(text, n: int) -> str:
     return text[:n].rstrip()
 
 
+def _clip_middle(text: str, n: int, head: int) -> str:
+    """Длинный текст — начало и КОНЕЦ (новое дописывается в конец), середина «…»."""
+    if len(text) <= n:
+        return text
+    a = text[:head]
+    cut = max(a.rfind(". "), a.rfind("! "), a.rfind("? "), a.rfind("\n"))
+    a = a[:cut + 1] if cut > head // 2 else a
+    b = text[-(n - len(a) - 3):]
+    m = re.search(r"(?<=[.!?…])\s+", b)
+    b = b[m.end():] if m and m.start() < len(b) // 3 else b
+    return a.rstrip() + " … " + b.lstrip()
+
+
 def _clean_entry(text) -> str:
     text = str(text or "").replace("\r", "").strip()
     text = re.sub(r"\n{3,}", "\n\n", text)
-    return text[:ENTRY_CHARS].rstrip()
+    return _clip_middle(text, ENTRY_CHARS, ENTRY_CHARS // 3)
 
 
 # ============================================================================
@@ -240,7 +253,16 @@ async def maybe_update(session_id: int, *, force: bool = False) -> dict | None:
     if not force and not schedule(session_id):
         return None
     if session_id in _running:
-        return None
+        if not force:
+            return None
+        # «Записать сейчас», а фоновый разбор этого чата ещё идёт — дождёмся
+        # его и разберём то, что осталось (раньше кнопка молча отвечала «нечего»).
+        for _ in range(300):
+            await asyncio.sleep(0.1)
+            if session_id not in _running:
+                break
+        else:
+            return None
     _running.add(session_id)
     try:
         return await _update(session_id, force)
@@ -293,13 +315,16 @@ def _lines(msgs, tzinfo, uname: str, cname: str) -> tuple[list[str], list[str], 
 def parse_reply(text: str) -> dict:
     out = {"days": [], "plans": [], "done": [], "cancel": []}
     raw = (text or "").strip()
-    m = re.search(r"\{.*\}", raw, re.S)
-    if not m:
-        return out
-    try:
-        data = json.loads(m.group(0))
-    except (ValueError, TypeError):
-        return out
+    dec = json.JSONDecoder()
+    data = None
+    for m in re.finditer(r"\{", raw):
+        try:
+            cand, _ = dec.raw_decode(raw, m.start())
+        except ValueError:
+            continue
+        if isinstance(cand, dict) and any(k in cand for k in out):
+            data = cand
+            break
     if not isinstance(data, dict):
         return out
     for k in out:
@@ -307,6 +332,15 @@ def parse_reply(text: str) -> dict:
         if isinstance(v, list):
             out[k] = v
     return out
+
+
+def _as_index(n) -> int | None:
+    if isinstance(n, bool):
+        return None
+    try:
+        return int(n)
+    except (TypeError, ValueError):
+        return None
 
 
 def screen_plan(item, today: date, user_norm: str, user_terms: set[str]) -> dict | None:
@@ -320,7 +354,7 @@ def screen_plan(item, today: date, user_norm: str, user_terms: set[str]) -> dict
         d = date.fromisoformat(due)
     except ValueError:
         return None
-    if d < today - timedelta(days=1) or d > today + timedelta(days=366):
+    if d < today or d > today + timedelta(days=366):
         return None
     text = _clean(item.get("text"), PLAN_CHARS)
     if len(text) < 3:
@@ -354,10 +388,12 @@ async def _update(session_id: int, force: bool) -> dict | None:
             return None
         pkey, char_id = who
         conf = await get_settings(db, pkey)
-        if not conf["enabled"] or not (conf["auto"] or force):
+        if not conf["enabled"]:
             await skip_to_end(db, session_id)
             await db.commit()
             return None
+        if not (conf["auto"] or force):
+            return None   # копится до «✍️ Записать сейчас»
         upto = int(sess.diary_upto or 0)
         msgs = (await db.execute(
             select(models.Message).where(models.Message.session_id == session_id,
@@ -372,15 +408,21 @@ async def _update(session_id: int, force: bool) -> dict | None:
         stale = oldest is not None and (datetime.utcnow() - oldest).total_seconds() >= FLUSH_AFTER
         if not force and len(msgs) < MIN_MESSAGES and chars < MIN_CHARS and not stale:
             return None
-        last_id = msgs[-1].id
         batch, used = [], 0
-        for m in reversed(msgs):
+        # Первый разбор давнего чата — только свежий хвост (старое не листаем);
+        # дальше — по порядку от указателя, чтобы ничего не пропустить.
+        order = list(reversed(msgs)) if upto == 0 else msgs
+        for m in order:
             size = min(len(m.content or ""), LINE_CHARS)
             if batch and (len(batch) >= BATCH_MESSAGES or used + size > BATCH_CHARS):
                 break
             batch.append(m)
             used += size
-        batch.reverse()
+        if upto == 0:
+            batch.reverse()
+            last_id = msgs[-1].id
+        else:
+            last_id = batch[-1].id
         tzinfo = tz_of(sess)
         today = today_of(sess)
         character = await db.get(models.Character, char_id)
@@ -392,10 +434,17 @@ async def _update(session_id: int, force: bool) -> dict | None:
                                           models.DiaryDay.character_id == char_id,
                                           models.DiaryDay.day.in_(days))
         )).scalars().all()}
+        # Какими записи были до запроса: пока модель думала, человек мог их
+        # поправить (или другой чат — дописать) — тогда не затираем.
+        seen_text = {d: r.text for d, r in existing.items()}
+        pq = select(models.DiaryPlan).where(
+            models.DiaryPlan.profile_key == pkey, models.DiaryPlan.status == "planned",
+            # Давно прошедшие незакрытые дела не вытесняют нынешние из списка.
+            models.DiaryPlan.due >= (today - timedelta(days=3)).isoformat())
+        if not conf["plans_shared"]:
+            pq = pq.where(or_(models.DiaryPlan.character_id == char_id, models.DiaryPlan.character_id.is_(None)))
         plans = (await db.execute(
-            select(models.DiaryPlan).where(models.DiaryPlan.profile_key == pkey,
-                                           models.DiaryPlan.status == "planned")
-            .order_by(models.DiaryPlan.due, models.DiaryPlan.id).limit(MAX_PLANS_LISTED)
+            pq.order_by(models.DiaryPlan.due, models.DiaryPlan.id).limit(MAX_PLANS_LISTED)
         )).scalars().all()
         plan_ids = [p.id for p in plans]
         card = ""
@@ -427,6 +476,7 @@ async def _update(session_id: int, force: bool) -> dict | None:
     user_norm, user_terms = _norm_key(user_text), terms(user_text)
     found = [p for p in (screen_plan(i, today, user_norm, user_terms) for i in parsed["plans"]) if p]
     stats = {"days": 0, "plans": 0, "done": 0, "cancelled": 0}
+    conflict = False
     lock = _locks.setdefault(pkey, asyncio.Lock())
     async with lock, AsyncSessionLocal() as db:
         sess = await db.get(models.ChatSession, session_id)
@@ -445,6 +495,9 @@ async def _update(session_id: int, force: bool) -> dict | None:
                     models.DiaryDay.profile_key == pkey, models.DiaryDay.character_id == char_id,
                     models.DiaryDay.day == day))).scalars().first()
                 mood = _clean(item.get("mood"), 8)
+                if (row.text if row is not None else None) != seen_text.get(day):
+                    conflict = True   # запись изменилась — разберём пакет ещё раз, уже с ней
+                    continue
                 if row is None:
                     db.add(models.DiaryDay(profile_key=pkey, character_id=char_id, day=day,
                                            mood=mood, text=entry))
@@ -466,13 +519,14 @@ async def _update(session_id: int, force: bool) -> dict | None:
                                         due=p["due"], time=p["time"], text=p["text"], quote=p["quote"]))
                 stats["plans"] += 1
             for field, status in (("done", "done"), ("cancel", "cancelled")):
-                for n in parsed[field]:
-                    if isinstance(n, int) and 1 <= n <= len(plan_ids):
+                for n in (_as_index(x) for x in parsed[field]):
+                    if n is not None and 1 <= n <= len(plan_ids):
                         plan = await db.get(models.DiaryPlan, plan_ids[n - 1])
                         if plan is not None and plan.status == "planned":
                             plan.status, plan.updated_at = status, datetime.utcnow()
                             stats["done" if status == "done" else "cancelled"] += 1
-        sess.diary_upto = max(int(sess.diary_upto or 0), last_id)
+        if not conflict:
+            sess.diary_upto = max(int(sess.diary_upto or 0), last_id)
         await db.commit()
     _failed_at.pop(session_id, None)
     if any(stats.values()):
@@ -488,8 +542,22 @@ def mentions(reply: str, plan_text: str) -> bool:
     pt = terms(plan_text)
     if not pt:
         return False
-    hit = len(pt & terms(reply))
-    return hit >= max(1, (len(pt) + 1) // 2)
+    rt = terms(reply)
+    hit = len(pt & rt)
+    if hit >= max(2, (len(pt) * 2 + 2) // 3) or (len(pt) == 1 and hit):
+        return True
+    # Одно общее слово («сходим погулять» и «сходить к врачу») — не напоминание,
+    # а самое длинное (обычно суть дела: «стоматолог», «отчёт») — да.
+    key = max(pt, key=len)
+    return len(key) >= 5 and key in rt
+
+
+def _near(p, today: date) -> bool:
+    """Дело, о котором уместно напоминать: на сегодня, завтра или вчерашнее."""
+    try:
+        return abs((date.fromisoformat(p.due) - today).days) <= 1
+    except ValueError:
+        return False
 
 
 async def note_reminders(session_id: int) -> int:
@@ -510,7 +578,7 @@ async def note_reminders(session_id: int) -> int:
         plans = await _visible_plans(db, pkey, char_id, today, await get_settings(db, pkey))
         n = 0
         for p in plans:
-            if p.reminded_on != today.isoformat() and mentions(last.content, p.text):
+            if p.reminded_on != today.isoformat() and _near(p, today) and mentions(last.content, p.text):
                 p.reminded_on = today.isoformat()
                 n += 1
         if n:
@@ -528,13 +596,13 @@ async def _visible_plans(db, pkey: str, char_id: int | None, today: date, conf: 
         models.DiaryPlan.due <= (today + timedelta(days=PLANS_AHEAD)).isoformat(),
     )
     if not conf.get("plans_shared", True) and char_id is not None:
-        q = q.where(models.DiaryPlan.character_id == char_id)
+        q = q.where(or_(models.DiaryPlan.character_id == char_id, models.DiaryPlan.character_id.is_(None)))
     return list((await db.execute(
         q.order_by(models.DiaryPlan.due, models.DiaryPlan.time, models.DiaryPlan.id).limit(PLANS_MAX)
     )).scalars().all())
 
 
-def render(days: list, plans: list, today: date) -> str:
+def render(days: list, plans: list, today: date, reminded: set | frozenset = frozenset()) -> str:
     parts = []
     if days:
         parts.append(BLOCK_HEADER)
@@ -544,14 +612,14 @@ def render(days: list, plans: list, today: date) -> str:
                 head = "Сегодня" if d == today else ("Вчера" if (today - d).days == 1 else fmt_day(d))
             except ValueError:
                 head = r.day
-            text = r.text if len(r.text) <= BLOCK_DAY_CHARS else r.text[:BLOCK_DAY_CHARS - 1].rstrip() + "…"
+            text = _clip_middle(r.text, BLOCK_DAY_CHARS, BLOCK_DAY_CHARS // 3)
             parts.append(f"{head}{(' ' + r.mood) if r.mood else ''}: {text}")
     if plans:
         if parts:
             parts.append("")
         parts.append(PLANS_HEADER + f" Сегодня {_RU_WEEKDAYS[today.weekday()]}, {today.strftime('%d.%m.%Y')}.")
         for p in plans:
-            mark = " (уже напомнил сегодня)" if p.reminded_on == today.isoformat() else ""
+            mark = " (уже напомнил сегодня)" if p.reminded_on == today.isoformat() or p.id in reminded else ""
             parts.append(f"- {when_label(p.due, p.time, today)} — {p.text}{mark}")
         parts.append(PLANS_HINT)
     return "\n".join(parts)
@@ -578,6 +646,18 @@ async def prompt_block(db, sess) -> str:
         )).scalars().all())
         days.reverse()
         plans = await _visible_plans(db, pkey, char_id, today, conf)
+        if any(_near(p, today) and p.reminded_on != today.isoformat() for p in plans):
+            # Ход не отметил напоминание сам (Telegram не зовёт after_turn): если
+            # последний ответ в этом чате уже упомянул дело — «уже напомнил».
+            last = (await db.execute(
+                select(models.Message.role, models.Message.content)
+                .where(models.Message.session_id == sess.id)
+                .order_by(models.Message.id.desc()).limit(2)
+            )).all()
+            said = " ".join(c or "" for r, c in last if r == "assistant")
+            if said:
+                reminded = {p.id for p in plans if _near(p, today) and mentions(said, p.text)}
+                return render(days, plans, today, reminded)
         return render(days, plans, today)
     except Exception:  # noqa: BLE001 — сбой дневника не роняет ход
         logger.exception("Дневник: не удалось собрать блок (чат %s)", getattr(sess, "id", None))
@@ -616,6 +696,12 @@ def build_router(current_user):
         if user is None and admin_service.security_cache().get("accounts_enabled"):
             raise HTTPException(401, "Требуется вход")
         return key_for_user(user)
+
+    async def _check_character(db, user, cid: int) -> None:
+        """Чужого приватного персонажа к своему дневнику не привязать (и имени его не узнать)."""
+        ch = await db.get(models.Character, cid)
+        if ch is None or not (user is None or user.role == "admin" or ch.owner_id in (None, user.id)):
+            raise HTTPException(404, "Персонаж не найден")
 
     async def _own_day(db, pkey, day_id):
         r = await db.get(models.DiaryDay, day_id)
@@ -659,7 +745,7 @@ def build_router(current_user):
             if sess is not None and key_for_session(sess) == pkey:
                 active = await owner_of(db, sess) is not None
                 block = await prompt_block(db, sess)
-        return {"settings": conf, "enabled": settings.DIARY, "chat_active": active,
+        return {"settings": conf, "enabled": settings.DIARY, "chat_active": active and settings.DIARY,
                 "characters": [{"id": c, "name": chars.get(c, "?"), "days": n} for c, n in counts.items()],
                 "days": days, "plans": plans, "block": block}
 
@@ -682,6 +768,7 @@ def build_router(current_user):
             cid = 0
         if not _DATE_RE.match(day) or not text or not cid:
             raise HTTPException(422, "Нужны персонаж, дата и текст")
+        await _check_character(db, user, cid)
         row = (await db.execute(select(models.DiaryDay).where(
             models.DiaryDay.profile_key == pkey, models.DiaryDay.character_id == cid,
             models.DiaryDay.day == day))).scalars().first()
@@ -745,6 +832,8 @@ def build_router(current_user):
                        db: AsyncSession = Depends(get_session)):
         fields = _plan_fields(payload, partial=False)
         cid = payload.get("character_id")
+        if isinstance(cid, int):
+            await _check_character(db, user, cid)
         p = models.DiaryPlan(profile_key=_pkey(user), source="manual",
                              character_id=int(cid) if isinstance(cid, int) else None, **fields)
         db.add(p)
@@ -777,6 +866,8 @@ def build_router(current_user):
         sess = await db.get(models.ChatSession, session_id)
         if sess is None or key_for_session(sess) != pkey:
             raise HTTPException(404, "Чат не найден")
+        if not settings.DIARY:
+            raise HTTPException(409, "Дневник выключен на сервере")
         if await owner_of(db, sess) is None:
             raise HTTPException(409, "В общих и групповых чатах дневник не ведётся")
         await db.close()

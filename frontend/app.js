@@ -10458,7 +10458,7 @@ createApp({
             </div>
             <div class="ins-block ins-static">
               <span class="ins-dot seg-tail" aria-hidden="true"></span>
-              <span class="grow">Хвост: память, заметка автора, якорь характера</span>
+              <span class="grow">Хвост: память, дневник, заметка автора, якорь характера</span>
               <span class="ins-w">{{ ctxStats.tail_tokens }}</span>
             </div>
           </details>
