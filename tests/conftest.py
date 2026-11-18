@@ -38,6 +38,7 @@ os.environ.setdefault("MEDIA_REFS", "0")
 # Память о пользователе разбирает реплики фоновым запросом к модели после хода:
 # подменные модели тестов получили бы лишний вызов. Её тесты включают явно.
 os.environ.setdefault("USER_MEMORY", "0")
+os.environ.setdefault("DIARY", "0")
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402

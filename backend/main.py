@@ -54,6 +54,7 @@ from backend import (
     accounts,
     admin_service,
     debug_log,
+    diary,
     drafts,
     gcp_billing,
     group_chat,
@@ -611,6 +612,9 @@ def _make_persist_new(model_used: str):
         _spawn_bg(horae_tasks.after_turn(session_id, [message_id]))
         if user_memory.schedule(session_id):
             _spawn_bg(user_memory.maybe_update(session_id))
+        # Дневник персонажа (2.28.0): напоминание в ответе и разбор дня — фоном.
+        if settings.DIARY:
+            _spawn_bg(diary.after_turn(session_id))
         return message_id
 
     return cb
@@ -5566,6 +5570,7 @@ def _localize_cdn(html: str, vendor: set[str]) -> str:
 # перехватил бы их пути.
 app.include_router(horae_api.build_router(current_user, _can_access_session))
 app.include_router(user_memory.build_router(current_user))
+app.include_router(diary.build_router(current_user))
 
 
 if _frontend_dir.exists():

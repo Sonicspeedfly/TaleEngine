@@ -164,7 +164,7 @@ createApp({
       // Вкладка «Память» — панель Хроники из horae.js; свои разделы (сжатие
       // истории, лорбук) app.js рисует в её слотах. memoryTabReq — переход на
       // раздел извне ({ tab, n }, см. openMemory).
-      memoryExtraTabs: [["compress", "Сжатие истории"], ["lore", "Лорбук"], ["about", "Обо мне"]],
+      memoryExtraTabs: [["compress", "Сжатие истории"], ["lore", "Лорбук"], ["about", "Обо мне"], ["diary", "Дневник"]],
       memoryTabReq: null,
       // Глобальный summary_enabled Хроники (GET /horae/settings): вместе с
       // autoSummary он задаёт, чем по умолчанию сжимается история (memoryEngine).
@@ -234,6 +234,15 @@ createApp({
       // (Telegram без аккаунтов) — ими больше некому управлять.
       userMemProfile: "",
       userMemProfiles: [],
+      // «Дневник» (2.28.0): записи персонажа о днях с вами и ваши дела с датами.
+      diary: null,
+      diaryError: "",
+      diaryChar: null,          // чей дневник открыт (id персонажа)
+      diaryEdit: { id: null, text: "", mood: "" },
+      diaryPlanEdit: { id: null, due: "", time: "", text: "" },
+      diaryNewPlan: { due: "", time: "", text: "" },
+      diaryShowDone: false,
+      diaryRunning: false,
       // Мастер-снимок: каждые summaryEvery сообщений ИИ дописывает в него то,
       // что вышло из окна. Ложь — снимок не обновляется (см. memoryEngine).
       autoSummary: true,
@@ -584,6 +593,27 @@ createApp({
       if (Number(n) < 0) return "весь чат";
       if (Number(n) === 0) return "только текущее сообщение";
       return n + " " + this.plural(Number(n), "сообщение", "сообщения", "сообщений");
+    },
+    // «Дневник»: персонаж открытого чата (в общем и групповом дневника нет).
+    diaryChatChar() {
+      if (this.sharedView || this.currentIsGroup) return null;
+      const r = this.chatRow;
+      return (r && r.character_id) || (this.selectedCharacter && this.selectedCharacter.id) || null;
+    },
+    diaryCharOptions() {
+      const out = [...((this.diary && this.diary.characters) || [])];
+      const cur = this.diaryChatChar;
+      if (cur && !out.some((c) => c.id === cur)) {
+        const ch = this.characters.find((c) => c.id === cur);
+        out.unshift({ id: cur, name: (ch && ch.name) || (this.chatRow && this.chatRow.character_name) || "Персонаж", days: 0 });
+      }
+      return out;
+    },
+    diaryPlansOpen() {
+      return ((this.diary && this.diary.plans) || []).filter((p) => p.status === "planned");
+    },
+    diaryPlansClosed() {
+      return ((this.diary && this.diary.plans) || []).filter((p) => p.status !== "planned");
     },
     // «Обо мне»: действующие сведения и кандидаты, ждущие подтверждения.
     userMemActive() {
@@ -6535,6 +6565,118 @@ createApp({
         try { this.userMemProfiles = await this.api("/user-memory/profiles"); } catch (e) { this.userMemProfiles = []; }
       }
     },
+    // ---------- «Дневник» (2.28.0) ----------
+    async loadDiary() {
+      if (this.diaryChar == null) this.diaryChar = this.diaryChatChar;
+      const q = [];
+      if (this.diaryChar) q.push("character_id=" + this.diaryChar);
+      if (this.sessionId) q.push("session_id=" + this.sessionId);
+      try {
+        const data = await this.api("/diary" + (q.length ? "?" + q.join("&") : ""));
+        this.diary = data;
+        this.diaryError = "";
+        if (!this.diaryChar && data.characters && data.characters.length) {
+          this.diaryChar = data.characters[0].id;
+          return this.loadDiary();
+        }
+      } catch (e) {
+        this.diaryError = e.message || "нет связи";
+      }
+    },
+    pickDiaryChar(id) {
+      this.diaryChar = Number(id) || null;
+      this.diaryEdit = { id: null, text: "", mood: "" };
+      this.loadDiary();
+    },
+    async _diaryCall(path, opts, okText) {
+      let ok = true;
+      try {
+        await this.api("/diary" + path, opts);
+        if (okText) this.showToast(okText);
+      } catch (e) {
+        ok = false;
+        this.showToast("Дневник: " + e.message);
+      }
+      await this.loadDiary();
+      this.loadCtxStats();
+      return ok;
+    },
+    async saveDiarySettings(key, ev) {
+      const want = ev.target.checked;
+      if (!(await this._diaryCall("/settings", { method: "PUT", body: JSON.stringify({ [key]: want }) }))) {
+        ev.target.checked = !want;
+      }
+    },
+    async diaryRunNow() {
+      if (!this.sessionId || this.diaryRunning) return;
+      this.diaryRunning = true;
+      try {
+        const r = await this.api("/diary/run?session_id=" + this.sessionId, { method: "POST" });
+        const s = (r && r.stats) || {};
+        this.showToast((s.days || s.plans || s.done)
+          ? "✍️ Записано: дней " + (s.days || 0) + ", новых дел " + (s.plans || 0)
+          : "Новых событий для дневника нет");
+      } catch (e) {
+        this.showToast("Дневник: " + e.message);
+      } finally {
+        this.diaryRunning = false;
+      }
+      this.diaryChar = this.diaryChatChar || this.diaryChar;
+      await this.loadDiary();
+    },
+    diaryDayTitle(d) {
+      const p = (d.day || "").split("-");
+      return (p.length === 3 ? p[2] + "." + p[1] + "." + p[0] : d.day) + (d.weekday ? ", " + d.weekday : "");
+    },
+    diaryPlanWhen(p) {
+      const parts = (p.due || "").split("-");
+      let s = parts.length === 3 ? parts[2] + "." + parts[1] : p.due;
+      const today = new Date();
+      const iso = (dt) => dt.getFullYear() + "-" + String(dt.getMonth() + 1).padStart(2, "0") + "-" + String(dt.getDate()).padStart(2, "0");
+      const tm = new Date(today.getTime() + 86400000);
+      if (p.due === iso(today)) s = "сегодня";
+      else if (p.due === iso(tm)) s = "завтра";
+      return s + (p.time ? " " + p.time : "");
+    },
+    diaryCharName(id) {
+      const c = this.characters.find((x) => x.id === id) || ((this.diary && this.diary.characters) || []).find((x) => x.id === id);
+      return c ? c.name : "";
+    },
+    startEditDiaryDay(d) { this.diaryEdit = { id: d.id, text: d.text, mood: d.mood || "" }; },
+    async saveDiaryDay() {
+      const e = this.diaryEdit;
+      if (!e.id) return;
+      if (await this._diaryCall("/days/" + e.id, { method: "PATCH", body: JSON.stringify({ text: e.text, mood: e.mood }) }, "Запись сохранена")) {
+        this.diaryEdit = { id: null, text: "", mood: "" };
+      }
+    },
+    async deleteDiaryDay(d) {
+      const ok = await this.askConfirm("Удалить запись дневника за " + this.diaryDayTitle(d) + "?", { title: "Дневник", okText: "Удалить" });
+      if (ok) await this._diaryCall("/days/" + d.id, { method: "DELETE" });
+    },
+    async addDiaryPlan() {
+      const n = this.diaryNewPlan;
+      if (!n.due || !n.text.trim()) { this.showToast("Укажите дату и что сделать"); return; }
+      const body = { due: n.due, time: n.time || "", text: n.text.trim(), character_id: this.diaryChatChar || undefined };
+      if (await this._diaryCall("/plans", { method: "POST", body: JSON.stringify(body) }, "Дело добавлено")) {
+        this.diaryNewPlan = { due: "", time: "", text: "" };
+      }
+    },
+    setDiaryPlan(p, status) {
+      return this._diaryCall("/plans/" + p.id, { method: "PATCH", body: JSON.stringify({ status }) },
+        status === "done" ? "✓ Сделано" : status === "cancelled" ? "Дело отменено" : "Дело снова в планах");
+    },
+    startEditDiaryPlan(p) { this.diaryPlanEdit = { id: p.id, due: p.due, time: p.time || "", text: p.text }; },
+    async saveDiaryPlan() {
+      const e = this.diaryPlanEdit;
+      if (!e.id) return;
+      if (await this._diaryCall("/plans/" + e.id, { method: "PATCH", body: JSON.stringify({ due: e.due, time: e.time, text: e.text }) }, "Дело сохранено")) {
+        this.diaryPlanEdit = { id: null, due: "", time: "", text: "" };
+      }
+    },
+    async deleteDiaryPlan(p) {
+      await this._diaryCall("/plans/" + p.id, { method: "DELETE" });
+    },
     async switchUserMemProfile(key) {
       this.userMemProfile = key;
       // Список прежнего профиля не показываем под новым: действия ушли бы не туда.
@@ -7737,6 +7879,8 @@ createApp({
         this.loadCtxStats();
         this.loadHoraeGlobal();
         this.loadUserMemory();
+        this.diaryChar = null;   // по умолчанию — дневник персонажа открытого чата
+        this.loadDiary();
       }
       if (tab === "generation") {
         this.loadMediaStatus();
@@ -9625,6 +9769,107 @@ createApp({
                 <div class="row" style="margin-top:8px" v-if="userMem.items.length">
                   <button class="btn-danger" @click="clearUserMem">Стереть всё о себе</button>
                 </div>
+              </template>
+            </template>
+            <template #diary>
+              <p class="muted">Личный дневник персонажа о днях с вами — <b>от его лица</b>, с чувствами: что вы рассказывали
+                и делали, как он это увидел. Один на все ваши чаты с этим персонажем. А ещё — <b>ваши дела с датами</b>
+                («завтра к врачу»): о них персонаж к месту напомнит, в каком бы чате вы ни были. Всё можно поправить.</p>
+              <p v-if="diaryError" class="field-hint danger-text">Не удалось загрузить: {{ diaryError }}
+                <button class="btn-icon" @click="loadDiary" aria-label="Повторить загрузку">↻</button></p>
+              <p v-if="!diary && !diaryError" class="muted">Загружаю…</p>
+              <template v-if="diary">
+                <p v-if="!diary.enabled" class="field-hint">Дневник выключен на сервере (DIARY=0).</p>
+                <div class="card">
+                  <label class="check"><input type="checkbox" :checked="diary.settings.enabled"
+                    @change="saveDiarySettings('enabled', $event)" /> Вести дневник и помнить дела</label>
+                  <label class="check"><input type="checkbox" :checked="diary.settings.auto"
+                    @change="saveDiarySettings('auto', $event)" /> Записывать самому по ходу разговора</label>
+                  <label class="check"><input type="checkbox" :checked="diary.settings.plans_shared"
+                    @change="saveDiarySettings('plans_shared', $event)" /> Мои дела знают все персонажи</label>
+                  <p class="field-hint">Записи дня — у каждого персонажа свои. Дела — общие (или только у того, с кем вы
+                    о них говорили). Пишет фоном модель памяти; общие и групповые чаты дневник не ведут.</p>
+                  <div class="row" v-if="diary.chat_active">
+                    <button @click="diaryRunNow" :disabled="diaryRunning">{{ diaryRunning ? '✍️ Пишу…' : '✍️ Записать сейчас' }}</button>
+                    <span class="field-hint">Не ждать, пока наберётся разговор: разобрать новое в этом чате.</span>
+                  </div>
+                </div>
+
+                <h4>📅 Мои дела</h4>
+                <p v-if="!diaryPlansOpen.length" class="muted">Пока ничего. Скажите в чате «завтра мне к стоматологу» — или добавьте сами.</p>
+                <div class="card diary-plan" v-for="p in diaryPlansOpen" :key="'dp' + p.id">
+                  <div v-if="diaryPlanEdit.id === p.id" class="row">
+                    <input type="date" v-model="diaryPlanEdit.due" aria-label="Дата" />
+                    <input type="time" v-model="diaryPlanEdit.time" aria-label="Время" style="max-width:110px" />
+                    <input v-model="diaryPlanEdit.text" @keydown.enter="saveDiaryPlan" aria-label="Что сделать" />
+                    <button class="btn-primary" @click="saveDiaryPlan">Сохранить</button>
+                    <button @click="diaryPlanEdit = { id: null, due: '', time: '', text: '' }">Отмена</button>
+                  </div>
+                  <div v-else class="row-between">
+                    <span><span class="tag">{{ diaryPlanWhen(p) }}</span> {{ p.text }}
+                      <span v-if="p.reminded_on" class="muted" style="font-size:12px" :title="'Напомнил ' + p.reminded_on">· 🔔</span></span>
+                    <span style="display:inline-flex; gap:4px">
+                      <button class="btn-icon" @click="setDiaryPlan(p, 'done')" :aria-label="'Сделано: ' + p.text" title="Сделано">✓</button>
+                      <button class="btn-icon" @click="startEditDiaryPlan(p)" :aria-label="'Изменить: ' + p.text">✎</button>
+                      <button class="btn-danger" @click="setDiaryPlan(p, 'cancelled')" :aria-label="'Отменить: ' + p.text" title="Отменить">✕</button>
+                    </span>
+                  </div>
+                  <div v-if="p.quote && diaryPlanEdit.id !== p.id" class="muted" style="font-size:12px">«{{ p.quote }}»<template v-if="diaryCharName(p.character_id)"> — в чате с {{ diaryCharName(p.character_id) }}</template></div>
+                </div>
+                <div class="card">
+                  <div class="row">
+                    <input type="date" v-model="diaryNewPlan.due" aria-label="Дата дела" />
+                    <input type="time" v-model="diaryNewPlan.time" aria-label="Время (необязательно)" style="max-width:110px" />
+                    <input v-model="diaryNewPlan.text" @keydown.enter="addDiaryPlan" placeholder="Например: сходить к врачу" aria-label="Что сделать" />
+                    <button class="btn-primary" @click="addDiaryPlan">Добавить</button>
+                  </div>
+                </div>
+                <details v-if="diaryPlansClosed.length" :open="diaryShowDone" @toggle="diaryShowDone = $event.target.open">
+                  <summary class="muted">Сделанные и отменённые ({{ diaryPlansClosed.length }})</summary>
+                  <div class="card muted" v-for="p in diaryPlansClosed" :key="'dpc' + p.id">
+                    <div class="row-between">
+                      <span>{{ p.status === 'done' ? '✓' : '✕' }} <span class="tag">{{ diaryPlanWhen(p) }}</span> {{ p.text }}</span>
+                      <span style="display:inline-flex; gap:4px">
+                        <button class="btn-icon" @click="setDiaryPlan(p, 'planned')" :aria-label="'Вернуть в планы: ' + p.text" title="Вернуть в планы">↺</button>
+                        <button class="btn-danger" @click="deleteDiaryPlan(p)" :aria-label="'Удалить: ' + p.text">🗑</button>
+                      </span>
+                    </div>
+                  </div>
+                </details>
+
+                <h4>📔 Дневник персонажа</h4>
+                <div class="row" v-if="diaryCharOptions.length">
+                  <label>Чей дневник
+                    <select :value="diaryChar" @change="pickDiaryChar($event.target.value)">
+                      <option v-for="c in diaryCharOptions" :key="'dc' + c.id" :value="c.id">{{ c.name }}<template v-if="c.days"> ({{ c.days }})</template></option>
+                    </select>
+                  </label>
+                </div>
+                <p v-if="!diary.days.length" class="muted">Записей пока нет — они появятся, когда вы поговорите
+                  (или нажмите «✍️ Записать сейчас»).</p>
+                <div class="card diary-day" v-for="d in diary.days" :key="'dd' + d.id">
+                  <div class="row-between">
+                    <b>{{ d.mood }} {{ diaryDayTitle(d) }}</b>
+                    <span style="display:inline-flex; gap:4px; align-items:center">
+                      <span v-if="d.edited" class="muted" style="font-size:12px" title="Вы правили эту запись — персонаж её дописывает, но не переписывает">✎ поправлено</span>
+                      <button v-if="diaryEdit.id !== d.id" class="btn-icon" @click="startEditDiaryDay(d)" :aria-label="'Изменить запись за ' + diaryDayTitle(d)">✎</button>
+                      <button class="btn-danger" @click="deleteDiaryDay(d)" :aria-label="'Удалить запись за ' + diaryDayTitle(d)">🗑</button>
+                    </span>
+                  </div>
+                  <template v-if="diaryEdit.id === d.id">
+                    <div class="row"><input v-model="diaryEdit.mood" placeholder="😊" aria-label="Настроение (эмодзи)" style="max-width:70px" /></div>
+                    <textarea v-model="diaryEdit.text" rows="6" aria-label="Текст записи"></textarea>
+                    <div class="row">
+                      <button class="btn-primary" @click="saveDiaryDay">Сохранить</button>
+                      <button @click="diaryEdit = { id: null, text: '', mood: '' }">Отмена</button>
+                    </div>
+                  </template>
+                  <div v-else class="diary-text">{{ d.text }}</div>
+                </div>
+                <details v-if="diary.block" class="mem-snapshot">
+                  <summary>Как это видит модель в этом чате</summary>
+                  <div class="muted mem-snapshot-text">{{ diary.block }}</div>
+                </details>
               </template>
             </template>
           </horae-panel>

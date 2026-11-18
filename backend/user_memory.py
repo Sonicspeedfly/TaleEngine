@@ -629,6 +629,9 @@ async def mark_copied(db, session_id: int, source=None) -> None:
     тем же разговором и повтором «в другом чате» не будет.
     """
     await skip_to_end(db, session_id)
+    from backend import diary   # копия — не новые дни для дневника (2.28.0)
+
+    await diary.skip_to_end(db, session_id)
     sess = await db.get(models.ChatSession, session_id)
     if sess is not None and source is not None:
         sess.profile_root = conversation_of(source)
@@ -640,12 +643,14 @@ async def clamp_pointer(db, session_id: int) -> None:
     отдаёт их id новым сообщениям, и те сошли бы за уже разобранные.
     """
     sess = await db.get(models.ChatSession, session_id)
-    if sess is None or not sess.profile_upto:
+    if sess is None or not (sess.profile_upto or getattr(sess, "diary_upto", 0)):
         return
     top = (await db.execute(select(func.max(models.Message.id)).where(
         models.Message.session_id == session_id))).scalar() or 0
-    if sess.profile_upto > top:
+    if (sess.profile_upto or 0) > top:
         sess.profile_upto = int(top)
+    if (sess.diary_upto or 0) > top:   # указатель дневника — так же (2.28.0)
+        sess.diary_upto = int(top)
 
 
 # ============================================================================
