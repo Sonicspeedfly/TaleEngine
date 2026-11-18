@@ -536,6 +536,19 @@ createApp({
       authPassword2: "",
       authPassShown: false,   // показать пароль текстом — обе строки разом
       friends: [],
+      // «Люди» (2.29.0): личная переписка с друзьями и пересылка реплик.
+      peopleOpen: false,
+      dmThreads: [],
+      dmUnread: 0,
+      dmWith: null,             // {id, name, avatar} — с кем открыта переписка
+      dmMessages: [],
+      dmMore: false,
+      dmInput: "",
+      dmSending: false,
+      dmLoading: false,
+      forwardMsg: null,         // реплика, которую пересылаем
+      forwardTo: null,          // id друга
+      forwardNote: "",
       friendsIncoming: [],
       newFriendName: "",
       inviteOpen: false,    // модалка приглашения друзей в чат
@@ -2258,6 +2271,144 @@ createApp({
     // Открыть чат и доехать до конкретной реплики. История грузится окнами,
     // поэтому нужное сообщение может быть ещё не загружено: догружаем порциями,
     // как это делает scrollToChatStart, с тем же предохранителем.
+    // ---------- Ссылка на сообщение и «Люди» (2.29.0) ----------
+    messageLink(m) {
+      return location.origin + location.pathname + "#msg=" + this.sessionId + "-" + m.id;
+    },
+    async copyMessageLink(m) {
+      const url = this.messageLink(m);
+      try {
+        await navigator.clipboard.writeText(url);
+        this.showToast("🔗 Ссылка на сообщение скопирована");
+      } catch (e) {
+        // Без доступа к буферу (http, старый браузер) — показываем, чтобы скопировать руками.
+        window.prompt("Ссылка на сообщение:", url);
+      }
+    },
+    _parseMsgLink(hash) {
+      const mm = /^#msg=(\d+)-(\d+)$/.exec(hash || location.hash || "");
+      return mm ? { sid: Number(mm[1]), mid: Number(mm[2]) } : null;
+    },
+    // Открыть чат по ссылке и доехать до сообщения: свой, групповой или общий
+    // (открытый мне другом). Нет доступа — сервер скажет, покажем тост.
+    async openMessageLink(sid, mid) {
+      if (!sid || !mid) return;
+      if (location.hash.startsWith("#msg=")) history.replaceState(null, "", location.pathname + location.search);
+      // Чат должен быть в моих списках: свой, группа или открытый мне. Не нашли —
+      // перечитываем списки (чат могли открыть мне только что); всё равно нет —
+      // доступа нет, и чат не открываем: иначе экран остался бы на пустом чужом
+      // чате, а «последний чат» и пояс записались бы ему.
+      const known = () => this.sessions.some((x) => x.id === sid) || this.allSessions.some((x) => x.id === sid)
+        || this.groups.some((x) => x.id === sid) || this.sharedSessions.some((x) => x.id === sid);
+      if (!known()) {
+        await Promise.all([this.loadAllSessions(), this.loadSharedSessions(), this.loadGroups().catch(() => {})]);
+      }
+      if (!known() && !this.isAdmin) { this.showToast("Нет доступа к этому чату"); return; }
+      this.peopleOpen = false;
+      try {
+        if (sid !== this.sessionId) await this._openById(sid);
+        if (this.sessionId !== sid) return;
+        await this.jumpToMessage(sid, mid);
+        if (!this.messages.some((m) => m.id === mid)) this.showToast("Сообщение не найдено — возможно, его удалили");
+      } catch (e) {
+        this.showToast("Не удалось открыть сообщение: " + (e.message || e));
+      }
+    },
+    async loadDmThreads() {
+      if (!this.currentUserObj) return;
+      try {
+        const r = await this.api("/dm");
+        this.dmThreads = r.threads || [];
+        this.dmUnread = r.unread || 0;
+      } catch (e) { /* нет аккаунтов или связи — раздел просто пуст */ }
+    },
+    async openPeople(user) {
+      this.peopleOpen = true;
+      await this.loadDmThreads();
+      if (user) await this.openDm(user);
+    },
+    closePeople() { this.peopleOpen = false; this.dmWith = null; },
+    async openDm(user) {
+      this.dmWith = user;
+      this.dmMessages = [];
+      this.dmInput = "";
+      await this.loadDm(false);
+      this.loadDmThreads();
+    },
+    async loadDm(older) {
+      const u = this.dmWith;
+      if (!u || (older && this.dmLoading)) return;
+      this.dmLoading = true;
+      const first = this.dmMessages[0];
+      const q = older && first ? "?before=" + first.id : "";
+      try {
+        const r = await this.api("/dm/" + u.id + q);
+        if (!this.dmWith || this.dmWith.id !== u.id) return;
+        const have = new Set(this.dmMessages.map((x) => x.id));
+        this.dmMessages = older ? [...(r.messages || []).filter((x) => !have.has(x.id)), ...this.dmMessages]
+          : (r.messages || []);
+        this.dmMore = !!r.more;
+        if (!older) this.$nextTick(() => { const b = this.$refs.dmBox; if (b) b.scrollTop = b.scrollHeight; });
+      } catch (e) {
+        this.showToast("Переписка: " + (e.message || e));
+      } finally {
+        this.dmLoading = false;
+      }
+    },
+    async sendDm() {
+      const text = this.dmInput.trim();
+      if (!text || !this.dmWith || this.dmSending) return;
+      this.dmSending = true;
+      try {
+        const d = await this.api("/dm/" + this.dmWith.id, { method: "POST", body: JSON.stringify({ content: text }) });
+        this.dmInput = "";
+        if (!this.dmMessages.some((x) => x.id === d.id)) this.dmMessages.push(d);
+        this.$nextTick(() => { const b = this.$refs.dmBox; if (b) b.scrollTop = b.scrollHeight; });
+      } catch (e) {
+        this.showToast("Не отправилось: " + (e.message || e));
+      } finally {
+        this.dmSending = false;
+      }
+    },
+    startForward(m) {
+      this.forwardMsg = m;
+      this.forwardTo = this.friends.length === 1 ? this.friends[0].id : null;
+      this.forwardNote = "";
+    },
+    async submitForward() {
+      const m = this.forwardMsg;
+      if (!m || !this.forwardTo || this.dmSending) return;
+      this.dmSending = true;
+      try {
+        await this.api("/dm/" + this.forwardTo, { method: "POST",
+          body: JSON.stringify({ content: this.forwardNote.trim(), forward_message_id: m.id }) });
+        const f = this.friends.find((x) => x.id === this.forwardTo);
+        this.forwardMsg = null;
+        this.showToast("↪ Переслано" + (f ? ": " + f.username : ""),
+          () => this.openPeople(f ? { id: f.id, name: f.username } : null));
+      } catch (e) {
+        this.showToast("Не удалось переслать: " + (e.message || e));
+      } finally {
+        this.dmSending = false;
+      }
+    },
+    _onDmEvent(ev) {
+      const d = ev.message;
+      if (!d) return;
+      const other = d.sender_id === this.myUserId ? d.recipient_id : d.sender_id;
+      const open = this.peopleOpen && this.dmWith && this.dmWith.id === other;
+      if (open) {
+        if (!this.dmMessages.some((x) => x.id === d.id)) this.dmMessages.push(d);
+        this.$nextTick(() => { const b = this.$refs.dmBox; if (b) b.scrollTop = b.scrollHeight; });
+        if (d.sender_id !== this.myUserId) this.api("/dm/" + other + "/read", { method: "POST" }).catch(() => {});
+      } else if (d.sender_id !== this.myUserId) {
+        const text = d.content || (d.forward ? "↪ " + (d.forward.content || "").slice(0, 60) : "");
+        this.showToast("💬 " + (ev.sender_name || "Сообщение") + ": " + text.slice(0, 80),
+          () => this.openPeople({ id: d.sender_id, name: ev.sender_name || "" }));
+        if (this.soundOn) this.playChime();
+      }
+      this.loadDmThreads();
+    },
     async jumpToMessage(sessionId, messageId) {
       if (sessionId !== this.sessionId) {
         await this.openSession(this._sessionCard(sessionId) || { id: sessionId });
@@ -2875,6 +3026,13 @@ createApp({
       }
       if (ev.type === "turn_done") this._onTurnDone(ev);
       if (ev.type === "draft") this._onDraftEvent(ev);
+      if (ev.type === "dm") this._onDmEvent(ev);
+      if (ev.type === "dm_read") {
+        if (this.dmWith && ev.reader_id === this.dmWith.id) {
+          for (const d of this.dmMessages) if (d.sender_id === this.myUserId && d.id <= ev.upto) d.read = true;
+        }
+        if (ev.reader_id === this.myUserId) this.loadDmThreads();   // счётчик в других вкладках
+      }
       // Общий чат (2.27.0): реплика человека видна сразу — даже без хода ИИ.
       if (ev.type === "message_new" && ev.session_id != null) {
         if (ev.session_id === this.sessionId && !this.switchingChat) this._pullNewMessages(ev.session_id).catch(() => {});
@@ -7663,6 +7821,10 @@ createApp({
       // персонажа молча: раньше это создавало чат как побочный эффект запуска.
       if ((await fast) || this.sessionId) this._afterFastRestore();
       else await this._restoreLastChat();
+      // Ссылка на сообщение (#msg=чат-сообщение, 2.29.0) — открываем его.
+      const link = this._parseMsgLink();
+      if (link) await this.openMessageLink(link.sid, link.mid);
+      this.loadDmThreads();
       // Периодически подтягиваем заявки в друзья/общие чаты — чтобы уведомления
       // в колокольчике появлялись без перезагрузки страницы.
       clearInterval(this._friendsTimer);
@@ -7902,6 +8064,11 @@ createApp({
     // Черновик привязан к чату: смену чата ловим сразу (sync) — пока поле ещё
     // показывает прежний чат, — при любом способе переключения (см. _draftSwitch).
     this.$watch("sessionId", (nv, ov) => this._draftSwitch(ov, nv), { flush: "sync" });
+    // Ссылка на сообщение, вставленная в уже открытую вкладку (2.29.0).
+    window.addEventListener("hashchange", () => {
+      const link = this._parseMsgLink();
+      if (link) this.openMessageLink(link.sid, link.mid);
+    });
     // Копирование кода: один слушатель на документ (разметка сообщений приходит
     // из v-html и перерисовывается, вешать обработчики на каждый блок бессмысленно).
     document.addEventListener("click", this._onDocClick);
@@ -8310,6 +8477,12 @@ createApp({
         <button class="btn-icon" @click="openPalette()"
                 title="Поиск по сообщениям и команды (Ctrl+K)"
                 aria-label="Поиск по сообщениям и команды, Ctrl+K">🔍</button>
+        <!-- «Люди»: личная переписка с друзьями (2.29.0). -->
+        <button v-if="currentUserObj" class="btn-icon people-btn" @click="openPeople()"
+                :title="'Люди: личные сообщения' + (dmUnread ? ' — непрочитанных: ' + dmUnread : '')"
+                :aria-label="'Люди: личные сообщения' + (dmUnread ? ', непрочитанных ' + dmUnread : '')">
+          💬<span v-if="dmUnread" class="notif-badge">{{ dmUnread }}</span>
+        </button>
         <!-- Колокольчик уведомлений: входящие заявки в друзья -->
         <div v-if="currentUserObj" class="notif-wrap">
           <button class="btn-icon" @click="notifOpen=!notifOpen" title="Уведомления" aria-label="Уведомления">
@@ -8617,6 +8790,12 @@ createApp({
                   <button class="btn-icon" @click="msgMenu = null; forkFrom(m)"
                           title="Форкнуть отсюда: новый чат с историей до этой реплики"
                           aria-label="Форкнуть отсюда: новый чат с историей до этой реплики">⑂</button>
+                  <!-- 2.29.0: ссылка на сообщение и пересылка другу в «Люди». -->
+                  <button v-if="typeof m.id === 'number'" class="btn-icon" @click="msgMenu = null; copyMessageLink(m)"
+                          title="Скопировать ссылку на это сообщение" aria-label="Скопировать ссылку на это сообщение">🔗</button>
+                  <button v-if="typeof m.id === 'number' && currentUserObj && friends.length" class="btn-icon"
+                          @click="msgMenu = null; startForward(m)"
+                          title="Переслать другу" aria-label="Переслать сообщение другу">↪</button>
                 </template>
               </template>
             </span>
@@ -10189,6 +10368,86 @@ createApp({
 
   <!-- ===== Профиль / привязка Telegram ===== -->
   <!-- ===== Модалка приглашения друзей в чат ===== -->
+  <!-- «Люди» (2.29.0): переписка с друзьями без ИИ. -->
+  <div v-if="peopleOpen" class="modal-backdrop" @click.self="closePeople">
+    <div class="modal people-modal" role="dialog" aria-modal="true" aria-label="Люди: личные сообщения">
+      <div class="row-between" style="margin-bottom:10px">
+        <h3 style="margin:0">💬 Люди</h3>
+        <button class="btn-icon" @click="closePeople" aria-label="Закрыть">✕</button>
+      </div>
+      <div v-if="!dmThreads.length" class="empty-state">
+        <div class="empty-icon">🫂</div>
+        <p><b>Здесь пишут друзьям — напрямую, без персонажа</b></p>
+        <p class="muted">Добавьте друзей во вкладке «Персона» → «Друзья-ролевики». Сюда же приходят пересланные сообщения (↪ у сообщения в чате).</p>
+      </div>
+      <div v-else class="people-layout" :class="{ 'has-chat': !!dmWith }">
+        <div class="people-list" role="list">
+          <button v-for="th in dmThreads" :key="'th' + th.user.id" role="listitem"
+                  :class="['people-item', dmWith && dmWith.id === th.user.id ? 'active' : '']" @click="openDm(th.user)">
+            <span class="avatar"><img v-if="th.user.avatar" :src="imgSrc(th.user.avatar)" alt="" /><template v-else>{{ (th.user.name || '?').charAt(0).toUpperCase() }}</template></span>
+            <span class="grow">
+              <b>{{ th.user.name }}</b>
+              <span class="muted people-last">{{ th.last ? (th.last.mine ? 'Вы: ' : '') + (th.last.forward && !th.last.content ? '↪ пересланное' : th.last.content) : 'Напишите первым' }}</span>
+            </span>
+            <span v-if="th.unread" class="notif-badge static">{{ th.unread }}</span>
+          </button>
+        </div>
+        <div v-if="dmWith" class="people-chat">
+          <div class="row-between people-chat-head">
+            <button class="btn-icon people-back" @click="dmWith = null" aria-label="К списку">←</button>
+            <b class="grow">{{ dmWith.name }}</b>
+          </div>
+          <div class="people-msgs" ref="dmBox">
+            <button v-if="dmMore" class="btn-link" :disabled="dmLoading" @click="loadDm(true)">Показать раньше</button>
+            <p v-if="!dmMessages.length" class="muted">Сообщений пока нет.</p>
+            <div v-for="d in dmMessages" :key="'dm' + d.id" :class="['dm', d.sender_id === myUserId ? 'mine' : 'theirs']">
+              <div class="bubble">
+                <div v-if="d.forward" class="dm-forward">
+                  <div class="muted dm-forward-head">↪ {{ d.forward.speaker || (d.forward.role === 'assistant' ? 'Персонаж' : 'Человек') }}<template v-if="d.forward.chat_title"> · «{{ d.forward.chat_title }}»</template></div>
+                  <div class="dm-forward-text">{{ d.forward.content }}<template v-if="d.forward.truncated">…</template></div>
+                  <button class="btn-link" @click="openMessageLink(d.forward.session_id, d.forward.message_id)">Открыть в чате</button>
+                </div>
+                <div v-if="d.content" class="dm-text">{{ d.content }}</div>
+              </div>
+              <div class="muted dm-meta">{{ fmtWhen(d.created_at) }}<template v-if="d.sender_id === myUserId"> · {{ d.read ? 'прочитано' : 'доставлено' }}</template></div>
+            </div>
+          </div>
+          <div class="row people-compose">
+            <textarea v-model="dmInput" rows="1" :placeholder="'Сообщение для ' + dmWith.name"
+                      aria-label="Сообщение другу" @keydown.enter.exact.prevent="sendDm"></textarea>
+            <button class="btn-primary" :disabled="!dmInput.trim() || dmSending" @click="sendDm">Отправить</button>
+          </div>
+        </div>
+        <div v-else class="people-chat people-pick muted">Выберите, кому написать.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Переслать сообщение другу (2.29.0). -->
+  <div v-if="forwardMsg" class="modal-backdrop" @click.self="forwardMsg = null">
+    <div class="modal" style="width:440px" role="dialog" aria-modal="true" aria-label="Переслать сообщение">
+      <div class="row-between" style="margin-bottom:10px">
+        <h3 style="margin:0">↪ Переслать</h3>
+        <button class="btn-icon" @click="forwardMsg = null" aria-label="Закрыть">✕</button>
+      </div>
+      <div class="dm-forward" style="margin-bottom:10px">
+        <div class="dm-forward-text">{{ (forwardMsg.content || '').slice(0, 400) }}<template v-if="(forwardMsg.content || '').length > 400">…</template></div>
+      </div>
+      <div class="invite-list">
+        <label v-for="f in friends" :key="'fw' + f.id" :class="['invite-item', forwardTo === f.id ? 'active' : '']">
+          <input type="radio" name="fwd" :checked="forwardTo === f.id" @change="forwardTo = f.id" />
+          <span class="avatar">{{ (f.username || '?').charAt(0).toUpperCase() }}</span>
+          <span class="grow">{{ f.username }}</span>
+        </label>
+      </div>
+      <input v-model="forwardNote" placeholder="Комментарий (необязательно)" aria-label="Комментарий к пересылке" style="margin-top:10px; width:100%" />
+      <div class="row" style="justify-content:flex-end; margin-top:12px; gap:8px">
+        <button @click="forwardMsg = null">Отмена</button>
+        <button class="btn-primary" :disabled="!forwardTo || dmSending" @click="submitForward">Переслать</button>
+      </div>
+    </div>
+  </div>
+
   <div v-if="inviteOpen" class="modal-backdrop" @click.self="inviteOpen=false">
     <div class="modal" style="width:420px" role="dialog" aria-modal="true" aria-label="Приглашение в чат">
       <div class="row-between" style="margin-bottom:12px">

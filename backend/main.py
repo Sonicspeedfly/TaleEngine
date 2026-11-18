@@ -55,6 +55,7 @@ from backend import (
     admin_service,
     debug_log,
     diary,
+    direct,
     drafts,
     gcp_billing,
     group_chat,
@@ -1595,6 +1596,10 @@ async def update_session(
     sess = await db.get(models.ChatSession, session_id)
     if not sess:
         raise HTTPException(404, "Сессия не найдена")
+    # Чужой чат не правим (раньше проверки не было вовсе: зная id, можно было
+    # поменять пояс, заметку или пресет чужого чата).
+    if not await _can_access_session(db, sess, user):
+        raise HTTPException(403, "Нет доступа к этому чату")
     data = payload.model_dump(exclude_none=True)
     if "preset_id" in data:
         # Пресет чата: 0 — снять; иначе — пресет, который этот человек видит
@@ -4735,6 +4740,12 @@ async def sse_events(request: Request):
                 if event.get("type") == "draft" and user is not None \
                         and event.get("owner_id") != drafts.owner_of(user):
                     continue
+                # Личная переписка (2.29.0) — только тем двоим, кто в ней.
+                dm = direct.visible_to(event, user)
+                if dm is not None:
+                    if dm:
+                        yield _sse(event)
+                    continue
                 if await allowed(event.get("session_id")):
                     yield _sse(event)
         finally:
@@ -5571,6 +5582,8 @@ def _localize_cdn(html: str, vendor: set[str]) -> str:
 app.include_router(horae_api.build_router(current_user, _can_access_session))
 app.include_router(user_memory.build_router(current_user))
 app.include_router(diary.build_router(current_user))
+app.include_router(direct.build_router(current_user, are_friends=_are_friends,
+                                       can_access_session=_can_access_session))
 
 
 if _frontend_dir.exists():

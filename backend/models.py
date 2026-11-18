@@ -580,6 +580,26 @@ class Friendship(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
+class DirectMessage(Base):
+    """
+    Личное сообщение между двумя людьми, без ИИ (2.29.0, раздел «Люди»).
+    pair — «меньший_id:больший_id»: по нему вся переписка двоих одним индексом.
+    forward — пересланная реплика чата (снимок): {session_id, message_id,
+    chat_title, speaker, role, content}; ссылка на оригинал откроется, если у
+    получателя есть доступ к тому чату.
+    """
+    __tablename__ = "direct_messages"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    pair: Mapped[str] = mapped_column(String(40), index=True)
+    sender_id: Mapped[int] = mapped_column(Integer, index=True)
+    recipient_id: Mapped[int] = mapped_column(Integer, index=True)
+    content: Mapped[str] = mapped_column(Text, default="")
+    forward: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 class SessionShare(Base):
     """Доступ друга к чату: он видит чат у себя и может в нём участвовать."""
     __tablename__ = "session_shares"
