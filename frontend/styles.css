@@ -2402,3 +2402,23 @@ input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
   text-decoration: none; color: var(--text-primary); cursor: pointer; }
 .avatar-edit-actions .avatar-edit-remove { color: var(--danger); }
 .avatar-edit-actions .avatar-edit-remove:hover { border-color: var(--danger); background: var(--danger-subtle); }
+
+/* ============================================================
+   Общий чат как мессенджер (2.27.0): реплики других людей — слева, со своим
+   именем и аватаром; под репликой — кому она; в окне ввода — выбор адресата.
+   ============================================================ */
+.msg.user.other { align-self: flex-start; flex-direction: row; }
+.msg.user.other .bubble { background: var(--surface-2, var(--bubble-assistant)); border: 1px solid var(--border-subtle); }
+.msg.user.other .speaker, .msg.user.other .reply-quote { text-align: left; }
+.msg.user.other .msg-meta, .msg.user.other .msg-actions { justify-content: flex-start; }
+.msg .speaker.human { color: var(--text-secondary); }
+.msg-addr { flex: none; white-space: nowrap; }
+.msg-addr.addr-ai { color: var(--accent); }
+.msg-addr.addr-people { opacity: .8; }
+.msg-call { flex: none; cursor: pointer; border: 1px solid var(--accent-border, var(--border-subtle));
+  background: transparent; color: var(--accent); font: inherit; }
+.msg-call:hover { background: var(--surface-selected); }
+.addr-pick { flex: none; white-space: nowrap; max-width: 14ch; overflow: hidden; text-overflow: ellipsis;
+  padding: 4px 8px; border-radius: 999px; border: 1px solid var(--border-subtle); background: transparent;
+  color: var(--text-secondary); font: inherit; font-size: var(--fs-100); cursor: pointer; }
+.addr-pick.on { color: var(--text-primary); background: var(--surface-selected); border-color: var(--accent-border, var(--border-subtle)); }

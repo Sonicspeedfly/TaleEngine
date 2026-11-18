@@ -318,6 +318,7 @@ def _sqlite_add_missing_columns(sync_conn) -> None:
             "profile_upto": "INTEGER DEFAULT 0",
             "profile_root": "INTEGER DEFAULT 0",
             "preset_id": "INTEGER",
+            "reply_mode": "VARCHAR(16) DEFAULT 'auto'",
         },
         "messages": {
             "swipes": "JSON",
@@ -327,6 +328,8 @@ def _sqlite_add_missing_columns(sync_conn) -> None:
             "reply_to_id": "INTEGER",
             "canvas_id": "INTEGER",
             "horae": "JSON",
+            "author_id": "INTEGER",
+            "address": "VARCHAR(16)",
         },
         "horae_entries": {
             "character_id": "INTEGER",

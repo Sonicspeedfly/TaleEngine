@@ -363,7 +363,7 @@ def _att_label(a: dict) -> str:
     return "вложение"
 
 
-def messages_to_history(msgs, att_map: dict | None = None) -> list[dict]:
+def messages_to_history(msgs, att_map: dict | None = None, labels: dict | None = None) -> list[dict]:
     """
     Превращает ORM-сообщения в историю для контекста, СОХРАНЯЯ вложения (картинки,
     аудио, видео, документы) — модель видит файлы всего чата, который видит.
@@ -380,23 +380,28 @@ def messages_to_history(msgs, att_map: dict | None = None) -> list[dict]:
 
     :param att_map: устаревший параметр (вложения, отобранные под лимит); не
         используется — оставлен ради совместимости вызовов.
+    :param labels: {author_id: имя} — в общем чате реплика человека уходит
+        модели как «Имя: текст» (backend/messenger.py, 2.27.0).
     """
     from backend.media_refs import history_content
 
     out: list[dict] = []
     for m in msgs:
         all_atts = [a for a in (m.attachments or []) if isinstance(a, dict)]
+        text = m.content or ""
+        if labels and m.role == "user" and labels.get(getattr(m, "author_id", None)):
+            text = f"{labels[m.author_id]}: {text}"
         content = None
         if all_atts and m.role == "user":
-            content = history_content(m.content or "", all_atts)
-            if content == (m.content or "") and not isinstance(content, list):
+            content = history_content(text, all_atts)
+            if content == text and not isinstance(content, list):
                 content = None   # у вложений нет данных — ниже пометка
         if content is None:
             if all_atts:
                 note = " ".join(f"[{_att_label(a)}]" for a in all_atts)
-                content = f"{m.content} {note}".strip() if m.content else note
+                content = f"{text} {note}".strip() if text else note
             else:
-                content = m.content or ""
+                content = text
         out.append({"role": m.role, "content": content})
     return out
 
@@ -407,8 +412,16 @@ async def messages_to_history_db(db, msgs, *_legacy, **_legacy_kw) -> list[dict]
     вложений не читаются — это делает stream_completion для файлов, которые
     реально уйдут в запрос. Лишние аргументы (старые лимиты файлов истории)
     принимаются и игнорируются.
+
+    В общем чате (несколько людей) реплики людей подписываются автором.
     """
-    return messages_to_history(msgs)
+    labels = None
+    sid = next((m.session_id for m in msgs if getattr(m, "session_id", None)), None)
+    if sid is not None and any(getattr(m, "author_id", None) for m in msgs):
+        from backend import messenger
+        from backend.models import ChatSession
+        labels = await messenger.author_labels(db, await db.get(ChatSession, sid)) or None
+    return messages_to_history(msgs, labels=labels)
 
 
 @dataclass

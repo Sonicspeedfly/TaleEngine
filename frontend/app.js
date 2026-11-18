@@ -516,6 +516,9 @@ createApp({
       // --- Аккаунты ---
       userToken: "",
       currentUserObj: null,
+      // Кому следующая реплика в общем чате (2.27.0): auto — решает сервер,
+      // ai — персонажу, people — только людям. Держится до смены чата.
+      sendAddress: "auto",
       needAuth: false,        // показывать экран входа/регистрации (режим аккаунтов)
       authTab: "login",       // login | register
       authForm: { username: "", password: "" },
@@ -680,6 +683,33 @@ createApp({
     currentIsGroup() {
       return !!this.currentGroup;
     },
+    // Строка открытого чата (свой, группа или открытый мне другом).
+    chatRow() {
+      return this.sharedView || this.currentGroup || this.currentSession
+        || this.allSessions.find((s) => s.id === this.sessionId) || null;
+    },
+    // Общий чат: людей больше одного (2.27.0).
+    isSharedChat() {
+      const r = this.chatRow;
+      return !!(this.sharedView || (r && r.shares > 0));
+    },
+    // Общий чат-мессенджер: персонаж отвечает, только когда обращаются к нему.
+    isMessengerChat() {
+      return this.isSharedChat && ((this.chatRow && this.chatRow.reply_mode) || "auto") !== "always";
+    },
+    // Кому отвечает персонаж — для подписей «→ Джеми» (дательный падеж — по
+    // имени не сделать, поэтому имя как есть, а без имени — «персонажу»).
+    chatCharName() {
+      const r = this.chatRow;
+      if ((r && r.is_group) || this.currentIsGroup) return "персонажам";
+      return (r && r.character_name) || (this.selectedCharacter && this.selectedCharacter.name) || "персонажу";
+    },
+    myUserId() {
+      return (this.currentUserObj && this.currentUserObj.id) || null;
+    },
+    sendAddressLabel() {
+      return { auto: "🤖 Авто", ai: "🎭 " + this.chatCharName, people: "👥 Людям" }[this.sendAddress] || "🤖 Авто";
+    },
     isAdmin() {
       // В режиме аккаунтов админ определяется ролью; в режиме кода доступа админка
       // открыта (гейт по паролю администратора при открытии).
@@ -736,6 +766,9 @@ createApp({
     },
     canRetry() {
       if (this.streaming || !this.messages.length) return false;
+      // Общий чат: реплика людям (или ждущая очереди) — ответа и не ждали.
+      const tail = this.messages[this.messages.length - 1];
+      if (tail && tail.role === "user" && (tail.address === "people" || tail.address_queued)) return false;
       // Пока у чата есть живой ход на сервере (ответ досчитывается после F5,
       // идёт из другой вкладки или Telegram), «не получен» — ложь, а кнопка
       // «Повторить» запустила бы второй, параллельный ответ на ту же реплику.
@@ -802,6 +835,13 @@ createApp({
       if (this.composerMode === "canvasCmd") return "Что сделать с Canvas… (Esc — обычное сообщение)";
       if (this.composerMode === "canvasGen") return "Опишите документ или код… (Esc — обычное сообщение)";
       if (this.composerMode === "art") return "Опишите картинку… (Esc — обычное сообщение)";
+      if (this.isMessengerChat) {
+        const who = { "персонажам": "персонажи", "персонажу": "персонаж" }[this.chatCharName] || this.chatCharName;
+        if (this.streaming) return "Пишите — реплика уйдёт сразу, не дожидаясь ответа";
+        if (this.sendAddress === "people") return "Сообщение людям — персонаж промолчит";
+        if (this.sendAddress === "ai") return "Сообщение — ответит " + who;
+        return "Сообщение… " + who + " ответит, если обратиться по имени или по смыслу";
+      }
       if (this.currentIsGroup) return "Сообщение… Режиссура: +Имя вызвать, -Имя исключить (🎬)";
       if (this.canAppend) return "Дописать к запросу — ответ начнётся заново с учётом дописанного"
         + (this.isTouch ? "" : " (Enter)");
@@ -2459,6 +2499,7 @@ createApp({
       // Пока чат переключается, сокет ещё смотрит в прежний чат — отправка
       // ждёт (send() проверяет флаг), иначе реплика ушла бы не туда.
       this.switchingChat = true;
+      this.sendAddress = "auto";
       const seq = (this._openSeq = (this._openSeq || 0) + 1);
       this.sessionId = s.id;
       this._clearPending(s.id); // открыли чат — снимаем метку «пришёл ответ»
@@ -2581,6 +2622,7 @@ createApp({
       this._handoffStreaming();
       this.sharedView = s;
       this.switchingChat = true;   // отправка ждёт новый сокет (см. openSession)
+      this.sendAddress = "auto";
       const seq = (this._openSeq = (this._openSeq || 0) + 1);
       this.sessionId = s.id;
       this._clearPending(s.id);
@@ -2803,6 +2845,19 @@ createApp({
       }
       if (ev.type === "turn_done") this._onTurnDone(ev);
       if (ev.type === "draft") this._onDraftEvent(ev);
+      // Общий чат (2.27.0): реплика человека видна сразу — даже без хода ИИ.
+      if (ev.type === "message_new" && ev.session_id != null) {
+        if (ev.session_id === this.sessionId && !this.switchingChat) this._pullNewMessages(ev.session_id).catch(() => {});
+        this._bumpChatList(ev.session_id);
+      }
+      if (ev.type === "message_address" && ev.session_id === this.sessionId) {
+        // Сообщение может ещё не дойти (его тянет message_new): пометку держим
+        // до его прихода — «в очереди» в списке сообщений сервера нет.
+        (this._addrNotes || (this._addrNotes = {}))[ev.message_id] = { address: ev.address, queued: !!ev.queued };
+        const m = this.messages.find((x) => x.id === ev.message_id);
+        if (m) { m.address = ev.address; m.address_queued = !!ev.queued; }
+        else this._pullNewMessages(ev.session_id).catch(() => {});
+      }
     },
     // Ход открытого чата, о котором страница не знает (соседняя вкладка,
     // Telegram, снимок после реконнекта шины): показываем его и слушаем по SSE.
@@ -2827,9 +2882,21 @@ createApp({
       const have = new Set(saved.map((m) => m.id));
       const lastId = saved.reduce((a, m) => Math.max(a, m.id), 0);
       const fresh = rows.filter((m) => typeof m.id === "number" && !have.has(m.id) && m.id > lastId);
+      for (const m of fresh) {
+        const note = this._addrNotes && this._addrNotes[m.id];
+        if (note) { m.address = note.address; m.address_queued = note.queued; }
+      }
       if (!fresh.length) return;
       const el = this.$refs.messages;
       const nearBottom = !el || (el.scrollHeight - el.scrollTop - el.clientHeight < 160);
+      // Своя же реплика пришла сохранённой — временная копия больше не нужна
+      // (в общем чате сообщение публикуется до ответа персонажа).
+      const mine = fresh.filter((m) => m.role === "user" && (!m.author || m.author.id === this.myUserId));
+      for (const f of mine) {
+        const i = this.messages.findIndex((x) => typeof x.id === "string" && x.id.startsWith("tmp")
+          && x.role === "user" && (x.content || "") === (f.content || ""));
+        if (i >= 0) this.messages.splice(i, 1);
+      }
       let at = this.messages.length;
       while (at > 0 && typeof this.messages[at - 1].id !== "number") at--;
       this.messages.splice(at, 0, ...fresh);
@@ -3936,6 +4003,20 @@ createApp({
       }
       if (t === "busy") return this._onBusy(ev);
       if (t === "job") return this._onJob(ev, src);
+      if (t === "posted") return this._onPosted(ev);
+      // Реплика, отправленная во время ответа (sendSide): у неё свой client_id,
+      // ход на экране она не трогает. Сбой — возвращаем текст в поле.
+      if (ev.client_id && this._sideSends && this._sideSends[ev.client_id]) {
+        const side = this._sideSends[ev.client_id];
+        if (t === "error" || t === "done") {
+          delete this._sideSends[ev.client_id];
+          const i = this.messages.findIndex((x) => x.id === "tmp:" + ev.client_id);
+          if (i >= 0) this.messages.splice(i, 1);
+          if (!this.input.trim()) this.input = side.content;
+          this.showToast("Не удалось отправить: " + (ev.content || "ошибка сервера"));
+        }
+        return;
+      }
       // Чужие события не трогают ход на экране. Раньше любое «done» (из WS, из
       // SSE сторожа, запоздалое от прошлого хода) гасило то, что идёт сейчас, —
       // например, новый ответ после «Дописать».
@@ -4009,6 +4090,15 @@ createApp({
     _firstSeen(ev) {
       if (!ev.job_id || !ev.seq) return true;
       return this._jobMark("_seenEvents", ev.job_id + ":" + ev.seq);
+    },
+    // Общий чат: реплика опубликована (2.27.0). Ответ персонажа — отдельным
+    // «job» следом, в очереди или не нужен вовсе (реплика людям).
+    _onPosted(ev) {
+      const sid = this.sessionId;
+      if (ev.client_id && ev.client_id === this.turnClientId && (!ev.job_id || ev.queued)) this._turnPosted = true;
+      if (ev.client_id && this._sideSends) delete this._sideSends[ev.client_id];
+      this._pullNewMessages(sid).catch(() => {});
+      if (ev.queued) this.showToast("🕒 Ответ на реплику — следом за текущим");
     },
     _onJob(ev, src) {
       // Сокет подхватил ход, за которым шёл SSE (реконнект во время HTTP-хода):
@@ -4103,7 +4193,12 @@ createApp({
       this.groupWaiting = 0;
       // Сервер — источник истины: перечитываем сообщения (там уже новый ответ/свайп).
       const sid = this.sessionId;
-      if (sid) delete this.processingChats[sid];
+      // Только свой ход: в общем чате следом мог начаться чужой (или ответ из
+      // очереди) — о нём шина уже сказала, и его покажем ниже (2.27.0).
+      const pc = sid ? this.processingChats[sid] : null;
+      if (pc && (!pc.job_id || !jid || pc.job_id === jid || this._isDone(pc.job_id))) delete this.processingChats[sid];
+      const posted = this._turnPosted;
+      this._turnPosted = false;
       // Сбой перечитки не должен обрывать конец хода: раньше исключение здесь
       // пропускало обновление списка, звук и тост.
       try { await this.loadMessages(); } catch (e) {}
@@ -4140,7 +4235,11 @@ createApp({
       const answered = fresh && !this.chatError && !stopped && !failed;
       this.liveStatus = answered ? "Ответ получен"
         : this.chatError ? "Ошибка генерации: " + this.chatError
+        : posted ? "Сообщение отправлено"
         : stopped ? "Ответ остановлен" : "Ответ не получен";
+      // В чате уже идёт другой ход (собеседник, ответ из очереди) — показываем его.
+      const next = this.processingChats[sid];
+      if (next && next.job_id && !this._isDone(next.job_id)) this._followForeignJob(sid, next);
       if (!answered) return;
       // Вкладка в фоне: тост никто не увидит — нужен заголовок и системное
       // уведомление (то же, что для других чатов; по job_id без дублей с шиной).
@@ -4288,6 +4387,7 @@ createApp({
     // выбиралось в двух местах (цепочка v-else-if в шаблоне и if-цепочка в
     // обработчике Enter), они могли разойтись между собой.
     submitComposer() {
+      if (this.streaming && this.isMessengerChat && this.composerMode === "text") return this.sendSide();
       if (this.streaming) return this.appendToRequest();
       if (this.composerMode === "canvasCmd") return this.applyCanvasCmd();
       if (this.composerMode === "art") return this.sendArt();
@@ -4310,6 +4410,51 @@ createApp({
       this.resetComposerHeight();
       this.composerMode = "text";
       await this.reviseCanvas(cmd);
+    },
+    // Общий чат, а персонаж сейчас отвечает (себе или другому): реплика не ждёт —
+    // уходит сразу, как в мессенджере (2.27.0). Персонажу — он ответит следом.
+    sendSide() {
+      const content = this.input.trim();
+      if (!content || !this.connected || this.switchingChat) return;
+      if (this.pendingAttachments.length) {
+        this.showToast("Файлы отправятся, когда закончится ответ — пока можно написать текстом");
+        return;
+      }
+      const clientId = this._newClientId();
+      (this._sideSends || (this._sideSends = {}))[clientId] = { content };
+      this.messages.push({ id: "tmp:" + clientId, role: "user", content, attachments: [], swipes: [content],
+        active_swipe: 0, created_at: new Date().toISOString(),
+        author: this.currentUserObj ? { id: this.currentUserObj.id, name: this.currentUserObj.username } : null });
+      this._wsSend({ type: "user_message", content, params: this.params, client_id: clientId, side: true,
+        reply_to_message_id: this.replyToId || null,
+        address: this.sendAddress === "auto" ? null : this.sendAddress });
+      this.input = "";
+      this.replyToId = null;
+      this.resetComposerHeight();
+      this.$nextTick(() => this.scrollDown());
+    },
+    async setReplyMode(mode) {
+      const row = this.chatRow;
+      if (!row || this.sharedView) return;
+      try {
+        await this.api("/sessions/" + this.sessionId, { method: "PATCH", body: JSON.stringify({ reply_mode: mode }) });
+        row.reply_mode = mode;
+        this.showToast(mode === "always" ? "Персонаж отвечает на каждую реплику" : "Персонаж отвечает на обращения к нему");
+      } catch (e) {
+        this.showToast("Не удалось сменить режим: " + (e.message || e));
+      }
+    },
+    cycleSendAddress() {
+      const order = ["auto", "ai", "people"];
+      this.sendAddress = order[(order.indexOf(this.sendAddress) + 1) % order.length];
+    },
+    // «Позвать персонажа» на реплику, которую отнесли людям.
+    callCharacter(m) {
+      if (!this.connected || this.streaming || !m || typeof m.id !== "number") return;
+      const clientId = this._beginTurn("send");
+      m.address = "ai";
+      this._wsSend({ type: "answer", message_id: m.id, params: this.params, client_id: clientId });
+      this._armAccept(clientId);
     },
     async send() {
       let content = this.input.trim();
@@ -4390,7 +4535,8 @@ createApp({
       const displayAtts = pend.map((a) => ({
         type: a.type, mime: a.mime, name: a.name, size: a.size, data: a.data, preview: a.preview,
       }));
-      this.messages.push({ id: "tmp", role: "user", content, attachments: displayAtts, swipes: [content], active_swipe: 0, created_at: new Date().toISOString() });
+      this.messages.push({ id: "tmp", role: "user", content, attachments: displayAtts, swipes: [content], active_swipe: 0, created_at: new Date().toISOString(),
+        author: this.currentUserObj ? { id: this.currentUserObj.id, name: this.currentUserObj.username } : null });
       const clientId = this._beginTurn(this.currentIsGroup ? "" : "send");
       // HTTP-ход (файлы): до ответа сервера job_id нет, а WS-стоп отменил бы
       // ход ЧАТА — возможно, чужой (соседняя вкладка). См. stop().
@@ -4405,6 +4551,8 @@ createApp({
       // Из какой версии черновика ушла реплика: сервер, приняв её, уберёт из
       // черновика ровно отправленное.
       const draftInfo = this._draftSent(pend, sentRaw);
+      // Общий чат: кому реплика (null — решит сервер).
+      const addr = this.isMessengerChat && this.sendAddress !== "auto" ? this.sendAddress : null;
       this.resetComposerHeight();
       if (this.sendScroll) this.scrollDown();
       if (bigList.length) {
@@ -4420,6 +4568,7 @@ createApp({
         const fd = new FormData();
         fd.append("payload", JSON.stringify({
           content, attachments: metas, params: this.params, reply_to_message_id: replyTo, ...draftInfo,
+          address: addr,
         }));
         // Файлы из очереди убираем, но держим под рукой: на 409 («в чате уже
         // идёт ответ») реплика не сохранена, и вложения возвращаются в поле.
@@ -4427,15 +4576,16 @@ createApp({
         for (const a of bigList) { fd.append("files", attFiles[a.id], a.name || "file"); bigFiles[a.id] = attFiles[a.id]; }
         for (const a of bigList) delete attFiles[a.id];
         this._postWithProgress("/sessions/" + sid + "/send_form", fd)
-          .then((r) => { this._draftSendSettled(pend, !!(r && r.job_id), sid); this._onHttpTurnStarted(sid, clientId, r); })
+          .then((r) => { this._draftSendSettled(pend, !!(r && (r.job_id || r.posted)), sid); this._onHttpTurnStarted(sid, clientId, r); })
           .catch((e) => { this._draftSendSettled(pend, false, sid); this._onHttpTurnFailed(sid, clientId, e, "Не удалось отправить файл: ", { content, pend, bigFiles }); });
       } else if (attachments.length) {
         // Вложения (особенно аудио/видео) не влезают в WebSocket-кадр (~16 МБ) —
         // отправляем ход по HTTP с ПРОГРЕССОМ загрузки, ответ слушаем по SSE.
         this._postWithProgress("/sessions/" + sid + "/send", {
           content, attachments, params: this.params, reply_to_message_id: replyTo, ...draftInfo,
+          address: addr,
         })
-          .then((r) => { this._draftSendSettled(pend, !!(r && r.job_id), sid); this._onHttpTurnStarted(sid, clientId, r); })
+          .then((r) => { this._draftSendSettled(pend, !!(r && (r.job_id || r.posted)), sid); this._onHttpTurnStarted(sid, clientId, r); })
           .catch((e) => { this._draftSendSettled(pend, false, sid); this._onHttpTurnFailed(sid, clientId, e, "Не удалось отправить вложение: ", { content, pend, bigFiles: {} }); });
       } else {
         this._wsSend({
@@ -4443,6 +4593,7 @@ createApp({
           attachments, params: this.params,
           reply_to_message_id: replyTo,
           client_id: clientId, ...draftInfo,
+          address: addr,
         });
         this._armAccept(clientId);
       }
@@ -4452,6 +4603,7 @@ createApp({
     // ход. Раньше ответ сервера вешался на тот чат, что открыт СЕЙЧАС.
     _onHttpTurnStarted(sid, clientId, r) {
       const jobId = r && r.job_id;
+      if (r && r.posted && sid === this.sessionId) this._onPosted(r);
       const current = this.streaming && sid === this.sessionId && clientId === this.turnClientId;
       if (!current) {
         if (jobId) {
@@ -5537,7 +5689,7 @@ createApp({
     },
     debugPurpose(p) {
       const names = { chat: "ход", canvas: "Канвас", summary: "фон: память чата", horae: "фон: Хроника",
-        profile: "фон: память о пользователе", director: "режиссёр группы", service: "служебный" };
+        profile: "фон: память о пользователе", director: "режиссёр группы", address: "кому реплика (общий чат)", service: "служебный" };
       return names[p] || p || "";
     },
     // Вернуть в поле файлы неотправленной реплики: к тому, что человек успел
@@ -5784,7 +5936,12 @@ createApp({
     },
     // Аватар для пузыря сообщения: ассистент — персонаж/участник группы,
     // пользователь — персона этого чата или аватар профиля.
+    // Реплика другого человека в общем чате (2.27.0).
+    isOtherHuman(m) {
+      return !!(m && m.role === "user" && m.author && m.author.id && m.author.id !== this.myUserId && this.isSharedChat);
+    },
     msgAvatar(m) {
+      if (this.isOtherHuman(m)) return this.imgSrc(m.author.avatar || "");
       if (m.role === "assistant") {
         return (m.speaker_name && this.memberAvatar(m.speaker_name))
           || this.imgSrc((this.sharedView && this.sharedView.character_avatar)
@@ -5796,7 +5953,9 @@ createApp({
     // Буква-заглушка, когда аватарки нет (первая буква имени).
     msgAvatarLetter(m) {
       let name;
-      if (m.role === "assistant") {
+      if (this.isOtherHuman(m)) {
+        name = m.author.name;
+      } else if (m.role === "assistant") {
         name = m.speaker_name
           || (this.sharedView && this.sharedView.character_name)
           || (this.selectedCharacter && this.selectedCharacter.name) || "ИИ";
@@ -8118,7 +8277,7 @@ createApp({
         <div v-if="sessionId && loadingOlder" class="load-older">⏳ Загружаю ранние сообщения…</div>
         <div v-else-if="sessionId && messages.length >= msgPageSize && noMoreMessages" class="load-older muted">— начало чата —</div>
 
-        <div v-for="m in messages" :key="m.id" :class="['msg', m.role]" :data-mid="m.id">
+        <div v-for="m in messages" :key="m.id" :class="['msg', m.role, { other: isOtherHuman(m) }]" :data-mid="m.id">
           <!-- Аватарка: персонаж/участник группы у ответа, персона/профиль у пользователя -->
           <div v-if="m.role === 'user' || m.role === 'assistant'" class="msg-ava"
                :title="m.role === 'assistant' ? (m.speaker_name || (selectedCharacter && selectedCharacter.name) || '') : ''">
@@ -8127,6 +8286,8 @@ createApp({
           </div>
           <div class="msg-body">
           <div v-if="m.speaker_name" class="speaker">{{ m.speaker_name }}</div>
+          <!-- Общий чат: реплику другого человека подписывает его имя (2.27.0). -->
+          <div v-else-if="isOtherHuman(m)" class="speaker human">{{ m.author.name }}</div>
           <!-- В режиме сцены реплику подписывает КАЖДЫЙ говорящий, а не только
                участник группы: это театральная ремарка, по которой читают, кто
                сейчас на сцене. В обычном режиме подпись осталась как была. -->
@@ -8250,6 +8411,14 @@ createApp({
               <!-- Время: у user — когда отправил, у assistant — когда пришёл ответ (в поясе чата) -->
               <span v-if="m.created_at" class="tag msg-time" :title="fmtWhenFull(m.created_at)">🕒 {{ fmtWhen(m.created_at) }}</span>
               <span v-if="m.model_used" class="tag msg-model" :title="m.model_used">{{ m.model_used }}</span>
+              <!-- Общий чат: кому реплика (решил сервер или выбрал автор). -->
+              <span v-if="m.role === 'user' && m.address" :class="['tag', 'msg-addr', 'addr-' + m.address]"
+                    :title="m.address === 'ai' ? 'Реплика персонажу — он отвечает' : 'Реплика людям — персонаж промолчал'">
+                {{ m.address === 'ai' ? '→ ' + chatCharName : '→ участникам' }}<template v-if="m.address === 'ai' && m.address_queued"> · в очереди</template>
+              </span>
+              <button v-if="m.role === 'user' && m.address === 'people' && !streaming && typeof m.id === 'number'"
+                      class="tag msg-call" @click="callCharacter(m)"
+                      :title="'Пусть ответит на эту реплику'">🙋 Позвать</button>
             </span>
             <span class="msg-actions" role="group" aria-label="Действия с сообщением"
                   @scroll.passive="msgStripEdge($event.currentTarget)">
@@ -8507,6 +8676,12 @@ createApp({
           <button v-if="currentIsGroup" class="btn-icon" :class="directorBar ? 'on' : ''"
                   :aria-expanded="directorBar ? 'true' : 'false'"
                   @click="directorBar = !directorBar" title="Режиссёр: кто отвечает и в каком порядке" aria-label="Режиссёр: кто отвечает и в каком порядке">🎬</button>
+          <!-- Общий чат (2.27.0): кому следующая реплика. Авто — решает сервер
+               (имя в тексте или быстрая модель), остальное — явный выбор. -->
+          <button v-if="isMessengerChat" class="btn-chip addr-pick" :class="sendAddress !== 'auto' ? 'on' : ''"
+                  @click="cycleSendAddress()"
+                  :title="'Кому реплика: авто — решит ИИ по смыслу; ' + chatCharName + ' — ответит; людям — промолчит. Клик — сменить'"
+                  :aria-label="'Кому реплика: ' + sendAddressLabel">{{ sendAddressLabel }}</button>
           <!-- Режим ассистента: держим у поля ввода, а не только в настройках —
                переключать его нужно ровно тогда, когда пишешь прикладную просьбу.
                Состояние — заливкой выбора: красный обещал сбой, которого нет.
@@ -8528,7 +8703,9 @@ createApp({
                     :aria-label="composerPlaceholder"
                     :placeholder="composerPlaceholder"
                     @input="autoGrow" @keydown="onComposerKeydown" @paste="onPaste"></textarea>
-          <button v-if="streaming && canAppend && input.trim()" class="btn-primary" @click="appendToRequest"
+          <button v-if="streaming && isMessengerChat && composerMode === 'text' && input.trim()" class="btn-primary"
+                  @click="sendSide" title="Реплика уйдёт сразу, не дожидаясь ответа персонажа">Отправить</button>
+          <button v-else-if="streaming && canAppend && input.trim()" class="btn-primary" @click="appendToRequest"
                   title="Остановить ответ, дописать текст к запросу и начать ответ заново">➕ Дописать</button>
           <button v-if="streaming" class="btn-danger" @click="stop">■ Стоп</button>
           <!-- ОДНА кнопка на все режимы. Раньше их было четыре в цепочке
@@ -9512,6 +9689,19 @@ createApp({
             <p class="muted" style="margin-top:8px">Делиться чатом: откройте чат в списке слева и нажмите 🔗 — друг увидит его в разделе «Доступные мне». Так же делятся и групповые чаты.</p>
           </div>
 
+          <template v-if="isSharedChat">
+            <div class="hr"></div>
+            <h3>Общий чат: когда отвечает {{ chatCharName }} 💬</h3>
+            <p class="muted">В чате несколько людей. «На обращения» — как в мессенджере: реплики друг другу просто публикуются, а {{ chatCharName }} отвечает, когда обращаются к нему (по имени или по смыслу — это быстро решает лёгкая модель). Под каждой репликой видно, кому она ушла, и любую можно отдать персонажу кнопкой «🙋 Позвать».</p>
+            <div class="row">
+              <label class="inline"><input type="radio" value="auto" :checked="(chatRow && chatRow.reply_mode) !== 'always'"
+                     :disabled="!!sharedView" @change="setReplyMode('auto')" /> На обращения</label>
+              <label class="inline"><input type="radio" value="always" :checked="(chatRow && chatRow.reply_mode) === 'always'"
+                     :disabled="!!sharedView" @change="setReplyMode('always')" /> На каждую реплику</label>
+            </div>
+            <p v-if="sharedView" class="muted">Режим выбирает владелец чата.</p>
+          </template>
+
           <div class="hr"></div>
           <h3>Часовой пояс этого чата 🕒</h3>
           <p class="muted">Нейросеть видит ваше текущее время (утро/ночь, день недели) и метки времени сообщений показываются в этом поясе. Настройка сохраняется для каждого чата отдельно; по умолчанию берётся из браузера.</p>
@@ -9874,7 +10064,7 @@ createApp({
         </div>
 
         <h4 style="margin:12px 0 4px">На что уходит</h4>
-        <p class="muted" style="margin:0 0 6px; font-size:12px">chat — сам чат; summary — авто-сводка сюжета; director — выбор отвечающего в группе; canvas / image-prompt — служебные.</p>
+        <p class="muted" style="margin:0 0 6px; font-size:12px">chat — сам чат; summary — авто-сводка сюжета; director — выбор отвечающего в группе; address — кому реплика в общем чате; canvas / image-prompt — служебные.</p>
         <div class="card" v-for="k in usage.by_kind" :key="k.kind">
           <div class="row-between"><b>{{ k.kind }}</b><span class="muted">{{ k.requests }} запр.</span></div>
           <div style="font-size:12px">вход {{ fmtTokens(k.prompt) }} · ответ {{ fmtTokens(k.completion) }}</div>
