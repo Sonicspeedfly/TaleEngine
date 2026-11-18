@@ -766,6 +766,9 @@ createApp({
     },
     canRetry() {
       if (this.streaming || !this.messages.length) return false;
+      // Общий чат: реплика людям (или ждущая очереди) — ответа и не ждали.
+      const tail = this.messages[this.messages.length - 1];
+      if (tail && tail.role === "user" && (tail.address === "people" || tail.address_queued)) return false;
       // Пока у чата есть живой ход на сервере (ответ досчитывается после F5,
       // идёт из другой вкладки или Telegram), «не получен» — ложь, а кнопка
       // «Повторить» запустила бы второй, параллельный ответ на ту же реплику.
@@ -4001,6 +4004,19 @@ createApp({
       if (t === "busy") return this._onBusy(ev);
       if (t === "job") return this._onJob(ev, src);
       if (t === "posted") return this._onPosted(ev);
+      // Реплика, отправленная во время ответа (sendSide): у неё свой client_id,
+      // ход на экране она не трогает. Сбой — возвращаем текст в поле.
+      if (ev.client_id && this._sideSends && this._sideSends[ev.client_id]) {
+        const side = this._sideSends[ev.client_id];
+        if (t === "error" || t === "done") {
+          delete this._sideSends[ev.client_id];
+          const i = this.messages.findIndex((x) => x.id === "tmp:" + ev.client_id);
+          if (i >= 0) this.messages.splice(i, 1);
+          if (!this.input.trim()) this.input = side.content;
+          this.showToast("Не удалось отправить: " + (ev.content || "ошибка сервера"));
+        }
+        return;
+      }
       // Чужие события не трогают ход на экране. Раньше любое «done» (из WS, из
       // SSE сторожа, запоздалое от прошлого хода) гасило то, что идёт сейчас, —
       // например, новый ответ после «Дописать».
@@ -4079,6 +4095,8 @@ createApp({
     // «job» следом, в очереди или не нужен вовсе (реплика людям).
     _onPosted(ev) {
       const sid = this.sessionId;
+      if (ev.client_id && ev.client_id === this.turnClientId && (!ev.job_id || ev.queued)) this._turnPosted = true;
+      if (ev.client_id && this._sideSends) delete this._sideSends[ev.client_id];
       this._pullNewMessages(sid).catch(() => {});
       if (ev.queued) this.showToast("🕒 Ответ на реплику — следом за текущим");
     },
@@ -4175,7 +4193,12 @@ createApp({
       this.groupWaiting = 0;
       // Сервер — источник истины: перечитываем сообщения (там уже новый ответ/свайп).
       const sid = this.sessionId;
-      if (sid) delete this.processingChats[sid];
+      // Только свой ход: в общем чате следом мог начаться чужой (или ответ из
+      // очереди) — о нём шина уже сказала, и его покажем ниже (2.27.0).
+      const pc = sid ? this.processingChats[sid] : null;
+      if (pc && (!pc.job_id || !jid || pc.job_id === jid || this._isDone(pc.job_id))) delete this.processingChats[sid];
+      const posted = this._turnPosted;
+      this._turnPosted = false;
       // Сбой перечитки не должен обрывать конец хода: раньше исключение здесь
       // пропускало обновление списка, звук и тост.
       try { await this.loadMessages(); } catch (e) {}
@@ -4212,7 +4235,11 @@ createApp({
       const answered = fresh && !this.chatError && !stopped && !failed;
       this.liveStatus = answered ? "Ответ получен"
         : this.chatError ? "Ошибка генерации: " + this.chatError
+        : posted ? "Сообщение отправлено"
         : stopped ? "Ответ остановлен" : "Ответ не получен";
+      // В чате уже идёт другой ход (собеседник, ответ из очереди) — показываем его.
+      const next = this.processingChats[sid];
+      if (next && next.job_id && !this._isDone(next.job_id)) this._followForeignJob(sid, next);
       if (!answered) return;
       // Вкладка в фоне: тост никто не увидит — нужен заголовок и системное
       // уведомление (то же, что для других чатов; по job_id без дублей с шиной).
@@ -4394,10 +4421,11 @@ createApp({
         return;
       }
       const clientId = this._newClientId();
+      (this._sideSends || (this._sideSends = {}))[clientId] = { content };
       this.messages.push({ id: "tmp:" + clientId, role: "user", content, attachments: [], swipes: [content],
         active_swipe: 0, created_at: new Date().toISOString(),
         author: this.currentUserObj ? { id: this.currentUserObj.id, name: this.currentUserObj.username } : null });
-      this._wsSend({ type: "user_message", content, params: this.params, client_id: clientId,
+      this._wsSend({ type: "user_message", content, params: this.params, client_id: clientId, side: true,
         reply_to_message_id: this.replyToId || null,
         address: this.sendAddress === "auto" ? null : this.sendAddress });
       this.input = "";

@@ -58,6 +58,13 @@ def test_quick_rules():
     people = [{"id": 1, "name": "Олег"}, {"id": 2, "name": "Марина"}]
     assert messenger.quick_decide("Джеми, привет!", 1, ["Джеми"], people) == messenger.AI
     assert messenger.quick_decide("+Джеми расскажи", 1, ["Джеми"], people) == messenger.AI
+    # «+1» — согласие, а не вызов персонажа.
+    assert messenger.quick_decide("+1", 1, ["Джеми"], people) is None
+    assert messenger.quick_decide("+100500 согласен", 1, ["Джеми"], people) is None
+    # Персона владельца — тоже обращение к человеку.
+    assert messenger.quick_decide("Рыцарь, ты где?", 2, ["Джеми"],
+                                  [{"id": 1, "name": "Олег", "alias": "Рыцарь"}, {"id": 2, "name": "Марина"}]) \
+        == messenger.PEOPLE
     assert messenger.quick_decide("Марина, ты тут?", 1, ["Джеми"], people) == messenger.PEOPLE
     assert messenger.quick_decide("@марина глянь", 1, ["Джеми"], people) == messenger.PEOPLE
     # Своё имя в тексте — не обращение к другому.

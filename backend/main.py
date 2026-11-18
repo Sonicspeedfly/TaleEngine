@@ -1524,6 +1524,8 @@ async def fork_session(
             active_swipe=m.active_swipe,
             model_used=m.model_used,
             speaker_name=m.speaker_name,
+            author_id=m.author_id,
+            address=m.address,
             reply_to_id=None,   # ссылки на реплики исходного чата в ветке не имеют смысла
             canvas_id=None,     # общий канвас связал бы ветку с исходным документом
             created_at=m.created_at,
@@ -3399,7 +3401,8 @@ async def canvas_generate(
     params = GenerationParams(**(payload.get("params") or {}))
 
     # 1. Сообщение пользователя — в чат как обычно (данные вложений — в blobs).
-    user_msg = models.Message(session_id=session_id, role="user", content=prompt, attachments=[])
+    user_msg = models.Message(session_id=session_id, role="user", content=prompt, attachments=[],
+                              author_id=user.id if user is not None else None)
     db.add(user_msg)
     await db.flush()
     user_msg.attachments = await store_attachments(db, user_msg.id, attachments)
@@ -3485,7 +3488,8 @@ async def canvas_edit(
     connection = await get_connection(db)
     params = GenerationParams(**(payload.get("params") or {}))
 
-    db.add(models.Message(session_id=session_id, role="user", content=prompt))
+    db.add(models.Message(session_id=session_id, role="user", content=prompt,
+                          author_id=user.id if user is not None else None))
     await db.commit()
 
     kind_word = "код" if canvas.kind == "code" else "документ"
@@ -4249,9 +4253,18 @@ def _queue_answer(session_id: int, message_id: int, params) -> None:
     prev = _answer_queue.get(session_id)
     if prev is None or prev[0] <= message_id:
         _answer_queue[session_id] = (message_id, params)
+        if prev is not None and prev[0] != message_id:
+            # Ответ будет на новую реплику (он увидит и прежнюю) — со старой снимаем «в очереди».
+            _publish_address(session_id, prev[0], messenger.AI)
     task = _answer_waiters.get(session_id)
     if task is None or task.done():
         _answer_waiters[session_id] = asyncio.create_task(_answer_waiter(session_id))
+
+
+def _drop_answer_queue(session_id: int) -> None:
+    item = _answer_queue.pop(session_id, None)
+    if item is not None:
+        _publish_address(session_id, item[0], messenger.AI)
 
 
 async def _answer_waiter(session_id: int) -> None:
@@ -4278,6 +4291,7 @@ async def _answer_waiter(session_id: int) -> None:
             except Exception:  # noqa: BLE001 — сбой одного ответа не роняет очередь
                 _turn_log.exception("Очередь ответов чата %s: не удалось ответить на %s",
                                     session_id, message_id)
+                _publish_address(session_id, message_id, messenger.AI)
     finally:
         if _answer_waiters.get(session_id) is asyncio.current_task():
             _answer_waiters.pop(session_id, None)
@@ -4404,6 +4418,7 @@ async def ws_chat(websocket: WebSocket, session_id: int):
     forward_task: asyncio.Task | None = None
     forward_job_id: str | None = None
     turn_tasks: set = set()
+    side_tasks: set = set()   # реплики общего чата во время ответа (2.27.0)
     stop_pending = False
 
     async def send(event: dict) -> bool:
@@ -4438,14 +4453,19 @@ async def ws_chat(websocket: WebSocket, session_id: int):
         forward_job_id = job.job_id
         forward_task = asyncio.create_task(forward(job))
 
-    async def posted(res: dict, client_id) -> None:
-        """Реплика в общем чате опубликована; ход персонажа — если он отвечает сразу."""
+    async def posted(res: dict, client_id, side: bool = False) -> None:
+        """
+        Реплика в общем чате опубликована; ход персонажа — если он отвечает сразу.
+        side — реплика ушла, пока на экране идёт ответ: ход на экране не трогаем
+        (ни «Стоп», ни follow сокета); её ответ страница подхватит по шине.
+        """
         nonlocal stop_pending
         await send({"type": "posted", "client_id": client_id, **res})
         job_id = res.get("job_id")
-        job = generation_manager.get(job_id) if job_id else None
-        if job is None:
-            stop_pending = False
+        job = generation_manager.get(job_id) if job_id and not res.get("queued") else None
+        if job is None or side:
+            if not side:
+                stop_pending = False
             await send({"type": "done", "content": "", "client_id": client_id, "posted": True})
             return
         if stop_pending:
@@ -4461,6 +4481,7 @@ async def ws_chat(websocket: WebSocket, session_id: int):
             res = await _answer_message(session_id, int(raw.get("message_id") or 0), rparams, ws_user)
             await posted(res, client_id)
             return True
+        side = bool(raw.get("side"))
         if mtype not in ("user_message", None) or not await _is_messenger_chat(session_id):
             return False
         msg = WSUserMessage(**raw)
@@ -4471,8 +4492,9 @@ async def ws_chat(websocket: WebSocket, session_id: int):
             await _foreign_turn(session_id, ws_user)
         except Exception:  # noqa: BLE001
             _turn_log.exception("Не удалось сдвинуть память о пользователе (чат %s)", session_id)
-        await _clear_draft(session_id, ws_user, raw)
-        await posted(res, client_id)
+        if not side:   # черновик — у реплики из поля ввода; side тоже из него, но без версии
+            await _clear_draft(session_id, ws_user, raw)
+        await posted(res, client_id, side=side)
         return True
 
     async def run_turn(mtype: str, raw: dict, client_id) -> None:
@@ -4576,9 +4598,12 @@ async def ws_chat(websocket: WebSocket, session_id: int):
                 # после F5 ход начат другим соединением.
                 job = generation_manager.active_for(session_id)
                 stopped = job is not None and generation_manager.cancel(job.job_id)
+                # «Стоп» останавливает и очередь ответов общего чата: иначе
+                # следом сразу начался бы ответ на реплику из очереди (2.27.0).
+                _drop_answer_queue(session_id)
                 # Прежний ход уже остановлен или сохраняется, а этот сокет готовит
                 # новый («Стоп» → «Дописать» → «Стоп»): остановка — для нового.
-                if not stopped and any(not t.done() for t in turn_tasks):
+                if not stopped and any(not t.done() for t in turn_tasks if t not in side_tasks):
                     stop_pending = True
                 continue
 
@@ -4592,6 +4617,9 @@ async def ws_chat(websocket: WebSocket, session_id: int):
             client_id = str(cid)[:100] if isinstance(cid, (str, int)) and cid != "" else None
             task = asyncio.create_task(run_turn(mtype, raw, client_id))
             turn_tasks.add(task)
+            if raw.get("side"):
+                side_tasks.add(task)
+                task.add_done_callback(side_tasks.discard)
             task.add_done_callback(turn_tasks.discard)
             # Задача хода переживает сокет (клиент мог отключиться, пока собирался
             # контекст) — держим её в общем реестре, чтобы остановка сервера её дождалась.
@@ -4963,6 +4991,7 @@ async def cancel_job(job_id: str, user=Depends(current_user), db: AsyncSession =
         return {"ok": True, "cancelled": False}
     if not await _job_access(db, job, user):
         raise HTTPException(403, "Нет доступа к этому чату")
+    _drop_answer_queue(job.session_id)   # «Стоп» — и очереди ответов общего чата
     return {"ok": True, "cancelled": generation_manager.cancel(job_id)}
 
 

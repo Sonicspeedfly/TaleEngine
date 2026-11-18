@@ -144,16 +144,18 @@ async def character_names(db, sess) -> list[str]:
     return [ch.name] if ch is not None and ch.name else []
 
 
-_PLUS_RE = re.compile(r"(?:^|\s)\+[^\s+\-]")
+_PLUS_RE = re.compile(r"(?:^|\s)\+([^\s+\-]\S*)")
 
 
 def quick_decide(text: str, author_id: int | None, chars: list[str], people: list[dict]) -> str | None:
     """Решение без модели — по явным признакам; None — нужна модель."""
-    if _PLUS_RE.search(text or ""):
-        return AI   # «+Имя» — режиссёр зовёт персонажа
+    # «+Имя» — режиссёр зовёт персонажа; «+1», «+100500» — просто согласие.
+    if any(name_in_text(c, tok) for tok in _PLUS_RE.findall(text or "") for c in chars):
+        return AI
     if any(name_in_text(c, text) for c in chars):
         return AI
-    others = [p["name"] for p in people if p["id"] != author_id and p["name"]]
+    others = [n for p in people if p["id"] != author_id
+              for n in (p["name"], p.get("alias")) if n]
     low = (text or "").lower()
     if any(("@" + o.lower()) in low or name_in_text(o, text) for o in others):
         return PEOPLE
@@ -200,11 +202,14 @@ async def decide(db, sess, msg, connection, *, explicit: str | None = None) -> t
     if explicit in ADDRESSES:
         return explicit, "explicit"
     people = await participants(db, sess)
+    labels = await author_labels(db, sess)
+    for p in people:   # владелец может играть персону — её имя тоже обращение к нему
+        if labels.get(p["id"]) and labels[p["id"]] != p["name"]:
+            p["alias"] = labels[p["id"]]
     chars = await character_names(db, sess)
     quick = quick_decide(msg.content or "", msg.author_id, chars, people)
     if quick:
         return quick, "rule"
-    labels = await author_labels(db, sess)
     lines = await _transcript(db, sess, msg.id, labels)
     names = ", ".join(chars) or "Персонаж"
     humans = ", ".join(p["name"] for p in people) or "—"
