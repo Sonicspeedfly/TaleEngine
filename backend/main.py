@@ -66,6 +66,7 @@ from backend import (
     llm_gateway,
     media_refs,
     memory_service,
+    messenger,
     models,
     native_io,
     telegram_runtime,
@@ -974,6 +975,7 @@ async def list_shared_sessions(user=Depends(current_user), db: AsyncSession = De
             "character_avatar": await images.public_value(db, "character", ch.id) if ch else None,
             "owner": owner.username if owner else "",
             "timezone": s.timezone or "",
+            "reply_mode": s.reply_mode or "auto",
             **_preview_fields(s, previews),
         })
     return out
@@ -1143,6 +1145,17 @@ async def _chat_presets(db, rows) -> dict[int, dict]:
     return {p.id: {"id": p.id, "name": p.name, "params": p.params or {}} for p in found}
 
 
+async def _share_counts(db, ids) -> dict[int, int]:
+    """Сколько людей позвано в чат (кроме владельца): общий чат — от одного."""
+    if not ids:
+        return {}
+    return dict((await db.execute(
+        select(models.SessionShare.session_id, func.count(models.SessionShare.id))
+        .where(models.SessionShare.session_id.in_(list(ids)))
+        .group_by(models.SessionShare.session_id)
+    )).all())
+
+
 async def _session_rows(db, rows) -> list[dict]:
     """Строки списка чатов (тот же вид у списка и у карточки одного чата)."""
     previews = await _session_previews(db, [s.id for s in rows])
@@ -1159,6 +1172,7 @@ async def _session_rows(db, rows) -> list[dict]:
         )).all())
     bgs = await images.public_values(db, "session_bg", [s.id for s in rows])
     presets = await _chat_presets(db, rows)
+    shares = await _share_counts(db, [s.id for s in rows])
     return [
         {
             "id": s.id,
@@ -1173,6 +1187,8 @@ async def _session_rows(db, rows) -> list[dict]:
             "is_group": s.is_group,
             "director": s.director,
             "timezone": s.timezone or "",
+            "reply_mode": s.reply_mode or "auto",
+            "shares": shares.get(s.id, 0),
             "pinned": s.pinned_at is not None,
             "pinned_at": s.pinned_at.isoformat() if s.pinned_at else None,
             **_preview_fields(s, previews),
@@ -1583,6 +1599,8 @@ async def update_session(
             preset = await db.get(models.SamplingPreset, data["preset_id"])
             if preset is None or not _preset_visible(preset, user):
                 raise HTTPException(404, "Пресет не найден")
+    if "reply_mode" in data and user is not None and user.role != "admin" and sess.owner_id != user.id:
+        raise HTTPException(403, "Режим ответов в общем чате меняет его владелец")
     if images.is_our_url(data.get("background")):
         data.pop("background")   # ссылка на копию фона пришла обратно — фон не менялся
     # закреплённые упорядочивались между собой, при снятии — NULL.
@@ -1819,6 +1837,18 @@ async def get_attachment(
     return _media_response(raw, mime, headers, rng)
 
 
+async def _message_authors(db, rows) -> dict[int, dict]:
+    """Авторы реплик людей: {user_id: {id, name, avatar}} одним запросом."""
+    ids = sorted({m.author_id for m in rows if getattr(m, "author_id", None)})
+    if not ids:
+        return {}
+    users = (await db.execute(
+        select(models.User.id, models.User.username).where(models.User.id.in_(ids))
+    )).all()
+    avatars = await images.public_values(db, "user", [u.id for u in users])
+    return {u.id: {"id": u.id, "name": u.username, "avatar": avatars.get(u.id)} for u in users}
+
+
 @app.get("/api/sessions/{session_id}/messages")
 async def get_messages(
     session_id: int, before: int | None = None, limit: int | None = None,
@@ -1851,11 +1881,16 @@ async def get_messages(
             await db.execute(select(models.Canvas).where(models.Canvas.id.in_(canvas_ids)))
         ).scalars().all()
         canvas_meta = {c.id: {"title": c.title, "kind": c.kind} for c in cvs}
+    authors = await _message_authors(db, rows)
     return [
         {
             "id": m.id,
             "role": m.role,
             "content": m.content,
+            # Кто из людей написал (2.27.0): {id, name, avatar} или None.
+            "author": authors.get(m.author_id) if m.author_id else None,
+            # Кому реплика в общем чате: "ai" | "people" | None.
+            "address": m.address,
             # Только МЕТА вложений (без base64 data) — иначе чат с фото/аудио весит
             # десятки МБ и грузится медленно. Сами данные отдаёт /messages/{id}/att/{i}.
             "attachments": [_att_meta(a) for a in (m.attachments or []) if isinstance(a, dict)],
@@ -1897,6 +1932,7 @@ async def list_groups(user=Depends(current_user), db: AsyncSession = Depends(get
     rows = _sort_by_activity(rows, previews)
     bgs = await images.public_values(db, "session_bg", [s.id for s in rows])
     presets = await _chat_presets(db, rows)
+    shares = await _share_counts(db, [s.id for s in rows])
     result = []
     for s in rows:
         members = await group_chat.load_members(db, s.id)
@@ -1908,6 +1944,8 @@ async def list_groups(user=Depends(current_user), db: AsyncSession = Depends(get
                 "director": s.director,
                 "scenario": s.scenario,
                 "timezone": s.timezone or "",
+                "reply_mode": s.reply_mode or "auto",
+                "shares": shares.get(s.id, 0),
                 "pinned": s.pinned_at is not None,
                 "pinned_at": s.pinned_at.isoformat() if s.pinned_at else None,
                 # Метаданные сессии — те же поля, что у личных чатов. Без них клиент
@@ -3631,7 +3669,7 @@ async def make_image(
 
 # ==================== КОНВЕЙЕР ГЕНЕРАЦИИ ====================
 async def _start_group_turn(session_id, content, attachments, params, db, reply_to_message_id=None,
-                            save_user=True, kind="group") -> str:
+                            save_user=True, kind="group", author_id=None) -> str:
     """
     Ход в групповом чате: сохраняем реплику пользователя и запускаем сценарий, где
     последовательно отвечают выбранные персонажи (по упоминанию / режиссёр / по кругу).
@@ -3655,7 +3693,7 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
     if save_user:
         msg = models.Message(
             session_id=session_id, role="user", content=original_content,
-            attachments=[], reply_to_id=reply_to_message_id,
+            attachments=[], reply_to_id=reply_to_message_id, author_id=author_id,
         )
         db.add(msg)
         await db.flush()
@@ -3676,11 +3714,12 @@ async def _start_group_turn(session_id, content, attachments, params, db, reply_
                     .order_by(models.Message.id)
                 )
             ).scalars().all()
+            authors = await messenger.author_labels(rdb, await rdb.get(models.ChatSession, session_id))
         last_assistant = next((m for m in reversed(msgs) if m.role == "assistant"), None)
         last_speaker = last_assistant.speaker_name if last_assistant else None
         transcript = "\n".join(
             (f"{m.speaker_name or 'Персонаж'}: {m.content}" if m.role == "assistant"
-             else f"Пользователь: {m.content}")
+             else f"{authors.get(m.author_id) or 'Пользователь'}: {m.content}")
             for m in msgs
         )
 
@@ -3827,19 +3866,24 @@ async def _reply_prefix(db, reply_to_message_id, session_id: int | None = None) 
     return f"(В ответ на {who}: «{rep.content[:300]}»)\n"
 
 
-async def _start_user_turn(session_id, content, attachments, params, db, reply_to_message_id=None) -> str:
+async def _start_user_turn(session_id, content, attachments, params, db, reply_to_message_id=None,
+                           author_id=None) -> str:
     """Сохранить сообщение пользователя -> собрать контекст -> запустить генерацию."""
     sess = await db.get(models.ChatSession, session_id)
     if not sess:
         raise HTTPException(404, "Сессия не найдена")
     reply_to_message_id = await _own_reply_id(db, session_id, reply_to_message_id)
     if sess.is_group:
-        return await _start_group_turn(session_id, content, attachments, params, db, reply_to_message_id)
+        return await _start_group_turn(session_id, content, attachments, params, db, reply_to_message_id,
+                                       author_id=author_id)
     character = await db.get(models.Character, sess.character_id)
     connection = await get_connection(db)
 
     # Для модели добавляем ссылку на сообщение, на которое отвечает пользователь.
-    model_text = (await _reply_prefix(db, reply_to_message_id, session_id)) + content
+    # В общем чате реплика подписана автором — как и реплики людей в истории.
+    labels = await messenger.author_labels(db, sess)
+    model_text = (await _reply_prefix(db, reply_to_message_id, session_id)) \
+        + messenger.label(content, labels.get(author_id))
     user_content = await _user_content(model_text, attachments)
     # Контекст строим ДО сохранения нового сообщения (иначе оно задвоится).
     messages = await build_context_from_db(
@@ -3856,6 +3900,7 @@ async def _start_user_turn(session_id, content, attachments, params, db, reply_t
         content=content,
         attachments=[],
         reply_to_id=reply_to_message_id,
+        author_id=author_id,
     )
     db.add(msg)
     await db.flush()
@@ -4024,24 +4069,48 @@ async def _start_retry(session_id, params, db) -> str:
     last = msgs[-1] if msgs else None
     if not last or last.role != "user":
         return await _start_regenerate(session_id, params, db, kind="retry")
+    return await _start_answer(session_id, params, db, last, msgs=msgs, kind="retry")
 
+
+async def _start_answer(session_id, params, db, target, msgs=None, kind="send") -> str:
+    """
+    Ответ персонажа на УЖЕ сохранённую реплику target (retry, общий чат 2.27.0).
+
+    Контекст: вся история, кроме target, + target как текущее сообщение. В
+    общем чате после target могли прийти реплики людей друг другу — модель
+    видит их до неё, а отвечает на неё.
+    """
+    sess = await db.get(models.ChatSession, session_id)
+    if not sess:
+        raise HTTPException(404, "Сессия не найдена")
+    if msgs is None:
+        msgs = (
+            await db.execute(
+                select(models.Message)
+                .where(models.Message.session_id == session_id)
+                .order_by(models.Message.id)
+            )
+        ).scalars().all()
     if sess.is_group:
         # Реплика уже в БД (runner группы читает историю из неё) — не дублируем.
-        return await _start_group_turn(session_id, last.content, [], params, db, save_user=False,
-                                       kind="retry")
+        return await _start_group_turn(session_id, target.content, [], params, db, save_user=False,
+                                       kind=kind if kind == "retry" else "group")
 
     character = await db.get(models.Character, sess.character_id)
     connection = await get_connection(db)
-    # Файлы повторяемой реплики — заготовками: готовая ссылка на хранилище
-    # (если сбой был из-за размера, повтор с ней лёгкий), иначе целиком, как в
-    # исходном ходе. Данные читает stream_completion.
-    user_content = media_refs.history_content(last.content, last.attachments, current=True, priority=2)
-    # Контекст: история ДО последней реплики + сама реплика как текущее сообщение —
+    labels = await messenger.author_labels(db, sess)
+    text = (await _reply_prefix(db, target.reply_to_id, session_id)) \
+        + messenger.label(target.content or "", labels.get(target.author_id))
+    # Файлы реплики — заготовками: готовая ссылка на хранилище (если сбой был
+    # из-за размера, повтор с ней лёгкий), иначе целиком, как в исходном ходе.
+    # Данные читает stream_completion.
+    user_content = media_refs.history_content(text, target.attachments, current=True, priority=2)
+    # Контекст: история без этой реплики + сама реплика как текущее сообщение —
     # ровно то же, что видел бы _start_user_turn, но без повторного сохранения.
-    prior = [m for m in msgs if m.id < last.id]
+    prior = [m for m in msgs if m.id != target.id]
     history = await messages_to_history_db(db, prior)
     messages = await build_context_from_db(
-        db, sess, character, last.content, user_content, _ctx_budget(params),
+        db, sess, character, text, user_content, _ctx_budget(params),
         history=history, history_ids=[m.id for m in prior],
         send_avatars=bool(params and params.send_avatars),
         knowledge_chars=_kb_chars(params),
@@ -4057,7 +4126,7 @@ async def _start_retry(session_id, params, db) -> str:
         params,
         on_complete=_make_persist_new(_effective_model(params, connection)),
         connection=connection,
-        kind="retry",
+        kind=kind,
     )
     return job_id
 
@@ -4115,6 +4184,129 @@ def _busy_response(job) -> JSONResponse:
         {"detail": "В этом чате уже идёт ответ", "job_id": job.job_id, "kind": job.kind},
         status_code=409,
     )
+
+
+# ==================== ОБЩИЙ ЧАТ КАК МЕССЕНДЖЕР (2.27.0) ====================
+# Реплики персонажу, пришедшие, пока он отвечает: {чат: (id реплики, params)} —
+# после текущего хода он ответит на последнюю из них (видя и остальные).
+_answer_queue: dict[int, tuple[int, object]] = {}
+_answer_waiters: dict[int, asyncio.Task] = {}
+ANSWER_QUEUE_ROUNDS = 20
+ANSWER_WAIT = 900
+
+
+def _publish_address(session_id: int, message_id: int, address: str, queued: bool = False) -> None:
+    turn_events.publish({"type": "message_address", "session_id": session_id,
+                         "message_id": message_id, "address": address, "queued": queued})
+
+
+async def _messenger_post(session_id: int, content: str, attachments, params, user,
+                          reply_to_message_id=None, address=None) -> dict:
+    """
+    Реплика в общий чат с несколькими людьми: сохраняем и СРАЗУ показываем всем
+    (message_new на шине), потом решаем, кому она (backend/messenger.py).
+    Персонажу — ход (или очередь, если он сейчас отвечает другому), людям —
+    только публикация. Ответ: {message_id, address, job_id?, queued?}.
+    """
+    author_id = user.id if user is not None else None
+    async with AsyncSessionLocal() as db:
+        sess = await db.get(models.ChatSession, session_id)
+        reply_to = await _own_reply_id(db, session_id, reply_to_message_id)
+        msg = models.Message(session_id=session_id, role="user", content=content or "",
+                             attachments=[], reply_to_id=reply_to, author_id=author_id)
+        db.add(msg)
+        await db.flush()
+        msg.attachments = await store_attachments(db, msg.id, attachments)
+        await db.commit()
+        connection = await get_connection(db)
+        media_refs.enqueue_message(msg.attachments, params, connection)
+        message_id = msg.id
+        turn_events.publish({"type": "message_new", "session_id": session_id,
+                             "message_id": message_id, "author_id": author_id})
+        # Пока решаем — фон не начинает запросов (как при сборке контекста хода).
+        with llm_gateway.turn_preparing():
+            where, how = await messenger.decide(db, sess, msg, connection, explicit=address)
+        msg.address = where
+        await db.commit()
+    _turn_log.info("Общий чат %s: реплика %s → %s (%s)", session_id, message_id, where, how)
+    out = {"message_id": message_id, "address": where, "decided_by": how}
+    if where != messenger.AI:
+        _publish_address(session_id, message_id, where)
+        return out
+    try:
+        async with AsyncSessionLocal() as db:
+            target = await db.get(models.Message, message_id)
+            out["job_id"] = await _guarded_turn(
+                session_id, lambda: _start_answer(session_id, params, db, target))
+    except TurnBusy as busy:
+        _queue_answer(session_id, message_id, params)
+        out.update(queued=True, busy_job_id=busy.job.job_id)
+    _publish_address(session_id, message_id, where, queued=bool(out.get("queued")))
+    return out
+
+
+def _queue_answer(session_id: int, message_id: int, params) -> None:
+    prev = _answer_queue.get(session_id)
+    if prev is None or prev[0] <= message_id:
+        _answer_queue[session_id] = (message_id, params)
+    task = _answer_waiters.get(session_id)
+    if task is None or task.done():
+        _answer_waiters[session_id] = asyncio.create_task(_answer_waiter(session_id))
+
+
+async def _answer_waiter(session_id: int) -> None:
+    """Дождаться конца идущего хода и ответить на реплики из очереди."""
+    try:
+        for _ in range(ANSWER_QUEUE_ROUNDS):
+            job = generation_manager.active_for(session_id)
+            if job is not None:
+                await generation_manager.wait_done(job, ANSWER_WAIT)
+            item = _answer_queue.pop(session_id, None)
+            if item is None:
+                return
+            message_id, params = item
+            try:
+                async with AsyncSessionLocal() as db:
+                    target = await db.get(models.Message, message_id)
+                    if target is None or target.session_id != session_id:
+                        continue
+                    await _guarded_turn(session_id, lambda: _start_answer(session_id, params, db, target))
+                _publish_address(session_id, message_id, messenger.AI)
+            except TurnBusy:
+                # Кто-то успел начать ход раньше — ждём и его.
+                _answer_queue.setdefault(session_id, item)
+            except Exception:  # noqa: BLE001 — сбой одного ответа не роняет очередь
+                _turn_log.exception("Очередь ответов чата %s: не удалось ответить на %s",
+                                    session_id, message_id)
+    finally:
+        if _answer_waiters.get(session_id) is asyncio.current_task():
+            _answer_waiters.pop(session_id, None)
+
+
+async def _answer_message(session_id: int, message_id: int, params, user) -> dict:
+    """«Позвать персонажа»: ответить на реплику, которую отнесли людям."""
+    async with AsyncSessionLocal() as db:
+        target = await db.get(models.Message, message_id)
+        if target is None or target.session_id != session_id or target.role != "user":
+            raise HTTPException(404, "Сообщение не найдено")
+        target.address = messenger.AI
+        await db.commit()
+    out = {"message_id": message_id, "address": messenger.AI}
+    try:
+        async with AsyncSessionLocal() as db:
+            target = await db.get(models.Message, message_id)
+            out["job_id"] = await _guarded_turn(
+                session_id, lambda: _start_answer(session_id, params, db, target))
+    except TurnBusy as busy:
+        _queue_answer(session_id, message_id, params)
+        out.update(queued=True, busy_job_id=busy.job.job_id)
+    _publish_address(session_id, message_id, messenger.AI, queued=bool(out.get("queued")))
+    return out
+
+
+async def _is_messenger_chat(session_id: int) -> bool:
+    async with AsyncSessionLocal() as db:
+        return await messenger.is_messenger(db, await db.get(models.ChatSession, session_id))
 
 
 def _error_text(exc: BaseException) -> str:
@@ -4246,10 +4438,60 @@ async def ws_chat(websocket: WebSocket, session_id: int):
         forward_job_id = job.job_id
         forward_task = asyncio.create_task(forward(job))
 
+    async def posted(res: dict, client_id) -> None:
+        """Реплика в общем чате опубликована; ход персонажа — если он отвечает сразу."""
+        nonlocal stop_pending
+        await send({"type": "posted", "client_id": client_id, **res})
+        job_id = res.get("job_id")
+        job = generation_manager.get(job_id) if job_id else None
+        if job is None:
+            stop_pending = False
+            await send({"type": "done", "content": "", "client_id": client_id, "posted": True})
+            return
+        if stop_pending:
+            stop_pending = False
+            generation_manager.cancel(job_id)
+        await send({"type": "job", "job_id": job_id, "kind": job.kind, "client_id": client_id})
+        follow(job)
+
+    async def run_messenger(mtype: str, raw: dict, client_id) -> bool:
+        """Общий чат (2.27.0): публикация реплики / «позвать персонажа». False — не наш случай."""
+        if mtype == "answer":
+            rparams = GenerationParams(**(raw.get("params") or {}))
+            res = await _answer_message(session_id, int(raw.get("message_id") or 0), rparams, ws_user)
+            await posted(res, client_id)
+            return True
+        if mtype not in ("user_message", None) or not await _is_messenger_chat(session_id):
+            return False
+        msg = WSUserMessage(**raw)
+        atts = await _resolve_draft_refs(session_id, ws_user, msg.attachments)
+        res = await _messenger_post(session_id, msg.content, atts, msg.params, ws_user,
+                                    reply_to_message_id=msg.reply_to_message_id, address=msg.address)
+        try:
+            await _foreign_turn(session_id, ws_user)
+        except Exception:  # noqa: BLE001
+            _turn_log.exception("Не удалось сдвинуть память о пользователе (чат %s)", session_id)
+        await _clear_draft(session_id, ws_user, raw)
+        await posted(res, client_id)
+        return True
+
     async def run_turn(mtype: str, raw: dict, client_id) -> None:
         nonlocal stop_pending
         await send({"type": "accepted", "client_id": client_id})
         await send({"type": "status", "stage": "preparing", "client_id": client_id})
+        if mtype not in ("regenerate", "continue", "retry"):
+            try:
+                if await run_messenger(mtype, raw, client_id):
+                    return
+            except Exception as exc:  # noqa: BLE001 — как сбой старта хода ниже
+                stop_pending = False
+                if isinstance(exc, HTTPException):
+                    _turn_log.warning("Реплика не отправлена (чат %s): %s", session_id, exc.detail)
+                else:
+                    _turn_log.exception("Реплика не отправлена (чат %s)", session_id)
+                await send({"type": "error", "content": _error_text(exc), "client_id": client_id})
+                await send({"type": "done", "content": "", "client_id": client_id})
+                return
         try:
             async with AsyncSessionLocal() as db:
                 if mtype == "regenerate":
@@ -4268,6 +4510,7 @@ async def ws_chat(websocket: WebSocket, session_id: int):
                     start = lambda: _start_user_turn(  # noqa: E731
                         session_id, msg.content, msg.attachments, msg.params, db,
                         reply_to_message_id=msg.reply_to_message_id,
+                        author_id=ws_user.id if ws_user is not None else None,
                     )
                 job_id = await _guarded_turn(session_id, start)
         except TurnBusy as busy:
@@ -4619,15 +4862,24 @@ async def http_send(
     if not await _can_access_session(db, sess, user):
         raise HTTPException(403, "Нет доступа к этому чату")
     atts = await _resolve_draft_refs(session_id, user, msg.attachments)
+    draft = msg.model_dump(include={"content", "draft_version", "draft_fids"})
+    if await _is_messenger_chat(session_id):
+        res = await _messenger_post(session_id, msg.content, atts, msg.params, user,
+                                    reply_to_message_id=msg.reply_to_message_id, address=msg.address)
+        await _foreign_turn(session_id, user)
+        await _clear_draft(session_id, user, draft)
+        return {"job_id": None if res.get("queued") else res.get("job_id"), "posted": True, **{
+            k: v for k, v in res.items() if k != "job_id"}}
     try:
         job_id = await _guarded_turn(session_id, lambda: _start_user_turn(
             session_id, msg.content, atts, msg.params, db,
             reply_to_message_id=msg.reply_to_message_id,
+            author_id=user.id if user is not None else None,
         ))
     except TurnBusy as busy:
         return _busy_response(busy.job)
     await _foreign_turn(session_id, user)
-    await _clear_draft(session_id, user, msg.model_dump(include={"content", "draft_version", "draft_fids"}))
+    await _clear_draft(session_id, user, draft)
     return {"job_id": job_id}
 
 
@@ -4678,10 +4930,19 @@ async def http_send_form(
 
     params = GenerationParams(**(data.get("params") or {})) if data.get("params") else None
     attachments = await _resolve_draft_refs(session_id, user, attachments)
+    if await _is_messenger_chat(session_id):
+        address = data.get("address") if data.get("address") in messenger.ADDRESSES else None
+        res = await _messenger_post(session_id, data.get("content") or "", attachments, params, user,
+                                    reply_to_message_id=data.get("reply_to_message_id"), address=address)
+        await _foreign_turn(session_id, user)
+        await _clear_draft(session_id, user, data)
+        return {"job_id": None if res.get("queued") else res.get("job_id"), "posted": True, **{
+            k: v for k, v in res.items() if k != "job_id"}}
     try:
         job_id = await _guarded_turn(session_id, lambda: _start_user_turn(
             session_id, (data.get("content") or ""), attachments, params, db,
             reply_to_message_id=data.get("reply_to_message_id"),
+            author_id=user.id if user is not None else None,
         ))
     except TurnBusy as busy:
         return _busy_response(busy.job)

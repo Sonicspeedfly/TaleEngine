@@ -338,13 +338,16 @@ async def build_group_messages(
                     _render_horae_block(activated), BEHAVIOR_GUIDE, horae_rules] if p
     )
 
+    # Общий чат (2.27.0): у каждой реплики человека — свой автор.
+    from backend import messenger
+    authors = await messenger.author_labels(db, session)
     lines = []
     for m in msgs:
         if m.role == "user":
             # Реплики пользователя очищаем от режиссёрских команд (+Имя/-Имя) —
             # модель их не должна видеть как часть роль-плея (в чате они остаются).
             _, _, ctext = parse_director_directives(m.content or "", members)
-            lines.append(f"{persona_name}: {ctext}")
+            lines.append(f"{authors.get(m.author_id) or persona_name}: {ctext}")
         else:
             lines.append(f"{m.speaker_name or target_character.name}: {m.content}")
     # Файлы реплик весят для модели по-настоящему (голосовое на минуту ≈ 2 тыс.

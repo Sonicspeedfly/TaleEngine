@@ -270,6 +270,9 @@ class SessionUpdate(BaseModel):
     # Часовой пояс пользователя ДЛЯ ЭТОГО чата (IANA-имя вида Europe/Moscow или
     # смещение "+03:00"): нейросеть видит текущее время пользователя.
     timezone: Optional[str] = None
+    # Общий чат (2.27.0): "auto" — персонаж отвечает на обращения к нему,
+    # "always" — на каждую реплику. Меняет только владелец.
+    reply_mode: Optional[Literal["auto", "always"]] = None
 
 
 class SessionFork(BaseModel):
@@ -339,6 +342,9 @@ class WSUserMessage(BaseModel):
     # человек успел набрать или прикрепить после «Отправить», остаётся.
     draft_version: Optional[int] = None
     draft_fids: list[int] = Field(default_factory=list, max_length=200)
+    # Общий чат (2.27.0): кому реплика — "ai" (персонажу), "people" (только
+    # людям); None — решает сервер (backend/messenger.py).
+    address: Optional[Literal["ai", "people"]] = None
 
 
 class WSRegenerate(BaseModel):

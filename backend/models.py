@@ -99,6 +99,9 @@ class ChatSession(Base):
     # Часовой пояс пользователя ДЛЯ ЭТОГО чата (IANA-имя или смещение "+03:00").
     # Нейросеть видит по нему текущее время собеседника; настраивается в UI на чат.
     timezone: Mapped[str] = mapped_column(String(64), default="")
+    # Общий чат (2.27.0): "auto" — персонаж отвечает, когда обращаются к нему
+    # (решает backend/messenger.py), "always" — на каждую реплику, как раньше.
+    reply_mode: Mapped[str] = mapped_column(String(16), default="auto")
     # Закрепление чата наверху списка. Храним ВРЕМЯ, а не флаг: так закреплённые
     # можно упорядочить между собой (последний закреплённый — сверху), а «не
     # закреплён» это просто NULL.
@@ -145,6 +148,12 @@ class Message(Base):
     speaker_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     # Ответ на конкретное сообщение (id) — чтобы модель понимала, к чему обращаются.
     reply_to_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Кто из людей написал реплику (users.id; 2.27.0). Старые сообщения и режим
+    # без аккаунтов — NULL. В общем чате по нему подпись и аватар автора.
+    author_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Кому реплика в общем чате (backend/messenger.py): "ai" — персонажу,
+    # "people" — только людям (модель не отвечала). NULL — личный чат.
+    address: Mapped[str | None] = mapped_column(String(16), nullable=True)
     # Если задано — это «плашка документа»: ответ ИИ открывается в Канвасе по клику,
     # а не выводится полотном в чат. content тогда — короткий заголовок/превью.
     canvas_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
