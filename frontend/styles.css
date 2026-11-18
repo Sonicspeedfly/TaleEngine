@@ -2426,3 +2426,45 @@ input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
 /* Дневник персонажа (2.28.0) */
 .diary-text { white-space: pre-wrap; line-height: 1.5; margin-top: 6px; font-style: italic; }
 .diary-day textarea { width: 100%; margin: 6px 0; }
+
+/* «Люди» — личная переписка (2.29.0) */
+.people-btn { position: relative; }
+.notif-badge.static { position: static; margin-left: 6px; }
+.people-modal { width: min(860px, calc(100vw - 32px)); height: min(640px, calc(100vh - 64px)); display: flex; flex-direction: column; }
+.people-layout { flex: 1; min-height: 0; display: grid; grid-template-columns: 240px 1fr; gap: 12px; }
+.people-list { overflow-y: auto; display: flex; flex-direction: column; gap: 4px; border-right: 1px solid var(--border-subtle); padding-right: 8px; }
+.people-item { display: flex; align-items: center; gap: 8px; text-align: left; padding: 8px; border-radius: 10px; border: 1px solid transparent; background: transparent; color: inherit; font: inherit; cursor: pointer; }
+.people-item:hover { background: var(--surface-2, var(--surface-selected)); }
+.people-item.active { background: var(--surface-selected); border-color: var(--accent-border, var(--border-subtle)); }
+.people-item .avatar { width: 34px; height: 34px; border-radius: 50%; overflow: hidden; display: inline-flex; align-items: center; justify-content: center; background: var(--surface-3); flex: none; }
+.people-item .avatar img { width: 100%; height: 100%; object-fit: cover; }
+.people-item .grow { min-width: 0; display: flex; flex-direction: column; }
+.people-last { font-size: var(--fs-100); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.people-chat { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.people-pick { align-items: center; justify-content: center; }
+.people-chat-head { padding-bottom: 6px; border-bottom: 1px solid var(--border-subtle); }
+.people-back { display: none; }
+.people-msgs { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding: 10px 2px; }
+.dm { max-width: 80%; display: flex; flex-direction: column; }
+.dm.mine { align-self: flex-end; align-items: flex-end; }
+.dm.theirs { align-self: flex-start; }
+.dm .bubble { padding: 8px 12px; border-radius: 14px; background: var(--bubble-assistant); white-space: pre-wrap; }
+.dm.mine .bubble { background: var(--bubble-user); }
+.dm-meta { font-size: 11px; margin: 2px 6px 0; }
+.dm-forward { border-left: 3px solid var(--accent); padding: 4px 8px; margin-bottom: 4px; background: var(--surface-2, transparent); border-radius: 6px; }
+.dm-forward-head { font-size: var(--fs-100); }
+.dm-forward-text { white-space: pre-wrap; max-height: 220px; overflow-y: auto; }
+.people-compose { gap: 8px; align-items: flex-end; }
+.people-compose textarea { flex: 1; resize: none; min-height: 38px; max-height: 120px; }
+@media (max-width: 640px) {
+  .people-layout { grid-template-columns: 1fr; }
+  .people-layout.has-chat .people-list { display: none; }
+  .people-layout:not(.has-chat) .people-chat { display: none; }
+  .people-back { display: inline-flex; }
+  .people-list { border-right: none; padding-right: 0; }
+}
+.btn-link { background: none; border: none; padding: 2px 0; color: var(--accent); font: inherit; font-size: var(--fs-100); cursor: pointer; text-decoration: underline; }
+/* Шапки модальных окон: заголовок слева, «✕» справа (раньше правило было
+   только у карточек, и в окнах крестик уезжал под заголовок). */
+.modal .row-between, .people-chat-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.people-chat-head .grow { flex: 1; }

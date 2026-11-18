@@ -55,6 +55,7 @@ from backend import (
     admin_service,
     debug_log,
     diary,
+    direct,
     drafts,
     gcp_billing,
     group_chat,
@@ -4735,6 +4736,12 @@ async def sse_events(request: Request):
                 if event.get("type") == "draft" and user is not None \
                         and event.get("owner_id") != drafts.owner_of(user):
                     continue
+                # Личная переписка (2.29.0) — только тем двоим, кто в ней.
+                dm = direct.visible_to(event, user)
+                if dm is not None:
+                    if dm:
+                        yield _sse(event)
+                    continue
                 if await allowed(event.get("session_id")):
                     yield _sse(event)
         finally:
@@ -5571,6 +5578,8 @@ def _localize_cdn(html: str, vendor: set[str]) -> str:
 app.include_router(horae_api.build_router(current_user, _can_access_session))
 app.include_router(user_memory.build_router(current_user))
 app.include_router(diary.build_router(current_user))
+app.include_router(direct.build_router(current_user, are_friends=_are_friends,
+                                       can_access_session=_can_access_session))
 
 
 if _frontend_dir.exists():
