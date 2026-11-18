@@ -1596,6 +1596,10 @@ async def update_session(
     sess = await db.get(models.ChatSession, session_id)
     if not sess:
         raise HTTPException(404, "Сессия не найдена")
+    # Чужой чат не правим (раньше проверки не было вовсе: зная id, можно было
+    # поменять пояс, заметку или пресет чужого чата).
+    if not await _can_access_session(db, sess, user):
+        raise HTTPException(403, "Нет доступа к этому чату")
     data = payload.model_dump(exclude_none=True)
     if "preset_id" in data:
         # Пресет чата: 0 — снять; иначе — пресет, который этот человек видит

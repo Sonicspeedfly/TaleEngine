@@ -545,6 +545,7 @@ createApp({
       dmMore: false,
       dmInput: "",
       dmSending: false,
+      dmLoading: false,
       forwardMsg: null,         // реплика, которую пересылаем
       forwardTo: null,          // id друга
       forwardNote: "",
@@ -2292,16 +2293,26 @@ createApp({
     // (открытый мне другом). Нет доступа — сервер скажет, покажем тост.
     async openMessageLink(sid, mid) {
       if (!sid || !mid) return;
+      if (location.hash.startsWith("#msg=")) history.replaceState(null, "", location.pathname + location.search);
+      // Чат должен быть в моих списках: свой, группа или открытый мне. Не нашли —
+      // перечитываем списки (чат могли открыть мне только что); всё равно нет —
+      // доступа нет, и чат не открываем: иначе экран остался бы на пустом чужом
+      // чате, а «последний чат» и пояс записались бы ему.
+      const known = () => this.sessions.some((x) => x.id === sid) || this.allSessions.some((x) => x.id === sid)
+        || this.groups.some((x) => x.id === sid) || this.sharedSessions.some((x) => x.id === sid);
+      if (!known()) {
+        await Promise.all([this.loadAllSessions(), this.loadSharedSessions(), this.loadGroups().catch(() => {})]);
+      }
+      if (!known() && !this.isAdmin) { this.showToast("Нет доступа к этому чату"); return; }
       this.peopleOpen = false;
-      const shared = this.sharedSessions.find((x) => x.id === sid);
       try {
-        if (shared && sid !== this.sessionId) await this.openSharedSession(shared);
+        if (sid !== this.sessionId) await this._openById(sid);
+        if (this.sessionId !== sid) return;
         await this.jumpToMessage(sid, mid);
         if (!this.messages.some((m) => m.id === mid)) this.showToast("Сообщение не найдено — возможно, его удалили");
       } catch (e) {
         this.showToast("Не удалось открыть сообщение: " + (e.message || e));
       }
-      if (location.hash.startsWith("#msg=")) history.replaceState(null, "", location.pathname + location.search);
     },
     async loadDmThreads() {
       if (!this.currentUserObj) return;
@@ -2326,17 +2337,22 @@ createApp({
     },
     async loadDm(older) {
       const u = this.dmWith;
-      if (!u) return;
+      if (!u || (older && this.dmLoading)) return;
+      this.dmLoading = true;
       const first = this.dmMessages[0];
       const q = older && first ? "?before=" + first.id : "";
       try {
         const r = await this.api("/dm/" + u.id + q);
         if (!this.dmWith || this.dmWith.id !== u.id) return;
-        this.dmMessages = older ? [...(r.messages || []), ...this.dmMessages] : (r.messages || []);
+        const have = new Set(this.dmMessages.map((x) => x.id));
+        this.dmMessages = older ? [...(r.messages || []).filter((x) => !have.has(x.id)), ...this.dmMessages]
+          : (r.messages || []);
         this.dmMore = !!r.more;
         if (!older) this.$nextTick(() => { const b = this.$refs.dmBox; if (b) b.scrollTop = b.scrollHeight; });
       } catch (e) {
         this.showToast("Переписка: " + (e.message || e));
+      } finally {
+        this.dmLoading = false;
       }
     },
     async sendDm() {
@@ -2384,7 +2400,7 @@ createApp({
       if (open) {
         if (!this.dmMessages.some((x) => x.id === d.id)) this.dmMessages.push(d);
         this.$nextTick(() => { const b = this.$refs.dmBox; if (b) b.scrollTop = b.scrollHeight; });
-        if (d.sender_id !== this.myUserId) this.loadDm(false);   // прочитано
+        if (d.sender_id !== this.myUserId) this.api("/dm/" + other + "/read", { method: "POST" }).catch(() => {});
       } else if (d.sender_id !== this.myUserId) {
         const text = d.content || (d.forward ? "↪ " + (d.forward.content || "").slice(0, 60) : "");
         this.showToast("💬 " + (ev.sender_name || "Сообщение") + ": " + text.slice(0, 80),
@@ -3011,8 +3027,11 @@ createApp({
       if (ev.type === "turn_done") this._onTurnDone(ev);
       if (ev.type === "draft") this._onDraftEvent(ev);
       if (ev.type === "dm") this._onDmEvent(ev);
-      if (ev.type === "dm_read" && this.dmWith && ev.reader_id === this.dmWith.id) {
-        for (const d of this.dmMessages) if (d.sender_id === this.myUserId && d.id <= ev.upto) d.read = true;
+      if (ev.type === "dm_read") {
+        if (this.dmWith && ev.reader_id === this.dmWith.id) {
+          for (const d of this.dmMessages) if (d.sender_id === this.myUserId && d.id <= ev.upto) d.read = true;
+        }
+        if (ev.reader_id === this.myUserId) this.loadDmThreads();   // счётчик в других вкладках
       }
       // Общий чат (2.27.0): реплика человека видна сразу — даже без хода ИИ.
       if (ev.type === "message_new" && ev.session_id != null) {
@@ -10379,7 +10398,7 @@ createApp({
             <b class="grow">{{ dmWith.name }}</b>
           </div>
           <div class="people-msgs" ref="dmBox">
-            <button v-if="dmMore" class="btn-link" @click="loadDm(true)">Показать раньше</button>
+            <button v-if="dmMore" class="btn-link" :disabled="dmLoading" @click="loadDm(true)">Показать раньше</button>
             <p v-if="!dmMessages.length" class="muted">Сообщений пока нет.</p>
             <div v-for="d in dmMessages" :key="'dm' + d.id" :class="['dm', d.sender_id === myUserId ? 'mine' : 'theirs']">
               <div class="bubble">

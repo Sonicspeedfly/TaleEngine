@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import func, or_, select, update
 
 from backend import models, turn_events
 
@@ -96,7 +96,7 @@ def build_router(current_user, *, are_friends, can_access_session):
                           "at": _iso(last.created_at), "id": last.id} if last else None),
                 "unread": int(unread.get(uid, 0)),
             })
-        out.sort(key=lambda r: (r["last"]["id"] if r["last"] else 0, r["user"]["name"]), reverse=True)
+        out.sort(key=lambda r: (-(r["last"]["id"] if r["last"] else 0), r["user"]["name"].lower()))
         return {"enabled": True, "threads": out, "unread": sum(r["unread"] for r in out)}
 
     @router.get("/{other_id}")
@@ -111,15 +111,33 @@ def build_router(current_user, *, are_friends, can_access_session):
             q = q.where(models.DirectMessage.id < before)
         rows = list(reversed((await db.execute(
             q.order_by(models.DirectMessage.id.desc()).limit(PAGE))).scalars().all()))
-        fresh = [m for m in rows if m.recipient_id == user.id and m.read_at is None]
-        if fresh:
-            now = datetime.utcnow()
-            for m in fresh:
-                m.read_at = now
-            await db.commit()
-            turn_events.publish({"type": "dm_read", "users": [user.id, other_id],
-                                 "reader_id": user.id, "upto": max(m.id for m in fresh)})
+        if not before and rows:
+            # Открыл переписку — прочитано ВСЁ входящее, а не только последняя страница.
+            await _mark_read(db, user.id, other_id, rows[-1].id)
+            for m in rows:
+                if m.recipient_id == user.id and m.read_at is None:
+                    m.read_at = datetime.utcnow()
         return {"messages": [serialize(m) for m in rows], "more": len(rows) == PAGE}
+
+    async def _mark_read(db, uid: int, other_id: int, upto: int) -> int:
+        res = await db.execute(update(models.DirectMessage).where(
+            models.DirectMessage.pair == pair_of(uid, other_id), models.DirectMessage.recipient_id == uid,
+            models.DirectMessage.read_at.is_(None), models.DirectMessage.id <= upto,
+        ).values(read_at=datetime.utcnow()))
+        await db.commit()
+        if res.rowcount:
+            turn_events.publish({"type": "dm_read", "users": [uid, other_id], "reader_id": uid, "upto": upto})
+        return res.rowcount or 0
+
+    @router.post("/{other_id}/read")
+    async def mark_read(other_id: int, user=Depends(current_user), db: AsyncSession = Depends(get_session)):
+        """Прочитал пришедшее, пока переписка открыта (без перечитывания страницы)."""
+        user = _need_user(user)
+        if not await are_friends(db, user.id, other_id):
+            raise HTTPException(403, "Переписка — только с друзьями")
+        top = (await db.execute(select(func.max(models.DirectMessage.id)).where(
+            models.DirectMessage.pair == pair_of(user.id, other_id)))).scalar() or 0
+        return {"read": await _mark_read(db, user.id, other_id, top)}
 
     @router.post("/{other_id}")
     async def send(other_id: int, payload: dict = Body(...), user=Depends(current_user),
@@ -145,7 +163,9 @@ def build_router(current_user, *, are_friends, can_access_session):
                     ch = await db.get(models.Character, sess.character_id)
                     speaker = ch.name if ch else ""
             else:
-                author = await db.get(models.User, src.author_id) if src.author_id else None
+                # Старые реплики без автора — владельца чата.
+                author = await db.get(models.User, src.author_id or sess.owner_id) \
+                    if (src.author_id or sess.owner_id) else None
                 speaker = author.username if author else ""
             forward = {"session_id": sess.id, "message_id": src.id, "chat_title": sess.title or "",
                        "speaker": speaker or "", "role": src.role,

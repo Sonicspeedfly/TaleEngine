@@ -45,6 +45,18 @@ def test_direct_messages_and_forward(client):
         assert [m["content"] for m in msgs] == ["привет, Боря!"]
         assert client.get("/api/dm", headers=bh).json()["unread"] == 0
         assert client.get(f"/api/dm/{bid}", headers=ah).json()["messages"][0]["read"] is True
+        # Больше страницы непрочитанных — открытие читает все.
+        for i in range(55):
+            client.post(f"/api/dm/{bid}", json={"content": f"п{i}"}, headers=ah)
+        assert client.get("/api/dm", headers=bh).json()["unread"] == 55
+        page = client.get(f"/api/dm/{aid}", headers=bh).json()
+        assert len(page["messages"]) == 50 and page["more"] is True
+        assert client.get("/api/dm", headers=bh).json()["unread"] == 0
+        older = client.get(f"/api/dm/{aid}?before={page['messages'][0]['id']}", headers=bh).json()
+        assert older["messages"][-1]["id"] < page["messages"][0]["id"]
+        client.post(f"/api/dm/{bid}", json={"content": "ещё"}, headers=ah)
+        assert client.post(f"/api/dm/{aid}/read", headers=bh).json() == {"read": 1}
+        assert client.post(f"/api/dm/{aid}/read", headers=ch).status_code == 403
         # Посторонний чужую переписку не читает.
         assert client.get(f"/api/dm/{aid}", headers=ch).status_code == 403
 
@@ -67,6 +79,9 @@ def test_direct_messages_and_forward(client):
         client.post(f"/api/sessions/{sid}/share", json={"username": "дм_боря"}, headers=ah)
         ok = client.post(f"/api/dm/{aid}", json={"forward_message_id": src["id"]}, headers=bh)
         assert ok.status_code == 200 and ok.json()["content"] == ""
+        # Чужой чат не поправить по id (раньше PATCH не проверял доступ).
+        csid = client.post(f"/api/sessions?character_id={cid}", headers=ah).json()["session_id"]
+        assert client.patch(f"/api/sessions/{csid}", json={"timezone": "UTC+5"}, headers=ch).status_code == 403
     finally:
         client.put("/api/admin/security", json={"accounts_enabled": False, "admin_password": ""},
                    headers={**ah, "X-Admin-Password": "dm_pw"})
