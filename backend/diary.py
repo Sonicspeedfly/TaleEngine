@@ -57,7 +57,8 @@ BATCH_CHARS = 9000
 LINE_CHARS = 500
 RETRY_AFTER = 600
 
-ENTRY_CHARS = 1500      # запись одного дня
+ENTRY_CHARS = 4000      # запись одного дня (дописывается за день; длиннее — середина «…»)
+ADD_CHARS = 1200        # одна дописка
 PLAN_CHARS = 200
 BLOCK_DAYS = 3          # сколько последних дней дневника видит модель
 BLOCK_DAY_CHARS = 700
@@ -79,17 +80,18 @@ DIARY_PROMPT = (
     "пиши честно, от первого лица, своим голосом и характером, с чувствами.\n\n"
     "Тебе дают твою карточку, прежние записи этих дней, список текущих дел {user} и новую "
     "переписку по дням. Ответ — ТОЛЬКО JSON без пояснений:\n"
-    '{{"days": [{{"day": "YYYY-MM-DD", "mood": "<одно эмодзи>", "entry": "<запись дня целиком>"}}], '
+    '{{"days": [{{"day": "YYYY-MM-DD", "mood": "<одно эмодзи>", "add": "<что дописать к записи дня>"}}], '
     '"plans": [{{"due": "YYYY-MM-DD", "time": "HH:MM или пусто", "text": "<дело>", "quote": "<цитата>"}}], '
     '"done": [<номер дела>], "cancel": [<номер дела>]}}\n\n'
     "ДНЕВНИК (days):\n"
-    "- день — только из дней переписки; запись — 3–7 предложений (до 1200 символов: насыщенный день — сожми прежнее, а не новое) о дне: что {user} рассказывал "
-    "и делал, что между вами происходило, что было важным, как ты это восприняла(-л), что "
-    "почувствовала(-л), о чём думаешь и чего ждёшь;\n"
+    "- день — только из дней переписки; add — то, что ты ДОПИСЫВАЕШЬ в дневник о новой части "
+    "разговора: 2–5 предложений — что {user} рассказывал и делал, что между вами происходило, "
+    "что было важным, как ты это восприняла(-л), что почувствовала(-л), о чём думаешь;\n"
+    "- у дня уже есть запись — НЕ переписывай и не пересказывай её: продолжи с того места, где "
+    "она кончается, только о новом (как новый абзац в дневнике вечером); ничего нового за "
+    "день — этот день не возвращай;\n"
     "- это дневник, а не протокол: без цитат реплик целиком, без перечисления по порядку, без "
     "служебных пометок; события ролевой истории описывай как пережитое вами вместе;\n"
-    "- у дня уже есть запись — верни её ЦЕЛИКОМ, сохранив прежнее (особенно то, что поправил "
-    "{user}), и допиши новое; ничего нового за день — этот день не возвращай;\n"
     "- mood — одно эмодзи твоего настроения за день.\n\n"
     "ДЕЛА (plans) — только РЕАЛЬНАЯ жизнь {user}, не сюжет игры: встреча, врач, экзамен, работа "
     "к сроку, поездка, покупка, звонок, день рождения близкого. Бери, только если {user} сам "
@@ -194,6 +196,25 @@ def _clip_middle(text: str, n: int, head: int) -> str:
     m = re.search(r"(?<=[.!?…])\s+", b)
     b = b[m.end():] if m and m.start() < len(b) // 3 else b
     return a.rstrip() + " … " + b.lstrip()
+
+
+def new_part(existing: str, item: dict) -> str:
+    """
+    Что дописать к записи дня. Модель присылает «add» — только новое. Старый
+    ответ «entry» (запись целиком) тоже понимаем: если он начинается с прежней
+    записи — берём хвост, иначе это дописка как есть. Повтор уже записанного
+    (дословно) не дописываем.
+    """
+    raw = item.get("add")
+    if raw is None:
+        raw = item.get("entry")
+    text = str(raw or "").replace("\r", "").strip()
+    existing = (existing or "").strip()
+    if existing and text.startswith(existing):
+        text = text[len(existing):].strip()
+    if existing and text and _norm_key(text) in _norm_key(existing):
+        return ""
+    return _clip_middle(re.sub(r"\n{3,}", "\n\n", text), ADD_CHARS, ADD_CHARS // 3)
 
 
 def _clean_entry(text) -> str:
@@ -488,21 +509,24 @@ async def _update(session_id: int, force: bool) -> dict | None:
                 if not isinstance(item, dict):
                     continue
                 day = str(item.get("day") or "").strip()
-                entry = _clean_entry(item.get("entry"))
-                if day not in days or len(entry) < 10:
+                if day not in days:
                     continue
                 row = (await db.execute(select(models.DiaryDay).where(
                     models.DiaryDay.profile_key == pkey, models.DiaryDay.character_id == char_id,
                     models.DiaryDay.day == day))).scalars().first()
-                mood = _clean(item.get("mood"), 8)
                 if (row.text if row is not None else None) != seen_text.get(day):
                     conflict = True   # запись изменилась — разберём пакет ещё раз, уже с ней
                     continue
+                add = new_part(row.text if row is not None else "", item)
+                if len(add) < 10:
+                    continue
+                mood = _clean(item.get("mood"), 8)
                 if row is None:
                     db.add(models.DiaryDay(profile_key=pkey, character_id=char_id, day=day,
-                                           mood=mood, text=entry))
+                                           mood=mood, text=_clean_entry(add)))
                 else:
-                    row.text, row.updated_at = entry, datetime.utcnow()
+                    # Запись ДОПИСЫВАЕТСЯ (2.29.2): прежнее — и правки человека — не трогаем.
+                    row.text, row.updated_at = _clean_entry(row.text.rstrip() + "\n\n" + add), datetime.utcnow()
                     if mood:
                         row.mood = mood
                 stats["days"] += 1

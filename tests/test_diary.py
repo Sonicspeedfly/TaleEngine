@@ -283,3 +283,28 @@ def test_parse_reply_skips_braces_before_json():
     out = diary.parse_reply(raw)
     assert out["plans"] == [{"due": "2030-01-01"}]
     assert [diary._as_index(x) for x in out["done"]] == [1, None]
+
+
+def test_entry_is_appended_not_rewritten(client, diary_on):
+    """2.29.2: модель дописывает день («add»), прежнее (и правку человека) не переписывает."""
+    cid, sid = _chat(client, "Дописная")
+    today = datetime.now(timezone.utc).date().isoformat()
+    _say(client, sid, "утром ходил на пробежку, было здорово")
+    _scan(client, sid, {"days": [{"day": today, "mood": "🙂", "add": "Утром он бегал и вернулся счастливым."}]})
+    _say(client, sid, "а вечером поругался с начальником")
+    seen = []
+    _scan(client, sid, {"days": [{"day": today, "mood": "😟", "add": "Вечером он поссорился с начальником, мне за него тревожно."}]},
+          seen=seen)
+    assert "Утром он бегал" in seen[0][1][1]["content"]          # модель видит прежнее
+    assert "НЕ переписывай" in seen[0][1][0]["content"]
+    day = client.get(f"/api/diary?character_id={cid}").json()["days"][0]
+    assert day["text"] == ("Утром он бегал и вернулся счастливым.\n\n"
+                           "Вечером он поссорился с начальником, мне за него тревожно.")
+    assert day["mood"] == "😟"
+    # Повтор уже записанного не дублируется; запись целиком (старый формат) — только хвост.
+    _say(client, sid, "ну вот так")
+    _scan(client, sid, {"days": [{"day": today, "add": "Утром он бегал и вернулся счастливым."}]})
+    _say(client, sid, "пойду спать")
+    _scan(client, sid, {"days": [{"day": today, "entry": day["text"] + " Ночью он пожелал мне спокойной ночи."}]})
+    text = client.get(f"/api/diary?character_id={cid}").json()["days"][0]["text"]
+    assert text.count("Утром он бегал") == 1 and text.endswith("Ночью он пожелал мне спокойной ночи.")
