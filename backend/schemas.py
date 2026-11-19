@@ -217,6 +217,8 @@ class ConnectionSettings(BaseModel):
     # было невозможно, хотя сервер их читал.
     summary_model: str = ""
     embedding_model: str = ""
+    # Сколько ждать ответа модели, секунды (2.29.1): 0 — без своего ограничения.
+    model_wait: int = Field(default=0, ge=0, le=86400)
     # Аккаунты Google на прокси и активный (2.25.0). None — не менять.
     accounts: Optional[list[dict[str, Any]]] = None
     active_account: Optional[int] = None

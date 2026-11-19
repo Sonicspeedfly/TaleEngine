@@ -223,6 +223,47 @@ def _request_timeout(messages: list[dict], ref_mb: float = 0.0) -> int:
     return max(settings.LARGE_REQUEST_TIMEOUT, min(1800, int(mb * 10 + ref_mb)))
 
 
+def model_wait(connection) -> int | None:
+    """
+    «Сколько ждать ответа модели» из настроек подключения (2.29.1), секунды:
+      * None — настройки нет (служебные вызовы без подключения, тесты): как
+        раньше, REQUEST_TIMEOUT и STREAM_IDLE_TIMEOUT из .env;
+      * 0 — своего ограничения нет: «думающая» модель (Carbon, Pro с высокими
+        рассуждениями) молчит и по 3–5 минут — ждём, пока не упрёмся в потолок
+        хода GENERATION_MAX_SECONDS; «Стоп» работает всегда;
+      * N — ждать первый ответ и тишину посреди ответа не дольше N секунд.
+    Настройка интерфейса главнее .env: там у многих осталось REQUEST_TIMEOUT=120
+    из примера, и думающая модель падала на второй минуте.
+    """
+    if not isinstance(connection, dict) or "model_wait" not in connection:
+        return None
+    try:
+        return max(0, int(connection.get("model_wait") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _wait_ceiling() -> int:
+    return int(settings.GENERATION_MAX_SECONDS) if settings.GENERATION_MAX_SECONDS else 3600
+
+
+def first_timeout(messages: list[dict], connection, ref_mb: float = 0.0) -> int:
+    """Таймаут запроса к модели: по размеру запроса и по «сколько ждать ответа»."""
+    base = _request_timeout(messages, ref_mb)
+    wait = model_wait(connection)
+    if wait is None:
+        return base
+    return max(base, wait if wait > 0 else _wait_ceiling())
+
+
+def idle_limit(connection) -> float:
+    """Сколько модель может молчать посреди ответа (0 — без ограничения)."""
+    wait = model_wait(connection)
+    if wait is None:
+        return settings.STREAM_IDLE_TIMEOUT
+    return wait
+
+
 def _has_media_blocks(messages: list[dict], media=None) -> bool:
     """
     Есть ли файлы у ТЕКУЩЕЙ реплики: image_url/input_audio — фото, видео, PDF,
@@ -824,7 +865,7 @@ class StreamStalled(RuntimeError):
     """Модель замолчала посреди ответа дольше STREAM_IDLE_TIMEOUT."""
 
 
-async def _idle_guarded(response):
+async def _idle_guarded(response, limit=None):
     """
     Чанки стрима с ограничением тишины МЕЖДУ ними (settings.STREAM_IDLE_TIMEOUT).
 
@@ -837,8 +878,9 @@ async def _idle_guarded(response):
     """
     it = response.__aiter__()
     first = True
-    while True:
+    if limit is None:
         limit = settings.STREAM_IDLE_TIMEOUT
+    while True:
         try:
             if first or not limit or limit <= 0:
                 chunk = await it.__anext__()
@@ -847,7 +889,8 @@ async def _idle_guarded(response):
         except StopAsyncIteration:
             return
         except asyncio.TimeoutError:
-            raise StreamStalled(f"Модель замолчала на {limit} с — ответ оборван") from None
+            raise StreamStalled(f"Модель замолчала на {limit} с — ответ оборван (сколько ждать — "
+                                "⚙ → «Подключение» → «Сколько ждать ответа модели», 0 — не обрывать)") from None
         first = False
         yield chunk
 
@@ -938,7 +981,7 @@ async def _stream_once(
         # Большой мультимодальный запрос (видео/аудио) получает увеличенный таймаут —
         # и файлы, переданные ссылкой, тоже: модель читает их у себя, и на час
         # видео до первого токена уходит заметно больше двух минут.
-        "timeout": _request_timeout(messages, ref_mb),
+        "timeout": first_timeout(messages, connection, ref_mb),
         # Сбой/лимит провайдера (429 RESOURCE_EXHAUSTED, обрыв связи) — LiteLLM
         # повторяет с экспоненциальным бэкоффом, прежде чем отдать ошибку наверх.
         "num_retries": settings.LLM_NUM_RETRIES,
@@ -1031,7 +1074,7 @@ async def _stream_once(
         finish_reason = None
         thought_len = 0
         usage: dict = {}
-        async for chunk in _idle_guarded(response):
+        async for chunk in _idle_guarded(response, idle_limit(connection)):
             if "ttft_s" not in entry:
                 entry["ttft_s"] = round(_time.monotonic() - _t_start, 1)
             # usage приходит отдельным служебным чанком в самом конце стрима
@@ -1107,6 +1150,17 @@ async def _stream_once(
                 "прокси или провайдер закрыли связь во время передачи файла. Обычно это "
                 "лимит размера запроса или нехватка памяти у LiteLLM-прокси (смотрите его "
                 f"консоль/лог) либо ограничение провайдера. Исходная ошибка: {msg}"
+            )
+            if entry.get("status") != "error":
+                debug_log.finish(entry, "error", error=friendly)
+            raise RuntimeError(friendly) from exc
+        # Модель думала дольше, чем мы готовы ждать: говорим, где это поменять.
+        if "timed out" in msg.lower() or "timeout" in type(exc).__name__.lower():
+            friendly = (
+                f"Модель не начала отвечать за {call_kwargs.get('timeout')} с. Думающим моделям "
+                "(Carbon, Pro с рассуждениями) бывает нужно больше: ⚙ → «Подключение» → "
+                "«Сколько ждать ответа модели» — 0 (не обрывать) или больше секунд. "
+                f"Исходная ошибка: {msg}"
             )
             if entry.get("status") != "error":
                 debug_log.finish(entry, "error", error=friendly)
@@ -1234,7 +1288,7 @@ async def generate_image(
         "prompt": prompt,
         "n": 1,
         "size": size,
-        "timeout": settings.REQUEST_TIMEOUT,
+        "timeout": first_timeout([], connection),
         **_route_kwargs(connection, model_name),
     }
     entry = debug_log.log_request(

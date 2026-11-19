@@ -214,7 +214,7 @@ createApp({
       presetShared: false,   // админ: сохранить пресет общим (видят все)
 
       // --- Подключение к LiteLLM (вкладка Connection) ---
-      connection: { use_proxy: true, base_url: "http://localhost:4000", api_key: "", default_model: "gpt-4o", image_model: "", image_via_chat: false, fallback_model: "", auto_fallback: true, summary_model: "", embedding_model: "", accounts: [{ name: "Основной", prefix: "" }], active_account: 0 },
+      connection: { use_proxy: true, base_url: "http://localhost:4000", api_key: "", default_model: "gpt-4o", image_model: "", image_via_chat: false, fallback_model: "", auto_fallback: true, summary_model: "", embedding_model: "", model_wait: 0, accounts: [{ name: "Основной", prefix: "" }], active_account: 0 },
       models: [],
       connStatus: "",
       connOk: null,
@@ -6583,6 +6583,8 @@ createApp({
       if (!this.params.model) this.params.model = this.connection.default_model || "";
     },
     async saveConnection() {
+      const w = Number(this.connection.model_wait);
+      this.connection.model_wait = Number.isFinite(w) && w > 0 ? Math.round(w) : 0;
       this.connection = await this.api("/settings/connection", { method: "PUT", body: JSON.stringify(this.connection) });
       this.connStatus = "Сохранено";
       this.connOk = true;
@@ -9549,6 +9551,12 @@ createApp({
           <!-- У каждого поля — своя однострочная подсказка прямо под ним, а не
                общий абзац сверху: «что будет, если оставить пустым» решается у
                конкретного поля, и искать ответ выше по панели никто не станет. -->
+          <label>Сколько ждать ответа модели, секунд
+            <input type="number" min="0" step="30" v-model.number="connection.model_wait" aria-describedby="conn-wait-hint" />
+            <span id="conn-wait-hint" class="field-hint">0 — не обрывать: думающие модели (Carbon, Pro с рассуждениями) молчат
+              и по несколько минут — ждём, пока ответят (не дольше 30 минут на ход; «Стоп» работает всегда).
+              Число — сколько можно ждать начала ответа и молчать посреди него.</span>
+          </label>
           <label>Быстрая модель для сводки и фактов
             <input v-model="connection.summary_model" list="models-list" placeholder="например gemini-2.5-flash"
                    aria-describedby="conn-summary-hint" />
