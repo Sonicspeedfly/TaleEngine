@@ -186,6 +186,18 @@ class GenerationJob:
 OnComplete = Callable[..., Awaitable[Optional[int]]]
 
 
+_TRANSIENT_SIGNS = ("unavailable", "service is currently", "overloaded", " 503", "503 ",
+                    "status code 503", "temporarily", "internal error encountered")
+
+
+def _transient(exc) -> bool:
+    """Временный сбой провайдера (не ошибка запроса): имеет смысл повторить ход."""
+    text = f"{type(exc).__name__} {exc}".lower()
+    if "timeout" in text or "timed out" in text or "замолчала" in text:
+        return False   # ждали и так долго — повтор удвоил бы ожидание
+    return any(s in text for s in _TRANSIENT_SIGNS)
+
+
 class GenerationManager:
     """Хранит активные генерации в памяти процесса и управляет их жизненным циклом."""
 
@@ -415,10 +427,16 @@ class GenerationManager:
         same = with_account(connection, fb) == with_account(connection, effective_model(params, connection))
         if fb and auto and not same and not job.stopping:
             await self._run_fallback(job, messages, params, connection, fb, exc)
+        elif _transient(exc) and not job.stopping and not job.discard:
+            # Провайдер сам оборвал ответ «сервис недоступен/перегружен» (Vertex
+            # UNAVAILABLE, 503) — запасной нет: один повтор той же моделью (2.29.2).
+            await self._run_fallback(job, messages, params, connection,
+                                     effective_model(params, connection), exc, retry=True)
         else:
             job.error = str(exc)
 
-    async def _run_fallback(self, job, messages, params, connection, fb_model, primary_exc) -> None:
+    async def _run_fallback(self, job, messages, params, connection, fb_model, primary_exc,
+                            retry: bool = False) -> None:
         """
         Повтор генерации ЗАПАСНОЙ моделью после сбоя основной. Частичный текст
         основной модели сбрасывается (событие 'fallback' велит клиенту очистить
@@ -426,17 +444,25 @@ class GenerationManager:
         """
         job.buffer = ""
         job.thought = ""
-        job.broadcast({"type": "fallback", "model": fb_model, "reason": str(primary_exc)})
-        # С этого момента любой сохранённый текст — от запасной модели.
-        job.model_used = fb_model
-        fparams = (
-            params.model_copy(update={"model": fb_model})
-            if params else GenerationParams(model=fb_model)
-        )
+        job.broadcast({"type": "fallback", "model": fb_model, "reason": str(primary_exc), "retry": retry})
+        if retry:
+            fparams = params   # та же модель и те же параметры
+        else:
+            # С этого момента любой сохранённый текст — от запасной модели.
+            job.model_used = fb_model
+            fparams = (
+                params.model_copy(update={"model": fb_model})
+                if params else GenerationParams(model=fb_model)
+            )
         self.set_stage(job, "waiting")
         exc2 = await self._drive(job, self._stream(job, messages, fparams, connection))
         if exc2 is None:
             return  # дописала, или Stop во время запасной генерации — частичный текст сохранится
+        if retry:
+            logger.error("Повтор после сбоя провайдера тоже не удался (job %s)", job.job_id, exc_info=exc2)
+            job.error = (f"Провайдер дважды оборвал ответ — сервис сейчас перегружен. Попробуйте позже "
+                         f"или укажите запасную модель в «Подключении». Ошибка: {exc2}")
+            return
         logger.error("Запасная модель тоже не ответила (job %s)", job.job_id, exc_info=exc2)
         job.error = f"Основная модель: {primary_exc}\nЗапасная ({fb_model}): {exc2}"
 
