@@ -34,6 +34,10 @@ def default_connection() -> dict:
         # сравнение по словам, без векторов).
         "summary_model": "",
         "embedding_model": "",
+        # Сколько ждать ответа модели, секунды (2.29.1): 0 — без своего
+        # ограничения (до потолка хода), N — до первого ответа и тишины посреди
+        # него. Главнее REQUEST_TIMEOUT/STREAM_IDLE_TIMEOUT из .env.
+        "model_wait": 0,
         # Аккаунты Google на прокси (2.25.0): у каждого — префикс имён моделей
         # в LiteLLM («acc2/» → в config.yaml шаблон «acc2/*» со своим ключом).
         # Активный дописывает свой префикс ко ВСЕМ запросам: ход, память,
@@ -82,7 +86,7 @@ async def set_connection(db, data: dict) -> dict:
     allowed = {
         "use_proxy", "base_url", "api_key", "default_model", "image_model",
         "image_via_chat", "fallback_model", "auto_fallback",
-        "summary_model", "embedding_model", "accounts", "active_account",
+        "summary_model", "embedding_model", "model_wait", "accounts", "active_account",
     }
     clean = {}
     for k, v in data.items():
