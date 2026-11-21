@@ -2471,3 +2471,7 @@ input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
 /* Инспектор: части хвоста запроса (2.29.3) */
 .ins-sub { padding-left: 18px; opacity: .9; }
 .ins-heavy .ins-w, .ins-heavy .grow { color: var(--danger, #d33); font-weight: 600; }
+/* Итоги дня (2.30.0) */
+.diary-view textarea { width: 100%; margin: 6px 0; }
+.diary-status { margin-top: 8px; font-size: var(--fs-100); padding: 4px 8px; border-radius: 8px; background: var(--surface-2, transparent); }
+.diary-status.hot { color: var(--accent); border-left: 3px solid var(--accent); }

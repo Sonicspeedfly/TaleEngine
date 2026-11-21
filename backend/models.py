@@ -459,7 +459,29 @@ class DiaryDay(Base):
     mood: Mapped[str] = mapped_column(String(16), default="")
     text: Mapped[str] = mapped_column(Text, default="")
     edited: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Итоги дня (2.30.0): что из дня ещё «горит» и уходит в промпт; пусто после
+    # итогов — день в архиве (хранится, в промпт не идёт). audited_at — когда
+    # подведены (NULL — ещё нет: тогда в промпт идёт сама запись, урезанной).
+    digest: Mapped[str] = mapped_column(Text, default="")
+    audited_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class DiaryView(Base):
+    """
+    Мнение персонажа о человеке (2.30.0): сложившийся портрет — какой он, что
+    ценит, что его тревожит, какие у вас отношения. Обновляется на итогах дня
+    и всегда уходит в промпт: из дней в «систему» переходит именно оно.
+    """
+    __tablename__ = "diary_views"
+    __table_args__ = (UniqueConstraint("profile_key", "character_id", name="uq_diary_view"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    profile_key: Mapped[str] = mapped_column(String(100), index=True)
+    character_id: Mapped[int] = mapped_column(Integer, index=True)
+    text: Mapped[str] = mapped_column(Text, default="")
+    edited: Mapped[bool] = mapped_column(Boolean, default=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
