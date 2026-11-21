@@ -461,3 +461,38 @@ def test_replay_skips_broken_meta_but_keeps_the_rest():
     broken = {"items": "не словарь", "scene": {"location": "Болото"}}
     state = hs.replay([(1, "assistant", good, False), (2, "assistant", broken, False)])
     assert "Кай" in state["npcs"]
+
+
+def test_state_block_is_capped():
+    """2.29.5: блок состояния в каждом ходе не длиннее state_max_chars."""
+    state = hs.empty_state()
+    state["time"] = {"date": "2026/2/4", "time": "15:00"}
+    state["scene"] = {"location": "Таверна", "atmosphere": "", "characters": ["Вольф"]}
+    for i in range(400):
+        state["npcs"][f"Прохожий{i}"] = {"id": f"{i:03d}", "appearance": "плащ " * 10, "personality": "тих"}
+    state["npcs"]["Вольф"] = {"id": "999", "appearance": "серая шерсть", "personality": "молчалив"}
+    for i in range(300):
+        state["items"][f"Хлам{i}"] = {"id": f"{i:03d}", "description": "обычная вещь " * 5}
+    state["items"]["Ключ"] = {"id": "777", "importance": "!!", "description": "главный ключ"}
+    for i in range(500):
+        state["events"].append({"mid": i + 1, "i": 0, "level": "important", "date": "2026/2/1",
+                                "time": "", "text": f"Событие номер {i} " + "подробности " * 8})
+    settings = {**hset.resolve(), "state_max_chars": 12000}
+    block = hs.render_state_block(state, settings, names=hs.Names("Лея", "Марина"))
+    assert len(block) <= 12000
+    # Время, сцена и присутствующие — целиком; кто в сцене и важное — остаются.
+    assert "[Время|" in block and "[Сцена|Таверна]" in block and "[Присутствуют|Вольф]" in block
+    assert "N999 Вольф" in block and "Ключ[критич.]" in block
+    # Хронология держит СВЕЖЕЕ: последние события на месте, старые скрыты.
+    assert "Событие номер 499" in block and "Событие номер 0 " not in block
+    assert "строк скрыто (лимит блока Хроники)" in block
+    # Без потолка — всё целиком.
+    full = hs.render_state_block(state, {**settings, "state_max_chars": 0}, names=hs.Names("Лея", "Марина"))
+    assert len(full) > 100000 and "Событие номер 0 " in full
+
+
+def test_state_block_under_cap_is_unchanged():
+    state = hs.replay(_entries(_meta()[1]))
+    a = hs.render_state_block(state, {**hset.resolve(), "state_max_chars": 0}, names=hs.Names("Лея", "Марина"))
+    b = hs.render_state_block(state, hset.resolve(), names=hs.Names("Лея", "Марина"))
+    assert a == b
