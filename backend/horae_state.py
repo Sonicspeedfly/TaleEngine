@@ -1559,6 +1559,11 @@ def render_state_block(state: dict, settings: dict, *, names: Names, summaries=(
                 if entry and not entry.get("deleted") and entry.get("desc") and (not found or found[0] != parent):
                     lines.append(f"[Память сцены:{parent}|{entry['desc']}]")
     present = list(sc.get("characters") or [])
+    marks: list[tuple[int, str]] = []   # (начало раздела в lines, раздел) — для потолка блока
+
+    def mark(name: str) -> None:
+        marks.append((len(lines), name))
+
     if s.get("send_characters", True):
         if present:
             has_content = True
@@ -1574,6 +1579,7 @@ def render_state_block(state: dict, settings: dict, *, names: Names, summaries=(
         if s.get("send_relationships"):
             rels = [x for x in state.get("relationships") or [] if x["from"] in present or x["to"] in present]
             if rels:
+                mark("relationships")
                 lines.append("\n[Сеть отношений]")
                 for x in rels:
                     lines.append(f"{x['from']}→{x['to']}: {x['type']}" + (f"({x['note']})" if x.get("note") else ""))
@@ -1586,7 +1592,11 @@ def render_state_block(state: dict, settings: dict, *, names: Names, summaries=(
         items = [(n, i) for n, i in state["items"].items() if n not in equipped]
         if items:
             has_content = True
+            mark("items")
             lines.append("\n[Список предметов]")
+            # Важные — первыми: при урезании блока они остаются.
+            rank = {"!!": 0, "!": 1}
+            items = sorted(items, key=lambda x: rank.get(x[1].get("importance") or "", 2))
             for name, it in items:
                 tag = {"!!": "[критич.]", "!": "[важно]"}.get(it.get("importance") or "", "")
                 desc = f" | {it['description']}" if it.get("description") else ""
@@ -1595,14 +1605,18 @@ def render_state_block(state: dict, settings: dict, *, names: Names, summaries=(
         elif has_content:
             lines.append("\n[Список предметов] (пусто)")
     if s.get("send_affection", True):
+        mark("affection")
         aff = [f"{n}:{'+' if v > 0 else ''}{_fmt_num(v)}" for n, v in state["affection"].items() if v]
         if aff:
             has_content = True
             lines.append("[Расположение|" + "|".join(aff) + "]")
     if s.get("send_characters", True) and state["npcs"]:
         has_content = True
+        mark("npcs")
         lines.append("\n[Известные NPC]")
-        for name, npc in state["npcs"].items():
+        # Те, кто в сцене, — первыми: при урезании блока они остаются.
+        here = set(present)
+        for name, npc in sorted(state["npcs"].items(), key=lambda x: x[0] not in here):
             per = npc.get("personality") or ""
             if not s.get("send_main_personality", True) and is_main_npc(name, npc, names, pinned):
                 per = ""
@@ -1627,23 +1641,106 @@ def render_state_block(state: dict, settings: dict, *, names: Names, summaries=(
             lines.append(line)
     if s.get("send_agenda", True) and state.get("agenda"):
         has_content = True
+        mark("agenda")
         lines.append("\n[Список дел]")
         for a in state["agenda"]:
             lines.append("· " + (f"{a['date']} " if a.get("date") else "") + a["text"])
     if rpg_block:
         has_content = True
+        mark("rpg")
         lines.append(rpg_block.rstrip())
     if s.get("send_timeline", True):
         tl = render_timeline(state, summaries, s, calendar=calendar, snapshot_upto=snapshot_upto)
         if tl:
             has_content = True
+            mark("timeline")
             lines.append(tl)
     if tables_block:
         has_content = True
+        mark("tables")
         lines.append(tables_block.rstrip())
     if not has_content:
         return ""
-    return "\n".join(lines).strip()
+    text = "\n".join(lines).strip()
+    limit = int(s.get("state_max_chars", STATE_MAX_CHARS) or 0)
+    if limit > 0 and len(text) > limit:
+        text = fit_state_block(lines, marks, limit)
+    return text
+
+
+# Потолок блока состояния (символов; 0 — без потолка). Хроника за тысячи реплик
+# копит свёртки, важные события, NPC и предметы — и блок, уходящий в КАЖДЫЙ ход,
+# дорастал до 70 тыс. токенов: ход становился тяжёлым, дорогим и ловил 429 (2.29.5).
+STATE_MAX_CHARS = 24000
+# Кого урезать первым и с какого края держать: хронологию — с конца (свежее),
+# остальное — с начала (важные предметы и NPC в сцене стоят первыми).
+_TRIM_SHARE = {"timeline": 0.35, "npcs": 0.2, "items": 0.15, "tables": 0.1, "relationships": 0.05,
+               "agenda": 0.05, "rpg": 0.05, "affection": 0.05}
+_TRIM_ORDER = (("tables", "head"), ("timeline", "tail"), ("npcs", "head"), ("relationships", "head"),
+               ("items", "head"), ("agenda", "head"), ("rpg", "head"), ("affection", "head"))
+
+
+def fit_state_block(lines: list[str], marks: list[tuple[int, str]], limit: int) -> str:
+    """
+    Блок состояния не длиннее limit символов: время, сцена и присутствующие —
+    целиком, разделы урезаются по очереди _TRIM_ORDER (заголовок раздела
+    остаётся, на месте выброшенного — «…ещё N строк скрыто»).
+    """
+    if not marks:
+        return "\n".join(lines).strip()[:limit]
+    bounds = [m[0] for m in marks] + [len(lines)]
+    core = "\n".join(lines[:bounds[0]]).split("\n")
+    sections: dict[str, list[str]] = {}
+    order: list[str] = []
+    for i, (_, name) in enumerate(marks):
+        if bounds[i] == bounds[i + 1]:
+            continue   # раздел отмечен, но пуст (нечего показать)
+        body = "\n".join(lines[bounds[i]:bounds[i + 1]]).split("\n")
+        sections[name] = sections.get(name, []) + body
+        if name not in order:
+            order.append(name)
+
+    def size() -> int:
+        return len("\n".join(core + [x for n in order for x in sections[n]]))
+
+    # Доля бюджета, ниже которой раздел не урезается в первом проходе: иначе
+    # первый же раздел по очереди (таблицы, хронология) исчезал бы целиком.
+    room = max(0, limit - len("\n".join(core)) - 40 * len(order))
+    floor = {name: int(room * _TRIM_SHARE.get(name, 0.05)) for name in order}
+
+    def trim(name: str, side: str, min_chars: int) -> None:
+        over = size() - limit
+        sec = sections.get(name)
+        if over <= 0 or not sec:
+            return
+        head = sec[:2] if (not sec[0].strip() and len(sec) > 1) else sec[:1]
+        body = sec[len(head):]
+        if body and body[0].startswith("…ещё "):
+            body = body[1:]
+        if body and body[-1].startswith("…ещё "):
+            body = body[:-1]
+        if not body:
+            return
+        keep_chars = max(min_chars, len("\n".join(body)) - over - 60)
+        kept: list[str] = []
+        used = 0
+        for ln in (body if side == "head" else reversed(body)):
+            if used + len(ln) + 1 > keep_chars:
+                break
+            kept.append(ln)
+            used += len(ln) + 1
+        if side == "tail":
+            kept.reverse()
+        hidden = len(body) - len(kept)
+        if hidden:
+            note = f"…ещё {hidden} строк скрыто (лимит блока Хроники)"
+            sections[name] = head + ([note] + kept if side == "tail" else kept + [note])
+
+    for name, side in _TRIM_ORDER:          # сначала — до гарантированной доли
+        trim(name, side, floor.get(name, 0))
+    for name, side in _TRIM_ORDER:          # не хватило — дальше, до нуля
+        trim(name, side, 0)
+    return "\n".join(core + [x for n in order for x in sections[n]]).strip()
 
 
 def analysis_context(state: dict, names: Names) -> str:

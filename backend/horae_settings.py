@@ -69,6 +69,8 @@ _BOOL = {
 _INT = {
     "aux_delay_ms": (1000, 0, 60000),
     "context_depth": (15, 0, 500),
+    # Потолок блока состояния в каждом ходе, символов (0 — без потолка), 2.29.5.
+    "state_max_chars": (24000, 0, 400000),
     "summary_keep_recent": (5, 3, 500),
     "summary_buffer_messages": (10, 5, 1000),
     "summary_buffer_tokens": (30000, 1000, 1_000_000),
