@@ -238,11 +238,13 @@ createApp({
       diary: null,
       diaryError: "",
       diaryChar: null,          // чей дневник открыт (id персонажа)
-      diaryEdit: { id: null, text: "", mood: "" },
+      diaryEdit: { id: null, text: "", mood: "", digest: "" },
       diaryPlanEdit: { id: null, due: "", time: "", text: "" },
       diaryNewPlan: { due: "", time: "", text: "" },
       diaryShowDone: false,
       diaryRunning: false,
+      diaryAuditing: false,
+      diaryViewEdit: null,      // правка мнения персонажа (текст) или null
       // Мастер-снимок: каждые summaryEvery сообщений ИИ дописывает в него то,
       // что вышло из окна. Ложь — снимок не обновляется (см. memoryEngine).
       autoSummary: true,
@@ -6815,13 +6817,45 @@ createApp({
       const c = this.characters.find((x) => x.id === id) || ((this.diary && this.diary.characters) || []).find((x) => x.id === id);
       return c ? c.name : "";
     },
-    startEditDiaryDay(d) { this.diaryEdit = { id: d.id, text: d.text, mood: d.mood || "" }; },
+    startEditDiaryDay(d) { this.diaryEdit = { id: d.id, text: d.text, mood: d.mood || "", digest: d.digest || "", was: d.digest || "", audited: d.audited }; },
     async saveDiaryDay() {
       const e = this.diaryEdit;
       if (!e.id) return;
-      if (await this._diaryCall("/days/" + e.id, { method: "PATCH", body: JSON.stringify({ text: e.text, mood: e.mood }) }, "Запись сохранена")) {
-        this.diaryEdit = { id: null, text: "", mood: "" };
+      const body = { text: e.text, mood: e.mood };
+      if (e.digest !== e.was) body.digest = e.digest;
+      if (await this._diaryCall("/days/" + e.id, { method: "PATCH", body: JSON.stringify(body) }, "Запись сохранена")) {
+        this.diaryEdit = { id: null, text: "", mood: "", digest: "" };
       }
+    },
+    async reauditDiaryDay(d) {
+      await this._diaryCall("/days/" + d.id, { method: "PATCH", body: JSON.stringify({ reaudit: true }) },
+        "Итоги дня подведутся заново");
+      this.diaryEdit = { id: null, text: "", mood: "", digest: "" };
+    },
+    async diaryAuditNow() {
+      if (!this.sessionId || this.diaryAuditing) return;
+      this.diaryAuditing = true;
+      try {
+        const r = await this.api("/diary/audit?session_id=" + this.sessionId, { method: "POST" });
+        this.showToast(r && r.days ? "🧾 Итоги подведены: дней — " + r.days : "Все прошедшие дни уже подведены");
+      } catch (e) {
+        this.showToast("Дневник: " + e.message);
+      } finally {
+        this.diaryAuditing = false;
+      }
+      await this.loadDiary();
+    },
+    async saveDiaryView() {
+      if (this.diaryViewEdit == null || !this.diaryChar) return;
+      if (await this._diaryCall("/view", { method: "PUT",
+        body: JSON.stringify({ character_id: this.diaryChar, text: this.diaryViewEdit }) }, "Мнение сохранено")) {
+        this.diaryViewEdit = null;
+      }
+    },
+    diaryIsToday(d) {
+      const n = new Date();
+      const iso = n.getFullYear() + "-" + String(n.getMonth() + 1).padStart(2, "0") + "-" + String(n.getDate()).padStart(2, "0");
+      return d.day === iso;
     },
     async deleteDiaryDay(d) {
       const ok = await this.askConfirm("Удалить запись дневника за " + this.diaryDayTitle(d) + "?", { title: "Дневник", okText: "Удалить" });
@@ -9991,7 +10025,8 @@ createApp({
                     о них говорили). Пишет фоном модель памяти; общие и групповые чаты дневник не ведут.</p>
                   <div class="row" v-if="diary.chat_active">
                     <button @click="diaryRunNow" :disabled="diaryRunning">{{ diaryRunning ? '✍️ Пишу…' : '✍️ Записать сейчас' }}</button>
-                    <span class="field-hint">Не ждать, пока наберётся разговор: разобрать новое в этом чате.</span>
+                    <button @click="diaryAuditNow" :disabled="diaryAuditing">{{ diaryAuditing ? '🧾 Подвожу…' : '🧾 Подвести итоги' }}</button>
+                    <span class="field-hint">Записать — разобрать новое в этом чате. Итоги — подвести прошедшие дни сейчас, не дожидаясь.</span>
                   </div>
                 </div>
 
@@ -10038,12 +10073,31 @@ createApp({
                 </details>
 
                 <h4>📔 Дневник персонажа</h4>
+                <p class="field-hint">Пишется целиком. В разговор уходит не всё: <b>сегодня</b> — запись, <b>💭 мнение</b> — всегда,
+                  с прошлых дней — только <b>🔥 что ещё горит</b>. Остальное после итогов дня уходит <b>🗄 в архив</b>:
+                  хранится здесь, но персонажу больше не мешает.</p>
                 <div class="row" v-if="diaryCharOptions.length">
                   <label>Чей дневник
                     <select :value="diaryChar" @change="pickDiaryChar($event.target.value)">
                       <option v-for="c in diaryCharOptions" :key="'dc' + c.id" :value="c.id">{{ c.name }}<template v-if="c.days"> ({{ c.days }})</template></option>
                     </select>
                   </label>
+                </div>
+                <div v-if="diaryChar" class="card diary-view">
+                  <div class="row-between">
+                    <b>💭 Как {{ diaryCharName(diaryChar) || 'персонаж' }} видит тебя</b>
+                    <button v-if="diaryViewEdit == null" class="btn-icon" @click="diaryViewEdit = (diary.view && diary.view.text) || ''"
+                            aria-label="Изменить мнение">✎</button>
+                  </div>
+                  <template v-if="diaryViewEdit != null">
+                    <textarea v-model="diaryViewEdit" rows="5" aria-label="Мнение персонажа"></textarea>
+                    <div class="row">
+                      <button class="btn-primary" @click="saveDiaryView">Сохранить</button>
+                      <button @click="diaryViewEdit = null">Отмена</button>
+                    </div>
+                  </template>
+                  <div v-else-if="diary.view && diary.view.text" class="diary-text">{{ diary.view.text }}</div>
+                  <div v-else class="muted">Сложится после первых итогов дня.</div>
                 </div>
                 <p v-if="!diary.days.length" class="muted">Записей пока нет — они появятся, когда вы поговорите
                   (или нажмите «✍️ Записать сейчас»).</p>
@@ -10059,12 +10113,21 @@ createApp({
                   <template v-if="diaryEdit.id === d.id">
                     <div class="row"><input v-model="diaryEdit.mood" placeholder="😊" aria-label="Настроение (эмодзи)" style="max-width:70px" /></div>
                     <textarea v-model="diaryEdit.text" rows="6" aria-label="Текст записи"></textarea>
+                    <label v-if="!diaryIsToday(d)">🔥 Что из этого дня ещё горит (уходит в разговор; пусто — день в архиве)
+                      <textarea v-model="diaryEdit.digest" rows="2" aria-label="Что ещё горит"></textarea></label>
                     <div class="row">
                       <button class="btn-primary" @click="saveDiaryDay">Сохранить</button>
-                      <button @click="diaryEdit = { id: null, text: '', mood: '' }">Отмена</button>
+                      <button v-if="!diaryIsToday(d) && diaryEdit.audited" @click="reauditDiaryDay(d)" title="Модель подведёт итоги этого дня заново">↻ Переподвести итоги</button>
+                      <button @click="diaryEdit = { id: null, text: '', mood: '', digest: '' }">Отмена</button>
                     </div>
                   </template>
-                  <div v-else class="diary-text">{{ d.text }}</div>
+                  <template v-else>
+                    <div class="diary-text">{{ d.text }}</div>
+                    <div v-if="diaryIsToday(d)" class="diary-status">📖 Сегодня — в разговоре целиком</div>
+                    <div v-else-if="d.audited && d.digest" class="diary-status hot">🔥 Горит: {{ d.digest }}</div>
+                    <div v-else-if="d.audited" class="diary-status muted">🗄 В архиве — в разговор не идёт</div>
+                    <div v-else class="diary-status muted">⏳ Итоги дня ещё не подведены — пока в разговоре записью</div>
+                  </template>
                 </div>
                 <details v-if="diary.block" class="mem-snapshot">
                   <summary>Как это видит модель в этом чате</summary>

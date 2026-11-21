@@ -334,3 +334,87 @@ def test_long_day_is_not_cut_in_storage(client, diary_on):
         _scan(client, sid, {"days": [{"day": today, "add": f"Абзац {i}. " + "подробности дня " * 60}]})
     text = client.get(f"/api/diary?character_id={cid}").json()["days"][0]["text"]
     assert len(text) > 5000 and all(f"Абзац {i}." in text for i in range(6)) and " … " not in text
+
+
+def _audit_llm(reply: dict, seen=None):
+    async def fake(*args, **kwargs):
+        messages = kwargs.get("messages") or []
+        sys0 = str(messages[0].get("content") or "") if messages else ""
+        if seen is not None:
+            seen.append(messages)
+        text = json.dumps(reply, ensure_ascii=False) if "подводишь итоги" in sys0 else "Ок."
+
+        async def gen():
+            yield _chunk(text)
+        return gen()
+    return fake
+
+
+def test_day_audit_opinion_hot_and_archive(client, diary_on):
+    """2.30.0: итоги дня — мнение в «систему», «горит» в промпт, остальное в архив."""
+    cid, sid = _chat(client, "Итоговая")
+    today = datetime.now(timezone.utc).date()
+    d1, d2 = (today - timedelta(days=2)).isoformat(), (today - timedelta(days=1)).isoformat()
+    tomorrow = (today + timedelta(days=1)).isoformat()
+    client.post("/api/diary/days", json={"character_id": cid, "day": d1, "text": "Смотрели кино, болтали ни о чём."})
+    client.post("/api/diary/days", json={"character_id": cid, "day": d2,
+                                         "text": "Он простыл, кашляет. Обещал завтра сходить к врачу."})
+    client.post("/api/diary/days", json={"character_id": cid, "day": today.isoformat(), "text": "Сегодня тихий вечер."})
+    replies = iter([
+        {"opinion": "Он мягкий и любит кино, со мной расслабляется.", "hot": "", "plans": [], "done": []},
+        {"opinion": "Он мягкий, любит кино, но запускает здоровье — за ним нужен глаз да глаз.",
+         "hot": "Он простыл и кашляет — спросить, как здоровье.",
+         "plans": [{"due": tomorrow, "text": "сходить к врачу", "quote": "сходить к врачу"}], "done": []},
+    ])
+    seen = []
+
+    async def fake(*args, **kwargs):
+        messages = kwargs.get("messages") or []
+        seen.append(messages)
+        text = json.dumps(next(replies), ensure_ascii=False)
+
+        async def gen():
+            yield _chunk(text)
+        return gen()
+
+    with patch("backend.llm_gateway.litellm.acompletion", new=fake):
+        n = client.portal.call(functools.partial(diary.maybe_audit, sid, force=True))
+    assert n == 2                                   # сегодняшний день не подводится
+    assert "Смотрели кино" in seen[0][1]["content"] and "подводишь итоги" in seen[0][0]["content"]
+    assert "Он мягкий и любит кино" in seen[1][1]["content"]   # мнение копится от дня к дню
+
+    data = client.get(f"/api/diary?character_id={cid}&session_id={sid}").json()
+    days = {d["day"]: d for d in data["days"]}
+    assert days[d1]["audited"] and days[d1]["digest"] == ""            # архив
+    assert days[d2]["digest"].startswith("Он простыл")                  # горит
+    assert not days[today.isoformat()]["audited"]
+    assert data["view"]["text"].startswith("Он мягкий, любит кино, но запускает здоровье")
+    assert any(p["text"] == "сходить к врачу" and p["due"] == tomorrow for p in data["plans"])
+
+    block = data["block"]
+    assert "Как ты видишь собеседника" in block and "запускает здоровье" in block
+    assert "Что ещё горит" in block and "Он простыл и кашляет" in block
+    assert "Сегодня: Сегодня тихий вечер." in block
+    assert "Смотрели кино" not in block                                 # архив не уходит
+
+    # Руками: день из архива — снова «горит»; мнение — своё.
+    client.patch(f"/api/diary/days/{days[d1]['id']}", json={"digest": "Хочет пересмотреть тот фильм вместе."})
+    client.put("/api/diary/view", json={"character_id": cid, "text": "Мой Джек — упрямый и добрый."})
+    block = client.get(f"/api/diary?character_id={cid}&session_id={sid}").json()["block"]
+    assert "Хочет пересмотреть тот фильм" in block and "Мой Джек — упрямый и добрый." in block
+    # «Переподвести» — день снова без итогов.
+    r = client.patch(f"/api/diary/days/{days[d2]['id']}", json={"reaudit": True}).json()
+    assert r["audited"] is False and r["digest"] == ""
+
+
+def test_appending_to_audited_day_resets_audit(client, diary_on):
+    cid, sid = _chat(client, "Дописанный итог")
+    today = datetime.now(timezone.utc).date().isoformat()
+    _say(client, sid, "вечером гуляли")
+    _scan(client, sid, {"days": [{"day": today, "add": "Вечером гуляли."}]})
+    day = client.get(f"/api/diary?character_id={cid}").json()["days"][0]
+    client.patch(f"/api/diary/days/{day['id']}", json={"digest": "держать"})
+    assert client.get(f"/api/diary?character_id={cid}").json()["days"][0]["audited"] is True
+    _say(client, sid, "и ещё поужинали")
+    _scan(client, sid, {"days": [{"day": today, "add": "И поужинали."}]})
+    assert client.get(f"/api/diary?character_id={cid}").json()["days"][0]["audited"] is False

@@ -321,6 +321,10 @@ def _sqlite_add_missing_columns(sync_conn) -> None:
             "reply_mode": "VARCHAR(16) DEFAULT 'auto'",
             "diary_upto": "INTEGER DEFAULT 0",
         },
+        "diary_days": {
+            "digest": "TEXT DEFAULT ''",
+            "audited_at": "DATETIME",
+        },
         "messages": {
             "swipes": "JSON",
             "active_swipe": "INTEGER DEFAULT 0",
