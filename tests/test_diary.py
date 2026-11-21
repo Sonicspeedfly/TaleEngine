@@ -308,3 +308,29 @@ def test_entry_is_appended_not_rewritten(client, diary_on):
     _scan(client, sid, {"days": [{"day": today, "entry": day["text"] + " Ночью он пожелал мне спокойной ночи."}]})
     text = client.get(f"/api/diary?character_id={cid}").json()["days"][0]["text"]
     assert text.count("Утром он бегал") == 1 and text.endswith("Ночью он пожелал мне спокойной ночи.")
+
+
+def test_backlog_catches_up_in_one_run(client, diary_on, monkeypatch):
+    """2.29.6: накопилось больше порции — разбор догоняет подряд, а не по порции за ход."""
+    monkeypatch.setattr(diary, "BATCH_MESSAGES", 4)
+    cid, sid = _chat(client, "Догоняющая")
+    _say(client, sid, "начало разговора")
+    _scan(client, sid, {})
+    for i in range(6):
+        _say(client, sid, f"реплика номер {i}")
+    seen = []
+    _scan(client, sid, {}, seen=seen)
+    assert len(seen) >= 3                       # несколько порций за один вызов
+    assert "реплика номер 5" in seen[-1][1][1]["content"]
+    assert client.portal.call(functools.partial(diary._has_backlog, sid)) is False
+
+
+def test_long_day_is_not_cut_in_storage(client, diary_on):
+    """Длинный день не теряет середину при дописывании (раньше — потолок 4000)."""
+    cid, sid = _chat(client, "Длинная")
+    today = datetime.now(timezone.utc).date().isoformat()
+    for i in range(6):
+        _say(client, sid, f"кусок дня {i}")
+        _scan(client, sid, {"days": [{"day": today, "add": f"Абзац {i}. " + "подробности дня " * 60}]})
+    text = client.get(f"/api/diary?character_id={cid}").json()["days"][0]["text"]
+    assert len(text) > 5000 and all(f"Абзац {i}." in text for i in range(6)) and " … " not in text

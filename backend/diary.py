@@ -49,19 +49,25 @@ DEFAULT_SETTINGS = {"enabled": True, "auto": True, "plans_shared": True}
 
 # Когда разбирать: столько новых реплик или символов — или старшая неразобранная
 # реплика старше FLUSH_AFTER (короткий разговор тоже попадёт в дневник).
-MIN_MESSAGES = 6
-MIN_CHARS = 2500
-FLUSH_AFTER = 2 * 3600
+MIN_MESSAGES = 4
+MIN_CHARS = 2000
+FLUSH_AFTER = 3600
+# Накопилось больше одной порции — разбираем подряд до конца, но не больше
+# стольких порций за раз (2.29.6: раньше одна порция на ход, и дневник отставал).
+CATCH_UP_BATCHES = 5
 BATCH_MESSAGES = 40
 BATCH_CHARS = 9000
 LINE_CHARS = 500
 RETRY_AFTER = 600
 
-ENTRY_CHARS = 4000      # запись одного дня (дописывается за день; длиннее — середина «…»)
+# Запись дня в базе не урезается (2.29.6: потолок 4000 вырезал середину
+# длинного дня безвозвратно) — это лишь предохранитель от мусора модели.
+ENTRY_CHARS = 60000
 ADD_CHARS = 1200        # одна дописка
 PLAN_CHARS = 200
 BLOCK_DAYS = 3          # сколько последних дней дневника видит модель
-BLOCK_DAY_CHARS = 700
+BLOCK_DAY_CHARS = 1200      # прошлые дни в промпте (начало и конец)
+BLOCK_TODAY_CHARS = 3000    # сегодняшний — подробнее
 PLANS_AHEAD = 14        # дела на столько дней вперёд
 PLANS_MAX = 8
 MAX_PLANS_LISTED = 30   # текущих дел в запросе разбора
@@ -286,13 +292,36 @@ async def maybe_update(session_id: int, *, force: bool = False) -> dict | None:
             return None
     _running.add(session_id)
     try:
-        return await _update(session_id, force)
+        stats = await _update(session_id, force)
+        # Накопилось больше одной порции — догоняем подряд (каждая порция всё
+        # так же ждёт, пока люди не пишут: это фоновые запросы).
+        for _ in range(CATCH_UP_BATCHES - 1):
+            if stats is None or stats.get("conflict") or not await _has_backlog(session_id):
+                break
+            more = await _update(session_id, True)
+            if more is None:
+                break
+            stats = {k: stats.get(k, 0) + more.get(k, 0) for k in set(stats) | set(more)}
+        return stats
     except Exception:  # noqa: BLE001
         _failed_at[session_id] = time.monotonic()
         logger.exception("Дневник: разбор чата %s не удался", session_id)
         return None
     finally:
         _running.discard(session_id)
+
+
+async def _has_backlog(session_id: int) -> bool:
+    """Остались ли неразобранные реплики после указателя."""
+    from sqlalchemy import func
+
+    async with AsyncSessionLocal() as db:
+        sess = await db.get(models.ChatSession, session_id)
+        if sess is None:
+            return False
+        top = (await db.execute(select(func.max(models.Message.id)).where(
+            models.Message.session_id == session_id))).scalar() or 0
+        return top > int(sess.diary_upto or 0)
 
 
 async def skip_to_end(db, session_id: int) -> None:
@@ -551,6 +580,8 @@ async def _update(session_id: int, force: bool) -> dict | None:
                             stats["done" if status == "done" else "cancelled"] += 1
         if not conflict:
             sess.diary_upto = max(int(sess.diary_upto or 0), last_id)
+        else:
+            stats["conflict"] = 1   # запись поправили, пока шёл запрос — повторим следующим ходом
         await db.commit()
     _failed_at.pop(session_id, None)
     if any(stats.values()):
@@ -636,7 +667,8 @@ def render(days: list, plans: list, today: date, reminded: set | frozenset = fro
                 head = "Сегодня" if d == today else ("Вчера" if (today - d).days == 1 else fmt_day(d))
             except ValueError:
                 head = r.day
-            text = _clip_middle(r.text, BLOCK_DAY_CHARS, BLOCK_DAY_CHARS // 3)
+            cap = BLOCK_TODAY_CHARS if r.day == today.isoformat() else BLOCK_DAY_CHARS
+            text = _clip_middle(r.text, cap, cap // 3)
             parts.append(f"{head}{(' ' + r.mood) if r.mood else ''}: {text}")
     if plans:
         if parts:
