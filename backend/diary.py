@@ -126,13 +126,17 @@ DIGEST_CHARS = 600        # «что горит» одного дня
 HOT_DAYS = 21             # из скольких последних дней берём «горящее»
 HOT_MAX = 8
 AUDIT_PER_RUN = 3         # сколько дней подводим за один фоновый проход
+AUDIT_MAX_FAILS = 3       # день, по которому модель трижды не ответила, — в архив без итогов
+AUDIT_DONE_DAYS = 2       # «сделано» по записи — только для свежих дней (старая запись не закрывает нынешнее дело)
+
+_auditing: set = set()                 # (владелец, персонаж) — итоги уже идут
+_audit_fails: dict[int, int] = {}      # день → сколько раз модель не подвела итоги
 
 AUDIT_PROMPT = (
     "Ты — {char}. Вечером ты перечитываешь свою запись в личном дневнике за прошедший день с "
     "{user} и подводишь итоги: что из этого дня важно дальше, а что можно отпустить в архив.\n\n"
     "Ответ — ТОЛЬКО JSON без пояснений:\n"
     '{{"opinion": "<твоё мнение о {user} целиком>", "hot": "<что из дня ещё горит>", '
-    '"plans": [{{"due": "YYYY-MM-DD", "time": "HH:MM или пусто", "text": "<дело>", "quote": "<цитата>"}}], '
     '"done": [<номер дела>]}}\n\n'
     "opinion — твоё сложившееся мнение о {user}, от первого лица, 4–10 предложений (до 1500 "
     "символов): какой он человек, что ценит, что его тревожит и радует, как он к тебе относится и "
@@ -142,9 +146,8 @@ AUDIT_PROMPT = (
     "hot — 1–3 предложения: что из этого дня ещё не закрыто и важно в ближайшие дни (тревога, "
     "незаконченное дело, обещание, здоровье, ожидаемый ответ). Всё закрыто или неважно — пустая "
     "строка: день уйдёт в архив.\n"
-    "plans — дела {user} в реальной жизни с датой или сроком из этой записи, которых ещё нет в "
-    "списке; quote — точная короткая цитата из записи. done — номера дел из списка, которые по "
-    "записи уже сделаны.\n"
+    "done — номера дел из списка, которые по этой записи уже сделаны (новые дела сюда не "
+    "пишутся: их записывают из реплик самого {user}).\n"
     "Пиши по-русски, своим голосом."
 )
 PLANS_HINT = (
@@ -306,8 +309,7 @@ async def after_turn(session_id: int) -> None:
         await maybe_update(session_id)
         try:
             await maybe_audit(session_id)
-        except Exception:  # noqa: BLE001 — итоги дня не мешают чату
-            _failed_at[session_id] = time.monotonic()
+        except Exception:  # noqa: BLE001 — итоги дня не мешают чату (и записи дневника тоже)
             logger.exception("Дневник: итоги дня не подведены (чат %s)", session_id)
 
 
@@ -652,15 +654,38 @@ async def maybe_audit(session_id: int, *, force: bool = False, limit: int = AUDI
     """Подвести итоги прошедших дней дневника этого персонажа. Сколько дней подведено."""
     if not settings.DIARY:
         return 0
-    from backend.memory_service import _background_connection
-    from backend.settings_service import get_connection
-
     async with AsyncSessionLocal() as db:
         sess = await db.get(models.ChatSession, session_id)
         who = await owner_of(db, sess) if sess is not None else None
-        if who is None:
+    if who is None:
+        return 0
+    if not force and await _has_backlog(session_id):
+        return 0   # вчерашние реплики ещё не записаны — итоги подведём, когда день дописан
+    if who in _auditing:
+        if not force:
+            return 0   # итоги этого дневника уже подводит другой ход
+        for _ in range(600):
+            await asyncio.sleep(0.1)
+            if who not in _auditing:
+                break
+        else:
             return 0
-        pkey, char_id = who
+    _auditing.add(who)
+    try:
+        return await _audit(session_id, who, force, limit)
+    finally:
+        _auditing.discard(who)
+
+
+async def _audit(session_id: int, who: tuple, force: bool, limit: int) -> int:
+    from backend.memory_service import _background_connection
+    from backend.settings_service import get_connection
+
+    pkey, char_id = who
+    async with AsyncSessionLocal() as db:
+        sess = await db.get(models.ChatSession, session_id)
+        if sess is None:
+            return 0
         conf = await get_settings(db, pkey)
         if not conf["enabled"] or not (conf["auto"] or force):
             return 0
@@ -689,12 +714,23 @@ async def maybe_audit(session_id: int, *, force: bool = False, limit: int = AUDI
                 continue
             view_row = (await db.execute(select(models.DiaryView).where(
                 models.DiaryView.profile_key == pkey, models.DiaryView.character_id == char_id))).scalars().first()
-            plans = (await db.execute(select(models.DiaryPlan).where(
-                models.DiaryPlan.profile_key == pkey, models.DiaryPlan.status == "planned",
-                models.DiaryPlan.due >= (today - timedelta(days=3)).isoformat())
-                .order_by(models.DiaryPlan.due, models.DiaryPlan.id).limit(MAX_PLANS_LISTED))).scalars().all()
+            try:
+                recent_day = (today - date.fromisoformat(row.day)).days <= AUDIT_DONE_DAYS
+            except ValueError:
+                recent_day = False
+            plans = []
+            if recent_day:
+                pq = select(models.DiaryPlan).where(
+                    models.DiaryPlan.profile_key == pkey, models.DiaryPlan.status == "planned",
+                    models.DiaryPlan.due >= (today - timedelta(days=3)).isoformat())
+                if not conf["plans_shared"]:
+                    pq = pq.where(or_(models.DiaryPlan.character_id == char_id,
+                                      models.DiaryPlan.character_id.is_(None)))
+                plans = (await db.execute(pq.order_by(models.DiaryPlan.due, models.DiaryPlan.id)
+                                          .limit(MAX_PLANS_LISTED))).scalars().all()
             plan_ids = [p.id for p in plans]
             seen_text = row.text
+            seen_view = view_row.text if view_row is not None else None
             try:
                 d = date.fromisoformat(row.day)
                 day_label = f"{row.day}, {_RU_WEEKDAYS[d.weekday()]}"
@@ -706,14 +742,28 @@ async def maybe_audit(session_id: int, *, force: bool = False, limit: int = AUDI
                      *([f"{i}. {p.due}{(' ' + p.time) if p.time else ''} — {p.text}" for i, p in enumerate(plans, 1)]
                        or ["(дел нет)"]),
                      "", f"[Запись дневника за {day_label}]", row.text]
-        with llm_gateway.sampling_overrides(max_tokens=3000, temperature=0.4):
-            reply = await llm_gateway.complete(
-                [{"role": "system", "content": AUDIT_PROMPT.format(char=cname, user=uname)},
-                 {"role": "user", "content": "\n".join(parts)}],
-                None, _background_connection(connection), kind="diary")
-        got = parse_audit(reply)
-        src_norm, src_terms = _norm_key(seen_text), terms(seen_text)
-        found = [p for p in (screen_plan(i, today, src_norm, src_terms) for i in got["plans"]) if p]
+        try:
+            with llm_gateway.sampling_overrides(max_tokens=3000, temperature=0.4):
+                reply = await llm_gateway.complete(
+                    [{"role": "system", "content": AUDIT_PROMPT.format(char=cname, user=uname)},
+                     {"role": "user", "content": "\n".join(parts)}],
+                    None, _background_connection(connection), kind="diary")
+            got = parse_audit(reply)
+        except llm_gateway.BackgroundCancelled:
+            raise
+        except Exception:  # noqa: BLE001 — сбой одного дня не стопорит остальные
+            fails = _audit_fails.get(day_id, 0) + 1
+            _audit_fails[day_id] = fails
+            logger.warning("Дневник: итоги дня %s не подведены (попытка %s)", day_id, fails, exc_info=True)
+            if fails >= AUDIT_MAX_FAILS:
+                async with AsyncSessionLocal() as db:
+                    row = await db.get(models.DiaryDay, day_id)
+                    if row is not None and row.audited_at is None and row.text == seen_text:
+                        row.audited_at, row.digest = datetime.utcnow(), ""
+                        await db.commit()
+                _audit_fails.pop(day_id, None)
+            continue
+        _audit_fails.pop(day_id, None)
         lock = _locks.setdefault(pkey, asyncio.Lock())
         async with lock, AsyncSessionLocal() as db:
             row = await db.get(models.DiaryDay, day_id)
@@ -725,19 +775,13 @@ async def maybe_audit(session_id: int, *, force: bool = False, limit: int = AUDI
             if len(opinion) >= 20:
                 view_row = (await db.execute(select(models.DiaryView).where(
                     models.DiaryView.profile_key == pkey, models.DiaryView.character_id == char_id))).scalars().first()
-                if view_row is None:
+                current = view_row.text if view_row is not None else None
+                if current != seen_view:
+                    pass   # мнение поправили, пока думала модель, — правку не затираем
+                elif view_row is None:
                     db.add(models.DiaryView(profile_key=pkey, character_id=char_id, text=opinion))
                 else:
                     view_row.text, view_row.updated_at = opinion, datetime.utcnow()
-            known = {(p.due, _norm_key(p.text)) for p in (await db.execute(
-                select(models.DiaryPlan).where(models.DiaryPlan.profile_key == pkey,
-                                               models.DiaryPlan.status != "cancelled"))).scalars().all()}
-            for p in found:
-                key = (p["due"], _norm_key(p["text"]))
-                if key not in known:
-                    known.add(key)
-                    db.add(models.DiaryPlan(profile_key=pkey, character_id=char_id, session_id=session_id,
-                                            due=p["due"], time=p["time"], text=p["text"], quote=p["quote"]))
             for n in (_as_index(x) for x in got["done"]):
                 if n is not None and 1 <= n <= len(plan_ids):
                     plan = await db.get(models.DiaryPlan, plan_ids[n - 1])
@@ -822,7 +866,7 @@ def render(days: list, plans: list, today: date, reminded: set | frozenset = fro
            view: str = "", hot: list | None = None) -> str:
     parts = []
     if (view or "").strip():
-        parts += [VIEW_HEADER, view.strip()]
+        parts += [VIEW_HEADER, _clip_middle(view.strip(), VIEW_CHARS, VIEW_CHARS // 2)]
     if days:
         if parts:
             parts.append("")
@@ -845,7 +889,7 @@ def render(days: list, plans: list, today: date, reminded: set | frozenset = fro
                 label = fmt_day(date.fromisoformat(r.day))
             except ValueError:
                 label = r.day
-            parts.append(f"- {label}: {r.digest.strip()}")
+            parts.append(f"- {label}: {_clip_middle(r.digest.strip(), DIGEST_CHARS, DIGEST_CHARS // 2)}")
     if plans:
         if parts:
             parts.append("")
@@ -912,14 +956,15 @@ async def prompt_block(db, sess) -> str:
 # ============================================================================
 # REST: /api/diary
 # ============================================================================
-def _day(r) -> dict:
+def _day(r, today: str = "") -> dict:
     try:
         wd = _RU_WEEKDAYS[date.fromisoformat(r.day).weekday()]
     except ValueError:
         wd = ""
     return {"id": r.id, "character_id": r.character_id, "day": r.day, "weekday": wd,
             "mood": r.mood, "text": r.text, "edited": bool(r.edited),
-            "digest": r.digest or "", "audited": r.audited_at is not None}
+            "digest": r.digest or "", "audited": r.audited_at is not None,
+            "is_today": bool(today) and r.day == today}
 
 
 def _plan(p) -> dict:
@@ -976,8 +1021,14 @@ def build_router(current_user):
             chars = dict((await db.execute(select(models.Character.id, models.Character.name).where(
                 models.Character.id.in_(list(counts))))).all())
         days = []
+        # «Сегодня» — по поясу открытого чата (как у сервера), а не по часам браузера.
+        today_s = datetime.now(timezone.utc).date().isoformat()
+        if session_id:
+            s0 = await db.get(models.ChatSession, session_id)
+            if s0 is not None and key_for_session(s0) == pkey:
+                today_s = today_of(s0).isoformat()
         if character_id:
-            days = [_day(r) for r in (await db.execute(
+            days = [_day(r, today_s) for r in (await db.execute(
                 select(models.DiaryDay).where(models.DiaryDay.profile_key == pkey,
                                               models.DiaryDay.character_id == character_id)
                 .order_by(models.DiaryDay.day.desc()).limit(120))).scalars().all()]
@@ -1041,6 +1092,8 @@ def build_router(current_user):
             text = _clean_entry(payload.get("text"))
             if not text:
                 raise HTTPException(422, "Пустая запись — удалите её")
+            if text != r.text and "digest" not in payload:
+                r.audited_at, r.digest = None, ""   # день переписан — итоги заново
             r.text, r.edited = text, True
         if "mood" in payload:
             r.mood = _clean(payload.get("mood"), 8)

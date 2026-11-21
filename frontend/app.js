@@ -6760,7 +6760,8 @@ createApp({
     },
     pickDiaryChar(id) {
       this.diaryChar = Number(id) || null;
-      this.diaryEdit = { id: null, text: "", mood: "" };
+      this.diaryEdit = { id: null, text: "", mood: "", digest: "" };
+      this.diaryViewEdit = null;   // правка мнения прежнего персонажа не уходит новому
       this.loadDiary();
     },
     async _diaryCall(path, opts, okText) {
@@ -6796,7 +6797,9 @@ createApp({
       } finally {
         this.diaryRunning = false;
       }
-      this.diaryChar = this.diaryChatChar || this.diaryChar;
+      const next = this.diaryChatChar || this.diaryChar;
+      if (next !== this.diaryChar) this.diaryViewEdit = null;
+      this.diaryChar = next;
       await this.loadDiary();
     },
     diaryDayTitle(d) {
@@ -6852,10 +6855,9 @@ createApp({
         this.diaryViewEdit = null;
       }
     },
+    // «Сегодня» — по серверу (пояс чата), а не по часам браузера.
     diaryIsToday(d) {
-      const n = new Date();
-      const iso = n.getFullYear() + "-" + String(n.getMonth() + 1).padStart(2, "0") + "-" + String(n.getDate()).padStart(2, "0");
-      return d.day === iso;
+      return !!d.is_today;
     },
     async deleteDiaryDay(d) {
       const ok = await this.askConfirm("Удалить запись дневника за " + this.diaryDayTitle(d) + "?", { title: "Дневник", okText: "Удалить" });

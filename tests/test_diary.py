@@ -389,7 +389,8 @@ def test_day_audit_opinion_hot_and_archive(client, diary_on):
     assert days[d2]["digest"].startswith("Он простыл")                  # горит
     assert not days[today.isoformat()]["audited"]
     assert data["view"]["text"].startswith("Он мягкий, любит кино, но запускает здоровье")
-    assert any(p["text"] == "сходить к врачу" and p["due"] == tomorrow for p in data["plans"])
+    # Новые дела итоги не записывают: дела — только из реплик самого человека.
+    assert not any(p["text"] == "сходить к врачу" for p in data["plans"])
 
     block = data["block"]
     assert "Как ты видишь собеседника" in block and "запускает здоровье" in block
@@ -418,3 +419,58 @@ def test_appending_to_audited_day_resets_audit(client, diary_on):
     _say(client, sid, "и ещё поужинали")
     _scan(client, sid, {"days": [{"day": today, "add": "И поужинали."}]})
     assert client.get(f"/api/diary?character_id={cid}").json()["days"][0]["audited"] is False
+
+
+def test_failing_day_does_not_block_others_and_is_archived(client, diary_on, monkeypatch):
+    """Ревью 2.30.0: день, на котором модель падает, не стопорит итоги остальных дней."""
+    cid, sid = _chat(client, "Сбойная")
+    today = datetime.now(timezone.utc).date()
+    bad, good = (today - timedelta(days=3)).isoformat(), (today - timedelta(days=2)).isoformat()
+    client.post("/api/diary/days", json={"character_id": cid, "day": bad, "text": "СЛОМАННЫЙ день."})
+    client.post("/api/diary/days", json={"character_id": cid, "day": good, "text": "Хороший день."})
+
+    async def fake(*args, **kwargs):
+        body = str((kwargs.get("messages") or [{}])[-1].get("content"))
+        text = "я не буду" if "СЛОМАННЫЙ" in body else json.dumps({"opinion": "Он хороший человек.", "hot": ""},
+                                                                    ensure_ascii=False)
+
+        async def gen():
+            yield _chunk(text)
+        return gen()
+
+    with patch("backend.llm_gateway.litellm.acompletion", new=fake):
+        assert client.portal.call(functools.partial(diary.maybe_audit, sid, force=True)) == 1
+        days = {d["day"]: d for d in client.get(f"/api/diary?character_id={cid}").json()["days"]}
+        assert days[good]["audited"] and not days[bad]["audited"]
+        for _ in range(diary.AUDIT_MAX_FAILS):
+            client.portal.call(functools.partial(diary.maybe_audit, sid, force=True))
+    days = {d["day"]: d for d in client.get(f"/api/diary?character_id={cid}").json()["days"]}
+    assert days[bad]["audited"] and days[bad]["digest"] == ""        # после N сбоев — в архив
+
+
+def test_opinion_edit_during_audit_is_kept(client, diary_on):
+    cid, sid = _chat(client, "Мнение во время итогов")
+    today = datetime.now(timezone.utc).date()
+    client.post("/api/diary/days", json={"character_id": cid, "day": (today - timedelta(days=1)).isoformat(),
+                                         "text": "Обычный день."})
+    client.put("/api/diary/view", json={"character_id": cid, "text": "Старое мнение."})
+
+    async def fake(*args, **kwargs):
+        from backend import models
+        from backend.database import AsyncSessionLocal
+        from sqlalchemy import select
+        async with AsyncSessionLocal() as db:
+            vr = (await db.execute(select(models.DiaryView).where(models.DiaryView.character_id == cid))).scalars().first()
+            vr.text = "Моя свежая правка мнения."
+            await db.commit()
+        text = json.dumps({"opinion": "Мнение модели, построенное на старом.", "hot": ""}, ensure_ascii=False)
+
+        async def gen():
+            yield _chunk(text)
+        return gen()
+
+    with patch("backend.llm_gateway.litellm.acompletion", new=fake):
+        client.portal.call(functools.partial(diary.maybe_audit, sid, force=True))
+    data = client.get(f"/api/diary?character_id={cid}&session_id={sid}").json()
+    assert data["view"]["text"] == "Моя свежая правка мнения."
+    assert data["days"][0]["audited"]
