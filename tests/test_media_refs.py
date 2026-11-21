@@ -802,3 +802,22 @@ async def test_transient_probe_failure_keeps_working_storage(db_ready):
     assert cap["ok"] and mr.usable(route) == "gcs"          # 429 не выключает рабочие ссылки
     assert mr._cap_stale(dict(cap, checked_at=cap["checked_at"] - 1000))   # но скоро перепроверим
 
+
+
+def test_deployments_for_wildcard_account_rule():
+    """Шаблон «acc2/*» → «vertex_ai/*» — это Gemini на Vertex, а не «не только Gemini» (2.30.3)."""
+    data = [
+        {"model_name": "gemini-4-carbon", "litellm_params": {"model": "vertex_ai/gemini-4-carbon"}},
+        {"model_name": "acc2/*", "litellm_params": {"model": "vertex_ai/*"}},
+        # Так прокси показывает модель, подобранную по шаблону: провайдер не виден.
+        {"model_name": "acc2/gemini-3.8-flash", "litellm_params": {"model": "acc2/gemini-3.8-flash"}},
+    ]
+    assert mr.deployments_for(data, "acc2/gemini-3.8-flash") == ["vertex_ai/gemini-3.8-flash"]
+    assert mr.deployments_for(data, "gemini-4-carbon") == ["vertex_ai/gemini-4-carbon"]
+    assert mr.deployments_for(data, "acc3/x") == []
+    # Точная запись с настоящей моделью важнее шаблона.
+    data.append({"model_name": "acc2/fast", "litellm_params": {"model": "vertex_ai/gemini-3.8-flash"}})
+    assert mr.deployments_for(data, "acc2/fast") == ["vertex_ai/gemini-3.8-flash"]
+    # Шаблон с хвостом.
+    tail = [{"model_name": "*-acc2", "litellm_params": {"model": "vertex_ai/*"}}]
+    assert mr.deployments_for(tail, "gemini-4-argon-acc2") == ["vertex_ai/gemini-4-argon"]

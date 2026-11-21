@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import fnmatch
 import hashlib
 import logging
 import re
@@ -1087,12 +1088,36 @@ async def _alias_deployments(route: Route) -> list[str] | None:
             data = resp.json().get("data") or []
         except Exception:  # noqa: BLE001
             continue
-        found = [((d.get("litellm_params") or {}).get("model") or "")
-                 for d in data if isinstance(d, dict) and d.get("model_name") == route.alias]
-        # Нет точного совпадения (шаблон «gemini/*», псевдоним группы) — решает
-        # сама проверка загрузкой и чтением.
-        return found or None
+        # Нет совпадения (неизвестный шаблон, псевдоним группы) — решает сама
+        # проверка загрузкой и чтением.
+        return deployments_for(data, route.alias) or None
     return None
+
+
+def deployments_for(data, alias: str) -> list[str]:
+    """
+    Модели провайдера за псевдонимом по ответу /model/info. Шаблон
+    «acc2/*» → «vertex_ai/*» раскрывается: «acc2/gemini-3.8-flash» →
+    «vertex_ai/gemini-3.8-flash». Запись, где модель провайдера — сам
+    псевдоним или нераскрытый шаблон (так прокси показывает модели,
+    подобранные по шаблону), ничего не говорит о провайдере и пропускается.
+    """
+    exact, pattern = [], []
+    for d in data or []:
+        if not isinstance(d, dict):
+            continue
+        name = str(d.get("model_name") or "")
+        model = str((d.get("litellm_params") or {}).get("model") or "")
+        if name == alias:
+            exact.append(model)
+        elif "*" in name and fnmatch.fnmatchcase(alias, name):
+            head, _, tail = name.partition("*")
+            rest = alias[len(head):len(alias) - len(tail) if tail else None]
+            pattern.append(model.replace("*", rest, 1))
+    useful = [m for m in exact if m and m != alias and "*" not in m]
+    if useful:
+        return useful
+    return [m for m in pattern if m and m != alias and "*" not in m]
 
 
 def _files_client(route: Route, timeout: float):
