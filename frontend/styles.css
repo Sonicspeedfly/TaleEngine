@@ -2468,3 +2468,6 @@ input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
    только у карточек, и в окнах крестик уезжал под заголовок). */
 .modal .row-between, .people-chat-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
 .people-chat-head .grow { flex: 1; }
+/* Инспектор: части хвоста запроса (2.29.3) */
+.ins-sub { padding-left: 18px; opacity: .9; }
+.ins-heavy .ins-w, .ins-heavy .grow { color: var(--danger, #d33); font-weight: 600; }

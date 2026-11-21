@@ -5877,6 +5877,17 @@ createApp({
         (a) => (a.data || files[a.id] || this._attByRef(a)) && !a.error
       );
     },
+    // Подписи блоков хвоста запроса для инспектора контекста.
+    tailLabel(key) {
+      return ({
+        snapshot: "Снимок памяти чата", horae_state: "Хроника: состояние (сцена, NPC, предметы, таблицы)",
+        horae_rules: "Хроника: правила тегов", horae_reminder: "Хроника: напоминание формата",
+        recalled: "Вспомнившиеся факты", horae_recall: "Вспомнившиеся события",
+        manifest: "Список файлов", appearance: "Внешность", web: "Интернет", time: "Время",
+        diary: "Дневник и дела", author_note: "Заметка автора", anchor: "Якорь характера",
+        post_history: "Инструкции после истории", global: "Общие инструкции", focus: "Фокус ответа",
+      })[key] || key;
+    },
     debugPurpose(p) {
       const names = { chat: "ход", canvas: "Канвас", summary: "фон: память чата", horae: "фон: Хроника",
         profile: "фон: память о пользователе", director: "режиссёр группы", address: "кому реплика (общий чат)", service: "служебный" };
@@ -10729,6 +10740,13 @@ createApp({
               <span class="ins-dot seg-tail" aria-hidden="true"></span>
               <span class="grow">Хвост: память, дневник, заметка автора, якорь характера</span>
               <span class="ins-w">{{ ctxStats.tail_tokens }}</span>
+            </div>
+            <!-- Хвост по частям (2.29.3): видно, какой блок раздулся. -->
+            <div v-for="(b, i) in (ctxStats.tail || []).filter((x) => x.tokens > 0)" :key="'tl' + i"
+                 class="ins-block ins-static ins-sub" :class="{ 'ins-heavy': b.tokens >= 8000 }" :title="(b.text || '').slice(0, 600)">
+              <span class="ins-dot" aria-hidden="true"></span>
+              <span class="grow">· {{ tailLabel(b.key) }}</span>
+              <span class="ins-w">{{ b.tokens }}</span>
             </div>
           </details>
         </template>
