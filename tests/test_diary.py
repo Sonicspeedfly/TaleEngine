@@ -474,3 +474,16 @@ def test_opinion_edit_during_audit_is_kept(client, diary_on):
     data = client.get(f"/api/diary?character_id={cid}&session_id={sid}").json()
     assert data["view"]["text"] == "Моя свежая правка мнения."
     assert data["days"][0]["audited"]
+
+
+def test_long_addition_is_kept_whole(client, diary_on):
+    """2.30.1: персонаж пишет в дневник столько, сколько нужно, — дописка не урезается."""
+    cid, sid = _chat(client, "Многословная")
+    today = datetime.now(timezone.utc).date().isoformat()
+    long_add = "\n\n".join(f"Абзац {i}: " + "я чувствую так много всего сразу, " * 30 for i in range(6))
+    _say(client, sid, "длинный вечер разговоров")
+    seen = []
+    _scan(client, sid, {"days": [{"day": today, "add": long_add}]}, seen=seen)
+    assert "не сжимай и не сокращай себя" in seen[0][1][0]["content"]
+    text = client.get(f"/api/diary?character_id={cid}").json()["days"][0]["text"]
+    assert text == long_add.strip() and len(text) > 5000
