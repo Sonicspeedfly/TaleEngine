@@ -2475,3 +2475,37 @@ input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
 .diary-view textarea { width: 100%; margin: 6px 0; }
 .diary-status { margin-top: 8px; font-size: var(--fs-100); padding: 4px 8px; border-radius: 8px; background: var(--surface-2, transparent); }
 .diary-status.hot { color: var(--accent); border-left: 3px solid var(--accent); }
+
+/* ============================================================
+   Подвал ответа (2.30.2): строка Хроники и панель действий — одним
+   аккуратным блоком, а не двумя тёмными коробками разной ширины.
+   ============================================================ */
+/* Значки действий — одного вида: цветные эмодзи (🎨, синий ⏩) рядом с
+   серыми пиктограммами выглядели пёстро. Цвет возвращается при наведении. */
+.msg-actions .btn-icon { filter: grayscale(1) brightness(1.1); }
+.msg-actions .btn-icon:hover, .msg-actions .btn-icon:focus-visible { filter: none; }
+
+/* Режим «Сцена»: подложка для читаемости на фоне-картинке — ОДНА на подвал,
+   по ширине реплики. Строка Хроники — верх подложки, сведения и действия — низ. */
+.view-scene .h-msg { margin-top: 6px; }
+.view-scene .h-msg-line {
+  background: rgba(14, 12, 15, 0.82); border-radius: var(--r-sm) var(--r-sm) 0 0;
+  padding: 5px 10px;
+}
+.view-scene .h-msg-line:hover { background: rgba(28, 24, 30, 0.9); }
+.view-scene .msg-meta { width: auto; padding: 2px 10px 4px; background: rgba(14, 12, 15, 0.82); }
+.view-scene .h-msg + .msg-meta {
+  margin-top: 0; border-radius: 0 0 var(--r-sm) var(--r-sm);
+  border-top: 1px solid rgba(240, 235, 230, 0.06);
+}
+.view-scene .h-msg.h-msg-open + .msg-meta { border-radius: var(--r-sm); margin-top: 4px; }
+/* На широком экране сведения и действия — одной строкой: действия справа,
+   без переноса на вторую строку (лишнее прокручивается). */
+@media (min-width: 768px) {
+  .view-scene .msg-meta { flex-wrap: nowrap; justify-content: space-between; }
+  .view-scene .msg-info { flex: none; }
+  .view-scene .msg-actions {
+    flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; min-width: 0;
+  }
+  .view-scene .msg-actions::-webkit-scrollbar { display: none; }
+}
