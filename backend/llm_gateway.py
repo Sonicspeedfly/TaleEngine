@@ -549,6 +549,65 @@ def _is_inline_media(b) -> bool:
 
 
 # Запрос длиннее лимита модели по токенам.
+# Провайдер отказал по нехватке мощности или лимита в минуту (429).
+_RATE_LIMIT_SIGNS = ("resource exhausted", "resource_exhausted", "ratelimiterror", "rate limit",
+                     "error code: 429", '"code": 429', "status 429", "quota exceeded")
+# Облегчённый повтор после 429 (2.29.4): только для тяжёлых запросов — лёгкий
+# упирается не в свой вес, и урезать ему нечего.
+LIGHT_RETRY_MIN_TOKENS = 60_000
+LIGHT_RETRY_PAUSE = 12.0
+LIGHT_RETRY_KEEP = 4          # последних сообщений истории остаётся всегда
+
+
+def _rate_limited(exc) -> bool:
+    text = f"{type(exc).__name__} {exc}".lower()
+    return any(s in text for s in _RATE_LIMIT_SIGNS)
+
+
+def lighten_history(messages: list[dict], target_tokens: int, keep: int = LIGHT_RETRY_KEEP) -> tuple[list[dict], int]:
+    """
+    Копия запроса, где из ИСТОРИИ выброшены самые старые сообщения, пока запрос
+    не станет не тяжелее target_tokens. Не трогаем: всё до истории (системный
+    промпт, аватары, база знаний, снимок памяти), хвост (system перед текущей
+    репликой), саму реплику и последние keep сообщений истории. История после
+    обрезки начинается с реплики человека. Возвращает (копия, сколько выброшено).
+    """
+    from backend.horae_memory import estimate_content_tokens
+
+    n = len(messages)
+    last = n - 1
+    while last >= 0 and messages[last].get("role") == "system":
+        last -= 1
+    if last <= 0 or messages[last].get("role") != "user":
+        return messages, 0
+    tail = last
+    while tail > 0 and messages[tail - 1].get("role") == "system":
+        tail -= 1
+    first_ai = next((i for i in range(tail) if messages[i].get("role") == "assistant"), None)
+    if first_ai is None:
+        return messages, 0
+    start = 0
+    for i in range(first_ai):
+        if messages[i].get("role") == "system":
+            start = i + 1
+    hist = messages[start:tail]
+    if len(hist) <= keep:
+        return messages, 0
+    costs = [estimate_content_tokens(m.get("content")) for m in messages]
+    total = sum(costs)
+    cut = 0
+    limit = len(hist) - keep
+    while cut < limit and total > target_tokens:
+        total -= costs[start + cut]
+        cut += 1
+    while cut < limit and hist[cut].get("role") != "user":
+        total -= costs[start + cut]
+        cut += 1
+    if not cut:
+        return messages, 0
+    return messages[:start] + hist[cut:] + messages[tail:], cut
+
+
 _TOKEN_LIMIT_ERRORS = ("maximum number of tokens", "input token count", "context length",
                        "context_length_exceeded", "too many tokens", "token limit")
 
@@ -838,6 +897,33 @@ async def stream_completion(
             async for token in _stream_once(
                     _strip_history_media(messages, drop_ids, refs=True, keep_ids=answered), params,
                     connection, on_thought, kind, ref_mb=ref_mb, media=(answered, drop_ids)):
+                yield token
+            return
+        if _rate_limited(error):
+            # 429 «Resource exhausted» на ТЯЖЁЛОМ ходе: у Google не хватило мощности
+            # (или минутного лимита) на запрос такого веса, а прокси уже
+            # повторил его несколько раз. Пауза — и один повтор вдвое легче: без
+            # старой части окна и без файлов истории (2.29.4).
+            from backend.horae_memory import estimate_content_tokens
+
+            weight = sum(estimate_content_tokens(m.get("content")) for m in messages)
+            if weight < LIGHT_RETRY_MIN_TOKENS:
+                raise error
+            light, cut = lighten_history(messages, weight // 2)
+            light = _strip_history_media(light, hist_ids | hist_refs | _history_ref_ids(light), refs=True,
+                                         keep_ids=answered)
+            new_weight = sum(estimate_content_tokens(m.get("content")) for m in light)
+            if new_weight >= weight * 0.85:
+                raise error
+            note = (f"Google не принял тяжёлый запрос (~{weight // 1000} тыс. токенов): «Resource "
+                    f"exhausted». Повторяю облегчённым (~{new_weight // 1000} тыс.: без {cut} старых "
+                    "сообщений окна и без файлов истории). Чтобы не упираться, уменьшите «Окно "
+                    "контекста» и «Активное окно».")
+            logging.getLogger("aichat.llm").warning("%s Исходная ошибка: %s", note, error)
+            _notify(on_notice, note)
+            await asyncio.sleep(LIGHT_RETRY_PAUSE)
+            async for token in _stream_once(light, params, connection, on_thought, kind,
+                                            ref_mb=0.0, media=(answered, hist_ids | hist_refs)):
                 yield token
             return
         dropped = _history_media_count(messages, hist_ids, keep_ids=answered)
