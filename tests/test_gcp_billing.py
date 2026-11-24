@@ -367,3 +367,21 @@ def gb_settings():
     from backend.schemas import GcpBillingSettings
 
     return GcpBillingSettings()
+
+
+async def test_closed_main_billing_is_a_note_when_other_account_active(db_ready, monkeypatch):
+    """2.30.4: запросы идут через «acc2/…» — закрытая оплата основного проекта не тревога."""
+    from backend.database import AsyncSessionLocal
+
+    monkeypatch.setattr(gb, "_request", _google(account_open=False))
+    monkeypatch.setattr(gb, "proxy_prices", _no_proxy_prices(PRICE))
+    conn = {"accounts": [{"name": "Основной", "prefix": ""}, {"name": "Второй", "prefix": "acc2/"}],
+            "active_account": 1}
+    async with AsyncSessionLocal() as db:
+        await gb.save_settings(db, {"bigquery": False})
+        snap = await gb.snapshot(db, conn, force=True)
+        assert snap["account"] == {"name": "Второй", "prefix": "acc2/", "main": False}
+        assert not any("закрыт" in a for a in snap["alerts"])
+        assert any("закрыт" in n and "«Второй»" in n for n in snap["notes"])
+        main = await gb.snapshot(db, {**conn, "active_account": 0}, force=True)
+        assert main["account"]["main"] and any("закрыт" in a for a in main["alerts"])

@@ -618,6 +618,20 @@ def _money(x: float | None) -> float | None:
     return None if x is None else round(x, 4)
 
 
+def active_account(connection: dict | None) -> dict:
+    """Активный аккаунт Google на прокси (2.25.0): имя, префикс, основной ли."""
+    conn = connection or {}
+    accounts = [a for a in (conn.get("accounts") or []) if isinstance(a, dict)]
+    try:
+        idx = int(conn.get("active_account") or 0)
+    except (TypeError, ValueError):
+        idx = 0
+    acc = accounts[idx] if 0 <= idx < len(accounts) else {}
+    prefix = "".join(str(acc.get("prefix") or "").split())
+    return {"name": str(acc.get("name") or "").strip() or prefix or "Основной",
+            "prefix": prefix, "main": not prefix}
+
+
 async def snapshot(db, connection: dict | None, force: bool = False) -> dict:
     """Всё для карточки «Google Cloud» одним ответом."""
     async with _lock:
@@ -647,16 +661,30 @@ async def _snapshot(db, connection, force):
     project = cfg["project_id"] or (settings.VERTEX_PROJECT or "").strip() or auth.get("quota_project") or ""
     quota = project
 
+    account = active_account(connection)
+    # Карточка видит только проект основного аккаунта (вход Google этого
+    # сервера). Когда запросы идут через другой аккаунт прокси («acc2/…»),
+    # беда с оплатой основного их не ломает — это пояснение, а не тревога.
+    urgent = alerts if account["main"] else notes
+    other = "" if account["main"] else (
+        f" Сейчас запросы идут через аккаунт «{account['name']}» — его оплату эта карточка не видит.")
+
     status = None
     if token and project:
         status = await _cached(f"status|{project}", STATUS_TTL, force,
                                lambda: fetch_status(token, quota, project))
         if status.get("ok"):
             if status.get("account_open") is False:
-                alerts.append("Платёжный аккаунт Google Cloud закрыт — запросы к моделям и файлам "
-                                "будут отклоняться. Откройте Billing в консоли.")
+                urgent.append(("Платёжный аккаунт Google Cloud закрыт — запросы к моделям и файлам "
+                               "будут отклоняться. Откройте Billing в консоли.") if account["main"] else
+                              f"Платёжный аккаунт основного проекта {project} закрыт: модели основного "
+                              "аккаунта отвечать не будут." + other)
             elif not status.get("billing_enabled"):
-                alerts.append(f"У проекта {project} не включена оплата (нет платёжного аккаунта).")
+                urgent.append(f"У проекта {project} не включена оплата (нет платёжного аккаунта)." + other)
+        elif not account["main"]:
+            notes.append(f"Карточка показывает основной проект {project}." + other)
+    elif not account["main"]:
+        notes.append("Карточка показывает основной аккаунт." + other)
     elif auth.get("ok") and not project:
         auth = {**auth, "error": "Не знаю ID проекта: впишите его в настройках карточки."}
 
@@ -722,6 +750,7 @@ async def _snapshot(db, connection, force):
         "configured": bool(auth.get("ok")),
         "auth": {k: v for k, v in auth.items() if k in ("ok", "type", "quota_project", "path", "error")},
         "project": project,
+        "account": account,
         "status": status,
         "bigquery": {k: v for k, v in bq.items() if k in ("state", "table", "exported_at", "error", "datasets")},
         "currency": currency,

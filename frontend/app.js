@@ -9275,7 +9275,7 @@ createApp({
                   <span v-if="gcp.status.account_open === false" class="gcp-bad">❌ Платёжный аккаунт закрыт</span>
                   <span v-else-if="!gcp.status.billing_enabled" class="gcp-bad">❌ У проекта выключена оплата</span>
                   <span v-else>✅ Оплата активна</span>
-                  <span class="muted"> · {{ gcp.project }}<span v-if="gcp.status.account_name"> · {{ gcp.status.account_name }}</span></span>
+                  <span class="muted"> · {{ gcp.project }}<span v-if="gcp.status.account_name"> · {{ gcp.status.account_name }}</span><span v-if="gcp.account && !gcp.account.main"> · основной аккаунт, сейчас активен «{{ gcp.account.name }}»</span></span>
                 </template>
                 <span v-else class="gcp-warn">⚠ Состояние оплаты: {{ gcp.status.error }}</span>
               </div>
