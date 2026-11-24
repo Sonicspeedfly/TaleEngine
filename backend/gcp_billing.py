@@ -35,7 +35,7 @@ import os
 import re
 import shutil
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from backend.config import settings
 
@@ -774,7 +774,9 @@ async def _snapshot(db, connection, force):
         "settings": cfg,
         "alerts": alerts,
         "notes": notes,
-        "checked_at": datetime.fromtimestamp(_fetched.get(f"status|{project}") or _now()).isoformat(timespec="minutes"),
+        # С поясом (UTC): браузер покажет время по часам пользователя, а не сервера.
+        "checked_at": datetime.fromtimestamp(_fetched.get(f"status|{project}") or _now(),
+                                             timezone.utc).isoformat(timespec="minutes"),
     }
     unpriced = [m["model"] for m in out["models"] if m["price"] is None and m["tokens"]]
     if unpriced:
