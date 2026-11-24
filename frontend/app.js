@@ -7635,6 +7635,13 @@ createApp({
     gcpPriceSource(src) {
       return { proxy: "прокси", local: "LiteLLM сервера", manual: "вручную" }[src] || src || "—";
     },
+    // Момент из ответа сервера (ISO с поясом) — по часам пользователя: «24.11.2026 15:37».
+    fmtLocalTime(iso) {
+      const d = iso ? new Date(iso) : null;
+      if (!d || isNaN(d)) return this.fmtDay(iso);
+      const p = (n) => String(n).padStart(2, "0");
+      return `${p(d.getDate())}.${p(d.getMonth() + 1)}.${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}`;
+    },
     fmtDay(iso) {
       return iso ? String(iso).slice(0, 10).split("-").reverse().join(".") : "";
     },
@@ -9288,7 +9295,7 @@ createApp({
               </div>
               <p v-else class="muted gcp-small">Чтобы видеть остаток кредита, впишите его в ⚙ — сумму и дату с экрана Billing → Credits.</p>
               <div class="gcp-line">Сегодня ≈ <b>{{ fmtMoney(gcp.today.spent) }}</b> · за месяц ≈ <b>{{ fmtMoney(gcp.month.spent) }}</b><span v-if="gcp.month.net != null"> · к оплате {{ fmtMoney(gcp.month.net) }}</span></div>
-              <div class="muted gcp-small">{{ gcpSourceLine }}<span v-if="gcp.checked_at"> Оплата проверена {{ fmtDay(gcp.checked_at) }} {{ String(gcp.checked_at).slice(11, 16) }}.</span></div>
+              <div class="muted gcp-small">{{ gcpSourceLine }}<span v-if="gcp.checked_at"> Оплата проверена {{ fmtLocalTime(gcp.checked_at) }}.</span></div>
               <p v-for="(a, i) in gcp.alerts" :key="'a' + i" class="gcp-bad gcp-small">⚠ {{ a }}</p>
               <p v-for="(n, i) in gcp.notes" :key="'n' + i" class="muted gcp-small">ℹ {{ n }}</p>
               <button class="gcp-more" @click="gcpDetailsOpen = !gcpDetailsOpen" :aria-expanded="gcpDetailsOpen ? 'true' : 'false'">{{ gcpDetailsOpen ? 'Скрыть подробности' : 'Подробнее' }}</button>
