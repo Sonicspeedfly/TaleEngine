@@ -8833,6 +8833,8 @@ createApp({
                    что выполняет действие: открытым оно оставалось бы висеть под
                    репликой, к которой человек уже не вернётся. -->
               <template v-if="!compactActions || msgMenu === m.id">
+                <!-- Тонкий разделитель: главные действия | остальные (2.30.8). -->
+                <span v-if="!compactActions" class="msg-sep" aria-hidden="true"></span>
                 <button v-if="!m.canvas_id" class="btn-icon" @click="msgMenu = null; replyTo(m)" title="Ответить на это сообщение" aria-label="Ответить на это сообщение">↩</button>
                 <!-- У длинного ответа верх уезжает за экран, и вернуться к нему
                      прокруткой на глаз неудобно — даём точный прыжок. -->

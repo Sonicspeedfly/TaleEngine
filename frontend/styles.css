@@ -2499,6 +2499,29 @@ input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
   border-top: 1px solid rgba(240, 235, 230, 0.06);
 }
 .view-scene .h-msg.h-msg-open + .msg-meta { border-radius: var(--r-sm); margin-top: 4px; }
+/* Панель действий на широком экране с мышью (2.30.8) — ровная строка
+   одинаковых квадратных кнопок 28×28 с узким шагом, а не россыпь кнопок
+   разной ширины: эмодзи (📋 🗑 ⏩ 🎨) и текстовые значки (✎ ↻ ↩ ⑂) имели
+   разную ширину, и ряд выглядел неровным и не помещался в одну строку.
+   Главные действия отделены от остальных тонкой чертой. На пальце кнопки
+   остаются по 44px — там это цель для касания. */
+@media (hover: hover) and (pointer: fine) and (min-width: 768px) {
+  .msg-actions { gap: 2px; }
+  .msg-actions .btn-icon {
+    width: 28px; height: 28px; padding: 0; flex: none;
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 15px; line-height: 1; border-radius: var(--r-sm);
+  }
+  .msg-sep {
+    flex: none; width: 1px; height: 16px; margin: 0 5px;
+    background: currentColor; opacity: 0.25;
+  }
+}
+.msg-sep { display: none; }
+@media (hover: hover) and (pointer: fine) and (min-width: 768px) {
+  .msg-sep { display: inline-block; }
+}
+
 /* На широком экране сведения слева, действия справа. Все кнопки видны
    всегда (2.30.7): раньше ряд действий не переносился и прятал лишнее за
    краем без полосы прокрутки — последние кнопки обрезались. Теперь, если
@@ -2509,6 +2532,6 @@ input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
   .view-scene .msg-info { flex: none; }
   .view-scene .msg-actions {
     flex: 1 1 auto; flex-wrap: wrap; justify-content: flex-end; overflow: visible;
-    gap: 2px 6px; min-width: 0;
+    gap: 2px; min-width: 0;
   }
 }
