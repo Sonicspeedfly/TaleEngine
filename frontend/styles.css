@@ -2499,13 +2499,16 @@ input[type="range"] { width: 100%; margin: 2px 0; box-sizing: border-box; }
   border-top: 1px solid rgba(240, 235, 230, 0.06);
 }
 .view-scene .h-msg.h-msg-open + .msg-meta { border-radius: var(--r-sm); margin-top: 4px; }
-/* На широком экране сведения и действия — одной строкой: действия справа,
-   без переноса на вторую строку (лишнее прокручивается). */
+/* На широком экране сведения слева, действия справа. Все кнопки видны
+   всегда (2.30.7): раньше ряд действий не переносился и прятал лишнее за
+   краем без полосы прокрутки — последние кнопки обрезались. Теперь, если
+   ряд не помещается рядом со сведениями, он целиком уходит строкой ниже, а
+   если не помещается и там — переносится, прижатый к правому краю. */
 @media (min-width: 768px) {
-  .view-scene .msg-meta { flex-wrap: nowrap; justify-content: space-between; }
+  .view-scene .msg-meta { flex-wrap: wrap; justify-content: space-between; row-gap: 2px; }
   .view-scene .msg-info { flex: none; }
   .view-scene .msg-actions {
-    flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; min-width: 0;
+    flex: 1 1 auto; flex-wrap: wrap; justify-content: flex-end; overflow: visible;
+    gap: 2px 6px; min-width: 0;
   }
-  .view-scene .msg-actions::-webkit-scrollbar { display: none; }
 }
