@@ -147,6 +147,9 @@ createApp({
       recording: false,
       mediaRecorder: null,
       recChunks: [],
+      // 2.31.0: писать вместе с микрофоном звук компьютера (Discord, видео…).
+      recSystem: (() => { try { return localStorage.getItem("recSystem") === "1"; } catch (e) { return false; } })(),
+      recWithSystem: false,   // идущая запись реально захватила звук компьютера
 
       // --- Редактирование сообщений ---
       editingId: null,
@@ -5998,6 +6001,42 @@ createApp({
       }
       return { blob: this._encodeWav(buf), ext: "wav", mime: "audio/wav" };
     },
+    // Можно ли писать звук компьютера: нужен показ экрана со звуком
+    // (Chrome/Edge на компьютере). На телефоне такого нет.
+    canRecSystem() {
+      return !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia) && !this.coarse;
+    },
+    toggleRecSystem() {
+      this.recSystem = !this.recSystem;
+      try { localStorage.setItem("recSystem", this.recSystem ? "1" : "0"); } catch (e) {}
+      if (this.recSystem) {
+        this.showToast("Звук компьютера: при записи браузер спросит, что показать. Выберите «Весь экран» "
+          + "и включите «Поделиться системным звуком» (или вкладку со звуком). Лучше в наушниках.");
+      }
+    },
+    // Звук компьютера — дорожка показа экрана. Видео сразу останавливаем:
+    // нужен только звук. null — человек отказался или звука не дали.
+    async _systemAudioStream() {
+      let disp;
+      try {
+        disp = await navigator.mediaDevices.getDisplayMedia({
+          video: true,
+          audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+          systemAudio: "include", selfBrowserSurface: "exclude", surfaceSwitching: "exclude",
+        });
+      } catch (e) {
+        this.showToast("Звук компьютера не подключён (" + (e.message || e.name) + ") — пишу только микрофон.");
+        return null;
+      }
+      disp.getVideoTracks().forEach((t) => t.stop());
+      if (!disp.getAudioTracks().length) {
+        disp.getTracks().forEach((t) => t.stop());
+        this.showToast("Браузер не дал звук: выберите «Весь экран» и включите «Поделиться системным звуком» "
+          + "(звук отдельного окна Windows не отдаёт). Пишу только микрофон.");
+        return null;
+      }
+      return disp;
+    },
     async toggleRecord() {
       if (this.recording) {
         // Остановка: onstop соберёт чанки, перекодирует и добавит аудио во вложения.
@@ -6007,22 +6046,43 @@ createApp({
       // Кодировщик тянем ПАРАЛЛЕЛЬНО с записью, а не ждём его здесь: пока
       // пользователь говорит, библиотека успевает догрузиться незаметно.
       this.ensureLame();
+      // Показ экрана просим ПЕРВЫМ, пока жив жест нажатия: после ожидания
+      // разрешения на микрофон браузер мог бы отказать без клика.
+      const disp = this.recSystem && this.canRecSystem() ? await this._systemAudioStream() : null;
+      let mic = null, mix = null;
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+        let stream = mic;
+        if (disp) {
+          // Микрофон и звук компьютера — в одну дорожку.
+          const AC = window.AudioContext || window.webkitAudioContext;
+          mix = new AC();
+          const dest = mix.createMediaStreamDestination();
+          mix.createMediaStreamSource(mic).connect(dest);
+          mix.createMediaStreamSource(new MediaStream(disp.getAudioTracks())).connect(dest);
+          stream = dest.stream;
+        }
+        const releaseAll = () => {
+          [mic, disp].forEach((s) => s && s.getTracks().forEach((t) => t.stop()));
+          if (mix && mix.close) try { mix.close(); } catch (e) {}
+        };
         this.recChunks = [];
         this.mediaRecorder = new MediaRecorder(stream);
         this.mediaRecorder.ondataavailable = (ev) => {
           if (ev.data.size > 0) this.recChunks.push(ev.data);
         };
         this.mediaRecorder.onstop = async () => {
-          stream.getTracks().forEach((t) => t.stop()); // отпускаем микрофон
+          releaseAll(); // отпускаем микрофон и показ экрана
+          const withSystem = this.recWithSystem;
           this.recording = false;
+          this.recWithSystem = false;
           const src = new Blob(this.recChunks, { type: this.mediaRecorder.mimeType || "audio/webm" });
           const recSid = this.sessionId;   // запись — в черновик ЭТОГО чата, даже если пока кодируем, откроют другой
           // Плашка со спиннером сразу — конвертация в MP3 занимает мгновение.
           const raw = {
             id: (this._attSeq = (this._attSeq || 0) + 1),
-            type: "audio", mime: "audio/mp3", name: "Голосовое сообщение.mp3",
+            type: "audio", mime: "audio/mp3",
+            name: withSystem ? "Запись разговора.mp3" : "Голосовое сообщение.mp3",
             size: 0, data: null, loading: true, error: false,
           };
           this.pendingAttachments.push(raw);
@@ -6030,7 +6090,7 @@ createApp({
           try {
             const { blob, ext, mime } = await this._voiceToCompatible(src);
             att.mime = mime;
-            att.name = "Голосовое сообщение." + ext;
+            att.name = (withSystem ? "Запись разговора." : "Голосовое сообщение.") + ext;
             att.size = blob.size;
             this._draftUpload(att, blob, att.name, recSid);
             const reader = new FileReader();
@@ -6044,7 +6104,10 @@ createApp({
         };
         this.mediaRecorder.start();
         this.recording = true;
+        this.recWithSystem = !!disp;
       } catch (e) {
+        [mic, disp].forEach((st) => st && st.getTracks().forEach((t) => t.stop()));
+        if (mix && mix.close) try { mix.close(); } catch (er) {}
         this.showToast("Не удалось получить доступ к микрофону: " + e.message);
       }
     },
@@ -9050,7 +9113,14 @@ createApp({
           </label>
           <!-- Голос — отдельной кнопкой: запись/стоп в один клик -->
           <button class="btn-icon" :class="recording ? 'rec-active' : ''" @click="toggleRecord"
-                  :title="recording ? 'Остановить запись' : 'Записать голос'" :aria-label="recording ? 'Остановить запись' : 'Записать голос'">{{ recording ? '⏺ стоп' : '🎤' }}</button>
+                  :title="recording ? 'Остановить запись' : (recSystem && canRecSystem() ? 'Записать голос и звук компьютера' : 'Записать голос')"
+                  :aria-label="recording ? 'Остановить запись' : (recSystem && canRecSystem() ? 'Записать голос и звук компьютера' : 'Записать голос')">{{ recording ? (recWithSystem ? '⏺ стоп · 🔊' : '⏺ стоп') : '🎤' }}</button>
+          <!-- 2.31.0: писать вместе с микрофоном звук компьютера (собеседник в
+               Discord, видео). Переключатель запоминается в этом браузере. -->
+          <button v-if="canRecSystem() && !recording" class="btn-icon rec-sys" :class="recSystem ? 'on' : ''"
+                  @click="toggleRecSystem" :aria-pressed="recSystem ? 'true' : 'false'"
+                  :title="recSystem ? 'Звук компьютера в записи: включён (нажмите, чтобы выключить)' : 'Добавлять в запись звук компьютера (Discord, видео) — выключено'"
+                  aria-label="Добавлять в запись голоса звук компьютера">{{ recSystem ? '🔊' : '🔈' }}</button>
           <!-- Режиссёр (только в группе): панель кнопок «вызвать/исключить».
                Открытая панель — включённый тумблер, а не авария: красная заливка
                уравнивала её с идущей записью голоса. Кнопка раскрывает панель,
